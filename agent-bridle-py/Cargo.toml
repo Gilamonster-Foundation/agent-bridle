@@ -1,0 +1,38 @@
+[package]
+name = "agent-bridle-py"
+description = "Python bindings (PyO3 wheel) for agent-bridle — Pillar A: call the Caveats-confined tool registry in-process from Python."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# This crate ships ONLY as a PyPI wheel (built by maturin), never to crates.io:
+# it depends transitively on `agent-bridle-tool-shell`, which git-deps our brush
+# fork. A maturin wheel compiles the Rust *in* (the brush git-dep is fine for a
+# wheel), so Pillar A's PyPI path is NOT blocked by the upstream-brush gate.
+publish = false
+
+[lib]
+# `import agent_bridle` loads this native extension module directly (it is the
+# whole package; there is no pure-Python wrapper layer needed for Pillar A).
+name = "agent_bridle"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The facade — with `shell` on, so the confined brush-backed shell is callable
+# (the Pillar-A demo tool). The wheel carries the shell runtime in.
+agent-bridle = { workspace = true, features = ["shell"] }
+agent-mesh-protocol = { workspace = true }
+serde_json = { workspace = true }
+
+# PyO3 with `extension-module` (mirrors agent-mesh-py): builds a Python
+# extension module that does not link libpython. This crate has no Rust test
+# targets (its surface is exercised by the pytest suite under `tests/`), so a
+# cdylib-only build never tries to link a test harness against libpython —
+# `cargo test --workspace --all-features` is therefore safe.
+pyo3 = { workspace = true, features = ["extension-module"] }
+
+# One shared tokio runtime bridges the registry's async `dispatch` to Python's
+# synchronous call boundary (`block_on`). Kept out of `agent-bridle-core`'s dep
+# budget on purpose — it lives here, in a leaf consumer.
+tokio = { workspace = true }

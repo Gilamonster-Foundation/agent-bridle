@@ -1,0 +1,77 @@
+# PyPI distribution for agent-bridle, Pillar A (DESIGN §8).
+#
+# `pip install agent-bridle` lays down a single native PyO3 extension module
+# (`import agent_bridle`) that calls the Caveats-confined tool registry
+# in-process. The maturin wheel compiles the Rust in — so the brush git-dep in
+# `agent-bridle-tool-shell` is fine for a wheel (unlike a crates.io crate);
+# Pillar A's PyPI path is NOT blocked by the upstream-brush gate.
+#
+# Distribution name on PyPI: `agent-bridle` (verified free). The import path is
+# `agent_bridle`.
+#
+# Build with: `maturin build --release` (or `maturin develop` for an editable
+# install inside a venv). Requires maturin>=1.7 (1.4 is too old for this layout).
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "agent-bridle"
+description = "Capability-confined agent tool registry, callable in-process from Python (Pillar A)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+license-files = ["LICENSE"]
+authors = [
+    { name = "Shawn Hartsock", email = "hartsock@users.noreply.github.com" },
+]
+keywords = [
+    "agent",
+    "capability",
+    "object-capability",
+    "ocap",
+    "leash",
+    "caveats",
+    "tools",
+    "mcp",
+    "sandbox",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/Gilamonster-Foundation/agent-bridle"
+Repository = "https://github.com/Gilamonster-Foundation/agent-bridle"
+Documentation = "https://github.com/Gilamonster-Foundation/agent-bridle#readme"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.maturin]
+# Build the cdylib in this package as the top-level `agent_bridle` module
+# (pure-Rust layout — no pure-Python wrapper needed for Pillar A). The lib is
+# named `agent_bridle` in Cargo.toml, so `import agent_bridle` loads it.
+manifest-path = "Cargo.toml"
+module-name = "agent_bridle"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
+# Ship LICENSE inside both the wheel and the sdist so PyPI's License-File
+# metadata validation accepts the upload.
+include = [{ path = "LICENSE", format = ["wheel", "sdist"] }]
