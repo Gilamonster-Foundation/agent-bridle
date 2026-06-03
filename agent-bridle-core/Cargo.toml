@@ -12,10 +12,11 @@ unsafe_code = "forbid"
 
 [features]
 default = []
-# Real Landlock ruleset is a documented P3 TODO. The feature exists so the
-# plumbing (SandboxKind, Sandbox trait, sandbox_kind field) is in place; for
-# P0 it still resolves to a NoopSandbox reporting SandboxKind::None.
-linux-landlock = []
+# Real, kernel-enforced Landlock ruleset (Linux only). Enables the `landlock`
+# dependency and the `LandlockSandbox` (see src/sandbox.rs). First increment
+# confines the `fs_write` axis; without this feature (or off-Linux) the sandbox
+# is the advisory NoopSandbox reporting SandboxKind::None. ADR 0001 (L3).
+linux-landlock = ["dep:landlock"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -23,3 +24,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 agent-mesh-protocol = { workspace = true }
+
+# Landlock is Linux-only; gate the dep on the target so enabling the feature on
+# macOS/Windows does not try to build it. Used only under
+# cfg(all(target_os = "linux", feature = "linux-landlock")).
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { version = "0.4", optional = true }
