@@ -19,8 +19,10 @@ shell = [
     "dep:brush-coreutils-builtins",
     "dep:tokio",
 ]
-# Real Landlock ruleset is a P3 TODO; forwarded to core so sandbox_kind plumbs
-# through. For P0 this still yields a NoopSandbox / SandboxKind::None.
+# Forward to core's real, kernel-enforced Landlock ruleset (Linux). Core's
+# LandlockSandbox currently confines the `fs_write` axis (ADR 0001 L3); wiring
+# it into this tool's spawn path is the next increment. Off-Linux / without the
+# feature, core falls back to the advisory NoopSandbox (SandboxKind::None).
 linux-landlock = ["agent-bridle-core/linux-landlock"]
 
 [dependencies]

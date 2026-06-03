@@ -35,7 +35,9 @@ pub use envelope::{Denial, DenialKind, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use registry::{Registry, RegistryBuilder};
-pub use sandbox::{NoopSandbox, Sandbox, SandboxKind};
+pub use sandbox::{best_available_sandbox, NoopSandbox, Sandbox, SandboxKind};
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+pub use sandbox::{landlock_is_supported, LandlockSandbox};
 pub use tool::Tool;
 
 #[cfg(test)]
