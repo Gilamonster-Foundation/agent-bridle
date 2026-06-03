@@ -1073,6 +1073,65 @@ mod tests {
         let _ = std::fs::remove_file(&victim);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn freeform_dangling_symlink_redirect_escape_is_denied_via_before_open() {
+        // SECURITY REGRESSION (audit 2026-06-03): the dangling-symlink fs_write
+        // escape, end-to-end at the shell boundary. A symlink INSIDE the allowed
+        // fs_write dir points OUTSIDE it to a target that does NOT yet exist.
+        // `echo PWNED > <allowed>/inno` would, with the old canonicalizer, pass
+        // the leash (the link's name canonicalized to itself, in-scope) while the
+        // real `open(O_CREAT)` followed the link and wrote out of scope. With the
+        // core fix the redirect is DENIED via before_open and the outside file is
+        // never created.
+        let root = std::env::temp_dir().join(format!(
+            "ab-shell-dangling-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&allowed).expect("mkdir allowed");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let link = allowed.join("inno");
+        let outside_target = outside.join("real"); // intentionally absent
+        std::os::unix::fs::symlink(&outside_target, &link).expect("symlink");
+        assert!(!outside_target.exists(), "precondition: target absent");
+
+        let cx = authorize(&Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        })
+        .unwrap();
+
+        // Both `>` and `>>` must be refused.
+        for redir in [">", ">>"] {
+            let cmd = format!("echo PWNED {redir} {}", link.display());
+            let out = ShellTool::new()
+                .invoke(serde_json::json!({ "cmd": cmd }), &cx)
+                .await
+                .expect("invoke");
+            assert_eq!(
+                out["denied"], true,
+                "dangling-symlink redirect ({redir}) must be flagged denied: {out:?}"
+            );
+            let denials = out["denials"].as_array().expect("denials array");
+            assert!(
+                denials.iter().any(|d| d["kind"] == "open"),
+                "expected an open denial for the dangling-symlink redirect, got {denials:?}"
+            );
+            assert!(
+                !outside_target.exists(),
+                "the denied redirect ({redir}) must NOT have created the outside file: {out:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Test-only unique-name disambiguator (a counter, never a clock).
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 }
