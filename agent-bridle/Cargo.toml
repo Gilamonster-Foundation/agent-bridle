@@ -13,14 +13,19 @@ readme = "../README.md"
 # A host that wants a leaner build can opt out with --no-default-features.
 default = ["shell"]
 shell = ["dep:agent-bridle-tool-shell"]
+# `web` adds the confined `web_fetch` tool (the `net` enforcer). Off by default
+# so the heavy reqwest/readability/DNS deps only enter a build that asks for it.
+web = ["dep:agent-bridle-tool-web"]
 linux-landlock = [
     "agent-bridle-core/linux-landlock",
     "agent-bridle-tool-shell?/linux-landlock",
+    "agent-bridle-tool-web?/linux-landlock",
 ]
 
 [dependencies]
 agent-bridle-core = { workspace = true }
 agent-bridle-tool-shell = { workspace = true, optional = true }
+agent-bridle-tool-web = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
