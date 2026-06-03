@@ -1,0 +1,28 @@
+[package]
+name = "agent-bridle"
+description = "The capability leash for agent tools: a ready-to-use, capability-governed tool registry for the Gilamonster agent line."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../README.md"
+
+[features]
+# Shell on by default so `agent-bridle::registry()` ships a useful tool set.
+# A host that wants a leaner build can opt out with --no-default-features.
+default = ["shell"]
+shell = ["dep:agent-bridle-tool-shell"]
+linux-landlock = [
+    "agent-bridle-core/linux-landlock",
+    "agent-bridle-tool-shell?/linux-landlock",
+]
+
+[dependencies]
+agent-bridle-core = { workspace = true }
+agent-bridle-tool-shell = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

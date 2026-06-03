@@ -1,0 +1,34 @@
+[package]
+name = "agent-bridle-tool-shell"
+description = "A capability-confined, brush-backed shell tool for agent-bridle (carried coreutils builtins)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# `shell` pulls in the brush runtime + tokio. Off by default so a host that
+# does not want a shell tool pays nothing for it. The crate still compiles with
+# the feature off (it then exposes no ShellTool) so the workspace builds under
+# `--no-default-features`.
+default = ["shell"]
+shell = ["dep:brush-core", "dep:brush-builtins", "dep:tokio"]
+# Real Landlock ruleset is a P3 TODO; forwarded to core so sandbox_kind plumbs
+# through. For P0 this still yields a NoopSandbox / SandboxKind::None.
+linux-landlock = ["agent-bridle-core/linux-landlock"]
+
+[dependencies]
+agent-bridle-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+# brush — the carried shell/coreutils runtime ("the hands"). MIT; see NOTICE.
+brush-core = { workspace = true, optional = true }
+brush-builtins = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

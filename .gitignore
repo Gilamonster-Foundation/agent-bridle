@@ -1,0 +1,17 @@
+# Rust
+/target
+**/target
+Cargo.lock.orig
+
+# Coverage
+*.profraw
+/coverage
+/lcov.info
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+
+# Scratch
+/.scratch
