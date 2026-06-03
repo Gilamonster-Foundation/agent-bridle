@@ -173,6 +173,59 @@ A complementary follow-up is to teach the brush fork's `exec` builtin to consult
 `before_exec` itself (so the hook is sufficient on its own); the curated builtin
 set makes the in-process leash airtight today regardless.
 
+**Dangling-symlink write escape (fixed 2026-06-03, audit-confirmed).** The
+canonicalizer (`context.rs::canonicalize_for_check`) used to walk the tail with
+`Path::exists()`, which **follows symlinks**. A symlink that lives *inside* the
+granted `fs_write` dir but points *outside* it, **whose target does not yet
+exist**, reported `exists() == false`; the link's own name was then treated as a
+plain non-existent tail component and never resolved, so the path canonicalized
+to *itself* (in-scope) and the membership test returned true — while the real
+`open(O_CREAT)` followed the link and wrote out of scope. PROVEN escape:
+`ln -s <outside>/real <allowed>/inno` (target absent), then
+`echo PWNED > <allowed>/inno` (and `>>`) wrote `<outside>/real`. A symlink whose
+target *already* existed was correctly denied (the fast-path `canonicalize`
+resolved it); the gap was specifically the *not-yet-created* final/interior
+symlink component. **Fix:** the tail walk now uses `symlink_metadata()` (`lstat`,
+does not follow) to detect a symlink at each step, `read_link`s it, and
+re-resolves the target against scope (bounded hop count for cycles) — so a
+dangling-or-not out-of-scope symlink is DENIED at the leash, before any open.
+Regression tests: `context.rs::check_path_write_rejects_dangling_symlink_escape`
+and `shell_tool.rs::freeform_dangling_symlink_redirect_escape_is_denied_via_before_open`.
+
+### THREAT MODEL — what the in-process hooks do and do NOT confine (READ THIS)
+
+The `before_open`/`before_exec` hooks confine **only brush's own in-process
+opens and its spawn *decision***. They are not a filesystem sandbox for child
+processes. Specifically:
+
+- **An external program permitted by the `exec` caveat is NOT fs-confined.**
+  Once `before_exec` allows a program to spawn, that program runs with the
+  agent's ambient filesystem authority until **Landlock** (P3 — *currently a
+  no-op*, `apply_sandbox` returns `Ok(())`) is wired. So
+  `fs_write: only[<dir>]` does **NOT** stop a permitted `cat`/`tee`/`cp`/`dd`
+  from reading or writing anywhere the host user can. Example: with
+  `exec: only[tee]`, `echo X | tee /etc/anything` is **not** blocked by the
+  `fs_write` caveat — `tee` opens the file itself, outside brush's
+  `Shell::open_file` funnel.
+- **Today, fs confinement of external programs = the `exec` scope + Landlock.**
+  The `exec` caveat (which programs may run *at all*) is the real fs lever for
+  child processes right now; the `fs_read`/`fs_write` caveats confine only
+  brush's *own* redirections, `source`/`.`, and globbing (the in-process opens
+  that route through `before_open`). Landlock (P3) is the kernel-real boundary
+  that will finally confine spawned children — its absence makes it
+  **higher priority**, not optional.
+- **`before_open` is a decision hook, not the `open(2)` call.** The actual open
+  happens inside the brush fork. The dangling-symlink fix above lives in the
+  *decision* (canonicalization rejects the escaping target before Allow). A
+  belt-and-suspenders `O_NOFOLLOW` on the final component at the fork's open
+  site is a worthwhile defense-in-depth follow-up in `hartsock/brush`, but the
+  authority decision is already fail-closed at the leash.
+- **Liveness note (not an authority leak):** a denied process substitution
+  (`<(...)`/`>(...)`) can leave an invocation blocked until the per-invoke
+  timeout fires, since the substitution's pipe peer never produces. This is a
+  liveness follow-up (tighten the denial path to fail fast), not a confinement
+  hole — nothing escapes, the call just waits out its bound.
+
 ## 7. Web tools = the `net` enforcer
 
 Three independently-gated tiers (see also the `net` Caveat — the axis no other
