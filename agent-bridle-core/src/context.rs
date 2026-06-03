@@ -149,20 +149,61 @@ fn scope_allows(scope: &Scope<String>, item: &str) -> bool {
 /// `fs_write` case: creating a new file under an allowed directory). So we
 /// canonicalize the deepest existing ancestor and re-attach the trailing
 /// not-yet-existing components, rejecting any `..` we cannot resolve away.
+///
+/// # Dangling-symlink escape (the load-bearing subtlety)
+///
+/// The tail walk must **not** use [`Path::exists`] — that follows symlinks, so a
+/// symlink whose target does not (yet) exist reports `exists() == false`. The
+/// old code then treated the symlink's own name as a plain non-existent tail
+/// component and never resolved it: the path canonicalized to *itself*
+/// (in-scope) while a real `open(O_CREAT)` would follow the link and write
+/// **out of scope**. PROVEN escape: `ln -s <outside>/real <allowed>/inno` (real
+/// absent), then `echo PWNED > <allowed>/inno` writes `<outside>/real`.
+///
+/// The fix uses [`Path::symlink_metadata`] (`lstat`, which does **not** follow)
+/// to detect a symlink at each step, [`std::fs::read_link`] to read its target,
+/// and re-resolves that target (relative to the canonicalized parent). A
+/// dangling-or-not symlink whose resolved target escapes scope is then caught by
+/// the normal membership test, because the returned path reflects the *target*,
+/// not the link's own name. We bound the number of link hops to refuse a symlink
+/// cycle.
 fn canonicalize_for_check(path: &Path) -> std::io::Result<PathBuf> {
-    // Fast path: the whole thing exists (this also resolves all symlinks).
+    // Fast path: the whole thing exists (this also resolves all symlinks — so an
+    // *existing*-target symlink is fully resolved here and caught downstream).
     if let Ok(c) = path.canonicalize() {
         return Ok(c);
     }
 
-    // Walk up to the deepest existing ancestor, canonicalize it (resolving any
-    // symlinks in the existing prefix), then re-append the tail. Reject `..`
-    // and `.` in the tail rather than letting them silently climb — `..` past a
-    // canonical, symlink-free base would be an escape we refuse to normalize.
+    resolve_unresolved(path, 0)
+}
+
+/// Maximum symlink hops before we give up (refuse a cycle / pathological chain).
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+/// Resolve a path that does not fully exist, following any symlink components
+/// with `lstat` semantics (so a dangling symlink resolves to its *target*, not
+/// its own name). `hops` counts symlinks followed so far.
+fn resolve_unresolved(path: &Path, hops: u32) -> std::io::Result<PathBuf> {
+    if hops > MAX_SYMLINK_HOPS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many symlink hops (possible cycle) while resolving path",
+        ));
+    }
+
+    // Walk up to the deepest ancestor that exists *as a real entry* — using
+    // `symlink_metadata` (lstat), which does NOT follow symlinks. The deepest
+    // such entry is canonicalized (resolving symlinks in the existing prefix);
+    // then we re-attach the tail one component at a time, lstat-ing each so a
+    // symlink in the tail is resolved against its target rather than silently
+    // pushed as a plain name.
     let mut existing = path;
     let mut tail: Vec<Component<'_>> = Vec::new();
     loop {
-        if existing.exists() {
+        // `symlink_metadata` succeeds for a dangling symlink (the link entry
+        // itself exists) and for any real entry; it fails only when the name is
+        // truly absent. That is exactly the boundary we want for the prefix.
+        if existing.symlink_metadata().is_ok() {
             break;
         }
         match existing.parent() {
@@ -188,10 +229,32 @@ fn canonicalize_for_check(path: &Path) -> std::io::Result<PathBuf> {
         }
     }
 
-    let mut base = existing.canonicalize()?;
+    // `existing` is now the deepest entry that exists (possibly a symlink, e.g.
+    // a dangling final component). If it is itself a symlink, resolve it before
+    // canonicalizing — `canonicalize` on a dangling symlink errors.
+    let meta = existing.symlink_metadata()?;
+    let mut base = if meta.file_type().is_symlink() {
+        resolve_symlink_component(existing, hops)?
+    } else {
+        existing.canonicalize()?
+    };
+
+    // Re-attach the unresolved tail, lstat-ing each step so a symlink that is
+    // created later in the tail (an interior symlink whose own target is absent)
+    // is still resolved to its target and re-checked against scope.
     for comp in tail.into_iter().rev() {
         match comp {
-            Component::Normal(name) => base.push(name),
+            Component::Normal(name) => {
+                base.push(name);
+                // If the just-appended component is a symlink, resolve it now so
+                // the returned path reflects the link TARGET (dangling or not),
+                // never the link's own in-scope-looking name.
+                if let Ok(meta) = base.symlink_metadata() {
+                    if meta.file_type().is_symlink() {
+                        base = resolve_symlink_component(&base, hops)?;
+                    }
+                }
+            }
             Component::ParentDir => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -208,6 +271,26 @@ fn canonicalize_for_check(path: &Path) -> std::io::Result<PathBuf> {
         }
     }
     Ok(base)
+}
+
+/// Resolve a single symlink at `link` to a canonical-for-check target path,
+/// counting one hop. The link target is taken relative to the link's parent
+/// directory when it is relative (POSIX symlink semantics), then re-run through
+/// [`resolve_unresolved`] so the *target* — which may itself be dangling, or a
+/// chain of symlinks — is what we ultimately scope-check.
+fn resolve_symlink_component(link: &Path, hops: u32) -> std::io::Result<PathBuf> {
+    let target = std::fs::read_link(link)?;
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        match link.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        }
+    };
+    // The target may be dangling or another symlink; recurse with an incremented
+    // hop count (this is where a symlink cycle is bounded).
+    resolve_unresolved(&resolved, hops + 1)
 }
 
 /// True iff `candidate` is `base` itself or a descendant of `base`. Both are
@@ -334,6 +417,90 @@ mod tests {
         }
 
         // Best-effort cleanup of our own scratch.
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Regression for the **dangling-symlink write escape** (security audit,
+    /// 2026-06-03). Mirrors [`check_path_write_rejects_dotdot_and_symlink_escape`]
+    /// but for a symlink whose target **does not yet exist** — the gap the old
+    /// `exists()`-based tail walk missed.
+    ///
+    /// Before the fix, `canonicalize_for_check` used `existing.exists()` (which
+    /// FOLLOWS symlinks): a symlink inside the allowed dir pointing OUTSIDE it,
+    /// whose target was absent, reported `exists() == false`, so the link's own
+    /// name was pushed as a plain non-existent tail component and never resolved.
+    /// The path canonicalized to *itself* (in-scope) and `path_is_within`
+    /// returned true — yet a real `open(O_CREAT)` follows the link and writes out
+    /// of scope. PROVEN: `ln -s <outside>/real <allowed>/inno` (real absent),
+    /// `echo PWNED > <allowed>/inno` wrote `<outside>/real`.
+    #[cfg(unix)]
+    #[test]
+    fn check_path_write_rejects_dangling_symlink_escape() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-bridle-dangling-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        fs::create_dir_all(&allowed).expect("mkdir allowed");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+
+        // Grant fs_write ONLY to `allowed`.
+        let cx = ctx(Caveats {
+            fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+
+        // A symlink INSIDE the allowed dir whose target is OUTSIDE and does NOT
+        // yet exist. This is the escape the audit found.
+        let link = allowed.join("inno");
+        let outside_target = outside.join("real"); // intentionally absent
+        assert!(
+            !outside_target.exists(),
+            "precondition: the symlink target must not yet exist"
+        );
+        std::os::unix::fs::symlink(&outside_target, &link).expect("symlink");
+
+        // (a) Writing THROUGH the dangling out-of-scope symlink must be DENIED —
+        // it resolves to `outside/real`, not under `allowed`.
+        assert!(
+            cx.check_path_write(&link).is_err(),
+            "dangling out-of-scope symlink write must be denied (got Ok for {link:?})"
+        );
+        // The escape would have created the file outside; assert it did not (the
+        // check denies *before* any open, so nothing is created).
+        assert!(
+            !outside_target.exists(),
+            "the denied write must not have created the outside file"
+        );
+
+        // (b) An in-scope symlink — pointing to a (dangling) name that still
+        // resolves INSIDE `allowed` — must be ALLOWED (no false denial).
+        let in_link = allowed.join("inside-link");
+        let in_target = allowed.join("brandnew.txt"); // absent, but in-scope
+        std::os::unix::fs::symlink(&in_target, &in_link).expect("in-scope symlink");
+        assert!(
+            cx.check_path_write(&in_link).is_ok(),
+            "in-scope symlink (resolving inside scope) must be allowed (got Err for {in_link:?})"
+        );
+
+        // (c) A plain new in-scope file still succeeds.
+        assert!(
+            cx.check_path_write(&allowed.join("plain.txt")).is_ok(),
+            "plain in-scope create must still succeed"
+        );
+
+        // (d) An INTERIOR dangling symlink (not the final component) that escapes
+        // must also be denied: `allowed/inno/child.txt` where `inno` -> outside.
+        let via_interior = link.join("child.txt");
+        assert!(
+            cx.check_path_write(&via_interior).is_err(),
+            "write through an interior out-of-scope symlink must be denied (got Ok for {via_interior:?})"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
