@@ -8,6 +8,14 @@ Cargo.lock.orig
 /coverage
 /lcov.info
 
+# Python (agent-bridle-py wheel: maturin build + pytest artifacts)
+__pycache__/
+*.pyc
+*.so
+.pytest_cache/
+*.egg-info/
+/wheelhouse
+
 # Editor / OS
 *.swp
 *~

@@ -5,8 +5,15 @@
 //!
 //! ```python
 //! import agent_bridle
-//! r = agent_bridle.invoke("shell", {"cmd": "echo hi"}, {"exec": {"only": ["echo"]}})
-//! print(r["exit_code"], r["stdout"])
+//! # The `shell` tool takes argv form (program + args), NOT a free-form
+//! # `cmd` string — that is the deliberate brush exec-bypass mitigation
+//! # (DESIGN §6): the leash gates on the named program token.
+//! r = agent_bridle.invoke(
+//!     "shell",
+//!     {"program": "echo", "args": ["hi"]},
+//!     {"exec": {"only": ["echo"]}},
+//! )
+//! print(r["exit_code"], r["stdout"])  # -> 0 'hi\n'
 //! ```
 //!
 //! The leash is the same one the Rust hosts use: every dispatch flows through
@@ -17,7 +24,7 @@
 //!
 //! ## Caveats shape (self-contained)
 //!
-//! `caveats` is an ordinary Python `dict` in the agent-mesh
+//! `caveats` is an ordinary Python `dict` in the agent-mesh-protocol **Rust**
 //! [`Caveats`](agent_mesh_protocol::Caveats) serde shape — you do **not** need
 //! to `import agent_mesh`:
 //!
@@ -26,9 +33,17 @@
 //! - `max_calls`: either `"unlimited"` or `{"at_most": N}`;
 //! - `valid_for_generation`: either `"all"` or `{"only": [N, …]}` (`u64`s).
 //!
-//! Any omitted axis defaults to its **top** (unrestricted). The exact same dict
-//! shape matches `agent_mesh.core.Caveats`'s serialization, so the two interop:
-//! a grant minted by agent-mesh can be passed straight here.
+//! Any omitted axis defaults to its **top** (unrestricted). This is exactly the
+//! shape `serde_json::to_value(&Caveats)` produces in Rust, so a grant a Rust
+//! host already holds round-trips straight through.
+//!
+//! Interop note: the `agent_mesh.core.Caveats` *pyclass* (agent-mesh PR #18)
+//! exposes a friendlier surface — `fs_read=["/repo"]` / `max_calls=10` /
+//! `top()`'s axes as `None`. Its `.to_json()` is **not** identical to this Rust
+//! serde shape. To pass an agent-mesh pyclass grant here, translate each axis to
+//! the serde form above (e.g. `["echo"]` → `{"only": ["echo"]}`, `None` →
+//! omit-the-axis, `10` → `{"at_most": 10}`). Both describe the *same* lattice;
+//! only the JSON spelling differs.
 //!
 //! `caveats=None` runs **UNCONFINED** (`Caveats::top()`) and prints a stderr
 //! WARNING, because an unconfined leash defeats the purpose of the bridle.
@@ -104,27 +119,25 @@ fn invoke<'py>(
     };
 
     // 3. Dispatch through the leash, bridging async → sync on the shared
-    //    runtime. `allow_threads` releases the GIL for the (possibly blocking)
-    //    tool work so other Python threads can run.
-    let result = py.allow_threads(|| {
-        runtime().block_on(shared_registry().dispatch(tool, args_json, &granted))
-    });
+    //    runtime. `detach` releases the GIL for the (possibly blocking) tool
+    //    work so other Python threads can run (pyo3 0.28 renamed the old
+    //    `allow_threads` to `detach`).
+    let result =
+        py.detach(|| runtime().block_on(shared_registry().dispatch(tool, args_json, &granted)));
 
     match result {
         Ok(value) => {
             // The tool envelope is always a JSON object → a Python dict.
-            json_to_py(py, &value)?
-                .downcast_into::<PyDict>()
-                .map_err(|_| {
-                    PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                        "tool returned a non-object result; expected a JSON object",
-                    )
-                })
+            json_to_py(py, &value)?.cast_into::<PyDict>().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    "tool returned a non-object result; expected a JSON object",
+                )
+            })
         }
         // Every ToolError (Denied, NotFound, Budget, Generation, Exec, Other)
         // surfaces as BridleDenied carrying the human-readable reason. The
         // leash outcomes (Denied/Budget/Generation) are the load-bearing ones.
-        Err(e) => Err(BridleDenied::new_err(e.to_string())),
+        Err(e) => Err(BridleDenied::new_err::<String>(e.to_string())),
     }
 }
 
@@ -146,7 +159,7 @@ fn tool_definitions(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
         .iter()
         .map(|def| {
             json_to_py(py, def)?
-                .downcast_into::<PyDict>()
+                .cast_into::<PyDict>()
                 .map(Bound::unbind)
                 .map_err(|_| {
                     PyErr::new::<pyo3::exceptions::PyTypeError, _>(
@@ -217,21 +230,22 @@ fn caveats_from_py(dict: &Bound<'_, PyDict>) -> PyResult<Caveats> {
 }
 
 /// Parse one string axis: `"all"` or `{"only": ["item", …]}`.
-fn parse_str_scope(name: &str, v: &serde_json::Value) -> PyResult<agent_mesh_protocol::Scope<String>> {
+fn parse_str_scope(
+    name: &str,
+    v: &serde_json::Value,
+) -> PyResult<agent_mesh_protocol::Scope<String>> {
     use agent_mesh_protocol::Scope;
     match v {
         serde_json::Value::String(s) if s == "all" => Ok(Scope::All),
         serde_json::Value::Object(o) => {
             let items = o.get("only").and_then(|x| x.as_array()).ok_or_else(|| {
-                invalid_caveats(format!(
-                    "{name}: object form must be {{\"only\": [..]}}"
-                ))
+                invalid_caveats(format!("{name}: object form must be {{\"only\": [..]}}"))
             })?;
             let mut set = std::collections::BTreeSet::new();
             for item in items {
-                let s = item.as_str().ok_or_else(|| {
-                    invalid_caveats(format!("{name}.only items must be strings"))
-                })?;
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| invalid_caveats(format!("{name}.only items must be strings")))?;
                 set.insert(s.to_string());
             }
             Ok(Scope::Only(set))
@@ -249,9 +263,7 @@ fn parse_u64_scope(name: &str, v: &serde_json::Value) -> PyResult<agent_mesh_pro
         serde_json::Value::String(s) if s == "all" => Ok(Scope::All),
         serde_json::Value::Object(o) => {
             let items = o.get("only").and_then(|x| x.as_array()).ok_or_else(|| {
-                invalid_caveats(format!(
-                    "{name}: object form must be {{\"only\": [..]}}"
-                ))
+                invalid_caveats(format!("{name}: object form must be {{\"only\": [..]}}"))
             })?;
             let mut set = std::collections::BTreeSet::new();
             for item in items {
@@ -326,7 +338,7 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     if let Ok(s) = obj.extract::<String>() {
         return Ok(Value::String(s));
     }
-    if let Ok(dict) = obj.downcast::<PyDict>() {
+    if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (k, v) in dict.iter() {
             let key = k.extract::<String>().map_err(|_| {
@@ -336,7 +348,7 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         }
         return Ok(Value::Object(map));
     }
-    if let Ok(list) = obj.downcast::<PyList>() {
+    if let Ok(list) = obj.cast::<PyList>() {
         let mut arr = Vec::with_capacity(list.len());
         for item in list.iter() {
             arr.push(py_any_to_json(&item)?);
@@ -393,12 +405,23 @@ fn json_to_py<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<Bound
 }
 
 /// The `agent_bridle` extension module.
+///
+/// The Python module name is set explicitly to `agent_bridle` (matching
+/// `[lib] name` in Cargo.toml) while the Rust function is named differently:
+/// `#[pymodule]` generates a hidden inner module named after the function, so a
+/// function literally named `agent_bridle` would shadow the `agent_bridle`
+/// *facade crate* and break `use agent_bridle::…`. The `name` attribute keeps
+/// the Python-visible name (and the `PyInit_agent_bridle` symbol) correct.
 #[pymodule]
-fn agent_bridle(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "agent_bridle")]
+fn agent_bridle_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BridleDenied", py.get_type::<BridleDenied>())?;
     m.add_function(wrap_pyfunction!(invoke, m)?)?;
     m.add_function(wrap_pyfunction!(tool_names, m)?)?;
     m.add_function(wrap_pyfunction!(tool_definitions, m)?)?;
-    m.add("__doc__", "agent-bridle Pillar A: call the Caveats-confined tool registry in-process.")?;
+    m.add(
+        "__doc__",
+        "agent-bridle Pillar A: call the Caveats-confined tool registry in-process.",
+    )?;
     Ok(())
 }
