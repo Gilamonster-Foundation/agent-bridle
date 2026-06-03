@@ -127,6 +127,15 @@ fn invoke<'py>(
 
     match result {
         Ok(value) => {
+            // A dispatch can return Ok yet carry a STRUCTURED in-band denial:
+            // a free-form shell `cmd` the interceptor refused returns
+            // `denied: true` in the envelope (the brush run exited non-zero, but
+            // a capability was refused). Raise BridleDenied for that too — so
+            // free-form denials are covered, not only the argv/Err-path ones —
+            // reading the structured field, NOT string-matching stderr.
+            if let Some(reason) = structured_denial_reason(&value) {
+                return Err(BridleDenied::new_err::<String>(reason));
+            }
             // The tool envelope is always a JSON object → a Python dict.
             json_to_py(py, &value)?.cast_into::<PyDict>().map_err(|_| {
                 PyErr::new::<pyo3::exceptions::PyTypeError, _>(
@@ -139,6 +148,30 @@ fn invoke<'py>(
         // leash outcomes (Denied/Budget/Generation) are the load-bearing ones.
         Err(e) => Err(BridleDenied::new_err::<String>(e.to_string())),
     }
+}
+
+/// If a tool result carries the structured `denied: true` flag, build the
+/// human-readable reason from its `denials` list. Returns `None` when the
+/// result was not denied (the normal path).
+fn structured_denial_reason(value: &serde_json::Value) -> Option<String> {
+    if value.get("denied").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let reasons: Vec<String> = value
+        .get("denials")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d.get("reason").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(if reasons.is_empty() {
+        "denied: the capability leash refused an operation".to_string()
+    } else {
+        reasons.join("; ")
+    })
 }
 
 /// The names of the registered tools (sorted).
