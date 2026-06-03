@@ -33,9 +33,16 @@ async-trait = "0.1"
 
 # Leaf-tool-only deps (never enter core or a host's default build).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
-brush-core = "0.5"
-brush-builtins = "0.2"
-brush-coreutils-builtins = "0.1"
+# brush — pinned to OUR fork at the commit that adds the `CommandInterceptor`
+# exec/open hook (`extensions::CommandInterceptor`, wired at the single
+# external-spawn funnel + `Shell::open_file`). All three crates share one
+# git+rev so cargo resolves them to a single checkout. This closes the
+# path-separator exec bypass in-process, cross-OS (DESIGN §6). NOTE: a git dep
+# means `agent-bridle-tool-shell` cannot publish to crates.io until the hook is
+# upstreamed into `reubeno/brush`; tracked as out-of-scope until then.
+brush-core = { git = "https://github.com/hartsock/brush", rev = "4e65a0627d4d363a5af473bc68bd40862ce9f011" }
+brush-builtins = { git = "https://github.com/hartsock/brush", rev = "4e65a0627d4d363a5af473bc68bd40862ce9f011" }
+brush-coreutils-builtins = { git = "https://github.com/hartsock/brush", rev = "4e65a0627d4d363a5af473bc68bd40862ce9f011" }
 
 [profile.release]
 # strip + thin-LTO is the verified real-world trigger for linker DCE silently
