@@ -83,6 +83,7 @@ shell runtime is baked in, not borrowed from the host.
 |---|---|---|
 | `agent-bridle-core` | `Tool` trait, `Registry`, `Gate`, `Caveats` re-export, `Sandbox` trait, result envelope | none beyond `anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol` |
 | `agent-bridle-tool-shell` | brush-backed confined shell (carried coreutils), `shell` feature | brush-core/builtins/coreutils-builtins, tokio |
+| `agent-bridle-tool-web` | confined `web_fetch` (the `net` enforcer), `web` feature | reqwest+rustls, dom_smoothie, htmd, hickory-resolver, url, tokio |
 | `agent-bridle` | facade re-exporting a ready-to-use registry | — |
 | `agent-bridle-mcp` | MCP (Model Context Protocol) stdio server frontend over the registry (binary) | tokio, toml |
 
@@ -183,6 +184,96 @@ fault:
 {"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"denied: exec of \"rm\" is not within the granted authority","type":"text"}],"isError":true}}
 ```
 
+## The `net` enforcer: `web_fetch` (`agent-bridle-tool-web`)
+
+`web_fetch` is the tool that exercises the **`net`** axis of the leash — the
+axis no other tool touches (DESIGN §7). It fetches an http(s) URL and returns
+the page's main content as markdown, with the `net` Caveat enforced *before the
+first request and on every redirect hop*:
+
+1. **Host allowlist, default-deny.** The URL's host must satisfy the effective
+   `net` scope (`ToolContext::check_net`).
+2. **SSRF block.** The host is DNS-resolved and any private / loopback /
+   link-local / unique-local address is **rejected** — `127.0.0.0/8`,
+   `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
+   `100.64.0.0/10` (CGNAT), `::1`, `fc00::/7`, `fe80::/10`, IPv4-mapped forms,
+   and more — **unless** that host is explicitly named in the `net` allowlist
+   (the deliberate opt-in for a test loopback or a named internal endpoint).
+3. **Per-redirect re-check.** Redirects are followed *manually*: every hop's
+   host is re-screened by (1) and (2). A 302 to a disallowed or private host is
+   denied, never blindly followed.
+4. **DNS-rebinding pin.** The connection is pinned to the exact IP that passed
+   screening, so a rebind between the check and the connect cannot smuggle
+   traffic elsewhere.
+
+The TLS stack is **rustls, not OpenSSL**, so the tool is portable and builds on
+Windows with no system OpenSSL. The result `{ url, final_url, status, title,
+markdown }` is **untrusted data** — never spliced into a system prompt.
+
+### Usage
+
+```rust
+use agent_bridle::registry;            // build with --features web
+use agent_bridle_core::{Caveats, CountBound, Scope};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let reg = registry();
+
+    // Confine the net axis to a single host. example.com may be reached;
+    // nothing else, and no private/loopback address (it is not opted in).
+    let granted = Caveats {
+        net: Scope::only(["example.com".to_string()]),
+        max_calls: CountBound::AtMost(5),
+        ..Caveats::top()
+    };
+
+    let out = reg
+        .dispatch(
+            "web_fetch",
+            serde_json::json!({ "url": "https://example.com/" }),
+            &granted,
+        )
+        .await?;
+    println!("{}", out["markdown"]); // extracted page content as markdown
+
+    // DENIED: a different host is not in the `net` allowlist.
+    let denied = reg
+        .dispatch(
+            "web_fetch",
+            serde_json::json!({ "url": "https://not-allowed.test/" }),
+            &granted,
+        )
+        .await;
+    assert!(denied.is_err());
+
+    Ok(())
+}
+```
+
+### Confinement example (the `net` allowlist, through MCP)
+
+Build the server with the web tool and grant a `net` allowlist of exactly one
+host:
+
+```bash
+cargo build -p agent-bridle-mcp --features web --release
+
+# net allowlist = only example.com. Note: a private/loopback host would ALSO be
+# SSRF-blocked unless you name it here (e.g. "127.0.0.1" for a local test).
+export AGENT_BRIDLE_CAVEATS='{"fs_read":"all","fs_write":"all","exec":"all","net":{"only":["example.com"]},"max_calls":"unlimited","valid_for_generation":"all"}'
+
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_fetch","arguments":{"url":"https://example.com/"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_fetch","arguments":{"url":"http://169.254.169.254/latest/meta-data/"}}}' \
+  | agent-bridle-mcp
+```
+
+The fetch to `example.com` returns markdown; the cloud-metadata SSRF probe to
+`169.254.169.254` is **denied** by the host allowlist (and would be SSRF-blocked
+even under `net: "all"`).
+
 ## Status
 
 This is **P0** plus the **MCP frontend** (DESIGN §4 frontend 2): the core leash,
@@ -190,9 +281,17 @@ a confined brush shell, and an `agent-bridle-mcp` stdio JSON-RPC server, with
 tests proving the leash *denies* out-of-scope exec, exhausted budgets,
 generation mismatch, and path-escape (`..` / symlink) attempts — including a
 through-MCP integration test that drives the real binary over stdio and proves
-an out-of-scope `tools/call` is denied across the protocol boundary. Landlock
-enforcement, the brush exec/open hook, the Python pillars (sidecar + host tools
-dir), and web/scm tools are later phases (see `docs/DESIGN.md` §12).
+an out-of-scope `tools/call` is denied across the protocol boundary.
+
+The **`net` enforcer** (`agent-bridle-tool-web`, `web` feature) is also landed:
+a confined `web_fetch` whose host allowlist, SSRF IP screen, per-redirect
+re-check, and DNS-rebinding IP pin are unit-tested in isolation and exercised
+end-to-end against a localhost mock server (a disallowed host, a private/loopback
+address, and a redirect to a disallowed host are all proven *denied*).
+
+Landlock enforcement, the brush exec/open hook, the Python pillars (sidecar +
+host tools dir), the browse tier (headless Chrome — subprocess), `web_search`,
+and scm tools are later phases (see `docs/DESIGN.md` §12).
 
 ## License
 

@@ -1,0 +1,50 @@
+[package]
+name = "agent-bridle-tool-web"
+description = "A capability-confined web_fetch tool for agent-bridle: the `net` enforcer (host allowlist + SSRF block + per-redirect re-check)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# `web` pulls in the HTTP client (reqwest+rustls), the readability extractor,
+# the HTML->markdown converter, the DNS resolver, and tokio. Off by default so a
+# host that does not want a web tool pays nothing for it. The crate still
+# compiles with the feature off (it then exposes no WebFetchTool) so the
+# workspace builds under `--no-default-features`.
+default = ["web"]
+web = [
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:url",
+    "dep:hickory-resolver",
+    "dep:dom_smoothie",
+    "dep:htmd",
+]
+# Real Landlock ruleset is a P3 TODO; forwarded to core so sandbox_kind plumbs
+# through. (Landlock is port-based, not host-based, so the net leash is enforced
+# in-process here regardless; this only keeps the sandbox_kind plumbing aligned.)
+linux-landlock = ["agent-bridle-core/linux-landlock"]
+
+[dependencies]
+agent-bridle-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+# Web-tool-only heavy deps ("the net"). rustls (NOT openssl) so the binary is
+# portable and builds on Windows without a system OpenSSL. See NOTICE.
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+hickory-resolver = { workspace = true, optional = true }
+# readability content extraction (clean main-article HTML + title) ...
+dom_smoothie = { workspace = true, optional = true }
+# ... then HTML -> markdown.
+htmd = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+httpmock = "0.8"

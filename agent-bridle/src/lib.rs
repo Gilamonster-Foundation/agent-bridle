@@ -31,10 +31,12 @@
 // Re-export the whole leash so hosts depend on one crate.
 pub use agent_bridle_core::*;
 
-// Anchor the shell tool's symbol in the facade (DESIGN §5): an explicit
-// `pub use` keeps the linker from DCE-ing a tool module under strip+lto.
+// Anchor each tool's symbol in the facade (DESIGN §5): an explicit `pub use`
+// keeps the linker from DCE-ing a tool module under strip+lto.
 #[cfg(feature = "shell")]
 pub use agent_bridle_tool_shell::ShellTool;
+#[cfg(feature = "web")]
+pub use agent_bridle_tool_web::WebFetchTool;
 
 /// Build the default tool registry for this host's compiled feature set.
 ///
@@ -43,6 +45,8 @@ pub use agent_bridle_tool_shell::ShellTool;
 /// compiled features:
 ///
 /// - `shell` (default): adds the confined brush-backed `shell` tool.
+/// - `web`: adds the confined `web_fetch` tool — the `net` enforcer (host
+///   allowlist + SSRF block + per-redirect re-check + IP pinning).
 ///
 /// Under `--no-default-features` the registry is empty but valid; a host adds
 /// tools by enabling features (or building its own registry).
@@ -54,6 +58,11 @@ pub fn registry() -> Registry {
     #[cfg(feature = "shell")]
     {
         builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
+    }
+
+    #[cfg(feature = "web")]
+    {
+        builder = builder.tool(std::sync::Arc::new(WebFetchTool::new()));
     }
 
     builder.build()
@@ -80,13 +89,48 @@ mod tests {
         );
     }
 
-    /// Under `--no-default-features` the shell tool must be absent (proves the
-    /// feature actually gates it) but the registry still builds.
+    /// Without the `shell` feature the shell tool must be absent (proves the
+    /// feature actually gates it).
     #[cfg(not(feature = "shell"))]
     #[test]
     fn shell_tool_absent_without_feature() {
         let reg = registry();
         assert!(!reg.contains("shell"));
+    }
+
+    /// Presence test (DESIGN §5): under `--features web` the `web_fetch` tool —
+    /// the `net` enforcer — must be registered (and thus exposed by
+    /// `agent-bridle-mcp`). This is the CI guard that linker DCE has not dropped
+    /// it under strip+lto.
+    #[cfg(feature = "web")]
+    #[test]
+    fn web_fetch_tool_is_present_with_feature() {
+        let reg = registry();
+        assert!(
+            reg.contains("web_fetch"),
+            "expected `web_fetch` tool to be registered"
+        );
+        assert!(
+            reg.tool_names().contains(&"web_fetch"),
+            "tool_names missing web_fetch: {:?}",
+            reg.tool_names()
+        );
+    }
+
+    /// Without the `web` feature the web tool must be absent.
+    #[cfg(not(feature = "web"))]
+    #[test]
+    fn web_fetch_tool_absent_without_feature() {
+        let reg = registry();
+        assert!(!reg.contains("web_fetch"));
+    }
+
+    /// Under `--no-default-features` (no `shell`, no `web`) the registry is empty
+    /// but valid.
+    #[cfg(all(not(feature = "shell"), not(feature = "web")))]
+    #[test]
+    fn registry_is_empty_with_no_tool_features() {
+        let reg = registry();
         assert!(reg.tool_names().is_empty());
     }
 
