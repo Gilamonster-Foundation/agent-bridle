@@ -55,12 +55,29 @@ impl ToolContext {
 
     /// Leash check: may this invocation execute `program`?
     ///
-    /// Allowed iff `exec` is `All`, or `program` is a member of the bounded
-    /// `exec` scope. Membership is on the program *token as named in the scope*
-    /// — callers should pass the resolved program name (argv0). Out-of-scope
-    /// programs are denied here, before the tool spawns anything.
+    /// Allowed iff `exec` is `All`, or the bounded `exec` scope contains the
+    /// program **as named** (the string passed in, typically argv0 or a
+    /// PATH-resolved absolute path) **or its basename**
+    /// (`Path::new(program).file_name()`).
+    ///
+    /// This is what makes *bare-name* grants usable: a grant of `["git"]`
+    /// allows `git`, `/usr/bin/git`, and `/opt/homebrew/bin/git` alike, because
+    /// the resolved absolute path the interceptor hands in has basename `git`.
+    /// To pin an exact executable instead, **grant a full path**: a grant of
+    /// `["/usr/bin/git"]` matches only `/usr/bin/git`, not a `git` found
+    /// elsewhere on PATH.
+    ///
+    /// Security tradeoff: a bare-name grant authorizes *any* binary named
+    /// `git` reachable on PATH (PATH ordering / shadowing decides which one
+    /// actually runs). When that ambiguity is unacceptable, grant the full
+    /// path to pin exactly. A grant that contains a path separator only ever
+    /// matches that exact path (its basename is still considered, but a grant
+    /// like `["/bin/echo"]` will not be matched by a bare `echo` because the
+    /// grant's own basename `echo` is compared against the program token, not
+    /// the reverse — see [`exec_scope_allows`]). Out-of-scope programs are
+    /// denied here, before the tool spawns anything.
     pub fn check_exec(&self, program: &str) -> ToolResult<()> {
-        if scope_allows(&self.effective.exec, program) {
+        if exec_scope_allows(&self.effective.exec, program) {
             Ok(())
         } else {
             Err(ToolError::denied(format!(
@@ -134,12 +151,43 @@ impl ToolContext {
     }
 }
 
-/// `scope.contains(item)` for the string axes (`exec`, `net`).
+/// `scope.contains(item)` for the exact string axis (`net` host matching).
+///
+/// This stays a strict membership test — network hosts must match exactly and
+/// must NOT be subjected to basename matching. Only `check_net` uses this.
 fn scope_allows(scope: &Scope<String>, item: &str) -> bool {
     match scope {
         Scope::All => true,
         Scope::Only(set) => set.contains(item),
     }
+}
+
+/// Exec-axis membership: `All`, OR the bounded set contains the program string
+/// **as given**, OR the set contains the program's **basename**.
+///
+/// Basename matching is what lets a bare-name grant (`["git"]`) match the
+/// resolved absolute path the brush interceptor hands in (`/usr/bin/git`),
+/// while a full-path grant (`["/usr/bin/git"]`) still pins exactly because the
+/// program string passed in is compared verbatim first. This is deliberately
+/// distinct from [`scope_allows`] (host matching), which must stay exact.
+fn exec_scope_allows(scope: &Scope<String>, program: &str) -> bool {
+    let set = match scope {
+        Scope::All => return true,
+        Scope::Only(set) => set,
+    };
+    // Exact match against the token as named (full-path grants pin here).
+    if set.contains(program) {
+        return true;
+    }
+    // Basename match: a bare-name grant matches any resolved path with that
+    // basename. `["git"]` allows `/usr/bin/git`; `["echo"]` does NOT allow
+    // `/bin/rm` because the basename `rm` is not in the grant.
+    if let Some(base) = Path::new(program).file_name().and_then(|b| b.to_str()) {
+        if set.contains(base) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve a path for a leash check.
@@ -253,6 +301,65 @@ mod tests {
         });
         assert!(cx.check_exec("echo").is_ok());
         assert!(cx.check_exec("rm").is_err());
+    }
+
+    /// A bare-name grant must match the RESOLVED ABSOLUTE PATH the interceptor
+    /// hands in. This is the usability bug: `["git"]` previously denied
+    /// `/usr/bin/git` because membership was exact on the full path. Now the
+    /// basename matches.
+    #[test]
+    fn check_exec_bare_name_grant_matches_resolved_paths() {
+        let cx = ctx(Caveats {
+            exec: Scope::only(["git".to_string()]),
+            ..Caveats::top()
+        });
+        // Bare name itself.
+        assert!(cx.check_exec("git").is_ok());
+        // Resolved absolute paths with basename `git`.
+        assert!(cx.check_exec("/usr/bin/git").is_ok());
+        assert!(cx.check_exec("/opt/homebrew/bin/git").is_ok());
+    }
+
+    /// A FULL-PATH grant is the escape hatch for exactness: it pins to exactly
+    /// that path and does NOT allow a same-named binary found elsewhere.
+    #[test]
+    fn check_exec_full_path_grant_pins_exactly() {
+        let cx = ctx(Caveats {
+            exec: Scope::only(["/usr/bin/git".to_string()]),
+            ..Caveats::top()
+        });
+        // The exact pinned path is allowed.
+        assert!(cx.check_exec("/usr/bin/git").is_ok());
+        // A `git` somewhere else is denied — full-path grant pins.
+        assert!(cx.check_exec("/opt/homebrew/bin/git").is_err());
+        // NOTE: a bare `git` carries basename `git`, which is not equal to the
+        // full-path grant token, so it is denied too.
+        assert!(cx.check_exec("git").is_err());
+    }
+
+    /// Path-separator deny is preserved: granting `echo` must not let `/bin/rm`
+    /// through, because the basename `rm` was never granted.
+    #[test]
+    fn check_exec_basename_deny_preserved() {
+        let cx = ctx(Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        });
+        assert!(cx.check_exec("/bin/rm").is_err());
+        // And `echo` granted does allow a resolved `/bin/echo` via basename.
+        assert!(cx.check_exec("/bin/echo").is_ok());
+    }
+
+    /// `All` allows anything on the exec axis.
+    #[test]
+    fn check_exec_all_allows_anything() {
+        let cx = ctx(Caveats {
+            exec: Scope::All,
+            ..Caveats::top()
+        });
+        assert!(cx.check_exec("git").is_ok());
+        assert!(cx.check_exec("/usr/bin/anything").is_ok());
+        assert!(cx.check_exec("/bin/rm").is_ok());
     }
 
     #[test]
