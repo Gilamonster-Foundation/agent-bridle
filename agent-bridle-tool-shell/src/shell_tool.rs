@@ -345,8 +345,18 @@ fn run_in_brush(parsed: ShellArgs, interceptor: CaveatInterceptor) -> ToolResult
 
     // brush's shell API is async; run it on a single-thread runtime confined to
     // this blocking worker thread.
+    //
+    // IO **must** be enabled (not just time): command substitution `$(...)`
+    // sets up real OS pipes via tokio's IO driver. With IO disabled, `$(/bin/rm
+    // ...)` panics deep in tokio ("IO is disabled"); that panic surfaces from
+    // `invoke` as an opaque `Err` instead of the clean, structured `denied:
+    // true` envelope the leash is supposed to produce. With IO enabled, the
+    // substitution runs through the normal command path, the inner program hits
+    // the `before_exec` funnel, and an out-of-scope command yields a recorded
+    // denial — fail-closed *and* legible. `enable_all` turns on both the IO and
+    // time drivers.
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
         .map_err(|e| ToolError::Exec(io_ctx("build shell runtime", e)))?;
 
@@ -363,8 +373,12 @@ fn run_in_brush(parsed: ShellArgs, interceptor: CaveatInterceptor) -> ToolResult
             Shell::builder_with_extensions::<LeashedExtensions>()
                 // The capability hook — THE in-process leash for free-form scripts.
                 .command_interceptor(interceptor)
-                // Carried builtins for our custom extensions type.
-                .builtins(default_builtins::<LeashedExtensions>(BuiltinSet::BashMode))
+                // Carried builtins for our custom extensions type — but CURATED:
+                // every builtin that can spawn/exec/open OUTSIDE the two
+                // interceptor funnels (`before_exec` / `before_open`) is removed,
+                // so the confined shell has no uncovered path to authority. See
+                // [`confined_builtins`].
+                .builtins(confined_builtins())
                 // Do not inherit the host environment — confinement, and so a
                 // carried builtin must come from brush, not the host PATH.
                 .do_not_inherit_env(true)
@@ -423,6 +437,55 @@ fn run_in_brush(parsed: ShellArgs, interceptor: CaveatInterceptor) -> ToolResult
         stdout,
         stderr,
     })
+}
+
+/// Builtins removed from the confined shell because they reach `spawn`/`exec`/
+/// `open` *without* going through the interceptor funnels (`before_exec` at the
+/// single external-spawn site, `before_open` at `Shell::open_file`).
+///
+/// The audit of the brush fork (rev 4e65a06) found exactly one such builtin:
+///
+/// - **`exec`** — In its non-subshell branch, `exec`
+///   ([`brush-builtins/src/exec.rs`]) calls `compose_std_command(...)` and then
+///   `cmd.exec()` (replace-process) *directly*, never consulting
+///   `before_exec`. PROVEN bypass: under `exec: only{echo}`,
+///   `exec /usr/bin/touch MARKER` ran `touch` (the marker file appeared) and
+///   actually replaced the host process image — the leash never fired. A
+///   confined shell does not need `exec` (there is nothing to replace into),
+///   so removing it costs nothing and closes a live authority leak.
+///
+/// Every *other* path that can run a program or open a file was verified to
+/// funnel through a hook and is therefore intentionally KEPT:
+///
+/// - `command`, `eval`, `.`/`source`, `fc`, `coproc`, background `&`,
+///   process substitution `<(...)`/`>(...)`, and ordinary external commands all
+///   route through `SimpleCommand::execute` → `execute_external_command`, whose
+///   first act is `before_exec` (the funnel).
+/// - `mapfile`/`readarray` and `read` only consume *already-open* fds
+///   (`try_fd`); the redirection that opened the fd went through `before_open`.
+/// - Redirections and `source` open files exclusively via `Shell::open_file`,
+///   which calls `before_open`.
+///
+/// `exec` cannot be smuggled back in: `enable -f` (load a builtin from a shared
+/// object) is `unimp` in the fork, and `enable`/`builtin exec` only act on
+/// registrations already present in the map — once removed, there is nothing to
+/// re-enable.
+const REMOVED_BUILTINS: &[&str] = &["exec"];
+
+/// The curated builtin set for the confined shell: the bash-mode default set
+/// with every [`REMOVED_BUILTINS`] entry stripped out.
+///
+/// `default_builtins` hands back a plain owned `HashMap`, so omission is a
+/// `remove` on that map — robust-by-construction: the shell builder seeds an
+/// empty map and only takes what we give it, and nothing in brush
+/// auto-registers a builtin, so a removed builtin is simply *gone* (a confined
+/// shell that runs `exec` gets "command not found", never a spawn).
+fn confined_builtins() -> HashMap<String, brush_core::builtins::Registration<LeashedExtensions>> {
+    let mut builtins = default_builtins::<LeashedExtensions>(BuiltinSet::BashMode);
+    for name in REMOVED_BUILTINS {
+        builtins.remove(*name);
+    }
+    builtins
 }
 
 /// Read a pipe to EOF, returning its bytes as a lossy UTF-8 string.
@@ -860,6 +923,154 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied { .. }), "got {err:?}");
+    }
+
+    // ── Security regression: bypass-capable builtins are removed ────────────
+    //
+    // These prove the audit's two holes are closed, fail-closed.
+
+    /// Build a unique scratch marker path under the temp dir (counter, not a
+    /// clock), pre-removed so a stale file can't mask a failure.
+    fn fresh_marker(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "ab-sec-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn exec_builtin_is_removed_from_the_confined_set() {
+        // The audit finding, asserted directly on the curated map: the only
+        // bypass-capable builtin (`exec`) is NOT registered in the confined
+        // shell, while a known-safe one (`echo`) still is.
+        let builtins = confined_builtins();
+        assert!(
+            !builtins.contains_key("exec"),
+            "`exec` must be absent from the confined builtin set"
+        );
+        for name in REMOVED_BUILTINS {
+            assert!(
+                !builtins.contains_key(*name),
+                "removed builtin `{name}` must be absent from the confined set"
+            );
+        }
+        // The carried-safe builtins survive the curation.
+        assert!(builtins.contains_key("echo"), "echo must still be carried");
+        assert!(
+            builtins.contains_key("command"),
+            "command (funnel-routed) is intentionally kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn freeform_exec_builtin_cannot_run_a_denied_program() {
+        // THE load-bearing security regression. Before the fix, the `exec`
+        // builtin called `cmd.exec()` directly — bypassing `before_exec` — so
+        // `exec /usr/bin/touch MARKER` ran `touch` (and replaced the process
+        // image). With `exec` removed from the confined set it is "command not
+        // found": the marker must NOT be created, and the program must not run.
+        let marker = fresh_marker("exec-builtin");
+        let cx = authorize(&echo_grant()).unwrap();
+        let cmd = format!("exec /usr/bin/touch {}", marker.display());
+        let out = ShellTool::new()
+            .invoke(serde_json::json!({ "cmd": cmd }), &cx)
+            .await
+            .expect("invoke must return cleanly, never panic/replace-process");
+        // exec is gone → non-zero (command not found), and the program is dead.
+        assert_ne!(out["exit_code"], 0, "exec must not succeed: {out:?}");
+        assert!(
+            !marker.exists(),
+            "the exec'd program must NOT have run (marker created): {out:?}"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn argv_exec_program_is_denied() {
+        // The argv form names `exec` as the program. It is not in the granted
+        // `exec` scope (`only{echo}`), so the leash's argv-mode pre-check denies
+        // it before any shell is built — defense in depth alongside removal.
+        let cx = authorize(&echo_grant()).unwrap();
+        let err = ShellTool::new()
+            .invoke(
+                serde_json::json!({ "program": "exec", "args": ["/usr/bin/touch", "/tmp/x"] }),
+                &cx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn argv_exec_program_even_if_granted_does_not_bypass() {
+        // Even when `exec` IS in the granted scope, the builtin is absent from
+        // the confined shell, so the argv pre-check passes but the shell reports
+        // "command not found" rather than process-replacing into the target.
+        // The carried program never runs.
+        let marker = fresh_marker("argv-exec");
+        let cx = authorize(&Caveats {
+            exec: Scope::only(["exec".to_string(), "echo".to_string()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        })
+        .unwrap();
+        let out = ShellTool::new()
+            .invoke(
+                serde_json::json!({
+                    "program": "exec",
+                    "args": ["/usr/bin/touch", marker.to_string_lossy()]
+                }),
+                &cx,
+            )
+            .await
+            .expect("invoke must return cleanly");
+        assert_ne!(
+            out["exit_code"], 0,
+            "exec builtin is gone → not found: {out:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "no program may run via a removed exec builtin: {out:?}"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn freeform_command_substitution_denies_cleanly_without_io_panic() {
+        // Before the fix, the runtime had only `enable_time()`, so `$(...)`
+        // command substitution panicked in tokio ("IO is disabled") and `invoke`
+        // returned an opaque Err. With IO enabled, the substitution runs through
+        // the funnel: the inner `/bin/rm` is denied via `before_exec`, the call
+        // returns a CLEAN envelope with `denied: true`, and nothing is deleted.
+        let victim = fresh_marker("cmdsubst-victim");
+        std::fs::write(&victim, b"keep me").expect("seed victim file");
+
+        let cx = authorize(&echo_grant()).unwrap();
+        let cmd = format!("echo $(/bin/rm -rf {})", victim.display());
+        let out = ShellTool::new()
+            .invoke(serde_json::json!({ "cmd": cmd }), &cx)
+            .await
+            .expect("invoke must NOT be an Err/panic — a clean denial envelope");
+        assert_eq!(
+            out["denied"], true,
+            "command substitution of a denied program must be flagged denied: {out:?}"
+        );
+        let denials = out["denials"].as_array().expect("denials array");
+        assert!(
+            denials.iter().any(|d| d["kind"] == "exec"
+                && d["target"]
+                    .as_str()
+                    .is_some_and(|t| t == "/bin/rm" || t.ends_with("/rm"))),
+            "expected an exec denial for /bin/rm, got {denials:?}"
+        );
+        assert!(
+            victim.exists(),
+            "the denied rm must NOT have deleted the victim file: {out:?}"
+        );
+        let _ = std::fs::remove_file(&victim);
     }
 
     /// Test-only unique-name disambiguator (a counter, never a clock).
