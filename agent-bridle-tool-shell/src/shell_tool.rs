@@ -32,7 +32,15 @@ const STDERR_FD: ShellFd = 2;
 /// hook denies it explicitly (and `/bin/rm` is denied regardless of `PATH`,
 /// since the path-separator branch goes straight to the spawn funnel). The host
 /// environment is still *not* inherited — only this `PATH` is seeded.
-const FREEFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+///
+/// `/opt/homebrew/bin` is first so Apple-Silicon Homebrew tools (git, rg, node,
+/// python3, …) resolve on a macOS testbed — that prefix is *the* arm64 brew
+/// location, and without it brew-installed externals are "command not found" on
+/// Apple Silicon. `/usr/local/bin` covers Intel-mac brew + Linux; non-existent
+/// dirs are simply skipped during resolution, so listing all is harmless. This
+/// widens *resolution* only, not authority: the `exec` caveat still gates (by
+/// basename) what is actually allowed to run.
+const FREEFORM_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 
 /// The brush [`ShellExtensions`](brush_core::extensions::ShellExtensions) we
 /// build: the default error formatter plus our capability [`CaveatInterceptor`].
