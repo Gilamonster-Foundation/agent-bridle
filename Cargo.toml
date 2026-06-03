@@ -40,7 +40,12 @@ async-trait = "0.1"
 pyo3 = { version = "0.28", default-features = false, features = ["macros"] }
 
 # Leaf-tool-only deps (never enter core or a host's default build).
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+# `net` is required for the runtime IO driver (`enable_io`/`enable_all`): the
+# confined shell turns IO on so `$(...)` command substitution flows through the
+# interceptor funnel and yields a clean denial instead of an "IO is disabled"
+# panic (DESIGN §6 / security fix). `rt`+`time` alone do not bring in the IO
+# driver.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
 # brush — pinned to OUR fork at the commit that adds the `CommandInterceptor`
 # exec/open hook (`extensions::CommandInterceptor`, wired at the single
 # external-spawn funnel + `Shell::open_file`). All three crates share one
