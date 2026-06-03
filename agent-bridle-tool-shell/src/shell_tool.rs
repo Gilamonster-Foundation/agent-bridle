@@ -233,7 +233,9 @@ impl Tool for ShellTool {
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
         let parsed = ShellArgs::parse(&args)?;
-        let sandbox_kind = cx.sandbox_kind();
+        // The kind we will actually run under (honest reporting). L3 is enforced
+        // on the confined thread below; this just predicts it for the envelope.
+        let sandbox_kind = intended_sandbox_kind(cx.caveats());
 
         // (1) The leash, argv-mode fast path. If a *named* program is not in the
         // `exec` scope, deny before building anything. Free-form (`cmd`) has no
@@ -243,10 +245,10 @@ impl Tool for ShellTool {
             cx.check_exec(program)?;
         }
 
-        // (2) Apply the OS-level sandbox before running. For P0 this is a noop
-        // (SandboxKind::None); P3 wires a real Landlock ruleset built from the
-        // effective caveats here.
-        apply_sandbox(cx.caveats(), sandbox_kind)?;
+        // (2) The OS-level sandbox (L3) is NOT applied here: Landlock's
+        // restrict_self is per-thread and irreversible, and this is the caller's
+        // (reused) async thread. It is applied inside `run_confined`, on the
+        // dedicated throwaway thread that actually runs brush — see there.
 
         // (3) Run via brush with carried builtins, captured output, the
         // capability interceptor (the cross-OS in-process leash), and a timeout.
@@ -262,7 +264,8 @@ impl Tool for ShellTool {
         let timeout = parsed.timeout;
         let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
         let interceptor = CaveatInterceptor::new(cx.clone(), Arc::clone(&sink));
-        let run = tokio::task::spawn_blocking(move || run_in_brush(parsed, interceptor));
+        let effective = cx.caveats().clone();
+        let run = tokio::task::spawn_blocking(move || run_confined(parsed, interceptor, effective));
         let joined = tokio::time::timeout(timeout, run).await;
 
         match joined {
@@ -309,12 +312,65 @@ fn take_denials(sink: &DenialSink) -> Vec<Denial> {
     std::mem::take(&mut *guard)
 }
 
-/// Apply the OS sandbox (P0: noop). Kept as a seam so P3 can drop in Landlock.
-fn apply_sandbox(_effective: &Caveats, _kind: SandboxKind) -> ToolResult<()> {
-    // P3 TODO(linux-landlock): when the feature is active and the kernel
-    // supports it, build + enforce a Landlock ruleset from `_effective` here,
-    // and have the gate stamp SandboxKind::Landlock.
+/// The sandbox kind this invocation will actually run under, for honest
+/// reporting in the result envelope.
+///
+/// Landlock only when the `linux-landlock` feature + kernel support it **and**
+/// the caveats actually restrict `fs_write` (the only axis L3 governs in this
+/// increment). Otherwise [`SandboxKind::None`] — the leash is then the in-process
+/// L2 interceptor only, advertised honestly. `fs_write = All` means nothing to
+/// confine at L3, so it is reported (and applied) as None.
+fn intended_sandbox_kind(effective: &Caveats) -> SandboxKind {
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    {
+        if matches!(effective.fs_write, agent_bridle_core::Scope::Only(_))
+            && agent_bridle_core::landlock_is_supported()
+        {
+            return SandboxKind::Landlock;
+        }
+    }
+    let _ = effective;
+    SandboxKind::None
+}
+
+/// Enforce the OS-level sandbox (L3) on the **current** thread.
+///
+/// MUST be called on the dedicated, throwaway shell thread (see [`run_confined`])
+/// — never on a reused thread — because Landlock's `restrict_self` is per-thread
+/// and irreversible. A no-op unless [`intended_sandbox_kind`] is Landlock.
+/// Fail-closed: a requested-but-unenforceable ruleset returns `Err`.
+fn apply_sandbox(effective: &Caveats) -> ToolResult<()> {
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    {
+        use agent_bridle_core::Sandbox;
+        if intended_sandbox_kind(effective) == SandboxKind::Landlock {
+            agent_bridle_core::LandlockSandbox::new().apply(effective)?;
+        }
+    }
+    let _ = effective;
     Ok(())
+}
+
+/// Run the confined shell on a **dedicated, throwaway OS thread**.
+///
+/// L3's Landlock `restrict_self` is per-thread and irreversible, and tokio
+/// reuses its blocking-pool threads — so restricting a pool thread would poison
+/// every later `spawn_blocking` task that lands on it. A fresh thread that dies
+/// when the invocation ends cannot leak its restriction. brush runs on a
+/// current-thread runtime *on this same thread* (see [`run_in_brush`]), so the
+/// `fork`/`exec` of any child it spawns happens here too and the child inherits
+/// the Landlock domain.
+fn run_confined(
+    parsed: ShellArgs,
+    interceptor: CaveatInterceptor,
+    effective: Caveats,
+) -> ToolResult<Captured> {
+    std::thread::Builder::new()
+        .name("agent-bridle-confined-shell".into())
+        .spawn(move || run_in_brush(parsed, interceptor, &effective))
+        .map_err(|e| ToolError::Exec(io_ctx("spawn confined shell thread", e)))?
+        .join()
+        .map_err(|_| ToolError::Other(anyhow::anyhow!("confined shell thread panicked")))?
 }
 
 /// What a finished brush run produced.
@@ -329,10 +385,17 @@ struct Captured {
 /// brush's `Stream`; pipes are mandatory). The shell is built with the supplied
 /// [`CaveatInterceptor`] so exec/open are confined in-process.
 ///
-/// This is synchronous: it runs on a blocking thread and spins a tiny current-
-/// thread tokio runtime for brush's async shell API.
-fn run_in_brush(parsed: ShellArgs, interceptor: CaveatInterceptor) -> ToolResult<Captured> {
-    // Real OS pipes for fd 1 and 2.
+/// This is synchronous: it runs on the dedicated confined thread (see
+/// [`run_confined`]) and spins a tiny current-thread tokio runtime for brush's
+/// async shell API.
+fn run_in_brush(
+    parsed: ShellArgs,
+    interceptor: CaveatInterceptor,
+    effective: &Caveats,
+) -> ToolResult<Captured> {
+    // Real OS pipes for fd 1 and 2. Created BEFORE the sandbox so their fds are
+    // already open: Landlock governs the path-based `open(2)`, not writes to an
+    // already-open fd, so capture keeps working under any `fs_write` scope.
     let (out_reader, out_writer) =
         std::io::pipe().map_err(|e| ToolError::Exec(io_ctx("create stdout pipe", e)))?;
     let (err_reader, err_writer) =
@@ -342,6 +405,13 @@ fn run_in_brush(parsed: ShellArgs, interceptor: CaveatInterceptor) -> ToolResult
     // deadlock by filling the pipe buffer before the shell exits.
     let out_handle = std::thread::spawn(move || drain(out_reader));
     let err_handle = std::thread::spawn(move || drain(err_reader));
+
+    // L3: enforce the OS-level sandbox on THIS (fresh, throwaway) thread, before
+    // any command runs. brush's current-thread runtime and every child it forks
+    // run on this thread and inherit the Landlock domain. Reads/exec are
+    // ungoverned in this increment; `fs_write` is confined to the granted scope.
+    // Fail-closed: a requested-but-unenforceable ruleset aborts the invocation.
+    apply_sandbox(effective)?;
 
     // brush's shell API is async; run it on a single-thread runtime confined to
     // this blocking worker thread.
@@ -1159,6 +1229,91 @@ mod tests {
             "the denied rm must NOT have deleted the victim file: {out:?}"
         );
         let _ = std::fs::remove_file(&victim);
+    }
+
+    // ── L3 (Landlock) kernel enforcement of an EXTERNAL program's writes ────
+
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    #[tokio::test]
+    async fn l3_landlock_confines_external_program_write_outside_fs_write() {
+        // THE reason L3 exists. L2 (`before_open`) cannot see an *external*
+        // program's own writes once it has spawned — only the kernel can. Grant
+        // exec={touch} + fs_write=Only{scratch}, then run the genuine external
+        // `/usr/bin/touch` (path-separator form forces the spawn funnel, never a
+        // carried builtin) to create a marker OUTSIDE scratch. Before this wiring
+        // the marker WAS created (L2 is blind to the child); with the Landlock
+        // ruleset enforced on the confined thread the kernel denies the write, so
+        // the marker must NOT exist — even though the in-process leash never
+        // fired for the child's syscalls.
+        use agent_bridle_core::landlock_is_supported;
+        let touch = std::path::Path::new("/usr/bin/touch");
+        if !landlock_is_supported() || !touch.is_file() {
+            return; // environment can't exercise this; self-skip.
+        }
+
+        let scratch = std::env::temp_dir().join(format!(
+            "ab-l3-ok-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+        // A sibling under the temp dir — NOT beneath the granted scratch root.
+        let outside = std::env::temp_dir().join(format!(
+            "ab-l3-escape-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&outside);
+
+        let cx = authorize(&Caveats {
+            exec: Scope::only(["touch".to_string()]),
+            fs_write: Scope::only([scratch.to_string_lossy().into_owned()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        })
+        .unwrap();
+
+        let cmd = format!("/usr/bin/touch {}", outside.display());
+        let out = ShellTool::new()
+            .invoke(serde_json::json!({ "cmd": cmd }), &cx)
+            .await
+            .expect("invoke");
+
+        // The envelope honestly reports kernel confinement is in force.
+        assert_eq!(
+            out["sandbox_kind"], "landlock",
+            "L3 must be active for a restricted fs_write scope: {out:?}"
+        );
+        // The kernel blocked the external's write: the marker is absent.
+        assert!(
+            !outside.exists(),
+            "Landlock must prevent an external program writing outside fs_write: {out:?}"
+        );
+        // A write WITHIN scope still succeeds through the same confined run.
+        let inside = scratch.join("inside.txt");
+        let cmd2 = format!("/usr/bin/touch {}", inside.display());
+        let cx2 = authorize(&Caveats {
+            exec: Scope::only(["touch".to_string()]),
+            fs_write: Scope::only([scratch.to_string_lossy().into_owned()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        })
+        .unwrap();
+        let out2 = ShellTool::new()
+            .invoke(serde_json::json!({ "cmd": cmd2 }), &cx2)
+            .await
+            .expect("invoke");
+        assert_eq!(
+            out2["exit_code"], 0,
+            "in-scope external write must succeed: {out2:?}"
+        );
+        assert!(
+            inside.exists(),
+            "in-scope marker should have been created: {out2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_file(&outside);
     }
 
     /// Test-only unique-name disambiguator (a counter, never a clock).
