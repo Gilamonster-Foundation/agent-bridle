@@ -5,6 +5,7 @@ members = [
     "agent-bridle-tool-shell",
     "agent-bridle",
     "agent-bridle-mcp",
+    "agent-bridle-py",
 ]
 
 [workspace.package]
@@ -30,6 +31,11 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
+
+# PyO3 — only the `agent-bridle-py` wheel turns this on (default-feature
+# builds of the rest of the workspace never touch it). `extension-module` is
+# enabled at the crate, not here, so any non-wheel consumer stays clean.
+pyo3 = { version = "0.28", default-features = false, features = ["macros"] }
 
 # Leaf-tool-only deps (never enter core or a host's default build).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
