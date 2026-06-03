@@ -31,7 +31,7 @@ mod sandbox;
 mod tool;
 
 pub use context::ToolContext;
-pub use envelope::ToolEnvelope;
+pub use envelope::{Denial, DenialKind, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use registry::{Registry, RegistryBuilder};
