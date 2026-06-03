@@ -71,15 +71,20 @@ only**, never in `bridle-core` or the host's default build.
 | `agent-bridle-tool-shell` | brush-backed confined shell (carried coreutils) | brush-core/builtins/coreutils-builtins (feature `shell`) |
 | `agent-bridle-tool-web` | `web_fetch`/`http`/`web_search` | reqwest+rustls, readability/htmd (feature `web`) |
 | `agent-bridle-tool-fs` | confined read/edit/search/list | (light) |
-| `agent-bridle-tool-scm` | git tools (migrated from newt-tools-scm) | kyln-git/arrow (feature `scm`) — **subprocess by default** |
+| `agent-bridle-tool-scm` | git tools (log/blame/diff/status/commit/branch/push/pull) | **`gix` (gitoxide)** — pure-Rust, on crates.io, **in-process** (feature `scm`). No heavy/private deps, no system `git`. |
 | `agent-bridle-browse` | headless-browser tool | chromiumoxide / Playwright-MCP — **subprocess only, never baked** |
 | `agent-bridle` (facade) | re-exports a registry the host consumes like newt-tools-scm | — |
 | `agent-bridle-mcp` | MCP server frontend (binary) over the registry | — |
 | `agent-bridle-py` | PyO3 wheel: Pillar A + the Python tool host/sidecar | pyo3 |
 
-newt's default build then contains **zero arrow/kyln** unless `scm` is compiled
-in — and git can instead run as a subprocess plugin (inverting PR#125's
-default-on kyln-git, the literal realization of "knock out for leanness").
+**The git tools are built on `gix` (gitoxide).** It's pure-Rust, crates.io-published,
+in-process, and needs no system `git` — so CI just works, the crate can publish to
+crates.io, and it carries git to Windows-with-just-a-filesystem the same way brush
+carries the shell. The tool layer takes **no private path-dependencies and no heavy
+columnar deps** (a private git-wrapper path dep plus `arrow-array` v58 broke an
+earlier git-tools attempt in CI; `gix` avoids both). Validate `gix` write coverage
+(commit/push/pull) at impl time — reads are solid. The default build pulls only
+`gix` under the `scm` feature.
 
 ## 4. The three frontends (one core)
 
