@@ -142,6 +142,37 @@ The judges verified against brush 0.5 source that the naive in-process leash is
   symlinks escaping scope) *before* the membership check — never string-prefix
   matching — with Landlock as backstop. Closes the `@repo`/`../../etc` traversal.
 
+**Second-layer hardening — the hook is necessary but not sufficient (verified
+against the fork at rev 4e65a06):** wiring `before_exec`/`before_open` is not the
+whole story, because not every brush *builtin* routes through those funnels.
+
+- **The `exec` builtin bypasses `before_exec`.** Its non-subshell branch
+  (`brush-builtins/src/exec.rs`) calls `compose_std_command(...)` then
+  `cmd.exec()` (replace-process) **directly**, never consulting the hook. Proven:
+  under `exec=only{echo}`, `exec /usr/bin/touch MARKER` ran `touch` and replaced
+  the host process image — the leash never fired. So the confined shell is built
+  with a **curated builtin set** that omits `exec` (`shell_tool::confined_builtins`
+  / `REMOVED_BUILTINS`). `default_builtins` hands back a plain owned map and the
+  shell builder seeds an empty one, so omission is robust-by-construction; nothing
+  re-registers it (`enable -f` is `unimp`, `enable`/`builtin exec` only act on
+  already-present entries). A confined shell has nothing to replace into, so
+  losing `exec` costs nothing. *Every other* program/file path was audited and
+  funnels through a hook and is kept: `command`, `eval`, `.`/`source`, `fc`,
+  `coproc`, background `&`, `<(...)`/`>(...)`, and ordinary externals all reach
+  `execute_external_command` (→ `before_exec`); `mapfile`/`read` consume only
+  already-open fds; redirections and `source` open via `Shell::open_file`
+  (→ `before_open`).
+- **The confined runtime must enable IO, not just time.** `$(...)` command
+  substitution sets up real pipes via tokio's IO driver; a time-only runtime
+  panics ("IO is disabled") and surfaces from `invoke` as an opaque `Err` instead
+  of the structured `denied: true` envelope. The runtime is built with
+  `enable_all()` so substitution flows through the funnel and an out-of-scope
+  inner command yields a clean recorded denial (fail-closed and legible).
+
+A complementary follow-up is to teach the brush fork's `exec` builtin to consult
+`before_exec` itself (so the hook is sufficient on its own); the curated builtin
+set makes the in-process leash airtight today regardless.
+
 ## 7. Web tools = the `net` enforcer
 
 Three independently-gated tiers (see also the `net` Caveat — the axis no other
