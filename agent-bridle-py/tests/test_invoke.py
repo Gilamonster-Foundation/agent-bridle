@@ -119,6 +119,49 @@ def test_freeform_path_separator_denial_raises() -> None:
         agent_bridle.invoke("shell", {"cmd": "/bin/rm -rf /tmp/x"}, ECHO_ONLY)
 
 
+def test_exec_builtin_cannot_bypass_the_leash(tmp_path) -> None:
+    """Security regression (exec-builtin bypass).
+
+    The brush ``exec`` builtin used to call ``cmd.exec()`` directly — bypassing
+    the ``before_exec`` interceptor funnel and even replacing the host process.
+    Under ``echo``-only, ``exec /usr/bin/touch MARKER`` ran ``touch`` (the marker
+    appeared) with the leash never firing. The fix removes ``exec`` from the
+    confined shell's builtin set, so it is now "command not found": the carried
+    program must NOT run (no marker), and ``invoke`` returns cleanly rather than
+    replacing the interpreter.
+    """
+    marker = tmp_path / "exec-bypass-marker"
+    assert not marker.exists()
+    r = agent_bridle.invoke(
+        "shell",
+        {"cmd": f"exec /usr/bin/touch {marker}"},
+        ECHO_ONLY,
+    )
+    # The shell returned (process not replaced) and exec is gone (non-zero).
+    assert r["exit_code"] != 0, r
+    assert not marker.exists(), f"exec builtin ran the program: {r}"
+
+
+def test_command_substitution_denial_does_not_panic(tmp_path) -> None:
+    """Security regression ($() IO panic).
+
+    The confined runtime previously enabled only the time driver, so a ``$(...)``
+    command substitution panicked ("IO is disabled") and surfaced as an opaque
+    error rather than a clean denial. With IO enabled, the inner ``/bin/rm`` flows
+    through ``before_exec`` and is denied — ``invoke`` raises ``BridleDenied``
+    (structured ``denied: true``), and the victim file is untouched.
+    """
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    with pytest.raises(agent_bridle.BridleDenied):
+        agent_bridle.invoke(
+            "shell",
+            {"cmd": f"echo $(/bin/rm -rf {victim})"},
+            ECHO_ONLY,
+        )
+    assert victim.exists(), "the denied rm must not have deleted the victim file"
+
+
 def test_unknown_tool_raises_bridle_denied() -> None:
     """A registry miss surfaces uniformly as ``BridleDenied``."""
     with pytest.raises(agent_bridle.BridleDenied):
