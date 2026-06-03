@@ -7,16 +7,17 @@ Build the extension first (in an isolated venv, never ``~/venv``)::
 
 These tests are the Python-side proof of the headline invariant: a tool runs
 **only** when the granted ``Caveats`` admit it, and an out-of-scope dispatch is
-refused by the leash *before the command runs* — surfacing as
-``agent_bridle.BridleDenied`` (a subclass of the built-in ``PermissionError``).
+refused by the leash — surfacing as ``agent_bridle.BridleDenied`` (a subclass of
+the built-in ``PermissionError``).
 
-Note on the ``shell`` arg shape: the tool takes **argv form**
-(``{"program": ..., "args": [...]}``), not a free-form ``{"cmd": "..."}`` string.
-That is the deliberate brush exec-bypass mitigation (DESIGN §6): the ``exec``
-caveat gates on the *named program token*, so the program must be a discrete
-field the leash can check. A ``cmd`` string would let ``echo hi; rm -rf /`` slip
-the leash, which is exactly the confused-deputy hole the bridle closes. The
-tests therefore exercise the real argv contract.
+Note on the ``shell`` arg shape: the tool takes **two** shapes. **Argv form**
+(``{"program": ..., "args": [...]}``) is gated *before the command runs* by an
+``exec`` pre-check on the named program. **Free-form** (``{"cmd": "..."}``) is an
+``sh -c``-style string confined in-process by the brush ``CommandInterceptor``
+hook (DESIGN §6) — a path-separator command like ``/bin/rm`` cannot bypass it.
+A free-form denial returns from dispatch with the structured ``denied: true``
+field set, which ``invoke()`` turns into ``BridleDenied`` just like an argv-form
+denial. The tests exercise both contracts.
 """
 
 from __future__ import annotations
@@ -87,12 +88,35 @@ def test_denied_reason_is_surfaced() -> None:
     assert "curl" in str(exc.value)
 
 
-def test_cmd_shorthand_is_rejected() -> None:
-    """Documents the contract: a free-form ``{"cmd": ...}`` is NOT accepted; the
-    shell tool requires the ``program`` field (argv form). Missing ``program``
-    is itself a denial."""
+def test_freeform_in_scope_runs() -> None:
+    """Free-form ``{"cmd": ...}`` IS accepted (it is confined in-process by the
+    interceptor hook). With ``echo`` in scope, ``echo hi`` runs and is not
+    flagged denied."""
+    r = agent_bridle.invoke("shell", {"cmd": "echo hi"}, ECHO_ONLY)
+    assert r["exit_code"] == 0, r
+    assert "hi" in r["stdout"], r
+    # An in-scope free-form run records no denial.
+    assert r.get("denied") in (None, False), r
+
+
+def test_freeform_denial_raises_bridle_denied() -> None:
+    """The load-bearing free-form test (the fix's Python coverage): a free-form
+    ``cmd`` the interceptor refuses (``rm`` ∉ ``exec``) returns the structured
+    ``denied: true`` envelope from dispatch, and ``invoke()`` raises
+    ``BridleDenied`` for it — exactly as it does for an argv-form denial. Before
+    the fix, a free-form denial slipped through as a plain non-zero result with
+    no exception."""
+    with pytest.raises(agent_bridle.BridleDenied) as exc:
+        agent_bridle.invoke("shell", {"cmd": "rm -rf /tmp/x"}, ECHO_ONLY)
+    # The structured denials' reason is carried through.
+    assert "not within the granted" in str(exc.value) or "denied" in str(exc.value)
+
+
+def test_freeform_path_separator_denial_raises() -> None:
+    """A path-separator-spelled command (``/bin/rm``) cannot bypass the leash in
+    free-form mode either — it raises ``BridleDenied``."""
     with pytest.raises(agent_bridle.BridleDenied):
-        agent_bridle.invoke("shell", {"cmd": "echo hi"}, ECHO_ONLY)
+        agent_bridle.invoke("shell", {"cmd": "/bin/rm -rf /tmp/x"}, ECHO_ONLY)
 
 
 def test_unknown_tool_raises_bridle_denied() -> None:
@@ -116,10 +140,10 @@ def test_tool_definitions_have_name_and_schema() -> None:
     assert isinstance(defs, list) and defs
     shell = next(d for d in defs if d["name"] == "shell")
     assert isinstance(shell["inputSchema"], dict)
-    # argv form: a `program` property, no `cmd` property.
+    # The shell exposes BOTH shapes: argv (`program`) and free-form (`cmd`).
     props = shell["inputSchema"]["properties"]
     assert "program" in props
-    assert "cmd" not in props
+    assert "cmd" in props
 
 
 def test_unknown_caveats_field_is_value_error() -> None:

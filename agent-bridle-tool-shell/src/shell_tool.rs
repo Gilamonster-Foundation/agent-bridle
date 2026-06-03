@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    Caveats, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    Caveats, Denial, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 use brush_builtins::{default_builtins, BuiltinSet};
@@ -13,7 +14,7 @@ use brush_core::extensions::{DefaultErrorFormatter, ShellExtensionsImpl};
 use brush_core::openfiles::OpenFile;
 use brush_core::{Shell, ShellFd};
 
-use crate::caveat_interceptor::CaveatInterceptor;
+use crate::caveat_interceptor::{CaveatInterceptor, DenialSink};
 
 /// Maximum permitted timeout, in seconds. Requests above this are clamped.
 const MAX_TIMEOUT_SECS: u64 = 300;
@@ -251,8 +252,16 @@ impl Tool for ShellTool {
         // capability interceptor (the cross-OS in-process leash), and a timeout.
         // Blocking shell work runs on a blocking thread; the interceptor carries
         // THIS invocation's effective caveats.
+        //
+        // The denial sink is minted FRESH here, once per invocation, and shared
+        // (Arc) into the interceptor — and through it into every brush-made
+        // clone. We keep our own clone of the Arc so we can read the recorded
+        // denials after the brush task finishes. Because each invocation gets a
+        // brand-new sink, two concurrent invocations can never observe each
+        // other's denials.
         let timeout = parsed.timeout;
-        let interceptor = CaveatInterceptor::new(cx.clone());
+        let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
+        let interceptor = CaveatInterceptor::new(cx.clone(), Arc::clone(&sink));
         let run = tokio::task::spawn_blocking(move || run_in_brush(parsed, interceptor));
         let joined = tokio::time::timeout(timeout, run).await;
 
@@ -261,21 +270,43 @@ impl Tool for ShellTool {
             Ok(join_result) => {
                 let captured = join_result
                     .map_err(|e| ToolError::Other(anyhow::anyhow!("shell task panicked: {e}")))??;
+                // Read the structured denial signal the interceptor recorded.
+                // `denied: true` is set iff at least one Deny actually fired —
+                // NOT merely because the command exited non-zero on its own.
+                let denials = take_denials(&sink);
                 Ok(ToolEnvelope::new(sandbox_kind)
                     .with_exit_code(captured.exit_code)
                     .with_stdout(captured.stdout)
                     .with_stderr(captured.stderr)
                     .with_timed_out(false)
+                    .with_denials(denials)
                     .into_json())
             }
             // Timed out: the blocking task is detached; report a timeout
-            // envelope so the caller sees the bound was hit.
-            Err(_elapsed) => Ok(ToolEnvelope::new(sandbox_kind)
-                .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
-                .with_timed_out(true)
-                .into_json()),
+            // envelope so the caller sees the bound was hit. Surface any denials
+            // recorded before the bound was hit, too.
+            Err(_elapsed) => {
+                let denials = take_denials(&sink);
+                Ok(ToolEnvelope::new(sandbox_kind)
+                    .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
+                    .with_timed_out(true)
+                    .with_denials(denials)
+                    .into_json())
+            }
         }
     }
+}
+
+/// Drain the per-invocation denial sink into an owned `Vec<Denial>`.
+///
+/// A poisoned lock (a brush callback panicking mid-record) is recovered rather
+/// than propagated: a security signal is too important to drop because one
+/// record raced a panic.
+fn take_denials(sink: &DenialSink) -> Vec<Denial> {
+    let mut guard = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *guard)
 }
 
 /// Apply the OS sandbox (P0: noop). Kept as a seam so P3 can drop in Landlock.
@@ -560,41 +591,64 @@ mod tests {
 
     #[tokio::test]
     async fn freeform_rm_denied_via_before_exec() {
-        // cmd `rm -rf /tmp/x` → DENIED via before_exec (rm ∉ exec). A standard
-        // PATH is seeded so `rm` resolves and the hook (not "command not found")
-        // is what stops it; the non-zero exit + denial text prove the hook.
+        // (a) cmd `rm -rf /tmp/x` → DENIED via before_exec (rm ∉ exec). A
+        // standard PATH is seeded so `rm` resolves and the hook (not "command
+        // not found") is what stops it. We assert the STRUCTURED signal: the
+        // result envelope carries `denied: true` and a denials entry naming
+        // kind=exec / target=rm — no stderr string-matching needed.
         let cx = authorize(&echo_grant()).unwrap();
         let out = ShellTool::new()
             .invoke(serde_json::json!({ "cmd": "rm -rf /tmp/x" }), &cx)
             .await
             .expect("invoke");
         assert_ne!(out["exit_code"], 0, "rm must not succeed: {out:?}");
-        let stderr = out["stderr"].as_str().unwrap();
-        assert!(
-            stderr.contains("not within the granted authority") || stderr.contains("denied"),
-            "expected an exec-denial in stderr, got {stderr:?}"
+        // The headline assertion: structured denial, not stderr-grepping.
+        assert_eq!(
+            out["denied"], true,
+            "result must be flagged denied: {out:?}"
         );
+        let denials = out["denials"].as_array().expect("denials array");
+        // The target is exactly what brush handed the hook: for a PATH-resolved
+        // command that is the resolved absolute path (e.g. /usr/bin/rm), so we
+        // assert kind=exec and that the program is `rm` (the basename).
+        assert!(
+            denials.iter().any(|d| d["kind"] == "exec"
+                && d["target"]
+                    .as_str()
+                    .is_some_and(|t| t == "rm" || t.ends_with("/rm"))),
+            "expected an exec denial naming rm, got {denials:?}"
+        );
+        // The reason is carried for surfacing to the agent.
+        assert!(denials[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not within the granted"));
     }
 
     #[tokio::test]
     async fn freeform_bin_rm_denied_closes_path_separator_bypass() {
-        // cmd `/bin/rm -rf /tmp/x` → DENIED. THE load-bearing case: a
+        // (b) cmd `/bin/rm -rf /tmp/x` → DENIED. THE load-bearing case: a
         // path-separator command bypasses PATH and the builtin table, so a
         // cleared PATH alone would NOT stop it — only the before_exec hook (at
-        // the single spawn funnel) does. Proves the bypass is closed.
+        // the single spawn funnel) does. Proves the bypass is closed AND that
+        // the path-separator denial is flagged structurally.
         let cx = authorize(&echo_grant()).unwrap();
         let out = ShellTool::new()
             .invoke(serde_json::json!({ "cmd": "/bin/rm -rf /tmp/x" }), &cx)
             .await
             .expect("invoke");
         assert_ne!(out["exit_code"], 0, "/bin/rm must not succeed: {out:?}");
-        let stderr = out["stderr"].as_str().unwrap();
-        assert!(
-            stderr.contains("not within the granted authority") || stderr.contains("denied"),
-            "expected an exec-denial for /bin/rm in stderr, got {stderr:?}"
+        assert_eq!(
+            out["denied"], true,
+            "/bin/rm must be flagged denied: {out:?}"
         );
-        // And the target must still exist if it did (we never created it); the
-        // denial is observable purely via the refusal above.
+        let denials = out["denials"].as_array().expect("denials array");
+        assert!(
+            denials
+                .iter()
+                .any(|d| d["kind"] == "exec" && d["target"] == "/bin/rm"),
+            "expected an exec//bin/rm denial, got {denials:?}"
+        );
     }
 
     #[tokio::test]
@@ -627,12 +681,19 @@ mod tests {
             out["exit_code"], 0,
             "redirect outside scope must fail: {out:?}"
         );
-        let stderr = out["stderr"].as_str().unwrap();
+        // (c) the open-denial is flagged structurally with kind=open and the
+        // refused path as target.
+        assert_eq!(
+            out["denied"], true,
+            "redirect must be flagged denied: {out:?}"
+        );
+        let denials = out["denials"].as_array().expect("denials array");
         assert!(
-            stderr.contains("denied")
-                || stderr.contains("not within the granted")
-                || stderr.contains("open denied"),
-            "expected an open-denial in stderr, got {stderr:?}"
+            denials.iter().any(|d| d["kind"] == "open"
+                && d["target"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("ab-should-not-exist"))),
+            "expected an open denial for the redirect target, got {denials:?}"
         );
         assert!(
             !std::path::Path::new("/etc/ab-should-not-exist").exists(),
@@ -671,10 +732,111 @@ mod tests {
             out["exit_code"], 0,
             "in-scope redirect must succeed: {out:?}"
         );
+        // An in-scope run records no denial: the structured field is omitted.
+        assert!(out.get("denied").is_none(), "must not be flagged: {out:?}");
+        assert!(out.get("denials").is_none(), "no denials expected: {out:?}");
         let written = std::fs::read_to_string(&target).expect("read back");
         assert!(written.contains("inscope"), "file content was {written:?}");
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn freeform_permitted_command_exiting_126_is_not_flagged_denied() {
+        // (d) NO FALSE POSITIVES. A permitted command that itself exits 126 must
+        // NOT be flagged as a leash denial — `denied` is set ONLY when the
+        // interceptor actually recorded a Deny, never merely from a 126 exit.
+        // `exit 126` is a carried shell builtin: it sets the code with no
+        // exec/open going through the interceptor, so nothing is recorded.
+        let cx = authorize(&echo_grant()).unwrap();
+        let out = ShellTool::new()
+            .invoke(serde_json::json!({ "cmd": "exit 126" }), &cx)
+            .await
+            .expect("invoke");
+        assert_eq!(out["exit_code"], 126, "expected a raw 126 exit: {out:?}");
+        // The whole point: 126 alone does NOT mean denied.
+        assert!(
+            out.get("denied").is_none(),
+            "a permitted 126 exit must NOT be flagged denied: {out:?}"
+        );
+        assert!(
+            out.get("denials").is_none(),
+            "no denials must be recorded for a permitted 126 exit: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_invocations_do_not_cross_contaminate_denials() {
+        // (e) The sink is PER-INVOCATION. Two invocations run concurrently with
+        // different grants; each must see only its OWN denials, never the
+        // other's. Both use path-separator-spelled programs so the before_exec
+        // hook fires at the spawn funnel regardless of whether the binary is
+        // installed (no reliance on a host having `rm`/`curl` on PATH).
+        // Invocation A (echo-only) runs `/bin/rm` → its own exec//bin/rm denial.
+        // Invocation B (rm-allowed) runs `/usr/bin/curl` → its own
+        // exec//usr/bin/curl denial. If the sink leaked across invocations, A
+        // would see `curl` or B would see `rm`.
+        let grant_a = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        };
+        let grant_b = Caveats {
+            exec: Scope::only(["rm".to_string()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        };
+        let cx_a = authorize(&grant_a).unwrap();
+        let cx_b = authorize(&grant_b).unwrap();
+
+        // Drive both at once on the same runtime so their brush runs overlap.
+        let tool = ShellTool::new();
+        let fut_a = tool.invoke(serde_json::json!({ "cmd": "/bin/rm /tmp/x" }), &cx_a);
+        let fut_b = tool.invoke(
+            serde_json::json!({ "cmd": "/usr/bin/curl http://x" }),
+            &cx_b,
+        );
+        let (out_a, out_b) = tokio::join!(fut_a, fut_b);
+        let out_a = out_a.expect("invoke A");
+        let out_b = out_b.expect("invoke B");
+
+        // Targets are whatever brush handed the hook (PATH-resolved absolute
+        // paths); test by basename so the assertion is host-independent.
+        let names = |out: &serde_json::Value| -> Vec<String> {
+            out["denials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| {
+                    let t = d["target"].as_str().unwrap();
+                    t.rsplit('/').next().unwrap_or(t).to_string()
+                })
+                .collect()
+        };
+
+        // A denied `rm`, and ONLY `rm` — never B's `curl`.
+        assert_eq!(out_a["denied"], true, "A must be denied: {out_a:?}");
+        let a_names = names(&out_a);
+        assert!(
+            a_names.iter().any(|n| n == "rm"),
+            "A should see its own rm: {a_names:?}"
+        );
+        assert!(
+            !a_names.iter().any(|n| n == "curl"),
+            "A must NOT see B's curl denial (cross-contamination): {a_names:?}"
+        );
+
+        // B denied `curl`, and ONLY `curl` — never A's `rm`.
+        assert_eq!(out_b["denied"], true, "B must be denied: {out_b:?}");
+        let b_names = names(&out_b);
+        assert!(
+            b_names.iter().any(|n| n == "curl"),
+            "B should see its own curl: {b_names:?}"
+        );
+        assert!(
+            !b_names.iter().any(|n| n == "rm"),
+            "B must NOT see A's rm denial (cross-contamination): {b_names:?}"
+        );
     }
 
     #[tokio::test]

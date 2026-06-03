@@ -74,13 +74,48 @@ pub async fn tools_call(registry: &Registry, granted: &Caveats, params: Value) -
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
     match registry.dispatch(name, arguments, granted).await {
+        // An Ok result can still carry a STRUCTURED in-band denial: a free-form
+        // shell `cmd` that the interceptor refused returns `Ok` with
+        // `denied: true` in the envelope (the brush run "succeeded" at the
+        // process level — exit 126 — but a capability was refused). Surface that
+        // as an MCP tool error too, reading the structured field, NOT stderr.
+        Ok(result) if is_denied(&result) => tool_error(&denial_reason(&result)),
         Ok(result) => tool_success(&result),
-        // A leash denial — the headline case. Surface the reason in-band.
+        // A leash denial on the Err path — the argv/pre-dispatch case. Surface
+        // the reason in-band.
         Err(e @ ToolError::Denied { .. }) => tool_error(&e.to_string()),
         // Other leash/runtime failures are also tool-level outcomes, not
         // transport faults: budget exhausted, generation mismatch, unknown
         // tool, or an error from inside a tool that passed the leash.
         Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+/// Whether a tool result carries the structured `denied: true` flag.
+fn is_denied(result: &Value) -> bool {
+    result
+        .get("denied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Build a denial message from a result's structured `denials`, falling back to
+/// a generic reason if the list is missing or empty.
+fn denial_reason(result: &Value) -> String {
+    let reasons: Vec<String> = result
+        .get("denials")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d.get("reason").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if reasons.is_empty() {
+        "denied: the capability leash refused an operation".to_string()
+    } else {
+        reasons.join("; ")
     }
 }
 
@@ -175,6 +210,32 @@ mod tests {
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("denied"), "denial reason missing: {text}");
         assert!(text.contains("rm"), "denied program missing: {text}");
+    }
+
+    #[cfg(feature = "shell")]
+    #[tokio::test]
+    async fn call_freeform_denied_is_in_band_error_from_structured_field() {
+        // A free-form `cmd` denial returns Ok from dispatch (exit 126) with the
+        // STRUCTURED `denied: true` in the envelope. The handler must turn that
+        // into an MCP tool error (isError=true) by reading the structured field,
+        // NOT by string-matching stderr. This is the regression the fix closes:
+        // before it, a free-form denial slipped through as isError=false.
+        let reg = agent_bridle::registry();
+        let v = tools_call(
+            &reg,
+            &echo_grant(),
+            serde_json::json!({ "name": "shell", "arguments": { "cmd": "rm -rf /tmp/x" } }),
+        )
+        .await;
+        assert_eq!(
+            v["isError"], true,
+            "free-form denial must surface as an MCP tool error: {v}"
+        );
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("not within the granted") || text.contains("denied"),
+            "denial reason missing: {text}"
+        );
     }
 
     #[tokio::test]
