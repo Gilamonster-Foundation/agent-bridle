@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "agent-bridle-core",
     "agent-bridle-tool-shell",
+    "agent-bridle-tool-web",
     "agent-bridle",
     "agent-bridle-mcp",
 ]
@@ -18,6 +19,7 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 # In-workspace crates (lock-step version).
 agent-bridle-core = { version = "0.1.0", path = "agent-bridle-core" }
 agent-bridle-tool-shell = { version = "0.1.0", path = "agent-bridle-tool-shell" }
+agent-bridle-tool-web = { version = "0.1.0", path = "agent-bridle-tool-web" }
 # `default-features = false` here so `agent-bridle-mcp` controls the facade's
 # feature set (its own `shell`/`--no-default-features` forward through).
 agent-bridle = { version = "0.1.0", path = "agent-bridle", default-features = false }
@@ -36,6 +38,20 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] 
 brush-core = "0.5"
 brush-builtins = "0.2"
 brush-coreutils-builtins = "0.1"
+
+# Web-tool-only deps (feature `web` in agent-bridle-tool-web). rustls, NOT
+# openssl, so the client is portable and builds on Windows with no system
+# OpenSSL. `charset`/`gzip` for real-world pages; default features off so we do
+# not drag in the openssl-tls path.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "charset",
+    "gzip",
+] }
+url = "2"
+hickory-resolver = "0.24"
+dom_smoothie = "0.17"
+htmd = "0.5"
 
 [profile.release]
 # strip + thin-LTO is the verified real-world trigger for linker DCE silently

@@ -18,6 +18,10 @@ path = "src/main.rs"
 # valid but empty). Forwarded to the facade so its tool set follows suit.
 default = ["shell"]
 shell = ["agent-bridle/shell"]
+# Expose the confined `web_fetch` tool (the `net` enforcer) through the server.
+# Off by default so the default MCP build stays light; enable with
+# `--features web` (or `--all-features`) to serve web_fetch over MCP.
+web = ["agent-bridle/web"]
 linux-landlock = ["agent-bridle/linux-landlock"]
 
 [dependencies]
