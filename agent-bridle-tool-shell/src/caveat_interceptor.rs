@@ -96,9 +96,12 @@ impl CommandInterceptor for CaveatInterceptor {
     ///
     /// `program` is what brush is about to spawn: for `PATH`-resolved commands
     /// the resolved absolute path, and for path-separator commands the path as
-    /// written (`/bin/rm`, `./x`). Either way we test that exact string against
-    /// the `exec` scope, so `/bin/rm` is denied whenever `rm` (or `/bin/rm`) is
-    /// not granted — this is the path-separator bypass, now closed at the funnel.
+    /// written (`/bin/rm`, `./x`). We hand that string to
+    /// [`ToolContext::check_exec`], which allows it if the `exec` scope contains
+    /// it verbatim OR contains its basename — so a bare-name grant (`["git"]`)
+    /// matches the resolved `/usr/bin/git`, while `/bin/rm` is denied whenever
+    /// neither `rm` nor `/bin/rm` is granted (the path-separator bypass stays
+    /// closed at the funnel).
     fn before_exec(&self, program: &str, _args: &[String]) -> ExecDecision {
         match &self.cx {
             Some(cx) => match cx.check_exec(program) {

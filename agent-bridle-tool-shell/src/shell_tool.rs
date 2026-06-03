@@ -902,6 +902,94 @@ mod tests {
         );
     }
 
+    /// A program that is a REAL external on the CI runner (NOT one of brush's
+    /// carried builtins, which bypass `before_exec` and so would not exercise
+    /// the leash). `env` is on every Linux runner and is not in the brush
+    /// builtin set, so it genuinely funnels through the interceptor.
+    const EXTERNAL_PROG: &str = "env";
+
+    #[tokio::test]
+    async fn freeform_external_granted_by_bare_name_actually_runs() {
+        // THE missing end-to-end test. This whole bug existed because nothing
+        // ever ran an ALLOWED EXTERNAL by bare name through the interceptor.
+        //
+        // Grant `exec = only{"env"}` (a BARE NAME) and run the EXTERNAL `env`
+        // via the confined free-form shell. The interceptor hands `before_exec`
+        // the PATH-resolved absolute path (`/usr/bin/env`); before the fix the
+        // bare-name grant never matched that path and the command was DENIED.
+        // With basename matching it is ALLOWED: it runs, exits 0, and records
+        // NO denial. `env` is a real external (NOT a carried brush builtin), so
+        // this proves a bare-name-granted external executes through the hook.
+        if which_external(EXTERNAL_PROG).is_none() {
+            return; // external not present on this host; nothing to prove.
+        }
+        let cx = authorize(&Caveats {
+            exec: Scope::only([EXTERNAL_PROG.to_string()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        })
+        .unwrap();
+        let out = ShellTool::new()
+            .invoke(serde_json::json!({ "cmd": EXTERNAL_PROG }), &cx)
+            .await
+            .expect("invoke");
+        assert_eq!(
+            out["exit_code"], 0,
+            "a bare-name-granted external must run and exit 0: {out:?}"
+        );
+        assert!(
+            out.get("denied").is_none(),
+            "a granted external must NOT be flagged denied: {out:?}"
+        );
+        assert!(
+            out.get("denials").is_none(),
+            "no denials expected for a granted external: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn freeform_external_not_granted_by_bare_name_is_denied() {
+        // The negative half: grant `exec = only{"echo"}` (a carried builtin
+        // only) and run the EXTERNAL `env`. Its resolved basename `env` is not
+        // in the grant, so the interceptor denies it via before_exec — proving
+        // basename matching did not over-broaden into allowing ungranted
+        // externals.
+        if which_external(EXTERNAL_PROG).is_none() {
+            return;
+        }
+        let cx = authorize(&echo_grant()).unwrap();
+        let out = ShellTool::new()
+            .invoke(serde_json::json!({ "cmd": EXTERNAL_PROG }), &cx)
+            .await
+            .expect("invoke");
+        assert_ne!(
+            out["exit_code"], 0,
+            "an ungranted external must not succeed: {out:?}"
+        );
+        assert_eq!(
+            out["denied"], true,
+            "an ungranted external must be flagged denied: {out:?}"
+        );
+        let denials = out["denials"].as_array().expect("denials array");
+        assert!(
+            denials.iter().any(|d| d["kind"] == "exec"
+                && d["target"].as_str().is_some_and(
+                    |t| t == EXTERNAL_PROG || t.ends_with(&format!("/{EXTERNAL_PROG}"))
+                )),
+            "expected an exec denial naming {EXTERNAL_PROG}, got {denials:?}"
+        );
+    }
+
+    /// Locate an external on the same `PATH` the free-form shell seeds
+    /// ([`FREEFORM_PATH`]), so the test's presence check matches what brush
+    /// will resolve. Returns `None` if not found (test self-skips).
+    fn which_external(name: &str) -> Option<std::path::PathBuf> {
+        FREEFORM_PATH.split(':').find_map(|dir| {
+            let p = std::path::Path::new(dir).join(name);
+            p.is_file().then_some(p)
+        })
+    }
+
     #[tokio::test]
     async fn freeform_and_argv_are_mutually_exclusive() {
         let cx = authorize(&echo_grant()).unwrap();
