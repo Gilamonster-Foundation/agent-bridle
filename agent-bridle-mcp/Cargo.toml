@@ -1,0 +1,39 @@
+[package]
+name = "agent-bridle-mcp"
+description = "MCP (Model Context Protocol) stdio server frontend over the agent-bridle capability-governed tool registry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "agent-bridle-mcp"
+path = "src/main.rs"
+
+[features]
+# Expose the confined brush-backed shell tool through the registry. On by
+# default so the server ships a useful, leashed tool surface; a host that wants
+# a leaner build can opt out with --no-default-features (the registry is then
+# valid but empty). Forwarded to the facade so its tool set follows suit.
+default = ["shell"]
+shell = ["agent-bridle/shell"]
+linux-landlock = ["agent-bridle/linux-landlock"]
+
+[dependencies]
+# The facade: re-exports the leash + assembles the default tool registry. The
+# workspace entry pins `default-features = false`, so this crate's own `shell`
+# feature (default-on) is what enables the facade's shell tool.
+agent-bridle = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Parses the `[caveats]` table in ~/.agent-bridle/config.toml into the
+# agent-mesh `Caveats` serde shape (the second leash source).
+toml = "0.8"
+# Async stdio + the JSON-RPC read/dispatch/write loop. The MCP frontend is a
+# leaf, so tokio lives here (not in core).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "time"] }

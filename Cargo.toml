@@ -4,6 +4,7 @@ members = [
     "agent-bridle-core",
     "agent-bridle-tool-shell",
     "agent-bridle",
+    "agent-bridle-mcp",
 ]
 
 [workspace.package]
@@ -17,6 +18,9 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 # In-workspace crates (lock-step version).
 agent-bridle-core = { version = "0.1.0", path = "agent-bridle-core" }
 agent-bridle-tool-shell = { version = "0.1.0", path = "agent-bridle-tool-shell" }
+# `default-features = false` here so `agent-bridle-mcp` controls the facade's
+# feature set (its own `shell`/`--no-default-features` forward through).
+agent-bridle = { version = "0.1.0", path = "agent-bridle", default-features = false }
 
 # The leash. One canonical authority type, shared across the whole agent line.
 agent-mesh-protocol = "0.6"
