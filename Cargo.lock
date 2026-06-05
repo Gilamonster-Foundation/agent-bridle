@@ -27,6 +27,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "landlock",
  "serde",
  "serde_json",
 ]
@@ -399,7 +400,7 @@ dependencies = [
 [[package]]
 name = "brush-builtins"
 version = "0.2.0"
-source = "git+https://github.com/hartsock/brush?rev=4e65a0627d4d363a5af473bc68bd40862ce9f011#4e65a0627d4d363a5af473bc68bd40862ce9f011"
+source = "git+https://github.com/hartsock/brush?rev=f0ef7715a02f44c670e7f5d5e59d1c7721ea282c#f0ef7715a02f44c670e7f5d5e59d1c7721ea282c"
 dependencies = [
  "brush-core",
  "brush-parser",
@@ -421,7 +422,7 @@ dependencies = [
 [[package]]
 name = "brush-core"
 version = "0.5.0"
-source = "git+https://github.com/hartsock/brush?rev=4e65a0627d4d363a5af473bc68bd40862ce9f011#4e65a0627d4d363a5af473bc68bd40862ce9f011"
+source = "git+https://github.com/hartsock/brush?rev=f0ef7715a02f44c670e7f5d5e59d1c7721ea282c#f0ef7715a02f44c670e7f5d5e59d1c7721ea282c"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -459,7 +460,7 @@ dependencies = [
 [[package]]
 name = "brush-coreutils-builtins"
 version = "0.1.0"
-source = "git+https://github.com/hartsock/brush?rev=4e65a0627d4d363a5af473bc68bd40862ce9f011#4e65a0627d4d363a5af473bc68bd40862ce9f011"
+source = "git+https://github.com/hartsock/brush?rev=f0ef7715a02f44c670e7f5d5e59d1c7721ea282c#f0ef7715a02f44c670e7f5d5e59d1c7721ea282c"
 dependencies = [
  "uucore",
 ]
@@ -467,7 +468,7 @@ dependencies = [
 [[package]]
 name = "brush-parser"
 version = "0.4.0"
-source = "git+https://github.com/hartsock/brush?rev=4e65a0627d4d363a5af473bc68bd40862ce9f011#4e65a0627d4d363a5af473bc68bd40862ce9f011"
+source = "git+https://github.com/hartsock/brush?rev=f0ef7715a02f44c670e7f5d5e59d1c7721ea282c#f0ef7715a02f44c670e7f5d5e59d1c7721ea282c"
 dependencies = [
  "bon",
  "cached",
@@ -1081,6 +1082,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
 dependencies = [
  "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
  "proc-macro2",
  "quote",
  "syn",
@@ -2007,6 +2028,17 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "635839550ae8b90d9fd2571460a6645dc0aec070225956ca7a2831ed31d2795d"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
