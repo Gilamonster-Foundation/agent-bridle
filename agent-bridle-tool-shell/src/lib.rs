@@ -1,38 +1,33 @@
-//! `agent-bridle-tool-shell` — a capability-confined, brush-backed shell tool.
+//! `agent-bridle-tool-shell` — capability-confined shell tool (stub release).
 //!
-//! brush is the carried, batteries-included shell/coreutils runtime ("the
-//! hands"); this crate puts it on the [`agent_bridle_core`] leash. The tool
-//! accepts **two input shapes**:
+//! The full brush-backed implementation with `CommandInterceptor` exec/open
+//! interception is temporarily disabled pending the upstream PR that adds the
+//! hook to `reubeno/brush`:
 //!
-//! - **argv form** (`program` + `args`) — a single named command;
-//! - **free-form `cmd`** — an `sh -c`-style command string (pipelines,
-//!   redirections, `&&`, globbing).
+//!   <https://github.com/reubeno/brush/pull/1184>
 //!
-//! Both are now confined *in-process* by the [`CaveatInterceptor`], which rides
-//! the `CommandInterceptor` exec/open hook in our brush fork. brush 0.5 bypasses
-//! `PATH` and the builtin table for any command containing a path separator
-//! (DESIGN §6) — so `/bin/rm` would otherwise run even with an empty `PATH` and
-//! an `exec` allow-list. The hook fires at the single external-spawn funnel
-//! (catching that bypass) and at every `Shell::open_file` (redirections and
-//! `source`), so free-form scripts are gateable too. This makes the confined
-//! shell a **true superset** of an `sh -c` cmd-string shell, cross-OS — the
-//! prerequisite for superseding an unconfined `shell_run`.
+//! In this stub release, [`ShellTool`] registers in the tool registry and
+//! advertises its complete JSON schema, but [`Tool::invoke`] returns a
+//! structured error explaining the situation. No functionality is silently
+//! missing — the error message links to the tracking issue.
 //!
-//! Landlock remains the authoritative Linux backstop (recorded as
-//! `sandbox_kind`); off-Linux the in-process hook is the enforcement.
+//! **Restoring full support:** once the upstream PR merges and brush ships a
+//! crates.io release containing `CommandInterceptor`, restore from git history:
 //!
-//! The crate compiles with the `shell` feature off — it then exposes nothing —
-//! so the workspace builds under `--no-default-features`.
+//! ```text
+//! git show <pre-stub-commit>:agent-bridle-tool-shell/src/shell_tool.rs
+//! git show <pre-stub-commit>:agent-bridle-tool-shell/src/caveat_interceptor.rs
+//! ```
+//!
+//! Then add brush back to `Cargo.toml` (see commented lines there) and publish
+//! a new agent-bridle version. See the tracking issue for the full checklist:
+//! <https://github.com/Gilamonster-Foundation/agent-bridle/issues/20>
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 #[cfg(feature = "shell")]
-mod caveat_interceptor;
-#[cfg(feature = "shell")]
 mod shell_tool;
 
-#[cfg(feature = "shell")]
-pub use caveat_interceptor::CaveatInterceptor;
 #[cfg(feature = "shell")]
 pub use shell_tool::ShellTool;
