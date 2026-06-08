@@ -2,18 +2,21 @@
 //!
 //! Spawns the real `agent-bridle-mcp` binary as a child process and drives it
 //! over its stdio JSON-RPC pipe, exactly as an MCP client would. It proves the
-//! capability leash holds *across the MCP boundary*, not merely in-process:
+//! capability behavior holds *across the MCP boundary*, not merely in-process:
 //!
 //! 1. `initialize` → the server reports its identity + the `tools` capability.
-//! 2. `tools/list` → the confined `shell` tool is advertised.
-//! 3. `tools/call shell` with an **in-scope** program (`echo`) → stdout comes
-//!    back in an `isError: false` content result.
-//! 4. `tools/call shell` with an **out-of-scope** program (`rm`) → the leash
-//!    denies it and the denial reason is carried back as an MCP **tool error**
-//!    (`isError: true`), NOT a transport error.
+//! 2. `tools/list` → the `shell` tool is advertised.
+//! 3. With NO flag (the fail-closed STUB), `tools/call shell` for `echo` is
+//!    **denied** in-band (`isError: true`) — the stub never spawns anything.
+//! 4. With `--dangerously-allow-all` (the opt-in UNCONFINED bash), the same
+//!    `tools/call shell` for `echo` **runs**, returning stdout in an
+//!    `isError: false` content result.
 //!
 //! The granted leash is supplied via `$AGENT_BRIDLE_CAVEATS` (the same path a
-//! real orchestrator uses), restricted to `exec: Only{echo}`.
+//! real orchestrator uses). With the brush-backed confined shell stubbed out,
+//! the `exec` scope no longer gates the stub (it denies regardless) nor the
+//! UNCONFINED bash (it is honest about not confining); the leash still mints the
+//! context and enforces budget/generation across the boundary.
 
 #![cfg(feature = "shell")]
 
@@ -43,10 +46,12 @@ struct McpChild {
 }
 
 impl McpChild {
-    /// Spawn the binary with `$AGENT_BRIDLE_CAVEATS` set to `grant`.
-    fn spawn(grant: &str) -> Self {
+    /// Spawn the binary with `$AGENT_BRIDLE_CAVEATS` set to `grant` and the
+    /// given CLI `args` (e.g. `["--dangerously-allow-all"]`).
+    fn spawn(grant: &str, args: &[&str]) -> Self {
         let exe = env!("CARGO_BIN_EXE_agent-bridle-mcp");
         let mut child = Command::new(exe)
+            .args(args)
             .env("AGENT_BRIDLE_CAVEATS", grant)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -97,11 +102,9 @@ impl McpChild {
     }
 }
 
-#[tokio::test]
-async fn leash_holds_through_the_mcp_boundary() {
-    let mut mcp = McpChild::spawn(GRANT_JSON);
-
-    // 1. initialize.
+/// Drive `initialize` + `tools/list` against a child and return the shell tool
+/// names, asserting the protocol handshake and that `shell` is advertised.
+async fn handshake(mcp: &mut McpChild) {
     let init = mcp
         .call(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
@@ -110,7 +113,6 @@ async fn leash_holds_through_the_mcp_boundary() {
     assert_eq!(init["result"]["serverInfo"]["name"], "agent-bridle-mcp");
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
-    // 2. tools/list includes the confined shell tool.
     let list = mcp
         .call(&serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
@@ -126,8 +128,50 @@ async fn leash_holds_through_the_mcp_boundary() {
         names.contains(&"shell"),
         "tools/list missing shell: {names:?}"
     );
+}
 
-    // 3. tools/call shell with an IN-SCOPE program → stdout, isError=false.
+#[tokio::test]
+async fn stub_shell_denies_through_the_mcp_boundary() {
+    // NO flag → the fail-closed STUB. Even an `echo` is denied in-band, and
+    // nothing is spawned. The denial is an MCP tool error (isError=true), NOT a
+    // transport error, and it hints at the escalation flags.
+    let mut mcp = McpChild::spawn(GRANT_JSON, &[]);
+    handshake(&mut mcp).await;
+
+    let denied = mcp
+        .call(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "shell",
+                "arguments": { "program": "echo", "args": ["leashed-hello"] }
+            }
+        }))
+        .await;
+    assert!(
+        denied.get("error").is_none(),
+        "denial must be in-band, not a transport error: {denied}"
+    );
+    assert_eq!(
+        denied["result"]["isError"], true,
+        "the stub must deny in-band: {denied}"
+    );
+    let reason = denied["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(reason.contains("denied"), "missing denial reason: {reason}");
+    assert!(
+        reason.contains("--insecure") || reason.contains("--dangerously-allow-all"),
+        "stub denial should hint at escalation flags: {reason}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn dangerously_allow_all_runs_through_the_mcp_boundary() {
+    // --dangerously-allow-all → an UNCONFINED bash. The same `echo` now runs and
+    // returns its stdout in an isError=false content result.
+    let mut mcp = McpChild::spawn(GRANT_JSON, &["--dangerously-allow-all"]);
+    handshake(&mut mcp).await;
+
     let allowed = mcp
         .call(&serde_json::json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -139,43 +183,12 @@ async fn leash_holds_through_the_mcp_boundary() {
         .await;
     assert_eq!(
         allowed["result"]["isError"], false,
-        "echo should run: {allowed}"
+        "unconfined echo should run: {allowed}"
     );
     let allowed_text = allowed["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
         allowed_text.contains("leashed-hello"),
         "expected echo stdout, got: {allowed_text}"
-    );
-
-    // 4. tools/call shell with an OUT-OF-SCOPE program → DENIED through MCP:
-    // an MCP tool error (isError=true) carrying the denial reason, NOT a
-    // transport error.
-    let denied = mcp
-        .call(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {
-                "name": "shell",
-                "arguments": { "program": "rm", "args": ["-rf", "/"] }
-            }
-        }))
-        .await;
-    assert!(
-        denied.get("error").is_none(),
-        "denial must be in-band, not a transport error: {denied}"
-    );
-    assert_eq!(
-        denied["result"]["isError"], true,
-        "out-of-scope exec must be an MCP tool error: {denied}"
-    );
-    let reason = denied["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(
-        reason.contains("denied") && reason.contains("rm"),
-        "denial reason must name the refused program: {reason}"
-    );
-    // The reason explains WHY (out-of-scope authority), so the model can adapt.
-    assert!(
-        reason.contains("granted authority"),
-        "denial should explain the leash: {reason}"
     );
 
     mcp.shutdown().await;

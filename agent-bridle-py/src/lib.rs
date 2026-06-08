@@ -5,16 +5,22 @@
 //!
 //! ```python
 //! import agent_bridle
-//! # The `shell` tool takes argv form (program + args), NOT a free-form
-//! # `cmd` string — that is the deliberate brush exec-bypass mitigation
-//! # (DESIGN §6): the leash gates on the named program token.
-//! r = agent_bridle.invoke(
-//!     "shell",
-//!     {"program": "echo", "args": ["hi"]},
-//!     {"exec": {"only": ["echo"]}},
-//! )
-//! print(r["exit_code"], r["stdout"])  # -> 0 'hi\n'
+//! # NOTE: the `shell` tool exposed by this wheel is currently the fail-closed
+//! # STUB — the brush-backed confined shell is pending an upstream brush merge
+//! # (see the workspace CHANGELOG). It DENIES every invocation and spawns
+//! # nothing, raising `BridleDenied`:
+//! try:
+//!     agent_bridle.invoke(
+//!         "shell",
+//!         {"program": "echo", "args": ["hi"]},
+//!         {"exec": {"only": ["echo"]}},
+//!     )
+//! except agent_bridle.BridleDenied as e:
+//!     print("shell is a stub:", e)  # mentions --insecure / --dangerously-allow-all
 //! ```
+//!
+//! The `shell` tool's input shape is unchanged for when the confined shell
+//! returns: argv form (`program` + `args`) or a free-form `cmd` string.
 //!
 //! The leash is the same one the Rust hosts use: every dispatch flows through
 //! the registry's [`Gate`](agent_bridle::Gate), which mints the tool's
@@ -79,7 +85,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// The process-wide tool registry (the host's compiled feature set: `shell` is
-/// on, so the confined brush-backed shell is present). Built once and reused.
+/// on, but as the fail-closed STUB — the brush-backed confined shell is pending
+/// upstream, see the workspace CHANGELOG). Built once and reused.
 fn shared_registry() -> &'static Registry {
     static REG: OnceLock<Registry> = OnceLock::new();
     REG.get_or_init(registry)

@@ -1,25 +1,38 @@
-//! `agent-bridle-tool-shell` — a capability-confined, brush-backed shell tool.
+//! `agent-bridle-tool-shell` — the agent-bridle `shell` tool.
 //!
-//! brush is the carried, batteries-included shell/coreutils runtime ("the
-//! hands"); this crate puts it on the [`agent_bridle_core`] leash. The tool
-//! accepts **two input shapes**:
+//! # Fail-closed stub (current state)
 //!
-//! - **argv form** (`program` + `args`) — a single named command;
-//! - **free-form `cmd`** — an `sh -c`-style command string (pipelines,
-//!   redirections, `&&`, globbing).
+//! The published `shell` tool is a **fail-closed stub**: by default it spawns
+//! NOTHING and returns a denial. The real, capability-confined, brush-backed
+//! shell — which rode a `CommandInterceptor` exec/open hook in our brush fork
+//! to confine commands *in-process*, cross-OS — depended on a **git** source
+//! for brush, and crates.io forbids any git dependency in a published manifest.
+//! To unblock `cargo publish` for the whole agent-bridle → newt line, the brush
+//! deps and the confined implementation were removed; the confined impl is
+//! preserved in git history at this commit and returns when the brush hook is
+//! upstreamed into `reubeno/brush` (see the workspace `CHANGELOG`).
 //!
-//! Both are now confined *in-process* by the [`CaveatInterceptor`], which rides
-//! the `CommandInterceptor` exec/open hook in our brush fork. brush 0.5 bypasses
-//! `PATH` and the builtin table for any command containing a path separator
-//! (DESIGN §6) — so `/bin/rm` would otherwise run even with an empty `PATH` and
-//! an `exec` allow-list. The hook fires at the single external-spawn funnel
-//! (catching that bypass) and at every `Shell::open_file` (redirections and
-//! `source`), so free-form scripts are gateable too. This makes the confined
-//! shell a **true superset** of an `sh -c` cmd-string shell, cross-OS — the
-//! prerequisite for superseding an unconfined `shell_run`.
+//! # The escalation ladder
 //!
-//! Landlock remains the authoritative Linux backstop (recorded as
-//! `sandbox_kind`); off-Linux the in-process hook is the enforcement.
+//! A consumer that needs to actually run commands *now* opts in explicitly,
+//! trading confinement for function — there is no confined middle ground until
+//! brush lands:
+//!
+//! - [`ShellTool::stub`] (= [`ShellTool::new`], the [`Default`]) — **Denied**.
+//!   The safe published default; never spawns anything.
+//! - [`ShellTool::insecure_bash`] — runs an **UNCONFINED** `bash -lc <command>`
+//!   (falling back to `sh -c`) but only after an [`ApprovalHook`] approves each
+//!   command. Reported honestly as `sandbox_kind = none`.
+//! - [`ShellTool::dangerous_unconfined`] — runs an **UNCONFINED** bash with NO
+//!   approval gate. For development only.
+//!
+//! The host (`agent-bridle-mcp`) wires these to `--insecure` (per-command TTY
+//! approval) and `--dangerously-allow-all`; with no flag it uses the stub.
+//!
+//! The tool accepts **two input shapes** (unchanged from the confined design,
+//! so the schema is stable): **argv form** (`program` + `args`) and a
+//! **free-form `cmd`** string. The argv form is sh-quoted into one command
+//! line; both paths build a single shell command string.
 //!
 //! The crate compiles with the `shell` feature off — it then exposes nothing —
 //! so the workspace builds under `--no-default-features`.
@@ -28,11 +41,7 @@
 #![warn(missing_docs)]
 
 #[cfg(feature = "shell")]
-mod caveat_interceptor;
-#[cfg(feature = "shell")]
 mod shell_tool;
 
 #[cfg(feature = "shell")]
-pub use caveat_interceptor::CaveatInterceptor;
-#[cfg(feature = "shell")]
-pub use shell_tool::ShellTool;
+pub use shell_tool::{ApprovalHook, ShellPolicy, ShellTool};

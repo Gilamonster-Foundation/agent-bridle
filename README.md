@@ -8,6 +8,25 @@ surface into an extensible, **capability-governed registry**.
 > **brush** = the hands. **`Caveats`** = the leash. **bridle** = the enforcer
 > that binds them.
 
+> ## ⚠️ The `shell` tool is currently a fail-closed STUB
+>
+> To unblock publishing the whole agent-bridle → newt line to crates.io, the
+> brush-backed **confined** shell was removed: it depended on a **git** fork of
+> brush (for an in-process `CommandInterceptor` exec/open hook), and crates.io
+> forbids git dependencies in a published manifest. So:
+>
+> - The published default `shell` tool is **fail-closed**: it **denies every
+>   invocation and spawns nothing**. A consumer who installs from crates.io with
+>   no source gets a deny-only shell.
+> - `agent-bridle-mcp --insecure` enables an **UNCONFINED** `bash` with
+>   **per-command approval** on `/dev/tty` (never stdin). `--dangerously-allow-all`
+>   enables an **UNCONFINED** bash with **no** approval gate. Both are explicit,
+>   development-time opt-ins — there is no confined middle ground until brush lands.
+> - The confined brush-backed shell (git fork rev `f0ef7715`; audit notes also
+>   reference rev `4e65a06`) **returns** when its `CommandInterceptor` hook is
+>   upstreamed into `reubeno/brush`. Its implementation is preserved in git
+>   history; see [`CHANGELOG.md`](CHANGELOG.md) `[Unreleased]`.
+
 Every tool declares the authority it needs as an
 [`agent_mesh_protocol::Caveats`] requirement. The registry refuses to dispatch
 unless `required ⊑ granted` under the meet-semilattice, and hands the tool only
@@ -34,22 +53,34 @@ permits.
 ## Usage
 
 ```rust
-use agent_bridle::registry;
+use agent_bridle::{registry, registry_with_shell, ShellTool};
 use agent_bridle_core::{Caveats, CountBound, Scope};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Build the default registry (shell tool included under `--features shell`).
+    // The DEFAULT registry ships the fail-closed STUB shell: it denies every
+    // invocation and spawns nothing (the confined brush shell is pending
+    // upstream — see the warning above).
     let reg = registry();
-
-    // Grant a tightly-scoped leash: may only exec `echo`, at most twice.
     let granted = Caveats {
         exec: Scope::only(["echo".to_string()]),
         max_calls: CountBound::AtMost(2),
         ..Caveats::top()
     };
+    let denied = reg
+        .dispatch(
+            "shell",
+            serde_json::json!({ "program": "echo", "args": ["hello"] }),
+            &granted,
+        )
+        .await;
+    assert!(denied.is_err()); // the stub denies regardless of the grant
 
-    // ALLOWED: echo is in scope, budget available.
+    // To actually run commands today, build the registry with an explicit,
+    // UNCONFINED opt-in policy. `dangerous_unconfined()` runs bash with no gate;
+    // `insecure_bash(hook)` runs bash only after a per-command ApprovalHook
+    // approves it. Both report `sandbox_kind: none` honestly.
+    let reg = registry_with_shell(ShellTool::dangerous_unconfined());
     let out = reg
         .dispatch(
             "shell",
@@ -57,32 +88,23 @@ async fn main() -> anyhow::Result<()> {
             &granted,
         )
         .await?;
-    println!("{out}"); // -> { "exit_code": 0, "stdout": "hello\n", ... }
-
-    // DENIED: `rm` is not in the granted `exec` scope. The leash refuses
-    // before the tool ever runs — no prompt hygiene required.
-    let denied = reg
-        .dispatch(
-            "shell",
-            serde_json::json!({ "program": "rm", "args": ["-rf", "/"] }),
-            &granted,
-        )
-        .await;
-    assert!(denied.is_err());
+    println!("{out}"); // -> { "exit_code": 0, "stdout": "hello\n", "sandbox_kind": "none", ... }
 
     Ok(())
 }
 ```
 
-`echo` runs via brush's **carried** builtin even with an empty `PATH` — the
-shell runtime is baked in, not borrowed from the host.
+The unconfined runner shells out to `bash -lc` (falling back to `sh -c`) on the
+host — it is **not** confined, which is why it is an explicit opt-in. The
+confined brush-backed shell (which carried its own coreutils so `echo` ran with
+an empty `PATH`) returns when the brush hook is upstreamed.
 
 ## Crates
 
 | Crate | Purpose | Heavy deps |
 |---|---|---|
 | `agent-bridle-core` | `Tool` trait, `Registry`, `Gate`, `Caveats` re-export, `Sandbox` trait, result envelope | none beyond `anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol` |
-| `agent-bridle-tool-shell` | brush-backed confined shell (carried coreutils), `shell` feature | brush-core/builtins/coreutils-builtins, tokio |
+| `agent-bridle-tool-shell` | the `shell` tool — currently a fail-closed stub (deny-only) + opt-in UNCONFINED bash, `shell` feature; brush-backed confined shell pending upstream | none beyond core (no brush, no tokio runtime) |
 | `agent-bridle-tool-web` | confined `web_fetch` (the `net` enforcer), `web` feature | reqwest+rustls, dom_smoothie, htmd, hickory-resolver, url, tokio |
 | `agent-bridle` | facade re-exporting a ready-to-use registry | — |
 | `agent-bridle-mcp` | MCP (Model Context Protocol) stdio server frontend over the registry (binary) | tokio, toml |
@@ -161,28 +183,35 @@ max_calls = { at_most = 20 }
 valid_for_generation = "all"
 ```
 
-### Confinement example (restricting `exec`)
+### The `shell` tool over MCP (stub vs. opt-in unconfined)
 
-Grant a leash that may exec only `echo`, then watch the server enforce it
-*through the MCP boundary*:
+With **no flag**, the server's `shell` tool is the fail-closed stub: every
+`tools/call shell` is denied in-band (`isError: true`), and nothing is spawned:
 
 ```bash
-export AGENT_BRIDLE_CAVEATS='{"fs_read":"all","fs_write":"all","exec":{"only":["echo"]},"net":"all","max_calls":"unlimited","valid_for_generation":"all"}'
-
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shell","arguments":{"program":"echo","args":["hi"]}}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"shell","arguments":{"program":"rm","args":["-rf","/"]}}}' \
   | agent-bridle-mcp
+# -> id:2 result isError:true, text mentions --insecure / --dangerously-allow-all
 ```
 
-`echo` runs (`isError: false`, stdout `hi`). `rm` is **denied** — the leash
-refuses it and the reason comes back as an MCP *tool error*, not a transport
-fault:
+To actually run commands, opt in to an **UNCONFINED** bash:
 
-```json
-{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"denied: exec of \"rm\" is not within the granted authority","type":"text"}],"isError":true}}
+```bash
+# Per-command approval on /dev/tty (NOT stdin — stdin is the JSON-RPC stream):
+agent-bridle-mcp --insecure
+
+# No approval gate (development only):
+agent-bridle-mcp --dangerously-allow-all
 ```
+
+Under `--dangerously-allow-all`, `echo` runs (`isError: false`, stdout `hi`,
+`sandbox_kind: none`). These modes are **unconfined**; the `exec`/`fs` leash
+axes are not enforced for the shell tool until the brush-backed confined shell
+returns. The leash still mints the context and enforces `max_calls` /
+`valid_for_generation` across the MCP boundary, and the `net` enforcer
+(`web_fetch`) remains fully confined.
 
 ## The `net` enforcer: `web_fetch` (`agent-bridle-tool-web`)
 
@@ -277,11 +306,18 @@ even under `net: "all"`).
 ## Status
 
 This is **P0** plus the **MCP frontend** (DESIGN §4 frontend 2): the core leash,
-a confined brush shell, and an `agent-bridle-mcp` stdio JSON-RPC server, with
-tests proving the leash *denies* out-of-scope exec, exhausted budgets,
-generation mismatch, and path-escape (`..` / symlink) attempts — including a
+the `shell` tool (currently a fail-closed stub pending the brush upstream merge,
+with an opt-in unconfined-bash escalation ladder), and an `agent-bridle-mcp`
+stdio JSON-RPC server, with tests proving the leash *denies* exhausted budgets,
+generation mismatch, and (for `web_fetch`) out-of-scope and SSRF access — plus a
 through-MCP integration test that drives the real binary over stdio and proves
-an out-of-scope `tools/call` is denied across the protocol boundary.
+the stub denies in-band and the opt-in unconfined shell runs across the protocol
+boundary.
+
+> The crates publish to crates.io because the brush **git** dependency has been
+> removed (crates.io forbids git sources). The confined brush-backed shell, and
+> its in-process exec/open confinement, return as a later increment once the
+> brush `CommandInterceptor` hook is upstreamed — see [`CHANGELOG.md`](CHANGELOG.md).
 
 The **`net` enforcer** (`agent-bridle-tool-web`, `web` feature) is also landed:
 a confined `web_fetch` whose host allowlist, SSRF IP screen, per-redirect
@@ -295,7 +331,8 @@ and scm tools are later phases (see `docs/DESIGN.md` §12).
 
 ## License
 
-Apache-2.0. `brush` is vendored as a dependency under MIT; its notice is carried
-in [`NOTICE`](NOTICE).
+Apache-2.0. The brush dependency (MIT) is currently removed (the confined shell
+is stubbed pending an upstream merge); its notice is retained in
+[`NOTICE`](NOTICE) for when the brush-backed shell returns.
 
 [`agent_mesh_protocol::Caveats`]: https://crates.io/crates/agent-mesh-protocol

@@ -11,43 +11,50 @@ out-of-scope dispatch is refused *before the tool runs* and surfaces as
 `agent_bridle.BridleDenied` (a subclass of the built-in `PermissionError`).
 
 This is **Pillar A** of the agent-bridle Python story (see `docs/DESIGN.md` §8):
-use the leashed tool registry as an ordinary library. The maturin wheel compiles
-the Rust in, so the confined brush-backed shell ships inside the wheel.
+use the leashed tool registry as an ordinary library.
+
+> **⚠️ The `shell` tool is currently a fail-closed STUB.** The brush-backed
+> confined shell depended on a *git* fork of brush (forbidden by crates.io), so
+> it was removed to unblock publishing; it returns when the brush hook is
+> upstreamed (see the workspace `CHANGELOG`). Through this wheel, the `shell`
+> tool **denies every invocation and spawns nothing**, raising `BridleDenied`.
+> The leash mechanics (gate, budget, generation) and the `web_fetch` `net`
+> enforcer are unaffected. The opt-in UNCONFINED bash escalation
+> (`registry_with_shell`) is a Rust-host concern (`--insecure` /
+> `--dangerously-allow-all` on `agent-bridle-mcp`), not exposed by this wheel.
 
 ## Usage
 
 ```python
 import agent_bridle
 
-# A grant that authorizes executing ONLY `echo` — nothing else.
 grant = {"exec": {"only": ["echo"]}}
 
-# ALLOWED: `echo` is within the granted `exec` scope. The brush-carried
-# builtin runs (even with an empty PATH) and stdout is captured.
-r = agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, grant)
-print(r["exit_code"], repr(r["stdout"]))   # -> 0 'hi\n'
-print(r["sandbox_kind"])                    # -> 'none' (advisory off-Linux; P0)
-
-# DENIED: `rm` is NOT in the granted `exec` scope. The leash refuses to mint
-# the tool's context, so the destructive command never runs — no prompt
-# hygiene required. The confused-deputy gap is closed structurally.
+# The `shell` tool is the fail-closed stub: it denies and spawns nothing,
+# regardless of the grant, raising BridleDenied (a subclass of PermissionError).
 try:
-    agent_bridle.invoke("shell", {"program": "rm", "args": ["-rf", "/tmp/x"]}, grant)
-except agent_bridle.BridleDenied as e:   # subclass of PermissionError
-    print("blocked by the leash:", e)
+    agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, grant)
+except agent_bridle.BridleDenied as e:
+    print("shell is a stub:", e)  # mentions --insecure / --dangerously-allow-all
 
-# Inspect the registry.
+# A registry miss is also a BridleDenied.
+try:
+    agent_bridle.invoke("no_such_tool", {}, grant)
+except agent_bridle.BridleDenied as e:
+    print("no such tool:", e)
+
+# Inspect the registry — the `shell` tool is present (as the stub) with its
+# stable input schema.
 print(agent_bridle.tool_names())          # -> ['shell']
 print(agent_bridle.tool_definitions())    # MCP tools/list schemas
 ```
 
-### The `shell` tool takes argv form, not a `cmd` string
+### The `shell` tool's input shape (stable across the stub change)
 
-The shell tool's arguments are **argv form** — `{"program": ..., "args": [...]}`
-— deliberately, not a free-form `{"cmd": "echo hi"}` string. The `exec` caveat
-gates on the *named program token*, so the program has to be a discrete field the
-leash can check. A `cmd` string would let `echo hi; rm -rf /` slip the leash,
-which is exactly the hole the bridle closes (DESIGN §6).
+The shell tool accepts **argv form** — `{"program": ..., "args": [...]}` — or a
+free-form `{"cmd": "..."}` string. The argv form names a discrete program token;
+the confined shell (when it returns) gates on it via the `exec` caveat and
+confines free-form scripts in-process. The stub denies both shapes.
 
 ## API
 
@@ -95,5 +102,6 @@ python3 -m venv /tmp/abp-venv
 
 ## License
 
-Apache-2.0. `brush` (vendored into the wheel) is MIT — its notice is carried in
-the workspace `NOTICE`.
+Apache-2.0. The brush dependency (MIT) is currently removed (the confined shell
+is stubbed pending an upstream merge); its notice is retained in the workspace
+`NOTICE` for when the brush-backed shell returns.

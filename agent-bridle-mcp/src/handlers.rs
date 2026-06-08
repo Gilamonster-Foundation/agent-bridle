@@ -181,7 +181,12 @@ mod tests {
 
     #[cfg(feature = "shell")]
     #[tokio::test]
-    async fn call_in_scope_succeeds() {
+    async fn call_stub_shell_is_in_band_denial() {
+        // The default `registry()` ships the fail-closed STUB shell: any
+        // `tools/call` for `shell` is denied in-band (isError=true), regardless
+        // of the grant — the brush-backed confined shell is pending upstream.
+        // Before the stub, an in-scope `echo` ran and returned its stdout; now
+        // it is denied with the escalation hint.
         let reg = agent_bridle::registry();
         let v = tools_call(
             &reg,
@@ -189,14 +194,21 @@ mod tests {
             serde_json::json!({ "name": "shell", "arguments": { "program": "echo", "args": ["hi"] } }),
         )
         .await;
-        assert_eq!(v["isError"], false);
+        assert_eq!(v["isError"], true, "stub shell must deny in-band: {v}");
         let text = v["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("hi"), "tool stdout missing: {text}");
+        assert!(text.contains("denied"), "denial reason missing: {text}");
+        assert!(
+            text.contains("--insecure") || text.contains("--dangerously-allow-all"),
+            "denial should hint at the escalation flags: {text}"
+        );
     }
 
     #[cfg(feature = "shell")]
     #[tokio::test]
     async fn call_out_of_scope_is_in_band_denial() {
+        // `rm` is denied too (the stub denies everything). The denial is an MCP
+        // tool error, NOT a transport error: isError=true with the reason in the
+        // content.
         let reg = agent_bridle::registry();
         let v = tools_call(
             &reg,
@@ -204,38 +216,28 @@ mod tests {
             serde_json::json!({ "name": "shell", "arguments": { "program": "rm", "args": ["-rf", "/"] } }),
         )
         .await;
-        // The denial is an MCP tool error, NOT a transport error: isError=true
-        // with the reason carried in the content.
         assert_eq!(v["isError"], true);
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("denied"), "denial reason missing: {text}");
-        assert!(text.contains("rm"), "denied program missing: {text}");
     }
 
     #[cfg(feature = "shell")]
     #[tokio::test]
-    async fn call_freeform_denied_is_in_band_error_from_structured_field() {
-        // A free-form `cmd` denial returns Ok from dispatch (exit 126) with the
-        // STRUCTURED `denied: true` in the envelope. The handler must turn that
-        // into an MCP tool error (isError=true) by reading the structured field,
-        // NOT by string-matching stderr. This is the regression the fix closes:
-        // before it, a free-form denial slipped through as isError=false.
-        let reg = agent_bridle::registry();
+    async fn call_dangerous_shell_runs_in_band_success() {
+        // With an explicit UNCONFINED shell wired in (the escalation seam), an
+        // in-scope-ish `echo` runs and returns its stdout as an MCP success.
+        // This proves `registry_with_shell` flows through the same handler path.
+        use agent_bridle::{registry_with_shell, ShellTool};
+        let reg = registry_with_shell(ShellTool::dangerous_unconfined());
         let v = tools_call(
             &reg,
             &echo_grant(),
-            serde_json::json!({ "name": "shell", "arguments": { "cmd": "rm -rf /tmp/x" } }),
+            serde_json::json!({ "name": "shell", "arguments": { "program": "echo", "args": ["hi"] } }),
         )
         .await;
-        assert_eq!(
-            v["isError"], true,
-            "free-form denial must surface as an MCP tool error: {v}"
-        );
+        assert_eq!(v["isError"], false, "unconfined echo should succeed: {v}");
         let text = v["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("not within the granted") || text.contains("denied"),
-            "denial reason missing: {text}"
-        );
+        assert!(text.contains("hi"), "tool stdout missing: {text}");
     }
 
     #[tokio::test]

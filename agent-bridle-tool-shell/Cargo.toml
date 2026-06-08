@@ -1,6 +1,6 @@
 [package]
 name = "agent-bridle-tool-shell"
-description = "A capability-confined, brush-backed shell tool for agent-bridle (carried coreutils builtins)."
+description = "The agent-bridle `shell` tool. Currently a fail-closed stub (deny-only) pending the brush-backed confined shell upstream merge; opt-in --insecure / --dangerously-allow-all enable an UNCONFINED bash for development."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,21 +8,26 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-# `shell` pulls in the brush runtime + tokio. Off by default so a host that
-# does not want a shell tool pays nothing for it. The crate still compiles with
+# `shell` anchors the `ShellTool` symbol (and the facade's `shell` tool). On by
+# default so the facade ships a `shell` tool, but the published default is a
+# FAIL-CLOSED STUB (deny-only) pending the brush-backed confined shell upstream
+# merge — it pulls in no brush, no tokio runtime. The crate still compiles with
 # the feature off (it then exposes no ShellTool) so the workspace builds under
 # `--no-default-features`.
+#
+# RESTORE (brush-backed confined shell): this feature previously pulled
+# dep:brush-core / dep:brush-builtins / dep:brush-coreutils-builtins / dep:tokio.
+# Restore them (and the brush-backed `ShellTool`, preserved in git history at
+# this commit) when the brush `CommandInterceptor` hook is upstreamed. See
+# CHANGELOG `[Unreleased]`.
 default = ["shell"]
-shell = [
-    "dep:brush-core",
-    "dep:brush-builtins",
-    "dep:brush-coreutils-builtins",
-    "dep:tokio",
-]
-# Forward to core's real, kernel-enforced Landlock ruleset (Linux). Core's
-# LandlockSandbox currently confines the `fs_write` axis (ADR 0001 L3); wiring
-# it into this tool's spawn path is the next increment. Off-Linux / without the
-# feature, core falls back to the advisory NoopSandbox (SandboxKind::None).
+shell = []
+# Forward to core's real, kernel-enforced Landlock ruleset (Linux). With the
+# brush-backed confined shell stubbed out, the shell crate no longer wires
+# Landlock into a spawn path, so this feature is currently a no-op here (it
+# stays so `--features linux-landlock` keeps compiling and so core's Landlock
+# code path is reachable when the confined shell returns). Core's
+# LandlockSandbox code is untouched.
 linux-landlock = ["agent-bridle-core/linux-landlock"]
 
 [dependencies]
@@ -32,14 +37,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 
-# brush — the carried shell/coreutils runtime ("the hands"). MIT; see NOTICE.
-# Pinned to OUR fork (workspace git+rev) for the `CommandInterceptor` exec/open
-# hook (DESIGN §6). All three resolve to one fork checkout. A git dep blocks
-# crates.io publish until the hook is upstreamed (out-of-scope until then).
-brush-core = { workspace = true, optional = true }
-brush-builtins = { workspace = true, optional = true }
-brush-coreutils-builtins = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-
 [dev-dependencies]
+# Only the crate's async tests (`#[tokio::test]`) need a runtime; the stub and
+# the opt-in unconfined bash runner use std::process + threads, no tokio.
 tokio = { workspace = true }

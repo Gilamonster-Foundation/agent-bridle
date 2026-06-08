@@ -5,19 +5,22 @@ Build the extension first (in an isolated venv, never ``~/venv``)::
     maturin develop
     pytest agent-bridle-py/tests/ -v
 
-These tests are the Python-side proof of the headline invariant: a tool runs
-**only** when the granted ``Caveats`` admit it, and an out-of-scope dispatch is
-refused by the leash — surfacing as ``agent_bridle.BridleDenied`` (a subclass of
-the built-in ``PermissionError``).
+These tests exercise the leash mechanics through the Python wheel: dispatch
+flows through the registry's gate, a registry miss / malformed grant / exhausted
+budget all surface as the right exception, and the ``shell`` tool advertises its
+stable input schema.
 
-Note on the ``shell`` arg shape: the tool takes **two** shapes. **Argv form**
-(``{"program": ..., "args": [...]}``) is gated *before the command runs* by an
-``exec`` pre-check on the named program. **Free-form** (``{"cmd": "..."}``) is an
-``sh -c``-style string confined in-process by the brush ``CommandInterceptor``
-hook (DESIGN §6) — a path-separator command like ``/bin/rm`` cannot bypass it.
-A free-form denial returns from dispatch with the structured ``denied: true``
-field set, which ``invoke()`` turns into ``BridleDenied`` just like an argv-form
-denial. The tests exercise both contracts.
+Note on the ``shell`` tool: it is currently the **fail-closed STUB**. The
+brush-backed confined shell (which gated commands in-process via a
+``CommandInterceptor`` exec/open hook) depended on a *git* fork of brush, which
+crates.io forbids, so it was removed to unblock publishing (see the workspace
+CHANGELOG). The wheel's ``invoke()`` builds the default registry, whose ``shell``
+tool **denies every invocation and spawns nothing**, raising
+``agent_bridle.BridleDenied``. To actually run commands today, a host uses the
+Rust ``registry_with_shell`` escalation seam (`--insecure` /
+``--dangerously-allow-all`` on ``agent-bridle-mcp``); that opt-in is not exposed
+through this Pillar-A wheel. When the brush hook is upstreamed, the confined
+shell returns and the run-and-capture tests below come back with it.
 """
 
 from __future__ import annotations
@@ -26,47 +29,39 @@ import pytest
 
 import agent_bridle
 
-# A grant that authorizes executing *only* ``echo`` — nothing else.
+# A grant that authorizes executing *only* ``echo`` — nothing else. Kept to show
+# that the stub denies regardless of how generous (or narrow) the grant is.
 ECHO_ONLY = {"exec": {"only": ["echo"]}}
 
 
 def test_shell_is_registered() -> None:
-    """The wheel is built with the ``shell`` feature, so the confined
-    brush-backed shell tool is present in the registry."""
+    """The wheel is built with the ``shell`` feature, so the ``shell`` tool
+    (currently the fail-closed stub) is present in the registry."""
     names = agent_bridle.tool_names()
     assert "shell" in names, f"shell missing from tool_names(): {names}"
 
 
-def test_in_scope_echo_runs_and_captures_stdout() -> None:
-    """An allowed dispatch passes the leash and runs: ``echo`` is within the
-    granted ``exec`` scope, so the brush-carried builtin runs and stdout is
-    captured. (Equivalent to the spec's ``echo hi`` in argv form.)"""
-    r = agent_bridle.invoke(
-        "shell",
-        {"program": "echo", "args": ["hi"]},
-        ECHO_ONLY,
-    )
-    assert r["exit_code"] == 0, r
-    assert "hi" in r["stdout"], r
-    # The recorded sandbox kind travels with every result (DESIGN §6).
-    assert r["sandbox_kind"] == "none"
-    assert r["timed_out"] is False
-
-
-def test_out_of_scope_program_is_denied() -> None:
-    """The load-bearing leash test: the SAME ``echo``-only grant denies ``rm``.
-
-    ``rm -rf /tmp/x`` is outside the granted ``exec`` scope, so the gate refuses
-    to mint the tool's ``ToolContext`` and the command never runs — surfacing as
-    ``BridleDenied``. This is the confused-deputy gap closed structurally: the
-    leash, not prompt hygiene, stops the destructive call.
-    """
+def test_shell_stub_denies_in_scope_program() -> None:
+    """The stub denies even an in-scope ``echo`` (it runs nothing): the
+    brush-backed confined shell is pending upstream, so the published default is
+    fail-closed. Surfaces as ``BridleDenied``."""
     with pytest.raises(agent_bridle.BridleDenied):
-        agent_bridle.invoke(
-            "shell",
-            {"program": "rm", "args": ["-rf", "/tmp/x"]},
-            ECHO_ONLY,
-        )
+        agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, ECHO_ONLY)
+
+
+def test_shell_stub_denies_freeform() -> None:
+    """Free-form ``{"cmd": ...}`` is denied by the stub too — nothing spawns."""
+    with pytest.raises(agent_bridle.BridleDenied):
+        agent_bridle.invoke("shell", {"cmd": "echo hi"}, ECHO_ONLY)
+
+
+def test_shell_stub_denial_hints_at_escalation() -> None:
+    """The stub's denial reason points the operator at the escalation flags so
+    the deny-only default is discoverable, not mysterious."""
+    with pytest.raises(agent_bridle.BridleDenied) as exc:
+        agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, ECHO_ONLY)
+    msg = str(exc.value)
+    assert "--insecure" in msg or "--dangerously-allow-all" in msg, msg
 
 
 def test_bridle_denied_is_a_permission_error() -> None:
@@ -74,92 +69,7 @@ def test_bridle_denied_is_a_permission_error() -> None:
     ``except PermissionError`` handlers catch a leash denial."""
     assert issubclass(agent_bridle.BridleDenied, PermissionError)
     with pytest.raises(PermissionError):
-        agent_bridle.invoke(
-            "shell",
-            {"program": "rm", "args": ["-rf", "/tmp/x"]},
-            ECHO_ONLY,
-        )
-
-
-def test_denied_reason_is_surfaced() -> None:
-    """The denial carries the human-readable reason (safe to show an agent)."""
-    with pytest.raises(agent_bridle.BridleDenied) as exc:
-        agent_bridle.invoke("shell", {"program": "curl"}, ECHO_ONLY)
-    assert "curl" in str(exc.value)
-
-
-def test_freeform_in_scope_runs() -> None:
-    """Free-form ``{"cmd": ...}`` IS accepted (it is confined in-process by the
-    interceptor hook). With ``echo`` in scope, ``echo hi`` runs and is not
-    flagged denied."""
-    r = agent_bridle.invoke("shell", {"cmd": "echo hi"}, ECHO_ONLY)
-    assert r["exit_code"] == 0, r
-    assert "hi" in r["stdout"], r
-    # An in-scope free-form run records no denial.
-    assert r.get("denied") in (None, False), r
-
-
-def test_freeform_denial_raises_bridle_denied() -> None:
-    """The load-bearing free-form test (the fix's Python coverage): a free-form
-    ``cmd`` the interceptor refuses (``rm`` ∉ ``exec``) returns the structured
-    ``denied: true`` envelope from dispatch, and ``invoke()`` raises
-    ``BridleDenied`` for it — exactly as it does for an argv-form denial. Before
-    the fix, a free-form denial slipped through as a plain non-zero result with
-    no exception."""
-    with pytest.raises(agent_bridle.BridleDenied) as exc:
-        agent_bridle.invoke("shell", {"cmd": "rm -rf /tmp/x"}, ECHO_ONLY)
-    # The structured denials' reason is carried through.
-    assert "not within the granted" in str(exc.value) or "denied" in str(exc.value)
-
-
-def test_freeform_path_separator_denial_raises() -> None:
-    """A path-separator-spelled command (``/bin/rm``) cannot bypass the leash in
-    free-form mode either — it raises ``BridleDenied``."""
-    with pytest.raises(agent_bridle.BridleDenied):
-        agent_bridle.invoke("shell", {"cmd": "/bin/rm -rf /tmp/x"}, ECHO_ONLY)
-
-
-def test_exec_builtin_cannot_bypass_the_leash(tmp_path) -> None:
-    """Security regression (exec-builtin bypass).
-
-    The brush ``exec`` builtin used to call ``cmd.exec()`` directly — bypassing
-    the ``before_exec`` interceptor funnel and even replacing the host process.
-    Under ``echo``-only, ``exec /usr/bin/touch MARKER`` ran ``touch`` (the marker
-    appeared) with the leash never firing. The fix removes ``exec`` from the
-    confined shell's builtin set, so it is now "command not found": the carried
-    program must NOT run (no marker), and ``invoke`` returns cleanly rather than
-    replacing the interpreter.
-    """
-    marker = tmp_path / "exec-bypass-marker"
-    assert not marker.exists()
-    r = agent_bridle.invoke(
-        "shell",
-        {"cmd": f"exec /usr/bin/touch {marker}"},
-        ECHO_ONLY,
-    )
-    # The shell returned (process not replaced) and exec is gone (non-zero).
-    assert r["exit_code"] != 0, r
-    assert not marker.exists(), f"exec builtin ran the program: {r}"
-
-
-def test_command_substitution_denial_does_not_panic(tmp_path) -> None:
-    """Security regression ($() IO panic).
-
-    The confined runtime previously enabled only the time driver, so a ``$(...)``
-    command substitution panicked ("IO is disabled") and surfaced as an opaque
-    error rather than a clean denial. With IO enabled, the inner ``/bin/rm`` flows
-    through ``before_exec`` and is denied — ``invoke`` raises ``BridleDenied``
-    (structured ``denied: true``), and the victim file is untouched.
-    """
-    victim = tmp_path / "victim.txt"
-    victim.write_text("keep me")
-    with pytest.raises(agent_bridle.BridleDenied):
-        agent_bridle.invoke(
-            "shell",
-            {"cmd": f"echo $(/bin/rm -rf {victim})"},
-            ECHO_ONLY,
-        )
-    assert victim.exists(), "the denied rm must not have deleted the victim file"
+        agent_bridle.invoke("shell", {"program": "rm", "args": ["-rf", "/tmp/x"]}, ECHO_ONLY)
 
 
 def test_unknown_tool_raises_bridle_denied() -> None:
@@ -168,22 +78,14 @@ def test_unknown_tool_raises_bridle_denied() -> None:
         agent_bridle.invoke("no_such_tool", {}, ECHO_ONLY)
 
 
-def test_caveats_none_runs_unconfined() -> None:
-    """``caveats=None`` runs with full ambient authority (``Caveats::top()``);
-    it must print a stderr UNCONFINED warning (checked via capsys) but still
-    run an otherwise-valid command."""
-    r = agent_bridle.invoke("shell", {"program": "echo", "args": ["unconfined"]})
-    assert r["exit_code"] == 0
-    assert "unconfined" in r["stdout"]
-
-
 def test_tool_definitions_have_name_and_schema() -> None:
-    """``tool_definitions()`` returns one MCP ``tools/list`` dict per tool."""
+    """``tool_definitions()`` returns one MCP ``tools/list`` dict per tool, and
+    the ``shell`` tool's input schema is stable across the stub/confined change:
+    it still exposes BOTH shapes (argv ``program`` and free-form ``cmd``)."""
     defs = agent_bridle.tool_definitions()
     assert isinstance(defs, list) and defs
     shell = next(d for d in defs if d["name"] == "shell")
     assert isinstance(shell["inputSchema"], dict)
-    # The shell exposes BOTH shapes: argv (`program`) and free-form (`cmd`).
     props = shell["inputSchema"]["properties"]
     assert "program" in props
     assert "cmd" in props
@@ -192,7 +94,7 @@ def test_tool_definitions_have_name_and_schema() -> None:
 def test_unknown_caveats_field_is_value_error() -> None:
     """A typo'd caveats axis is surfaced as a ``ValueError`` (bad input), NOT a
     silent no-op and NOT a ``BridleDenied`` (the grant is malformed, not an
-    authority refusal)."""
+    authority refusal). This is validated before the tool policy is consulted."""
     with pytest.raises(ValueError):
         agent_bridle.invoke(
             "shell",
@@ -202,8 +104,9 @@ def test_unknown_caveats_field_is_value_error() -> None:
 
 
 def test_max_calls_budget_denies_within_one_grant() -> None:
-    """``max_calls`` is enforced: a grant of ``{"at_most": 0}`` is exhausted by
-    the per-dispatch charge, so even an in-scope program is denied."""
+    """``max_calls`` is enforced at the gate (before the tool policy): a grant of
+    ``{"at_most": 0}`` is exhausted by the per-dispatch charge, so the dispatch
+    is denied at the budget check."""
     grant = {"exec": {"only": ["echo"]}, "max_calls": {"at_most": 0}}
     with pytest.raises(agent_bridle.BridleDenied):
         agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, grant)

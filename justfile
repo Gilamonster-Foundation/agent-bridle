@@ -46,9 +46,9 @@ install-hooks:
 fmt:
     cargo fmt --all
 
-# Publish the brush-free crates to crates.io, IN ORDER (core before its
-# dependents). cargo >= 1.66 blocks each publish until the new version is
-# downloadable, so the order is causal — no sleeps needed.
+# Publish the crates to crates.io, IN ORDER (core before its dependents).
+# cargo >= 1.66 blocks each publish until the new version is downloadable, so
+# the order is causal — no sleeps needed.
 #
 # AUTH: this recipe names no token and no secret location on purpose. Provide
 # crates.io auth the standard way — run `cargo login` once, OR set
@@ -56,22 +56,22 @@ fmt:
 #     CARGO_REGISTRY_TOKEN="$(cat /path/to/your/token)" just publish-crates
 # Keep the token on your machine; do not put it in CI secrets.
 #
-# NOT PUBLISHED: agent-bridle-tool-shell (and transitively the `agent-bridle`
-# facade + agent-bridle-mcp) git-dep our brush fork, and crates.io forbids any
-# git source in a published manifest. They publish once the CommandInterceptor
-# hook lands upstream in reubeno/brush, or via a renamed fork. Until then the
-# confined shell is consumable via the MCP server / subprocess / maturin wheel.
-# See docs/adr/0001 and docs/DESIGN.md.
+# The brush git dependency was removed (the `shell` tool is now a fail-closed
+# stub + opt-in unconfined bash; see CHANGELOG `[Unreleased]`), so all four
+# library crates publish. The dependency order is core → tool-shell + tool-web
+# → facade. agent-bridle-mcp (a binary) and agent-bridle-py (a maturin wheel)
+# are not published via crates.io.
 #
-# DRY_RUN=1 packages + verifies without uploading (note: tool-web's dry-run
-# needs core already on crates.io to resolve its dependency).
+# DRY_RUN=1 packages + verifies without uploading (note: a dependent's dry-run
+# needs its in-workspace deps already on crates.io to resolve — run a real
+# publish, or dry-run leaf crates only).
 publish-crates:
     #!/usr/bin/env bash
     set -euo pipefail
     dry=""
     [ "${DRY_RUN:-0}" != "0" ] && dry="--dry-run"
-    for crate in agent-bridle-core agent-bridle-tool-web; do
+    for crate in agent-bridle-core agent-bridle-tool-shell agent-bridle-tool-web agent-bridle; do
         echo ">>> cargo publish -p ${crate} ${dry}"
         cargo publish -p "${crate}" ${dry}
     done
-    echo "Published the brush-free crates. (tool-shell stays gated on the upstream brush hook.)"
+    echo "Published the agent-bridle library crates."

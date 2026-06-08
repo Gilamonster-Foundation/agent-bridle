@@ -6,10 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-# This crate ships ONLY as a PyPI wheel (built by maturin), never to crates.io:
-# it depends transitively on `agent-bridle-tool-shell`, which git-deps our brush
-# fork. A maturin wheel compiles the Rust *in* (the brush git-dep is fine for a
-# wheel), so Pillar A's PyPI path is NOT blocked by the upstream-brush gate.
+# This crate ships ONLY as a PyPI wheel (built by maturin), never to crates.io.
+# (Historically it was wheel-only because it git-dep'd our brush fork through
+# `agent-bridle-tool-shell`; that git dep is now removed — the `shell` tool is a
+# fail-closed stub pending the brush upstream merge, see CHANGELOG — but a PyO3
+# extension-module crate is still a wheel artifact, not a crates.io library.)
 publish = false
 
 [lib]
@@ -19,8 +20,11 @@ name = "agent_bridle"
 crate-type = ["cdylib"]
 
 [dependencies]
-# The facade — with `shell` on, so the confined brush-backed shell is callable
-# (the Pillar-A demo tool). The wheel carries the shell runtime in.
+# The facade — with `shell` on so the `shell` tool symbol is anchored. NOTE:
+# the default `shell` tool is currently the fail-closed STUB (the brush-backed
+# confined shell is pending upstream; see CHANGELOG). Python callers wanting to
+# run commands must build the registry via `registry_with_shell` with an opt-in
+# unconfined policy.
 agent-bridle = { workspace = true, features = ["shell"] }
 agent-mesh-protocol = { workspace = true }
 serde_json = { workspace = true }

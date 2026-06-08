@@ -6,6 +6,14 @@
 //! profiles — and each tool's symbol is anchored here by a `pub use`, so the
 //! linker can never silently drop one from `tools/list`.
 //!
+//! The default [`registry`] ships a **fail-closed stub** `shell` tool: the
+//! brush-backed confined shell is pending an upstream brush merge, so the
+//! published default denies every shell invocation rather than running anything
+//! unconfined. A host that needs to actually run commands opts in explicitly via
+//! [`registry_with_shell`] with [`ShellTool::insecure_bash`] (per-command
+//! approval) or [`ShellTool::dangerous_unconfined`] — both run an UNCONFINED
+//! bash. See `agent-bridle-mcp`'s `--insecure` / `--dangerously-allow-all`.
+//!
 //! ```
 //! use agent_bridle::registry;
 //! use agent_bridle::{Caveats, CountBound, Scope};
@@ -17,10 +25,12 @@
 //!     max_calls: CountBound::AtMost(2),
 //!     ..Caveats::top()
 //! };
-//! let out = reg
+//! // The default `shell` tool is the fail-closed stub: it denies and spawns
+//! // nothing, regardless of the grant. Escalate via `registry_with_shell`.
+//! let denied = reg
 //!     .dispatch("shell", serde_json::json!({ "program": "echo", "args": ["hi"] }), &granted)
-//!     .await?;
-//! assert_eq!(out["exit_code"], 0);
+//!     .await;
+//! assert!(denied.is_err());
 //! # Ok(())
 //! # }
 //! ```
@@ -34,7 +44,7 @@ pub use agent_bridle_core::*;
 // Anchor each tool's symbol in the facade (DESIGN §5): an explicit `pub use`
 // keeps the linker from DCE-ing a tool module under strip+lto.
 #[cfg(feature = "shell")]
-pub use agent_bridle_tool_shell::ShellTool;
+pub use agent_bridle_tool_shell::{ApprovalHook, ShellPolicy, ShellTool};
 #[cfg(feature = "web")]
 pub use agent_bridle_tool_web::WebFetchTool;
 
@@ -44,28 +54,54 @@ pub use agent_bridle_tool_web::WebFetchTool;
 /// set is deterministic and DCE-proof. Which tools are present depends on the
 /// compiled features:
 ///
-/// - `shell` (default): adds the confined brush-backed `shell` tool.
+/// - `shell` (default): adds the `shell` tool as the **fail-closed stub**
+///   ([`ShellTool::stub`]) — it denies every invocation and spawns nothing. The
+///   brush-backed confined shell is pending an upstream brush merge; to run
+///   commands now, use [`registry_with_shell`] with an opt-in unconfined policy.
 /// - `web`: adds the confined `web_fetch` tool — the `net` enforcer (host
 ///   allowlist + SSRF block + per-redirect re-check + IP pinning).
 ///
 /// Under `--no-default-features` the registry is empty but valid; a host adds
 /// tools by enabling features (or building its own registry).
+#[cfg(feature = "shell")]
 #[must_use]
 pub fn registry() -> Registry {
-    #[allow(unused_mut)]
-    let mut builder = Registry::builder();
+    registry_with_shell(ShellTool::stub())
+}
 
-    #[cfg(feature = "shell")]
-    {
-        builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
-    }
+/// Build the default tool registry when the `shell` feature is OFF: only the
+/// (optional) `web_fetch` tool can be present; otherwise the registry is empty
+/// but valid.
+#[cfg(not(feature = "shell"))]
+#[must_use]
+pub fn registry() -> Registry {
+    with_web(Registry::builder()).build()
+}
 
+/// Build the tool registry using a caller-supplied [`ShellTool`] (plus the
+/// `web_fetch` tool under the `web` feature).
+///
+/// This is the escalation seam: a host passes [`ShellTool::insecure_bash`]
+/// (per-command approval) or [`ShellTool::dangerous_unconfined`] to enable an
+/// UNCONFINED bash, while [`registry`] uses the safe [`ShellTool::stub`]. Under
+/// `--no-default-features` (no `shell` feature) there is no `ShellTool` type, so
+/// this function is unavailable; use [`registry`].
+#[cfg(feature = "shell")]
+#[must_use]
+pub fn registry_with_shell(shell: ShellTool) -> Registry {
+    let builder = Registry::builder().tool(std::sync::Arc::new(shell));
+    with_web(builder).build()
+}
+
+/// Add the `web_fetch` tool to a builder when the `web` feature is on; a no-op
+/// otherwise. Factored out so the two registry constructors share it.
+#[allow(unused_mut)]
+fn with_web(mut builder: RegistryBuilder) -> RegistryBuilder {
     #[cfg(feature = "web")]
     {
         builder = builder.tool(std::sync::Arc::new(WebFetchTool::new()));
     }
-
-    builder.build()
+    builder
 }
 
 #[cfg(test)]

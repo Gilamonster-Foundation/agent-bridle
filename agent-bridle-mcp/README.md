@@ -12,8 +12,13 @@ else a loudly-warned unconfined default. Every `tools/call` is dispatched
 through the registry against that grant, so confinement holds *through* the
 MCP boundary.
 
-- `shell` feature (default-on): serves the confined, brush-backed shell tool
-- `web` feature (off by default): serves the confined `web_fetch` tool
+- `shell` feature (default-on): serves the `shell` tool. With no CLI flag it is
+  the **fail-closed stub** (deny-only) — the brush-backed confined shell is
+  pending an upstream merge (see the workspace `CHANGELOG`). Opt in to an
+  UNCONFINED bash with `--insecure` (per-command approval prompted on `/dev/tty`,
+  never stdin) or `--dangerously-allow-all` (no gate; development only).
+- `web` feature (off by default): serves the confined `web_fetch` tool (still
+  fully confined: host allowlist + SSRF screen + per-redirect re-check + IP pin)
 - `--no-default-features` yields a valid but empty registry
 
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
