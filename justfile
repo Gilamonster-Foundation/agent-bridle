@@ -46,32 +46,27 @@ install-hooks:
 fmt:
     cargo fmt --all
 
-# Publish the brush-free crates to crates.io, IN ORDER (core before its
-# dependents). cargo >= 1.66 blocks each publish until the new version is
+# Publish all crates to crates.io, IN TOPOLOGICAL ORDER (each crate before
+# its dependents). cargo >= 1.66 blocks each publish until the new version is
 # downloadable, so the order is causal — no sleeps needed.
 #
-# AUTH: this recipe names no token and no secret location on purpose. Provide
-# crates.io auth the standard way — run `cargo login` once, OR set
-# CARGO_REGISTRY_TOKEN from wherever you keep the token, e.g.:
+# AUTH: run `cargo login` once, OR set CARGO_REGISTRY_TOKEN:
 #     CARGO_REGISTRY_TOKEN="$(cat /path/to/your/token)" just publish-crates
-# Keep the token on your machine; do not put it in CI secrets.
 #
-# NOT PUBLISHED: agent-bridle-tool-shell (and transitively the `agent-bridle`
-# facade + agent-bridle-mcp) git-dep our brush fork, and crates.io forbids any
-# git source in a published manifest. They publish once the CommandInterceptor
-# hook lands upstream in reubeno/brush, or via a renamed fork. Until then the
-# confined shell is consumable via the MCP server / subprocess / maturin wheel.
-# See docs/adr/0001 and docs/DESIGN.md.
+# NOT PUBLISHED: agent-bridle-py — PyO3 arm64 linker issues make it
+# unpublishable from this machine. Publish via a maturin wheel job if needed.
 #
-# DRY_RUN=1 packages + verifies without uploading (note: tool-web's dry-run
-# needs core already on crates.io to resolve its dependency).
+# DRY_RUN=1 packages + verifies without uploading.
+#
+# HOOK PARITY: the crate list and order here must match the publish-crates
+# job matrix in .github/workflows/release.yml.
 publish-crates:
     #!/usr/bin/env bash
     set -euo pipefail
     dry=""
     [ "${DRY_RUN:-0}" != "0" ] && dry="--dry-run"
-    for crate in agent-bridle-core agent-bridle-tool-web; do
+    for crate in agent-bridle-core agent-bridle-tool-shell agent-bridle-tool-web agent-bridle agent-bridle-mcp; do
         echo ">>> cargo publish -p ${crate} ${dry}"
         cargo publish -p "${crate}" ${dry}
     done
-    echo "Published the brush-free crates. (tool-shell stays gated on the upstream brush hook.)"
+    echo "All agent-bridle crates published."
