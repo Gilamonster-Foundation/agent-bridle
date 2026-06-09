@@ -1,0 +1,172 @@
+# agent-bridle release workflow.
+#
+# HOOK PARITY: publish sequencing mirrors the `publish-crates` recipe in
+# justfile. When editing the crate list or order here, update the justfile
+# recipe to match.
+#
+# Triggers:
+#  - Tag push `v*`           → build MCP binary + publish all crates to crates.io
+#  - workflow_dispatch       → manual build (no upload)
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#  - CARGO_REGISTRY_TOKEN — crates.io publish token (account scope)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # gh release create + binary asset upload
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Build the agent-bridle-mcp binary ─────────────────────────────────
+
+  build-mcp-binary:
+    name: Build agent-bridle-mcp (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build agent-bridle-mcp
+        run: cargo build --release --locked --target ${{ matrix.target }} -p agent-bridle-mcp
+
+      - name: Stage archive (Unix)
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME//\//-}"
+          STAGE="agent-bridle-mcp-${VERSION}-${{ matrix.label }}"
+          mkdir -p "$STAGE"
+          cp target/${{ matrix.target }}/release/agent-bridle-mcp "$STAGE/"
+          cp LICENSE README.md "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-bridle-mcp-${{ matrix.label }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── GitHub release (tag-only) ─────────────────────────────────────────
+
+  github-release:
+    name: GitHub release (${{ github.ref_name }})
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-mcp-binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts/
+      - name: Collect archives
+        run: |
+          mkdir -p dist
+          find all-artifacts -type f -name '*.tar.gz' -exec cp {} dist/ \;
+          ls -la dist/
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "agent-bridle ${{ github.ref_name }}"
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          files: dist/*
+
+  # ── Publish to crates.io (tag-only, topological order) ────────────────
+  #
+  # Order is load-bearing: each crate must land before its dependents.
+  # cargo >= 1.66 blocks until the new version is downloadable, so
+  # max-parallel: 1 + the ordered matrix ensures correct sequencing.
+  #
+  # agent-bridle-py is excluded: PyO3 arm64 linker issues on the GitHub
+  # Actions macOS runner make it unpublishable here. Publish manually or
+  # via a maturin wheel job if/when needed.
+
+  publish-crates:
+    name: Publish ${{ matrix.crate }} → crates.io
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-mcp-binary]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1    # one at a time — internal deps need topological order
+      matrix:
+        crate:
+          - agent-bridle-core
+          - agent-bridle-tool-shell
+          - agent-bridle-tool-web
+          - agent-bridle          # facade — depends on the three above
+          - agent-bridle-mcp      # binary crate — depends on the facade
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-${{ matrix.crate }}
+
+      - name: Confirm CARGO_REGISTRY_TOKEN is mounted
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN not set — add it under Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "CARGO_REGISTRY_TOKEN: present (${#CARGO_REGISTRY_TOKEN} chars)"
+
+      - name: cargo publish ${{ matrix.crate }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Resilient publish: idempotent on already-published versions,
+        # backs off on 429 rate-limits (new crate names), fails on anything else.
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if cargo publish -p ${{ matrix.crate }} --locked --no-verify 2>publish.err; then
+              cat publish.err >&2 || true
+              echo "published ${{ matrix.crate }}"
+              exit 0
+            elif grep -qiE 'already (exists|uploaded)|is already uploaded|already published' publish.err; then
+              cat publish.err >&2
+              echo "::notice::${{ matrix.crate }} already published at this version — skipping"
+              exit 0
+            elif grep -qi '429 Too Many Requests' publish.err; then
+              cat publish.err >&2
+              wait=$((attempt * 90))
+              echo "::warning::crates.io rate-limited on ${{ matrix.crate }} — waiting ${wait}s, retry ${attempt}/6"
+              sleep "$wait"
+            else
+              cat publish.err >&2
+              exit 1
+            fi
+          done
+          echo "::error::${{ matrix.crate }} still rate-limited after 6 retries"
+          exit 1

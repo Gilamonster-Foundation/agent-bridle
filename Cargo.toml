@@ -40,22 +40,26 @@ async-trait = "0.1"
 pyo3 = { version = "0.28", default-features = false, features = ["macros"] }
 
 # Leaf-tool-only deps (never enter core or a host's default build).
-# `net` is required for the runtime IO driver (`enable_io`/`enable_all`): the
-# confined shell turns IO on so `$(...)` command substitution flows through the
-# interceptor funnel and yields a clean denial instead of an "IO is disabled"
-# panic (DESIGN §6 / security fix). `rt`+`time` alone do not bring in the IO
-# driver.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
-# brush — pinned to OUR fork at the commit that adds the `CommandInterceptor`
-# exec/open hook (`extensions::CommandInterceptor`, wired at the single
-# external-spawn funnel + `Shell::open_file`). All three crates share one
-# git+rev so cargo resolves them to a single checkout. This closes the
-# path-separator exec bypass in-process, cross-OS (DESIGN §6). NOTE: a git dep
-# means `agent-bridle-tool-shell` cannot publish to crates.io until the hook is
-# upstreamed into `reubeno/brush`; tracked as out-of-scope until then.
-brush-core = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
-brush-builtins = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
-brush-coreutils-builtins = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
+# `net` is NOT included here — the stub shell no longer needs the IO driver.
+# Restore `net` when the brush `CommandInterceptor` feature is re-enabled
+# (tracked in https://github.com/Gilamonster-Foundation/agent-bridle/issues/20).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+# brush — TEMPORARILY REMOVED pending reubeno/brush#1184.
+#
+# The shell tool is currently a stub (returns a clear error on invoke). Full
+# CommandInterceptor-backed execution is restored once the upstream PR merges
+# and brush publishes a crates.io release that includes the hook.  git deps are
+# forbidden by crates.io, so we cannot carry this as an optional dep in the
+# published package.
+#
+# To restore: uncomment these three lines, update the rev to the post-merge
+# commit, re-enable the `shell` feature body in agent-bridle-tool-shell, and
+# restore caveat_interceptor.rs + the full shell_tool.rs from git history.
+# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+#
+# brush-core = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
+# brush-builtins = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
+# brush-coreutils-builtins = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
 
 # Web-tool-only deps (feature `web` in agent-bridle-tool-web). rustls, NOT
 # openssl, so the client is portable and builds on Windows with no system

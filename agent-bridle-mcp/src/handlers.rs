@@ -179,9 +179,16 @@ mod tests {
         assert!(shell["description"].is_string());
     }
 
+    // NOTE: the three shell-execution tests below are updated for the stub
+    // release (pending reubeno/brush#1184). All shell invocations now return
+    // an in-band MCP tool error explaining the temporary degradation.
+    // Restore the original test bodies from git history when brush support
+    // is re-enabled. See https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+
     #[cfg(feature = "shell")]
     #[tokio::test]
     async fn call_in_scope_succeeds() {
+        // Stub: even in-scope calls return an unavailable error.
         let reg = agent_bridle::registry();
         let v = tools_call(
             &reg,
@@ -189,14 +196,21 @@ mod tests {
             serde_json::json!({ "name": "shell", "arguments": { "program": "echo", "args": ["hi"] } }),
         )
         .await;
-        assert_eq!(v["isError"], false);
+        assert_eq!(
+            v["isError"], true,
+            "stub must surface as MCP tool error: {v}"
+        );
         let text = v["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("hi"), "tool stdout missing: {text}");
+        assert!(
+            text.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR: {text}"
+        );
     }
 
     #[cfg(feature = "shell")]
     #[tokio::test]
     async fn call_out_of_scope_is_in_band_denial() {
+        // Stub: returns unavailable error (not a caveats denial) in all cases.
         let reg = agent_bridle::registry();
         let v = tools_call(
             &reg,
@@ -204,22 +218,21 @@ mod tests {
             serde_json::json!({ "name": "shell", "arguments": { "program": "rm", "args": ["-rf", "/"] } }),
         )
         .await;
-        // The denial is an MCP tool error, NOT a transport error: isError=true
-        // with the reason carried in the content.
-        assert_eq!(v["isError"], true);
+        assert_eq!(
+            v["isError"], true,
+            "stub must surface as MCP tool error: {v}"
+        );
         let text = v["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("denied"), "denial reason missing: {text}");
-        assert!(text.contains("rm"), "denied program missing: {text}");
+        assert!(
+            text.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR: {text}"
+        );
     }
 
     #[cfg(feature = "shell")]
     #[tokio::test]
     async fn call_freeform_denied_is_in_band_error_from_structured_field() {
-        // A free-form `cmd` denial returns Ok from dispatch (exit 126) with the
-        // STRUCTURED `denied: true` in the envelope. The handler must turn that
-        // into an MCP tool error (isError=true) by reading the structured field,
-        // NOT by string-matching stderr. This is the regression the fix closes:
-        // before it, a free-form denial slipped through as isError=false.
+        // Stub: free-form cmd also returns the unavailable error.
         let reg = agent_bridle::registry();
         let v = tools_call(
             &reg,
@@ -229,12 +242,12 @@ mod tests {
         .await;
         assert_eq!(
             v["isError"], true,
-            "free-form denial must surface as an MCP tool error: {v}"
+            "stub must surface as MCP tool error: {v}"
         );
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("not within the granted") || text.contains("denied"),
-            "denial reason missing: {text}"
+            text.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR: {text}"
         );
     }
 
