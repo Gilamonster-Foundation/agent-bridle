@@ -196,7 +196,10 @@ mod tests {
             serde_json::json!({ "name": "shell", "arguments": { "program": "echo", "args": ["hi"] } }),
         )
         .await;
-        assert_eq!(v["isError"], true, "stub must surface as MCP tool error: {v}");
+        assert_eq!(
+            v["isError"], true,
+            "stub must surface as MCP tool error: {v}"
+        );
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("reubeno/brush/pull/1184"),
@@ -215,7 +218,10 @@ mod tests {
             serde_json::json!({ "name": "shell", "arguments": { "program": "rm", "args": ["-rf", "/"] } }),
         )
         .await;
-        assert_eq!(v["isError"], true, "stub must surface as MCP tool error: {v}");
+        assert_eq!(
+            v["isError"], true,
+            "stub must surface as MCP tool error: {v}"
+        );
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("reubeno/brush/pull/1184"),
@@ -234,7 +240,10 @@ mod tests {
             serde_json::json!({ "name": "shell", "arguments": { "cmd": "rm -rf /tmp/x" } }),
         )
         .await;
-        assert_eq!(v["isError"], true, "stub must surface as MCP tool error: {v}");
+        assert_eq!(
+            v["isError"], true,
+            "stub must surface as MCP tool error: {v}"
+        );
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("reubeno/brush/pull/1184"),

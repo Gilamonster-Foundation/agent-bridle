@@ -10,6 +10,7 @@
 //! 2. Add brush deps back to `Cargo.toml` (see commented lines there).
 //! 3. Restore `caveat_interceptor.rs` and the full `shell_tool.rs` from git
 //!    history (`git show HEAD~1:agent-bridle-tool-shell/src/shell_tool.rs`).
+//!
 //! See <https://github.com/Gilamonster-Foundation/agent-bridle/issues/20>.
 
 use agent_bridle_core::{Tool, ToolContext, ToolError, ToolResult};
@@ -120,10 +121,19 @@ mod tests {
         struct Passthrough;
         #[async_trait::async_trait]
         impl Tool for Passthrough {
-            fn name(&self) -> &str { "passthrough" }
-            fn schema(&self) -> serde_json::Value { serde_json::Value::Null }
-            async fn invoke(&self, _: serde_json::Value, _: &agent_bridle_core::ToolContext)
-                -> agent_bridle_core::ToolResult<serde_json::Value> { Ok(serde_json::Value::Null) }
+            fn name(&self) -> &str {
+                "passthrough"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            async fn invoke(
+                &self,
+                _: serde_json::Value,
+                _: &agent_bridle_core::ToolContext,
+            ) -> agent_bridle_core::ToolResult<serde_json::Value> {
+                Ok(serde_json::Value::Null)
+            }
         }
         let cx = Gate::new(0)
             .authorize(&Passthrough, &Caveats::top())
