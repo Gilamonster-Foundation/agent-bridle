@@ -8,6 +8,13 @@ surface into an extensible, **capability-governed registry**.
 > **brush** = the hands. **`Caveats`** = the leash. **bridle** = the enforcer
 > that binds them.
 
+> Governed by the [Steward's Charter](https://github.com/Gilamonster-Foundation/steward-charter).
+> agent-bridle realizes the **`writ`** invariant (authority is borrowed, scoped,
+> revocable — the `Caveats`/`Gate`). A leash *denial* is a Charter **`refusal`**:
+> the draft edge in [`integrations/charter-bridle`](integrations/charter-bridle)
+> records each denial into the **`scar`**, so a refusal becomes metabolized memory
+> rather than an ephemeral error.
+
 Every tool declares the authority it needs as an
 [`agent_mesh_protocol::Caveats`] requirement. The registry refuses to dispatch
 unless `required ⊑ granted` under the meet-semilattice, and hands the tool only
