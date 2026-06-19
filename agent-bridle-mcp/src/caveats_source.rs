@@ -9,8 +9,10 @@
 //!    inline (e.g. the Desk handing a worker an attenuated grant).
 //! 2. **`~/.agent-bridle/config.toml`**, table **`[caveats]`** — a persistent
 //!    per-host default, same field/enum shape expressed in TOML.
-//! 3. **Default `Caveats::top()`** — UNCONFINED. Emits a prominent stderr
-//!    warning, because an unconfined leash defeats the purpose of the bridle.
+//! 3. **Default: DENY-ALL (fail-closed).** No grant configured ⇒ no authority on
+//!    any axis. This is the red-team §9.3 fix: the bridle exists to *confine*, so
+//!    a missing grant must mean "nothing," never `top()` ("everything"). An
+//!    operator grants authority by setting source 1 or 2; absence is safe.
 //!
 //! The TOML/JSON shapes are identical to the Rust `Caveats` serde derive:
 //! string axes are either `"all"` or `{ "only": [..] }`; `max_calls` is either
@@ -18,10 +20,24 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_bridle::Caveats;
+use agent_bridle::{Caveats, CountBound, Scope};
 
 /// Environment variable carrying an inline JSON grant.
 const ENV_CAVEATS: &str = "AGENT_BRIDLE_CAVEATS";
+
+/// The fail-closed bottom: no authority on any axis. The dual of `Caveats::top()`
+/// — used as the default when no grant is configured (§9.3). `agent-mesh-protocol`
+/// ships `top()` but no lattice bottom yet; constructed here until it does.
+fn deny_all() -> Caveats {
+    Caveats {
+        fs_read: Scope::none(),
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::AtMost(0),
+        valid_for_generation: Scope::none(),
+    }
+}
 
 /// Where the granted leash came from — surfaced in the startup banner so an
 /// operator can see, at a glance, whether the server is confined.
@@ -31,8 +47,8 @@ pub enum CaveatsSource {
     Env,
     /// Loaded from `~/.agent-bridle/config.toml` `[caveats]`.
     ConfigFile(PathBuf),
-    /// No grant configured — defaulted to `Caveats::top()` (UNCONFINED).
-    UnconfinedDefault,
+    /// No grant configured — defaulted to DENY-ALL (fail-closed, §9.3).
+    FailClosedDefault,
 }
 
 /// The resolved leash plus where it came from.
@@ -87,10 +103,10 @@ impl GrantedCaveats {
             }
         }
 
-        // 3. Default: UNCONFINED.
+        // 3. Default: DENY-ALL (fail-closed). A missing grant grants nothing.
         Ok(Self {
-            caveats: Caveats::top(),
-            source: CaveatsSource::UnconfinedDefault,
+            caveats: deny_all(),
+            source: CaveatsSource::FailClosedDefault,
         })
     }
 
@@ -108,11 +124,11 @@ impl GrantedCaveats {
                     p.display()
                 )
             }
-            CaveatsSource::UnconfinedDefault => format!(
-                "WARNING: agent-bridle-mcp is running UNCONFINED \
-                 (no ${ENV_CAVEATS}, no ~/.agent-bridle/config.toml [caveats]); \
-                 every tool runs with FULL ambient authority. Set ${ENV_CAVEATS} \
-                 or [caveats] to confine it."
+            CaveatsSource::FailClosedDefault => format!(
+                "agent-bridle-mcp: no grant configured (no ${ENV_CAVEATS}, no \
+                 ~/.agent-bridle/config.toml [caveats]) — running DENY-ALL \
+                 (fail-closed); every tool is refused. Set ${ENV_CAVEATS} or \
+                 [caveats] to grant authority."
             ),
         }
     }
@@ -127,14 +143,14 @@ struct Config {
 }
 
 /// Read and parse the `[caveats]` table from a config file. A file that exists
-/// but has no `[caveats]` table is treated as "no grant configured" → top, to
-/// keep the same fall-through semantics as a missing file.
+/// but has no `[caveats]` table is treated as "no grant configured" → DENY-ALL
+/// (fail-closed, §9.3), matching the fall-through semantics of a missing file.
 fn load_from_config(path: &Path) -> anyhow::Result<Caveats> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
     let cfg: Config = toml::from_str(&text)
         .map_err(|e| anyhow::anyhow!("cannot parse {} [caveats]: {e}", path.display()))?;
-    Ok(cfg.caveats.unwrap_or_else(Caveats::top))
+    Ok(cfg.caveats.unwrap_or_else(deny_all))
 }
 
 /// Resolve `$HOME` without pulling in a dirs crate (lean dep budget).
@@ -213,19 +229,37 @@ valid_for_generation = "all"
     }
 
     #[test]
-    fn default_is_unconfined_top_with_warning_banner() {
+    fn default_is_fail_closed_deny_all() {
+        // §9.3: no grant configured ⇒ DENY-ALL, never top(). A missing grant must
+        // grant nothing, and the banner must say so (no "UNCONFINED" footgun).
         let dir = tempdir(); // no config file inside
         let g = GrantedCaveats::resolve(None, Some(&dir)).unwrap();
-        assert_eq!(g.source, CaveatsSource::UnconfinedDefault);
-        assert_eq!(g.caveats, Caveats::top());
-        assert!(g.banner().contains("UNCONFINED"), "banner: {}", g.banner());
-        assert!(g.banner().starts_with("WARNING"));
+        assert_eq!(g.source, CaveatsSource::FailClosedDefault);
+        assert_eq!(g.caveats, deny_all());
+        assert_ne!(g.caveats, Caveats::top(), "default must NOT be unconfined");
+        assert_eq!(g.caveats.fs_write, Scope::none());
+        assert_eq!(g.caveats.exec, Scope::none());
+        assert_eq!(g.caveats.max_calls, CountBound::AtMost(0));
+        assert!(g.banner().contains("DENY-ALL"), "banner: {}", g.banner());
+        assert!(g.banner().contains("fail-closed"), "banner: {}", g.banner());
     }
 
     #[test]
-    fn missing_home_falls_through_to_default() {
+    fn config_file_without_caveats_table_is_fail_closed() {
+        // An existing config that declares no [caveats] grants nothing, not top().
+        let dir = tempdir();
+        let ab = dir.join(".agent-bridle");
+        std::fs::create_dir_all(&ab).unwrap();
+        std::fs::write(ab.join("config.toml"), "# host config, no caveats\n").unwrap();
+        let g = GrantedCaveats::resolve(None, Some(&dir)).unwrap();
+        assert_eq!(g.caveats, deny_all());
+    }
+
+    #[test]
+    fn missing_home_falls_through_to_fail_closed_default() {
         let g = GrantedCaveats::resolve(None, None).unwrap();
-        assert_eq!(g.source, CaveatsSource::UnconfinedDefault);
+        assert_eq!(g.source, CaveatsSource::FailClosedDefault);
+        assert_eq!(g.caveats, deny_all());
     }
 
     /// A unique temp dir under the test temp root, no external crate needed.
