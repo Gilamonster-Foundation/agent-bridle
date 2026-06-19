@@ -30,3 +30,9 @@ agent-mesh-protocol = { workspace = true }
 # cfg(all(target_os = "linux", feature = "linux-landlock")).
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4", optional = true }
+
+[dev-dependencies]
+# Test-only: the MVP software `DischargeVerifier` reads ed25519 assertions over
+# the step-up challenge. NOT a runtime dependency — real WebAuthn/CTAP2 verifiers
+# live in host crates. Already in the lockfile (transitive via agent-mesh-protocol).
+ed25519-dalek = "2"
