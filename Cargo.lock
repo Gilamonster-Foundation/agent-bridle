@@ -27,6 +27,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "ed25519-dalek",
  "landlock",
  "serde",
  "serde_json",

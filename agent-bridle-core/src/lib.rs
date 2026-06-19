@@ -14,7 +14,9 @@
 //!
 //! Dependency budget is deliberately tiny — `anyhow`, `serde`, `serde_json`,
 //! `async-trait`, `agent-mesh-protocol`. No tokio. No brush. Heavy runtimes
-//! live in leaf tool crates only.
+//! live in leaf tool crates only. The [`step_up`] module's content-addressing
+//! reuses `agent-mesh-protocol`'s BLAKE3 primitive (no new runtime dep); its
+//! test-only software verifier uses a dev-only `ed25519-dalek`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -28,6 +30,7 @@ mod error;
 mod gate;
 mod registry;
 mod sandbox;
+mod step_up;
 mod tool;
 
 pub use context::ToolContext;
@@ -38,6 +41,10 @@ pub use registry::{Registry, RegistryBuilder};
 pub use sandbox::{best_available_sandbox, NoopSandbox, Sandbox, SandboxKind};
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, LandlockSandbox};
+pub use step_up::{
+    AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
+    DischargeAttempt, DischargeVerifier, Presence, Rule, StepUpPolicy,
+};
 pub use tool::Tool;
 
 #[cfg(test)]

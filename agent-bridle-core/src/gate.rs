@@ -16,6 +16,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::step_up::{
+    Attestation, CallRequest, Challenge, Decision, DischargeAttempt, StepUpPolicy,
+};
 use crate::{
     Caveats, CountBound, Sandbox, SandboxKind, Scope, Tool, ToolContext, ToolError, ToolResult,
 };
@@ -154,6 +157,88 @@ impl Gate {
                 }
             }
         }
+    }
+}
+
+/// Step-up admission (human-presence capabilities) — see [`crate::step_up`].
+///
+/// [`Gate::evaluate`] is the pure entry point; when a step-up is owed it returns
+/// [`Decision::NeedsDischarge`] without minting or charging. The caller obtains a
+/// proof and re-presents it to [`Gate::authorize_with_discharge`]. The gate only
+/// ever *verifies* a proof — it never performs the gesture (that is a host
+/// capability, a sibling of [`Sandbox`](crate::Sandbox)).
+impl Gate {
+    /// Evaluate a call under a [`StepUpPolicy`] without performing any gesture.
+    ///
+    /// [`Decision::Allow`] (minted and charged) when no step-up is owed,
+    /// [`Decision::NeedsDischarge`] (nothing minted or charged) when one is, and
+    /// [`Decision::Deny`] on a generation or budget failure.
+    pub fn evaluate(
+        &self,
+        tool: &dyn Tool,
+        granted: &Caveats,
+        request: &CallRequest,
+        policy: &StepUpPolicy,
+    ) -> Decision {
+        let effective = granted.meet(&tool.required());
+        if self.check_generation(granted).is_err() {
+            return Decision::Deny(ToolError::Generation);
+        }
+        let required = policy.required_for(request);
+        if required.demands_gesture() {
+            return Decision::NeedsDischarge(required);
+        }
+        match self.charge_one(granted) {
+            Ok(()) => Decision::Allow(ToolContext::mint(effective, self.sandbox_kind)),
+            Err(e) => Decision::Deny(e),
+        }
+    }
+
+    /// Admit a call that owes a step-up by verifying a [`Discharge`].
+    ///
+    /// Recomputes the bound [`Challenge`] from `request`, the gate's generation,
+    /// and `nonce`, then asks `verifier` to check the proof. On success mints the
+    /// context (least authority, exactly as [`Gate::authorize`]) and — when the
+    /// policy demanded a record — returns a content-addressed [`Attestation`].
+    /// Ordering matches `authorize`: deny on generation or verification *before*
+    /// charging, so a rejected discharge consumes no call. With no step-up owed
+    /// this degenerates to an ordinary authorize.
+    pub fn authorize_with_discharge(
+        &self,
+        tool: &dyn Tool,
+        granted: &Caveats,
+        request: &CallRequest,
+        policy: &StepUpPolicy,
+        attempt: &DischargeAttempt,
+    ) -> ToolResult<(ToolContext, Option<Attestation>)> {
+        let effective = granted.meet(&tool.required());
+        self.check_generation(granted)?;
+
+        let required = policy.required_for(request);
+        if !required.demands_gesture() {
+            self.charge_one(granted)?;
+            return Ok((ToolContext::mint(effective, self.sandbox_kind), None));
+        }
+
+        let expected = Challenge::bind(&request.content_id(), self.generation, &attempt.nonce);
+        if let Err(reason) = attempt
+            .verifier
+            .verify(attempt.discharge, &required, &expected)
+        {
+            return Err(ToolError::denied(reason));
+        }
+
+        let attestation = required.record.then(|| {
+            Attestation::from_verified(
+                &request.tool,
+                &request.resource,
+                attempt.discharge,
+                self.generation,
+            )
+        });
+
+        self.charge_one(granted)?;
+        Ok((ToolContext::mint(effective, self.sandbox_kind), attestation))
     }
 }
 
