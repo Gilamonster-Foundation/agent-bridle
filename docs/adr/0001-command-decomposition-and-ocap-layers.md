@@ -1,5 +1,9 @@
 # ADR 0001 — Command decomposition and the object-capability enforcement layers
 
+> **Amended by ADR 0005** (2026-06-24): L2 runtime interception is reframed from
+> *authoritative* to *convenience*; the object-capability **boundary is L3**. The
+> three-layer model below stands; what moves is where the guarantee rests.
+
 - Status: Accepted
 - Date: 2026-06-03
 - Context: agent-bridle confined shell (`agent-bridle-tool-shell`), `agent-bridle-core` Caveats gate
