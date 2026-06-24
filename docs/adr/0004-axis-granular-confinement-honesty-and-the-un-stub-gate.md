@@ -1,6 +1,6 @@
 # ADR 0004 — Axis-granular confinement honesty, the un-stub gate, and fence strength is derived (never domain-keyed)
 
-- Status: Proposed
+- Status: Accepted (ratified 2026-06-24)
 - Date: 2026-06-24
 - Context: `agent-bridle-core` `LandlockSandbox` (the `fs_write` first increment,
   I10) and result-envelope `sandbox_kind` (I9); `agent-bridle-tool-shell` (the
@@ -142,10 +142,22 @@ loadouts). We adopt three rules so strength can never be set by the wrong thing:
 - **No new security vocabulary per tool** (ADR 0002 consequence) — D1/D3 live in
   `agent-bridle-core` over `Caveats`; a tool still only declares `required` and
   reads its `ToolContext` + the report.
-- This ADR is **Proposed**: it adds `Planned` refinements (D1 primitive may land
-  ahead of the shell; D2/D3 land with the un-stub) and downgrades nothing. When
-  the real shell lands, the relevant ADR 0002 invariants move *up* the ladder
-  per D1/D2, never silently (ADR 0003's revisit rule).
+- This ADR is **Accepted** (ratified 2026-06-24): it adds `Planned` refinements
+  (D1 primitive may land ahead of the shell; D2/D3 land with the un-stub) and
+  downgrades nothing. When the real shell lands, the relevant ADR 0002 invariants
+  move *up* the ladder per D1/D2, never silently (ADR 0003's revisit rule).
+
+## Tracking (so the decision cannot rot into prose)
+
+Each decision has a tracking issue; the honesty rule (D1/I9) and the un-stub gate
+(D2) are release-blocking, not aspirational:
+
+- **D1** — axis-granular confinement report: agent-bridle#30.
+- **D2** — the un-stub gate (no confinement regression below the fail-closed
+  stub): agent-bridle#31. **Gates #20** (restore full `CommandInterceptor` once
+  reubeno/brush#1184 merges); relates to #28.
+- **D3** — fence strength derived from `Caveats`, never domain-keyed:
+  agent-bridle#32.
 
 ## Alternatives considered
 
