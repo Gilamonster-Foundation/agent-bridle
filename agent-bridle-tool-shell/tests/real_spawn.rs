@@ -301,3 +301,61 @@ async fn real_allowlisted_var_expands_from_the_environment() {
         "$HOME must expand to the env value: {out}"
     );
 }
+
+#[tokio::test]
+async fn real_stderr_redirect_to_file() {
+    // `cat <missing> 2> err` — cat's error goes to the file; captured stderr is
+    // empty (it was redirected), stdout empty, exit non-zero.
+    let path = unique_temp("err");
+    let p = path.to_string_lossy().into_owned();
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!("cat /nonexistent/agent-bridle 2> {p}")}),
+            &ctx(exec_only(&["cat"])),
+        )
+        .await
+        .expect("invoke");
+    assert_ne!(out["exit_code"], 0);
+    assert_eq!(out["stderr"], "", "stderr went to the file: {out}");
+    assert!(
+        !std::fs::read_to_string(&path).unwrap().is_empty(),
+        "the error must be in the file"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn real_2to1_merges_stderr_into_captured_stdout() {
+    // `cat <missing> 2>&1` — the error is merged into stdout (captured), so
+    // captured stdout is non-empty and captured stderr is empty.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "cat /nonexistent/agent-bridle 2>&1"}),
+            &ctx(exec_only(&["cat"])),
+        )
+        .await
+        .expect("invoke");
+    assert_ne!(out["exit_code"], 0);
+    assert!(
+        !out["stdout"].as_str().unwrap_or("").is_empty(),
+        "the error must appear on merged stdout: {out}"
+    );
+    assert_eq!(out["stderr"], "", "stderr was merged into stdout: {out}");
+}
+
+#[tokio::test]
+async fn real_2to1_before_a_pipe_feeds_stderr_downstream() {
+    // `cat <missing> 2>&1 | cat` — stage 0's stderr is merged into its stdout
+    // pipe, so stage 1 (cat) receives and re-emits the error to captured stdout.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "cat /nonexistent/agent-bridle 2>&1 | cat"}),
+            &ctx(exec_only(&["cat"])),
+        )
+        .await
+        .expect("invoke");
+    assert!(
+        !out["stdout"].as_str().unwrap_or("").is_empty(),
+        "stderr merged into the pipe must reach the downstream stage: {out}"
+    );
+}

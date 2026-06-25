@@ -11,16 +11,16 @@
 //! *advisory*: the result's `sandbox_kind` reports what actually enforced it
 //! (I9), today [`agent_bridle_core::SandboxKind::None`].
 //!
-//! **Increments 1–6** of agent-bridle#34 (Track A complete): a sequence of
-//! pipelines joined by `&&`/`||`/`;` (short-circuit semantics), each pipeline
-//! simple commands with quoted arguments, **file redirections** (`> out`,
-//! `>> out`, `< in`), **filename globbing** (`*`/`?`/`[…]`) and **allowlisted
-//! `$VAR` expansion** — every filesystem/env touch bridle performs (redirect
-//! opens, glob directory listings, variable allowlist) is leash-/policy-checked
-//! before any spawn. The dynamic constructs (`$(…)`, backticks, subshells) stay
-//! refused by design. The process spawning is behind a `Spawner` seam (mocked in
-//! unit tests; real path in `tests/real_spawn.rs`). `brush-bridle-core` remains
-//! the deferred, reversible
+//! The engine (agent-bridle#34 Track A + #45): a sequence of pipelines joined by
+//! `&&`/`||`/`;` (short-circuit semantics), each pipeline simple commands with
+//! quoted arguments, **redirections** (`> out`, `>> out`, `< in`, `2> err`,
+//! `2>&1`), **filename globbing** (`*`/`?`/`[…]`) and **allowlisted `$VAR`
+//! expansion** — every filesystem/env touch bridle performs (redirect opens,
+//! glob directory listings, variable allowlist) is leash-/policy-checked before
+//! any spawn. The dynamic constructs (`$(…)`, backticks, subshells) stay refused
+//! by design. The process spawning is behind a `Spawner` seam (mocked in unit
+//! tests; real path in `tests/real_spawn.rs`). `brush-bridle-core` remains the
+//! deferred, reversible
 //! full-bash alternative engine behind the same registry seam (ADR 0005 D4 —
 //! tracked on agent-bridle#20).
 

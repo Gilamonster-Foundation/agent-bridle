@@ -8,21 +8,22 @@
 //! *advisory*: the result's `sandbox_kind` reports what actually enforced it (I9),
 //! today [`SandboxKind::None`].
 //!
-//! **Increments 1–6** of agent-bridle#34 (Track A complete): a sequence of
-//! pipelines joined by `&&`/`||`/`;`, each pipeline simple commands with quoted
-//! arguments, file redirections (`> out`, `>> out`, `< in`), filename globbing
+//! The engine (agent-bridle#34 Track A + #45): a sequence of pipelines joined by
+//! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments,
+//! redirections (`> out`, `>> out`, `< in`, `2> err`, `2>&1`), filename globbing
 //! (`*`/`?`/`[…]`), and **allowlisted `$VAR` expansion**. Because `agent-bridle`
 //! performs each redirect's open and each glob's directory listing itself, those
 //! filesystem touches are leash-checked (`fs_write`/`fs_read`) *before any stage
 //! spawns*; a `$VAR` is expanded only if its name is on a small secret-free
 //! allowlist ([`VAR_ALLOWLIST`]), checked before any spawn — a real enforcement
-//! point, unlike a spawned program's own opens (L3's job). Process spawning is
-//! behind a [`Spawner`] seam (mocked in unit tests; real path in
+//! point, unlike a spawned program's own opens (L3's job). `2>&1` uses a shared
+//! `std::io::pipe()` writer cloned into both stdout and stderr. Process spawning
+//! is behind a [`Spawner`] seam (mocked in unit tests; real path in
 //! `tests/real_spawn.rs`).
 
-use std::io::Read;
+use std::io::{PipeReader, PipeWriter, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use agent_bridle_core::{
 };
 use async_trait::async_trait;
 
-use crate::parse::{classify, Arg, Command, Redirect, Refusal, Script, ScriptItem, Sep};
+use crate::parse::{classify, Arg, Command, Redirect, Refusal, Script, ScriptItem, Sep, StderrTo};
 
 /// Maximum permitted (and default-clamped) wall-clock timeout.
 const MAX_TIMEOUT_SECS: u64 = 300;
@@ -137,14 +138,14 @@ impl Tool for ShellTool {
                 "cmd": {
                     "type": "string",
                     "description": "Free-form command line run by the confined safe-subset engine: \
-                        pipelines (a | b) joined by &&/||/;, with quoted arguments, file \
-                        redirections (> out, >> out, < in; targets gated by fs_write/fs_read), and \
+                        pipelines (a | b) joined by &&/||/;, with quoted arguments, redirections \
+                        (> out, >> out, < in, 2> err, 2>&1; file targets gated by fs_write/fs_read), \
                         filename globbing (*, ?, [..]; gated by fs_read on the listed directory), \
                         and whole-word $VAR/${VAR} expansion for an allowlisted, secret-free set \
                         (HOME, PWD, USER, TMPDIR, ...). Dynamic constructs ($(...), backticks, \
                         subshells) are refused by design; a $VAR mixed into a word, quoted, or \
-                        outside the allowlist, and fd-number redirections (2>, 2>&1), are refused. \
-                        Mutually exclusive with `program`."
+                        outside the allowlist, and fd redirections other than 1>/2>/0</2>&1, \
+                        are refused. Mutually exclusive with `program`."
                 },
                 "cwd": {
                     "type": "string",
@@ -239,10 +240,12 @@ impl Tool for ShellTool {
                 }
                 for redirect in &stage.redirects {
                     let (path, checked) = match redirect {
-                        Redirect::Stdout { path, .. } => {
+                        Redirect::Stdout { path, .. } | Redirect::Stderr { path, .. } => {
                             (path, cx.check_path_write(Path::new(path)))
                         }
                         Redirect::Stdin { path } => (path, cx.check_path_read(Path::new(path))),
+                        // `2>&1` opens no file — nothing to leash-check.
+                        Redirect::StderrToStdout => continue,
                     };
                     if let Err(e) = checked {
                         return Ok(deny(sandbox_kind, DenialKind::Open, path, &e));
@@ -600,11 +603,18 @@ fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
 fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
+    let last = n - 1;
 
     let mut children: Vec<Child> = Vec::with_capacity(n);
-    let mut prev_stdout: Option<ChildStdout> = None;
+    // The read end feeding the NEXT stage's stdin (from the prior stage's stdout).
+    let mut prev_stdin: Option<PipeReader> = None;
+    // The read end capturing final stdout (last stage, when not redirected).
+    let mut stdout_capture: Option<PipeReader> = None;
+    // Reader threads for stages whose stderr is captured separately.
+    let mut stderr_threads: Vec<std::thread::JoinHandle<Vec<u8>>> = Vec::new();
 
     for (i, stage) in stages.iter().enumerate() {
+        let is_last = i == last;
         let argv = expand_stage_argv(stage, cwd);
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
@@ -612,79 +622,85 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
             cmd.current_dir(dir);
         }
 
-        // stdin: a `< file` redirect wins over the incoming pipe.
+        // ── stdin: a `< file` redirect wins over the incoming pipe ──────────
         if let Some(path) = stage.stdin_path() {
-            let file = match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    kill_all(&mut children);
-                    return Err(ToolError::Exec(e));
-                }
-            };
+            let file = ok_or_kill(std::fs::File::open(path), &mut children)?;
             cmd.stdin(Stdio::from(file));
-            prev_stdout = None;
+            prev_stdin = None;
         } else {
-            cmd.stdin(match prev_stdout.take() {
-                Some(out) => Stdio::from(out),
+            cmd.stdin(match prev_stdin.take() {
+                Some(reader) => Stdio::from(reader),
                 None => Stdio::null(),
             });
         }
 
-        // stdout: a `> file` / `>> file` redirect wins over the pipe/capture.
-        let stdout_to_file = stage.stdout_redirect().is_some();
+        // ── stdout (+ the handle stderr clones for `2>&1`) ──────────────────
+        // A `> file` redirect goes to the file; otherwise a `std::io::pipe()` is
+        // used so its writer can be cloned for `2>&1` in any position.
+        let dup_source: DupSource;
         if let Some((path, append)) = stage.stdout_redirect() {
-            let file = match open_for_write(path, append) {
-                Ok(f) => f,
-                Err(e) => {
-                    kill_all(&mut children);
-                    return Err(ToolError::Exec(e));
-                }
-            };
+            let file = ok_or_kill(open_for_write(path, append), &mut children)?;
+            let clone = ok_or_kill(file.try_clone(), &mut children)?;
             cmd.stdout(Stdio::from(file));
+            dup_source = DupSource::File(clone);
         } else {
-            cmd.stdout(Stdio::piped());
-        }
-        cmd.stderr(Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                kill_all(&mut children);
-                return Err(ToolError::Exec(e));
+            let (reader, writer) = ok_or_kill(std::io::pipe(), &mut children)?;
+            let clone = ok_or_kill(writer.try_clone(), &mut children)?;
+            cmd.stdout(Stdio::from(writer));
+            if is_last {
+                stdout_capture = Some(reader);
+            } else {
+                prev_stdin = Some(reader);
             }
-        };
+            dup_source = DupSource::Pipe(clone);
+        }
 
-        if !stdout_to_file && i + 1 < n {
-            prev_stdout = child.stdout.take();
+        // ── stderr ──────────────────────────────────────────────────────────
+        match stage.stderr_disposition() {
+            // `2>&1`: stderr writes to the stdout destination (the dup is moved
+            // into the child; nothing captured separately).
+            StderrTo::Stdout => match dup_source {
+                DupSource::File(f) => {
+                    cmd.stderr(Stdio::from(f));
+                }
+                DupSource::Pipe(w) => {
+                    cmd.stderr(Stdio::from(w));
+                }
+            },
+            // `2> file`: stderr to its own file.
+            StderrTo::File { path, append } => {
+                let file = ok_or_kill(open_for_write(&path, append), &mut children)?;
+                cmd.stderr(Stdio::from(file));
+                // `dup_source` is dropped here (unused) — never retain a writer.
+            }
+            // Default: capture stderr separately via a piped fd.
+            StderrTo::Capture => {
+                cmd.stderr(Stdio::piped());
+            }
+        }
+
+        let mut child = ok_or_kill(cmd.spawn(), &mut children)?;
+
+        if matches!(stage.stderr_disposition(), StderrTo::Capture) {
+            let mut err = child.stderr.take().expect("stderr is piped");
+            stderr_threads.push(std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = err.read_to_end(&mut buf);
+                buf
+            }));
         }
         children.push(child);
     }
 
-    // Drain every stage's stderr concurrently.
-    let mut stderr_readers = Vec::with_capacity(n);
-    for child in &mut children {
-        let mut err = child.stderr.take().expect("stderr is piped");
-        stderr_readers.push(std::thread::spawn(move || {
+    // The parent now holds no pipe writers, so a captured reader sees EOF once
+    // the child(ren) exit. Drain stdout concurrently with waiting.
+    let stdout_thread = stdout_capture.map(|mut reader| {
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = err.read_to_end(&mut buf);
+            let _ = reader.read_to_end(&mut buf);
             buf
-        }));
-    }
-    // Drain the last stage's stdout, unless it went to a file.
-    let last = n - 1;
-    let stdout_reader = if stages[last].stdout_redirect().is_none() {
-        let mut out = children[last]
-            .stdout
-            .take()
-            .expect("last stage stdout is piped");
-        Some(std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            buf
-        }))
-    } else {
-        None
-    };
+        })
+    });
 
     // Wait all stages; the pipeline's exit code is the last stage's.
     let mut exit_code = -1;
@@ -695,16 +711,31 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
         }
     }
 
-    let stdout = stdout_reader.map_or_else(Vec::new, |h| h.join().unwrap_or_default());
+    let stdout = stdout_thread.map_or_else(Vec::new, |h| h.join().unwrap_or_default());
     let mut stderr = Vec::new();
-    for reader in stderr_readers {
-        stderr.extend(reader.join().unwrap_or_default());
+    for h in stderr_threads {
+        stderr.extend(h.join().unwrap_or_default());
     }
 
     Ok(Captured {
         exit_code,
         stdout: capped_utf8(&stdout),
         stderr: capped_utf8(&stderr),
+    })
+}
+
+/// What a stage's stderr clones from for `2>&1` (the stdout destination).
+enum DupSource {
+    File(std::fs::File),
+    Pipe(PipeWriter),
+}
+
+/// Map an `io::Result`, killing already-spawned children on error so a failure
+/// mid-pipeline never orphans processes.
+fn ok_or_kill<T>(result: std::io::Result<T>, children: &mut [Child]) -> ToolResult<T> {
+    result.map_err(|e| {
+        kill_all(children);
+        ToolError::Exec(e)
     })
 }
 
@@ -934,6 +965,45 @@ mod tests {
             .expect("invoke");
         assert_eq!(out["denied"], true);
         assert!(ran_programs(&mock).is_empty());
+    }
+
+    // ── stderr redirects / 2>&1 (issue #45) ─────────────────────────────────
+
+    /// A `2> file` target is leash-checked (`fs_write`) before any spawn.
+    #[tokio::test]
+    async fn stderr_to_file_out_of_scope_denied() {
+        let mock = Arc::new(MockSpawner::default());
+        let granted = Caveats {
+            exec: Scope::only(["cmd".to_string()]),
+            fs_write: Scope::only([std::env::temp_dir().to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "cmd 2> /etc/passwd"}),
+                &ctx(granted),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true);
+        assert_eq!(out["denials"][0]["kind"], "open");
+        assert_eq!(out["denials"][0]["target"], "/etc/passwd");
+        assert!(ran_programs(&mock).is_empty());
+    }
+
+    /// `2>&1` parses to a merge and reaches the spawner (no separate file open).
+    #[tokio::test]
+    async fn stderr_merge_reaches_spawner() {
+        let mock = Arc::new(MockSpawner::default());
+        ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "cmd 2>&1"}),
+                &ctx(exec_only(&["cmd"])),
+            )
+            .await
+            .expect("invoke");
+        let c = calls(&mock);
+        assert_eq!(c[0][0].stderr_disposition(), StderrTo::Stdout);
     }
 
     #[tokio::test]
