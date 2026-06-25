@@ -197,3 +197,51 @@ async fn real_pipeline_with_stdout_redirect_on_last_stage() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn real_and_chain_runs_then_short_circuits() {
+    // `true && echo ran` → echo runs.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "true && echo ran"}),
+            &ctx(exec_only(&["true", "echo"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["stdout"], "ran\n");
+    assert_eq!(out["exit_code"], 0);
+
+    // `false && echo nope` → echo is skipped; exit is `false`'s.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "false && echo nope"}),
+            &ctx(exec_only(&["false", "echo"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["stdout"], "", "echo must be skipped: {out}");
+    assert_eq!(out["exit_code"], 1);
+}
+
+#[tokio::test]
+async fn real_or_fallback_and_semicolon_sequence() {
+    // `false || echo fallback` → fallback runs.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "false || echo fallback"}),
+            &ctx(exec_only(&["false", "echo"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["stdout"], "fallback\n");
+
+    // `echo a ; echo b` → both run, output concatenated in order.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "echo a ; echo b"}),
+            &ctx(exec_only(&["echo"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["stdout"], "a\nb\n");
+}

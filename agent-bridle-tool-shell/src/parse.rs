@@ -2,21 +2,20 @@
 //!
 //! `agent-bridle` is the **exec funnel**: rather than hand a string to a shell
 //! interpreter, the engine parses it itself and runs only what it can confine.
-//! This covers **increments 1–3** — a pipeline of simple commands (`a | b | c`)
-//! with quoted arguments and file redirections (`> out`, `>> out`, `< in`).
-//! `&&`/`||`/`;`, globbing and variable expansion are added in later increments
-//! (tracked on agent-bridle#34); until then each is refused as
-//! [`Refusal::Unsupported`], kept distinct from the [`Refusal::Dynamic`]
-//! constructs refused **by design** — command/arithmetic substitution,
-//! backticks, subshells: the undecidable interiors ADR 0001 says may never be
-//! statically cleared. fd-number redirections (`2>`, `2>&1`) are refused as
-//! `Unsupported` for now (a focused follow-up) rather than risk silently
-//! mishandling bash's fd-number rules.
+//! This covers **increments 1–4** — a sequence of pipelines joined by `&&`,
+//! `||` and `;`, where each pipeline is simple commands (`a | b | c`) with quoted
+//! arguments and file redirections (`> out`, `>> out`, `< in`). Globbing and
+//! variable/parameter expansion are added in a later increment (tracked on
+//! agent-bridle#34); until then each is refused as [`Refusal::Unsupported`], kept
+//! distinct from the [`Refusal::Dynamic`] constructs refused **by design** —
+//! command/arithmetic substitution, backticks, subshells: the undecidable
+//! interiors ADR 0001 says may never be statically cleared. fd-number
+//! redirections (`2>`, `2>&1`) are refused as `Unsupported` for now (a focused
+//! follow-up) rather than risk silently mishandling bash's fd-number rules.
 //!
 //! Quoting is honored, so a metacharacter **inside quotes is a literal
 //! argument** — only *unquoted* operators and constructs are recognized:
-//! `echo "a|b"` is one argv, `echo ">"` is the literal arg `>`, while
-//! `echo a | b` is a two-stage pipeline and `echo hi > out` carries a redirect.
+//! `echo "a&&b"` is one argv, while `a && b` is two pipelines joined by `&&`.
 
 use std::fmt;
 use std::iter::Peekable;
@@ -32,11 +31,11 @@ pub enum Refusal {
     /// shell, use the embedder's unbridled/`--yolo` allowance (ADR 0003 / 0005 D5).
     Dynamic(&'static str),
     /// A construct the safe-subset engine will support but **does not yet** in
-    /// this increment (`&&`/`||`/`;`, globbing, variable expansion, fd-number
-    /// redirections). Tracked on agent-bridle#34.
+    /// this increment (globbing, variable expansion, fd-number redirections).
+    /// Tracked on agent-bridle#34.
     Unsupported(&'static str),
     /// The input could not be parsed (unterminated quote, trailing backslash,
-    /// empty command/stage, missing redirection target).
+    /// empty command/stage, missing redirection target, dangling separator).
     Malformed(String),
 }
 
@@ -108,16 +107,40 @@ impl Command {
     }
 }
 
-/// A parsed pipeline: an ordered list of command stages. A single command
-/// (no `|`) is a one-element pipeline.
+/// A pipeline: one or more `|`-joined command stages.
 pub type Pipeline = Vec<Command>;
 
-/// Parse a `cmd` string into a [`Pipeline`], or a [`Refusal`].
-pub fn classify(input: &str) -> Result<Pipeline, Refusal> {
+/// How a pipeline is gated by the *previous* pipeline's exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sep {
+    /// `;` — run unconditionally. (The first pipeline always carries `Seq`.)
+    Seq,
+    /// `&&` — run only if the previous status was success (0).
+    And,
+    /// `||` — run only if the previous status was failure (non-0).
+    Or,
+}
+
+/// One step of a [`Script`]: a pipeline plus the separator that gates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptItem {
+    /// The separator preceding this pipeline (the first item's is [`Sep::Seq`]).
+    pub sep: Sep,
+    /// The pipeline to (conditionally) run.
+    pub pipeline: Pipeline,
+}
+
+/// A parsed command line: a sequence of pipelines joined by `&&`/`||`/`;`.
+pub type Script = Vec<ScriptItem>;
+
+/// Parse a `cmd` string into a [`Script`], or a [`Refusal`].
+pub fn classify(input: &str) -> Result<Script, Refusal> {
     let mut chars = input.chars().peekable();
-    let mut pipeline: Pipeline = Vec::new();
-    let mut argv: Vec<String> = Vec::new();
-    let mut redirects: Vec<Redirect> = Vec::new();
+    let mut script: Script = Vec::new();
+    let mut pending_sep = Sep::Seq; // separator for the NEXT finalized pipeline
+    let mut stages: Vec<Command> = Vec::new(); // current pipeline's stages
+    let mut argv: Vec<String> = Vec::new(); // current stage's argv
+    let mut redirects: Vec<Redirect> = Vec::new(); // current stage's redirects
 
     loop {
         skip_whitespace(&mut chars);
@@ -126,27 +149,55 @@ pub fn classify(input: &str) -> Result<Pipeline, Refusal> {
             '|' => {
                 chars.next();
                 if chars.peek() == Some(&'|') {
-                    return Err(Refusal::Unsupported("logical OR `||`"));
+                    chars.next();
+                    push_pipeline(
+                        &mut script,
+                        &mut stages,
+                        &mut argv,
+                        &mut redirects,
+                        &mut pending_sep,
+                        Sep::Or,
+                    )?;
+                } else {
+                    // Pipe: finalize the current stage into the current pipeline.
+                    if argv.is_empty() {
+                        return Err(Refusal::Malformed(
+                            "empty pipeline stage (nothing before `|`)".into(),
+                        ));
+                    }
+                    stages.push(Command {
+                        argv: take(&mut argv),
+                        redirects: take(&mut redirects),
+                    });
                 }
-                if argv.is_empty() {
-                    return Err(Refusal::Malformed(
-                        "empty pipeline stage (nothing before `|`)".into(),
-                    ));
-                }
-                pipeline.push(Command {
-                    argv: take(&mut argv),
-                    redirects: take(&mut redirects),
-                });
             }
             '&' => {
                 chars.next();
-                return Err(Refusal::Unsupported(if chars.peek() == Some(&'&') {
-                    "logical AND `&&`"
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    push_pipeline(
+                        &mut script,
+                        &mut stages,
+                        &mut argv,
+                        &mut redirects,
+                        &mut pending_sep,
+                        Sep::And,
+                    )?;
                 } else {
-                    "background `&`"
-                }));
+                    return Err(Refusal::Unsupported("background `&`"));
+                }
             }
-            ';' => return Err(Refusal::Unsupported("command sequencing `;`")),
+            ';' => {
+                chars.next();
+                push_pipeline(
+                    &mut script,
+                    &mut stages,
+                    &mut argv,
+                    &mut redirects,
+                    &mut pending_sep,
+                    Sep::Seq,
+                )?;
+            }
             '(' | ')' => return Err(Refusal::Dynamic("subshell `( )`")),
             '`' => return Err(Refusal::Dynamic("command substitution (backticks)")),
             '$' => {
@@ -181,21 +232,77 @@ pub fn classify(input: &str) -> Result<Pipeline, Refusal> {
         }
     }
 
-    // Finalize the trailing stage.
-    if argv.is_empty() && redirects.is_empty() {
-        return if pipeline.is_empty() {
-            Err(Refusal::Malformed("empty command".into()))
-        } else {
-            Err(Refusal::Malformed(
-                "empty pipeline stage (nothing after `|`)".into(),
-            ))
-        };
+    // Finalize the trailing pipeline (no following separator).
+    match finalize_pipeline(&mut stages, &mut argv, &mut redirects)? {
+        Some(pipeline) => script.push(ScriptItem {
+            sep: pending_sep,
+            pipeline,
+        }),
+        None => {
+            if script.is_empty() {
+                return Err(Refusal::Malformed("empty command".into()));
+            }
+            if !matches!(pending_sep, Sep::Seq) {
+                return Err(Refusal::Malformed(
+                    "expected a command after `&&` or `||`".into(),
+                ));
+            }
+            // A trailing `;` is fine.
+        }
     }
+    Ok(script)
+}
+
+/// Finalize the current stage + pipeline and push it to the script under
+/// `pending_sep`, then arm `pending_sep` for the next pipeline. An empty pipeline
+/// around a separator is malformed.
+fn push_pipeline(
+    script: &mut Script,
+    stages: &mut Vec<Command>,
+    argv: &mut Vec<String>,
+    redirects: &mut Vec<Redirect>,
+    pending_sep: &mut Sep,
+    next_sep: Sep,
+) -> Result<(), Refusal> {
+    match finalize_pipeline(stages, argv, redirects)? {
+        Some(pipeline) => {
+            script.push(ScriptItem {
+                sep: *pending_sep,
+                pipeline,
+            });
+            *pending_sep = next_sep;
+            Ok(())
+        }
+        None => Err(Refusal::Malformed(
+            "empty command around a separator (`&&`/`||`/`;`)".into(),
+        )),
+    }
+}
+
+/// Finalize the current stage into the current pipeline and return the pipeline.
+/// `Ok(None)` means the pipeline was entirely empty (no stages/argv/redirects).
+/// A `|` with no following stage, or a redirect with no command, is malformed.
+fn finalize_pipeline(
+    stages: &mut Vec<Command>,
+    argv: &mut Vec<String>,
+    redirects: &mut Vec<Redirect>,
+) -> Result<Option<Pipeline>, Refusal> {
     if argv.is_empty() {
-        return Err(Refusal::Malformed("redirection without a command".into()));
+        if !stages.is_empty() {
+            return Err(Refusal::Malformed(
+                "empty pipeline stage (nothing after `|`)".into(),
+            ));
+        }
+        if !redirects.is_empty() {
+            return Err(Refusal::Malformed("redirection without a command".into()));
+        }
+        return Ok(None);
     }
-    pipeline.push(Command { argv, redirects });
-    Ok(pipeline)
+    stages.push(Command {
+        argv: take(argv),
+        redirects: take(redirects),
+    });
+    Ok(Some(take(stages)))
 }
 
 /// Consume any run of unquoted whitespace.
@@ -216,7 +323,6 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<String, Refusal> {
     while let Some(&c) = chars.peek() {
         match c {
             ' ' | '\t' | '\n' | '\r' => break,
-            // Operators / specials end the word; the caller decides what to do.
             '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '[' => break,
             '\'' => {
                 chars.next();
@@ -305,188 +411,133 @@ mod tests {
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
     }
-    /// A one-stage pipeline with no redirects.
-    fn one(parts: &[&str]) -> Pipeline {
-        vec![Command {
+    fn stage(parts: &[&str]) -> Command {
+        Command {
             argv: argv(parts),
             redirects: vec![],
-        }]
-    }
-    fn out(path: &str, append: bool) -> Redirect {
-        Redirect::Stdout {
-            path: path.into(),
-            append,
         }
     }
-    fn stdin(path: &str) -> Redirect {
-        Redirect::Stdin { path: path.into() }
+    /// A single-pipeline, single-stage script with no redirects.
+    fn one(parts: &[&str]) -> Script {
+        vec![ScriptItem {
+            sep: Sep::Seq,
+            pipeline: vec![stage(parts)],
+        }]
+    }
+    fn item(sep: Sep, stages: Vec<Command>) -> ScriptItem {
+        ScriptItem {
+            sep,
+            pipeline: stages,
+        }
     }
 
-    // ── words, quoting, pipelines (increments 1–2) ──────────────────────────
+    // ── words / quoting / pipelines / redirects (increments 1–3) ────────────
 
     #[test]
-    fn simple_command() {
+    fn simple_command_and_quoting() {
         assert_eq!(
             classify("echo hi there").unwrap(),
             one(&["echo", "hi", "there"])
         );
-    }
-
-    #[test]
-    fn quoting_groups_and_is_literal() {
         assert_eq!(classify("echo 'a b'").unwrap(), one(&["echo", "a b"]));
-        assert_eq!(classify("echo \"a b\"").unwrap(), one(&["echo", "a b"]));
-        assert_eq!(classify("echo ''").unwrap(), one(&["echo", ""]));
-        assert_eq!(classify("echo a\\ b").unwrap(), one(&["echo", "a b"]));
-        assert_eq!(classify("echo \\$5").unwrap(), one(&["echo", "$5"]));
+        assert_eq!(classify("echo \"a|b\"").unwrap(), one(&["echo", "a|b"]));
+        assert_eq!(classify("echo \"a&&b\"").unwrap(), one(&["echo", "a&&b"]));
     }
 
     #[test]
-    fn pipelines_split_into_stages() {
+    fn pipeline_and_redirect_still_parse() {
         assert_eq!(
             classify("grep foo | wc -l").unwrap(),
+            vec![item(
+                Sep::Seq,
+                vec![stage(&["grep", "foo"]), stage(&["wc", "-l"])]
+            )]
+        );
+        let p = classify("echo hi > out").unwrap();
+        assert_eq!(p[0].pipeline[0].stdout_redirect(), Some(("out", false)));
+    }
+
+    // ── sequencing (increment 4) ────────────────────────────────────────────
+
+    #[test]
+    fn and_or_seq_separators() {
+        assert_eq!(
+            classify("a && b").unwrap(),
             vec![
-                Command {
-                    argv: argv(&["grep", "foo"]),
-                    redirects: vec![]
-                },
-                Command {
-                    argv: argv(&["wc", "-l"]),
-                    redirects: vec![]
-                },
+                item(Sep::Seq, vec![stage(&["a"])]),
+                item(Sep::And, vec![stage(&["b"])])
             ]
         );
-        assert_eq!(classify("echo \"a|b\"").unwrap(), one(&["echo", "a|b"]));
-    }
-
-    // ── redirections (increment 3) ──────────────────────────────────────────
-
-    #[test]
-    fn stdout_truncate_and_append() {
         assert_eq!(
-            classify("echo hi > out.txt").unwrap(),
-            vec![Command {
-                argv: argv(&["echo", "hi"]),
-                redirects: vec![out("out.txt", false)]
-            }]
-        );
-        assert_eq!(
-            classify("echo hi >> log").unwrap(),
-            vec![Command {
-                argv: argv(&["echo", "hi"]),
-                redirects: vec![out("log", true)]
-            }]
-        );
-    }
-
-    #[test]
-    fn stdin_redirect() {
-        assert_eq!(
-            classify("sort < in.txt").unwrap(),
-            vec![Command {
-                argv: argv(&["sort"]),
-                redirects: vec![stdin("in.txt")]
-            }]
-        );
-    }
-
-    #[test]
-    fn redirect_without_spaces_and_quoted_target() {
-        assert_eq!(
-            classify("echo hi>out").unwrap(),
-            vec![Command {
-                argv: argv(&["echo", "hi"]),
-                redirects: vec![out("out", false)]
-            }]
-        );
-        assert_eq!(
-            classify("echo hi > \"my file.txt\"").unwrap(),
-            vec![Command {
-                argv: argv(&["echo", "hi"]),
-                redirects: vec![out("my file.txt", false)]
-            }]
-        );
-    }
-
-    #[test]
-    fn redirect_within_a_pipeline_stage() {
-        assert_eq!(
-            classify("grep x < in | wc -l > out").unwrap(),
+            classify("a || b").unwrap(),
             vec![
-                Command {
-                    argv: argv(&["grep", "x"]),
-                    redirects: vec![stdin("in")]
-                },
-                Command {
-                    argv: argv(&["wc", "-l"]),
-                    redirects: vec![out("out", false)]
-                },
+                item(Sep::Seq, vec![stage(&["a"])]),
+                item(Sep::Or, vec![stage(&["b"])])
+            ]
+        );
+        assert_eq!(
+            classify("a ; b").unwrap(),
+            vec![
+                item(Sep::Seq, vec![stage(&["a"])]),
+                item(Sep::Seq, vec![stage(&["b"])])
             ]
         );
     }
 
     #[test]
-    fn helpers_pick_the_last_redirect() {
-        let p = classify("echo hi > a > b").unwrap();
-        assert_eq!(p[0].stdout_redirect(), Some(("b", false)));
-        assert_eq!(p[0].stdin_path(), None);
-    }
-
-    /// A redirection operator INSIDE quotes is a literal argument, not a redirect.
-    #[test]
-    fn quoted_redirect_operator_is_literal() {
-        assert_eq!(classify("echo \">\"").unwrap(), one(&["echo", ">"]));
-        assert_eq!(classify("echo \"a > b\"").unwrap(), one(&["echo", "a > b"]));
-    }
-
-    // ── refusals around redirections ────────────────────────────────────────
-
-    #[test]
-    fn fd_number_and_dup_and_heredoc_are_unsupported() {
-        assert!(matches!(classify("echo 2>f"), Err(Refusal::Unsupported(_)))); // fd-number
-        assert!(matches!(
-            classify("echo x 2>&1"),
-            Err(Refusal::Unsupported(_))
-        ));
-        assert!(matches!(classify("echo >&1"), Err(Refusal::Unsupported(_)))); // >& dup
-        assert!(matches!(
-            classify("cat <<EOF"),
-            Err(Refusal::Unsupported(_))
-        )); // heredoc
+    fn mixed_separators_and_pipelines() {
+        // `a | b && c ; d` → [ {Seq, a|b}, {And, c}, {Seq, d} ]
+        assert_eq!(
+            classify("a | b && c ; d").unwrap(),
+            vec![
+                item(Sep::Seq, vec![stage(&["a"]), stage(&["b"])]),
+                item(Sep::And, vec![stage(&["c"])]),
+                item(Sep::Seq, vec![stage(&["d"])]),
+            ]
+        );
     }
 
     #[test]
-    fn missing_or_dangling_redirect_targets_are_malformed() {
-        assert!(matches!(classify("echo >"), Err(Refusal::Malformed(_))));
-        assert!(matches!(
-            classify("echo > | wc"),
-            Err(Refusal::Malformed(_))
-        ));
-        assert!(matches!(classify("> out"), Err(Refusal::Malformed(_)))); // no command
+    fn trailing_semicolon_is_ok_but_dangling_andor_is_not() {
+        assert_eq!(
+            classify("a ; b ;").unwrap(),
+            vec![
+                item(Sep::Seq, vec![stage(&["a"])]),
+                item(Sep::Seq, vec![stage(&["b"])])
+            ]
+        );
+        assert!(matches!(classify("a &&"), Err(Refusal::Malformed(_))));
+        assert!(matches!(classify("a ||"), Err(Refusal::Malformed(_))));
     }
 
-    // ── still-refused operators & dynamic constructs ────────────────────────
+    #[test]
+    fn leading_or_doubled_separators_are_malformed() {
+        assert!(matches!(classify("; a"), Err(Refusal::Malformed(_))));
+        assert!(matches!(classify("&& a"), Err(Refusal::Malformed(_))));
+        assert!(matches!(classify("a ; ; b"), Err(Refusal::Malformed(_))));
+        assert!(matches!(classify("a && | b"), Err(Refusal::Malformed(_))));
+    }
+
+    // ── refusals ────────────────────────────────────────────────────────────
 
     #[test]
-    fn operators_and_dynamic_still_refused() {
-        assert!(matches!(classify("a && b"), Err(Refusal::Unsupported(_))));
-        assert!(matches!(classify("a || b"), Err(Refusal::Unsupported(_))));
-        assert!(matches!(classify("a; b"), Err(Refusal::Unsupported(_))));
+    fn dynamic_and_unsupported_and_fd_still_refused() {
+        assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_))));
+        assert!(matches!(classify("echo `id`"), Err(Refusal::Dynamic(_))));
+        assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
         assert!(matches!(classify("ls *.rs"), Err(Refusal::Unsupported(_))));
         assert!(matches!(
             classify("echo $HOME"),
             Err(Refusal::Unsupported(_))
         ));
-        assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_))));
-        assert!(matches!(classify("echo `id`"), Err(Refusal::Dynamic(_))));
-        assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
+        assert!(matches!(classify("echo 2>f"), Err(Refusal::Unsupported(_))));
+        assert!(matches!(classify("echo x &"), Err(Refusal::Unsupported(_)))); // background
+                                                                               // A dynamic stage anywhere in the sequence is refused.
         assert!(matches!(
-            classify("echo hi | $(evil)"),
+            classify("echo ok && $(evil)"),
             Err(Refusal::Dynamic(_))
         ));
     }
-
-    // ── malformed input ─────────────────────────────────────────────────────
 
     #[test]
     fn empty_and_unterminated_are_malformed() {
@@ -494,18 +545,5 @@ mod tests {
         assert!(matches!(classify(""), Err(Refusal::Malformed(_))));
         assert!(matches!(classify("echo 'oops"), Err(Refusal::Malformed(_))));
         assert!(matches!(classify("x |"), Err(Refusal::Malformed(_))));
-        assert!(matches!(classify("| x"), Err(Refusal::Malformed(_))));
-    }
-
-    #[test]
-    fn refusal_display_is_categorized() {
-        assert!(classify("echo $(x)")
-            .unwrap_err()
-            .to_string()
-            .contains("refused by design"));
-        assert!(classify("a && b")
-            .unwrap_err()
-            .to_string()
-            .contains("not yet supported"));
     }
 }

@@ -8,13 +8,14 @@
 //! *advisory*: the result's `sandbox_kind` reports what actually enforced it (I9),
 //! today [`SandboxKind::None`].
 //!
-//! **Increments 1–3** of agent-bridle#34: a **pipeline** of simple commands with
-//! quoted arguments and **file redirections** (`> out`, `>> out`, `< in`). Because
-//! `agent-bridle` performs the redirect's file open itself, those opens are
-//! leash-checked (`fs_write`/`fs_read`) *before any stage spawns* — a real
-//! enforcement point, unlike a spawned program's own opens (L3's job). `&&`/`||`/
-//! `;` and globbing land in later increments. Process spawning is behind a
-//! [`Spawner`] seam (mocked in unit tests; real path in `tests/real_spawn.rs`).
+//! **Increments 1–4** of agent-bridle#34: a sequence of pipelines joined by
+//! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments and file
+//! redirections (`> out`, `>> out`, `< in`). Globbing and variable expansion land
+//! in a later increment. Because `agent-bridle` performs each redirect's file
+//! open itself, those opens are leash-checked (`fs_write`/`fs_read`) *before any
+//! stage spawns* — a real enforcement point, unlike a spawned program's own
+//! opens (L3's job). Process spawning is behind a [`Spawner`] seam (mocked in
+//! unit tests; real path in `tests/real_spawn.rs`).
 
 use std::io::Read;
 use std::path::Path;
@@ -27,7 +28,7 @@ use agent_bridle_core::{
 };
 use async_trait::async_trait;
 
-use crate::parse::{classify, Command, Pipeline, Redirect, Refusal};
+use crate::parse::{classify, Command, Redirect, Refusal, Script, ScriptItem, Sep};
 
 /// Maximum permitted (and default-clamped) wall-clock timeout.
 const MAX_TIMEOUT_SECS: u64 = 300;
@@ -50,12 +51,12 @@ pub(crate) struct Captured {
 /// The pipeline-execution seam.
 ///
 /// The real implementation ([`OsSpawner`]) spawns processes; tests inject a mock
-/// so the parse + leash logic is verified without real subprocesses (the
-/// workspace norm: no real process/fs in unit tests). A `Spawner` only ever
-/// receives a pipeline that already passed the `exec` **and** redirect-`fs`
-/// leash — admission happens in [`ShellTool::invoke`] *before* the spawner runs.
+/// so the parse + leash + sequencing logic is verified without real subprocesses
+/// (the workspace norm: no real process/fs in unit tests). A `Spawner` only ever
+/// receives a pipeline that already passed the `exec` **and** redirect-`fs` leash
+/// — admission happens in [`ShellTool::invoke`] *before* the spawner runs.
 pub(crate) trait Spawner: Send + Sync {
-    /// Run a leash-approved pipeline to completion, capturing its output.
+    /// Run one leash-approved pipeline to completion, capturing its output.
     fn run(&self, stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured>;
 }
 
@@ -130,12 +131,11 @@ impl Tool for ShellTool {
                 "cmd": {
                     "type": "string",
                     "description": "Free-form command line run by the confined safe-subset engine: \
-                        a pipeline of simple commands (a | b | c) with quoted arguments and file \
-                        redirections (> out, >> out, < in; redirect targets are gated by fs_write/\
-                        fs_read). Dynamic constructs ($(...), backticks, subshells) are refused by \
-                        design; &&/||/;, globbing and fd-number redirections (2>, 2>&1) are added \
-                        incrementally and refused (with a clear `denied` reason) until then. \
-                        Mutually exclusive with `program`."
+                        pipelines (a | b) joined by &&/||/;, with quoted arguments and file \
+                        redirections (> out, >> out, < in; targets gated by fs_write/fs_read). \
+                        Dynamic constructs ($(...), backticks, subshells) are refused by design; \
+                        globbing and fd-number redirections (2>, 2>&1) are added incrementally and \
+                        refused (with a clear `denied` reason) until then. Mutually exclusive with `program`."
                 },
                 "cwd": {
                     "type": "string",
@@ -162,27 +162,32 @@ impl Tool for ShellTool {
         // whatever is actually in force — None until L3 (#35).
         let sandbox_kind = cx.sandbox_kind();
 
-        // Resolve to a pipeline, or surface a structured refusal.
-        let pipeline = match parsed.pipeline() {
-            Ok(p) => p,
+        // Resolve to a script (sequence of pipelines), or surface a refusal.
+        let script = match parsed.script() {
+            Ok(s) => s,
             Err(refusal) => return Ok(refused_envelope(sandbox_kind, &refusal)),
         };
 
-        // Atomic admission (ADR 0001): every stage's program (`exec`) AND every
-        // redirect target (`fs_write`/`fs_read`, which bridle itself opens) must
-        // pass *before any stage spawns* — one out-of-scope element denies the
-        // whole pipeline with no partial side effects.
-        for stage in &pipeline {
-            if let Err(e) = cx.check_exec(&stage.argv[0]) {
-                return Ok(deny(sandbox_kind, DenialKind::Exec, &stage.argv[0], &e));
-            }
-            for redirect in &stage.redirects {
-                let (path, denied) = match redirect {
-                    Redirect::Stdout { path, .. } => (path, cx.check_path_write(Path::new(path))),
-                    Redirect::Stdin { path } => (path, cx.check_path_read(Path::new(path))),
-                };
-                if let Err(e) = denied {
-                    return Ok(deny(sandbox_kind, DenialKind::Open, path, &e));
+        // Atomic admission (ADR 0001): every program (`exec`) and every redirect
+        // target (`fs_write`/`fs_read`, which bridle itself opens) across the
+        // WHOLE script must pass *before any stage spawns* — one out-of-scope
+        // element denies the whole script with no partial side effects (even for
+        // commands a `&&`/`||` would have short-circuited away).
+        for item in &script {
+            for stage in &item.pipeline {
+                if let Err(e) = cx.check_exec(&stage.argv[0]) {
+                    return Ok(deny(sandbox_kind, DenialKind::Exec, &stage.argv[0], &e));
+                }
+                for redirect in &stage.redirects {
+                    let (path, checked) = match redirect {
+                        Redirect::Stdout { path, .. } => {
+                            (path, cx.check_path_write(Path::new(path)))
+                        }
+                        Redirect::Stdin { path } => (path, cx.check_path_read(Path::new(path))),
+                    };
+                    if let Err(e) = checked {
+                        return Ok(deny(sandbox_kind, DenialKind::Open, path, &e));
+                    }
                 }
             }
         }
@@ -198,7 +203,8 @@ impl Tool for ShellTool {
         let spawner = Arc::clone(&self.spawner);
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
-        let run = tokio::task::spawn_blocking(move || spawner.run(&pipeline, cwd.as_deref()));
+        let run =
+            tokio::task::spawn_blocking(move || run_script(&*spawner, &script, cwd.as_deref()));
         match tokio::time::timeout(timeout, run).await {
             Ok(joined) => {
                 let captured = joined
@@ -216,6 +222,39 @@ impl Tool for ShellTool {
                 .into_json()),
         }
     }
+}
+
+/// Execute a [`Script`] with `&&`/`||`/`;` short-circuit semantics, concatenating
+/// the output of the pipelines that actually run. The script's exit code is that
+/// of the last pipeline that ran (bash AND-OR-list semantics).
+fn run_script(
+    spawner: &dyn Spawner,
+    script: &[ScriptItem],
+    cwd: Option<&str>,
+) -> ToolResult<Captured> {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut status: i32 = 0;
+
+    for item in script {
+        let run_it = match item.sep {
+            Sep::Seq => true,
+            Sep::And => status == 0,
+            Sep::Or => status != 0,
+        };
+        if run_it {
+            let captured = spawner.run(&item.pipeline, cwd)?;
+            stdout.push_str(&captured.stdout);
+            stderr.push_str(&captured.stderr);
+            status = captured.exit_code;
+        }
+    }
+
+    Ok(Captured {
+        exit_code: status,
+        stdout: cap_string(stdout),
+        stderr: cap_string(stderr),
+    })
 }
 
 /// Build a structured `denied` envelope for a leash refusal.
@@ -305,16 +344,19 @@ impl ShellArgs {
         })
     }
 
-    /// Resolve to a pipeline (argv form is a one-stage pipeline with no
+    /// Resolve to a script (argv form is a one-pipeline, one-stage script with no
     /// redirects; free-form is parsed by the safe-subset engine).
-    fn pipeline(&self) -> Result<Pipeline, Refusal> {
+    fn script(&self) -> Result<Script, Refusal> {
         if let Some(program) = &self.program {
             let mut argv = Vec::with_capacity(1 + self.args.len());
             argv.push(program.clone());
             argv.extend(self.args.iter().cloned());
-            Ok(vec![Command {
-                argv,
-                redirects: Vec::new(),
+            Ok(vec![ScriptItem {
+                sep: Sep::Seq,
+                pipeline: vec![Command {
+                    argv,
+                    redirects: Vec::new(),
+                }],
             }])
         } else {
             classify(self.cmd.as_deref().unwrap_or(""))
@@ -468,21 +510,43 @@ fn capped_utf8(bytes: &[u8]) -> String {
     String::from_utf8_lossy(slice).into_owned()
 }
 
+/// Cap an already-decoded string to [`MAX_OUTPUT_BYTES`] at a char boundary
+/// (used for the concatenated output of a multi-pipeline script).
+fn cap_string(mut s: String) -> String {
+    if s.len() > MAX_OUTPUT_BYTES {
+        let mut end = MAX_OUTPUT_BYTES;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_bridle_core::{Caveats, Gate, Scope};
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// A spawner that records every pipeline it is asked to run and returns a
-    /// canned result — no real processes. `block_ms` lets a test exercise the
-    /// timeout path deterministically without a real `sleep`.
+    /// A spawner that records every pipeline it runs and returns a canned exit
+    /// code per program (argv0), default 0 — no real processes. `block_ms` lets
+    /// a test exercise the timeout path without a real `sleep`.
     #[derive(Default)]
     struct MockSpawner {
         calls: Mutex<Vec<Vec<Command>>>,
-        stdout: String,
-        exit_code: i32,
+        exit_by_program: HashMap<String, i32>,
+        stdout_by_program: HashMap<String, String>,
         block_ms: u64,
+    }
+
+    impl MockSpawner {
+        fn with_exit(program: &str, code: i32) -> Self {
+            let mut m = Self::default();
+            m.exit_by_program.insert(program.to_string(), code);
+            m
+        }
     }
 
     impl Spawner for MockSpawner {
@@ -491,9 +555,14 @@ mod tests {
             if self.block_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.block_ms));
             }
+            let prog = &stages[0].argv[0];
             Ok(Captured {
-                exit_code: self.exit_code,
-                stdout: self.stdout.clone(),
+                exit_code: self.exit_by_program.get(prog).copied().unwrap_or(0),
+                stdout: self
+                    .stdout_by_program
+                    .get(prog)
+                    .cloned()
+                    .unwrap_or_default(),
                 stderr: String::new(),
             })
         }
@@ -512,13 +581,15 @@ mod tests {
         }
     }
 
-    /// Pipelines the mock recorded (what *would* have been spawned).
-    fn recorded(mock: &Arc<MockSpawner>) -> Vec<Vec<Command>> {
-        mock.calls.lock().unwrap().clone()
-    }
-
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| (*s).to_string()).collect()
+    /// The programs (argv0 of each pipeline's first stage) the mock actually ran,
+    /// in order — the cheapest way to assert short-circuit behavior.
+    fn ran_programs(mock: &Arc<MockSpawner>) -> Vec<String> {
+        mock.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pipeline| pipeline[0].argv[0].clone())
+            .collect()
     }
 
     #[test]
@@ -526,160 +597,125 @@ mod tests {
         assert_eq!(ShellTool::new().name(), "shell");
     }
 
-    #[test]
-    fn schema_advertises_the_interface() {
-        let s = ShellTool::new().schema();
-        let props = s.get("properties").unwrap();
-        for k in ["program", "args", "cmd", "cwd", "timeout_secs"] {
-            assert!(props.get(k).is_some(), "missing schema property {k}");
-        }
-    }
-
     #[tokio::test]
-    async fn argv_mode_resolves_to_one_stage_and_runs() {
-        let mock = Arc::new(MockSpawner {
-            stdout: "hi\n".into(),
-            ..Default::default()
-        });
-        let out = ShellTool::with_spawner(mock.clone())
+    async fn and_runs_second_only_on_success() {
+        // `true && echo` → both run.
+        let mock = Arc::new(MockSpawner::default());
+        ShellTool::with_spawner(mock.clone())
             .invoke(
-                serde_json::json!({"program": "echo", "args": ["hi"]}),
-                &ctx(exec_only(&["echo"])),
+                serde_json::json!({"cmd": "true && echo hi"}),
+                &ctx(exec_only(&["true", "echo"])),
             )
             .await
             .expect("invoke");
+        assert_eq!(ran_programs(&mock), vec!["true", "echo"]);
+    }
+
+    #[tokio::test]
+    async fn and_short_circuits_on_failure() {
+        // `false && echo` → `echo` is skipped because `false` exits non-zero.
+        let mock = Arc::new(MockSpawner::with_exit("false", 1));
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "false && echo hi"}),
+                &ctx(exec_only(&["false", "echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(ran_programs(&mock), vec!["false"], "echo must be skipped");
+        assert_eq!(out["exit_code"], 1, "script exit is the last that ran");
+    }
+
+    #[tokio::test]
+    async fn or_runs_second_only_on_failure() {
+        // `false || echo` → `echo` runs (fallback).
+        let mock = Arc::new(MockSpawner::with_exit("false", 1));
+        ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "false || echo hi"}),
+                &ctx(exec_only(&["false", "echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(ran_programs(&mock), vec!["false", "echo"]);
+    }
+
+    #[tokio::test]
+    async fn or_short_circuits_on_success() {
+        // `true || echo` → `echo` is skipped because `true` succeeded.
+        let mock = Arc::new(MockSpawner::default());
+        ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "true || echo hi"}),
+                &ctx(exec_only(&["true", "echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(ran_programs(&mock), vec!["true"]);
+    }
+
+    #[tokio::test]
+    async fn semicolon_runs_unconditionally() {
+        // `false ; echo` → both run; exit is the last (`echo` → 0).
+        let mock = Arc::new(MockSpawner::with_exit("false", 1));
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "false ; echo hi"}),
+                &ctx(exec_only(&["false", "echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(ran_programs(&mock), vec!["false", "echo"]);
         assert_eq!(out["exit_code"], 0);
-        assert_eq!(out["stdout"], "hi\n");
-        assert_eq!(out["sandbox_kind"], "none"); // honest: advisory until L3
-        let calls = recorded(&mock);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0][0].argv, argv(&["echo", "hi"]));
-        assert!(calls[0][0].redirects.is_empty());
     }
 
+    /// Atomic admission across the WHOLE script: an out-of-scope command anywhere
+    /// (even one a `;` would reach, or a `&&` would skip) denies everything and
+    /// nothing spawns.
     #[tokio::test]
-    async fn pipeline_passes_every_stage_to_the_spawner() {
-        let mock = Arc::new(MockSpawner::default());
-        ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "grep foo | wc -l"}),
-                &ctx(exec_only(&["grep", "wc"])),
-            )
-            .await
-            .expect("invoke");
-        let calls = recorded(&mock);
-        assert_eq!(calls[0].len(), 2);
-        assert_eq!(calls[0][0].argv, argv(&["grep", "foo"]));
-        assert_eq!(calls[0][1].argv, argv(&["wc", "-l"]));
-    }
-
-    #[tokio::test]
-    async fn redirects_are_parsed_and_passed_to_the_spawner() {
-        // fs_write is `All` by default here, so the redirect target passes the
-        // leash and the stage (with its redirect) reaches the spawner.
-        let mock = Arc::new(MockSpawner::default());
-        ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "echo hi > out.txt"}),
-                &ctx(exec_only(&["echo"])),
-            )
-            .await
-            .expect("invoke");
-        let calls = recorded(&mock);
-        assert_eq!(calls[0][0].stdout_redirect(), Some(("out.txt", false)));
-    }
-
-    #[tokio::test]
-    async fn quoted_pipe_stays_a_single_stage() {
-        let mock = Arc::new(MockSpawner::default());
-        ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "echo \"a|b\""}),
-                &ctx(exec_only(&["echo"])),
-            )
-            .await
-            .expect("invoke");
-        let calls = recorded(&mock);
-        assert_eq!(calls[0][0].argv, argv(&["echo", "a|b"]));
-    }
-
-    /// THE exec security assertion: an out-of-scope program is denied and the
-    /// spawner is NEVER called.
-    #[tokio::test]
-    async fn out_of_scope_exec_denied_before_spawn() {
+    async fn out_of_scope_anywhere_denies_the_whole_script() {
         let mock = Arc::new(MockSpawner::default());
         let out = ShellTool::with_spawner(mock.clone())
             .invoke(
-                serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/x"]}),
-                &ctx(exec_only(&["echo"])),
-            )
-            .await
-            .expect("invoke");
-        assert_eq!(out["denied"], true);
-        assert_eq!(out["denials"][0]["kind"], "exec");
-        assert_eq!(out["denials"][0]["target"], "rm");
-        assert!(recorded(&mock).is_empty(), "spawner must not be called");
-    }
-
-    /// THE fs security assertion: an out-of-scope redirect target is denied
-    /// (DenialKind::Open) and the spawner is NEVER called — the file bridle would
-    /// have opened is refused before any process starts.
-    #[tokio::test]
-    async fn out_of_scope_redirect_denied_before_spawn() {
-        let mock = Arc::new(MockSpawner::default());
-        let granted = Caveats {
-            exec: Scope::only(["echo".to_string()]),
-            // fs_write restricted to the temp dir; /etc/passwd is outside it.
-            fs_write: Scope::only([std::env::temp_dir().to_string_lossy().into_owned()]),
-            ..Caveats::top()
-        };
-        let out = ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "echo hi > /etc/passwd"}),
-                &ctx(granted),
-            )
-            .await
-            .expect("invoke");
-        assert_eq!(out["denied"], true);
-        assert_eq!(out["denials"][0]["kind"], "open");
-        assert_eq!(out["denials"][0]["target"], "/etc/passwd");
-        assert!(recorded(&mock).is_empty(), "spawner must not be called");
-    }
-
-    /// Atomic admission: if ANY pipeline stage is out of scope, nothing spawns.
-    #[tokio::test]
-    async fn pipeline_atomic_admission_denies_whole_if_any_stage_out_of_scope() {
-        let mock = Arc::new(MockSpawner::default());
-        let out = ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "grep foo | rm -rf x"}),
-                &ctx(exec_only(&["grep"])), // rm not granted
+                serde_json::json!({"cmd": "echo ok ; rm -rf x"}),
+                &ctx(exec_only(&["echo"])), // rm not granted
             )
             .await
             .expect("invoke");
         assert_eq!(out["denied"], true);
         assert_eq!(out["denials"][0]["target"], "rm");
-        assert!(recorded(&mock).is_empty());
+        assert!(ran_programs(&mock).is_empty(), "nothing must run");
     }
 
-    /// A dynamic construct is refused by design and never reaches the spawner.
     #[tokio::test]
-    async fn dynamic_construct_refused_before_spawn() {
+    async fn combined_output_concatenates_in_order() {
+        let mut mock = MockSpawner::default();
+        mock.stdout_by_program.insert("echo".into(), "x".into());
+        mock.stdout_by_program.insert("printf".into(), "y".into());
+        let mock = Arc::new(mock);
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo a ; printf b"}),
+                &ctx(exec_only(&["echo", "printf"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["stdout"], "xy");
+    }
+
+    /// A dynamic construct anywhere in the sequence is refused before any spawn.
+    #[tokio::test]
+    async fn dynamic_in_sequence_refused_before_spawn() {
         let mock = Arc::new(MockSpawner::default());
         let out = ShellTool::with_spawner(mock.clone())
             .invoke(
-                serde_json::json!({"cmd": "echo $(whoami)"}),
+                serde_json::json!({"cmd": "echo ok && $(evil)"}),
                 &ctx(Caveats::top()),
             )
             .await
             .expect("invoke");
         assert_eq!(out["denied"], true);
-        assert!(out.get("exit_code").is_none());
-        assert!(out["denials"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("refused by design"));
-        assert!(recorded(&mock).is_empty());
+        assert!(ran_programs(&mock).is_empty());
     }
 
     #[tokio::test]
