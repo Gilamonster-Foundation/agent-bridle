@@ -3,12 +3,10 @@
 //! Spawns the real `agent-bridle-mcp` binary as a child process and drives it
 //! over its stdio JSON-RPC pipe, exactly as an MCP client would.
 //!
-//! NOTE: this test is updated for the stub release (pending reubeno/brush#1184).
-//! Steps 3 and 4 both assert the stub unavailable error, NOT real execution.
-//! Restore the original assertions from git history when brush support is
-//! re-enabled. See https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+//! The shell is the argv + safe-subset engine (ADR 0005); steps 3 and 4 assert
+//! real execution and a real in-band leash denial through the MCP boundary.
 //!
-//! Original behaviour tested:
+//! Behaviour tested:
 //! 1. `initialize` → the server reports its identity + the `tools` capability.
 //! 2. `tools/list` → the confined `shell` tool is advertised.
 //! 3. `tools/call shell` with an **in-scope** program (`echo`) → stdout comes
@@ -132,9 +130,7 @@ async fn leash_holds_through_the_mcp_boundary() {
         "tools/list missing shell: {names:?}"
     );
 
-    // 3. Stub: even an in-scope `echo` call returns the unavailable error.
-    // Restore to assert isError=false + stdout contains "leashed-hello" once
-    // reubeno/brush#1184 merges and brush ships a crates.io release.
+    // 3. An in-scope `echo` runs: stdout comes back in an isError:false result.
     let allowed = mcp
         .call(&serde_json::json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -145,39 +141,38 @@ async fn leash_holds_through_the_mcp_boundary() {
         }))
         .await;
     assert_eq!(
-        allowed["result"]["isError"], true,
-        "stub must surface as MCP tool error: {allowed}"
+        allowed["result"]["isError"], false,
+        "in-scope echo must succeed through the MCP boundary: {allowed}"
     );
     let allowed_text = allowed["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        allowed_text.contains("reubeno/brush/pull/1184"),
-        "stub error must link to tracking PR: {allowed_text}"
+        allowed_text.contains("leashed-hello"),
+        "stdout must carry through: {allowed_text}"
     );
 
-    // 4. Stub: out-of-scope program also returns unavailable error (not a denial).
-    // Restore to assert isError=true with denial reason containing "rm" and
-    // "granted authority" once brush support is re-enabled.
+    // 4. An out-of-scope program is denied: the leash reason is carried back as
+    // an in-band MCP tool error (isError: true), never a transport error.
     let denied = mcp
         .call(&serde_json::json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": {
                 "name": "shell",
-                "arguments": { "program": "rm", "args": ["-rf", "/"] }
+                "arguments": { "program": "rm", "args": ["-rf", "/tmp/x"] }
             }
         }))
         .await;
     assert!(
         denied.get("error").is_none(),
-        "stub result must be in-band, not a transport error: {denied}"
+        "a denial must be in-band, not a transport error: {denied}"
     );
     assert_eq!(
         denied["result"]["isError"], true,
-        "stub must surface as MCP tool error: {denied}"
+        "out-of-scope exec must surface as an MCP tool error: {denied}"
     );
     let reason = denied["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        reason.contains("reubeno/brush/pull/1184"),
-        "stub error must link to tracking PR: {reason}"
+        reason.contains("rm") && reason.contains("granted authority"),
+        "denial reason must name the refused exec: {reason}"
     );
 
     mcp.shutdown().await;
