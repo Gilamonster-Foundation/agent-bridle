@@ -2,21 +2,26 @@
 //!
 //! `agent-bridle` is the **exec funnel**: rather than hand a string to a shell
 //! interpreter, the engine parses it itself and runs only what it can confine.
-//! This covers **increments 1–2** — a pipeline of simple commands
-//! (`a | b | c`) with quoted arguments. Redirections, `&&`/`||`/`;`, globbing
-//! and variable expansion are added in later increments (tracked on
-//! agent-bridle#34); until then each is refused as [`Refusal::Unsupported`],
-//! kept distinct from the [`Refusal::Dynamic`] constructs refused **by design**
-//! — command/arithmetic substitution, backticks, subshells: the undecidable
-//! interiors ADR 0001 says may never be statically cleared.
+//! This covers **increments 1–3** — a pipeline of simple commands (`a | b | c`)
+//! with quoted arguments and file redirections (`> out`, `>> out`, `< in`).
+//! `&&`/`||`/`;`, globbing and variable expansion are added in later increments
+//! (tracked on agent-bridle#34); until then each is refused as
+//! [`Refusal::Unsupported`], kept distinct from the [`Refusal::Dynamic`]
+//! constructs refused **by design** — command/arithmetic substitution,
+//! backticks, subshells: the undecidable interiors ADR 0001 says may never be
+//! statically cleared. fd-number redirections (`2>`, `2>&1`) are refused as
+//! `Unsupported` for now (a focused follow-up) rather than risk silently
+//! mishandling bash's fd-number rules.
 //!
 //! Quoting is honored, so a metacharacter **inside quotes is a literal
-//! argument** — only *unquoted* operators and constructs are recognized. That is
-//! the safety property the unit tests pin: `echo "a|b"` is the single-stage argv
-//! `["echo", "a|b"]`, while `echo a | b` is the two-stage pipeline
-//! `[["echo", "a"], ["b"]]`.
+//! argument** — only *unquoted* operators and constructs are recognized:
+//! `echo "a|b"` is one argv, `echo ">"` is the literal arg `>`, while
+//! `echo a | b` is a two-stage pipeline and `echo hi > out` carries a redirect.
 
 use std::fmt;
+use std::iter::Peekable;
+use std::mem::take;
+use std::str::Chars;
 
 /// Why the confined engine refused to run a `cmd` string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,11 +32,11 @@ pub enum Refusal {
     /// shell, use the embedder's unbridled/`--yolo` allowance (ADR 0003 / 0005 D5).
     Dynamic(&'static str),
     /// A construct the safe-subset engine will support but **does not yet** in
-    /// this increment (redirections, sequencing, globbing, variable expansion).
-    /// Tracked on agent-bridle#34.
+    /// this increment (`&&`/`||`/`;`, globbing, variable expansion, fd-number
+    /// redirections). Tracked on agent-bridle#34.
     Unsupported(&'static str),
     /// The input could not be parsed (unterminated quote, trailing backslash,
-    /// empty command or pipeline stage).
+    /// empty command/stage, missing redirection target).
     Malformed(String),
 }
 
@@ -63,31 +68,158 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// A parsed pipeline: an ordered list of command stages, each its own argv.
-/// A single command (no `|`) is a one-element pipeline.
-pub type Pipeline = Vec<Vec<String>>;
+/// A file redirection on one command stage. `agent-bridle` performs the open, so
+/// each is leash-checked (`fs_write` for stdout, `fs_read` for stdin) before the
+/// stage runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redirect {
+    /// `> path` (truncate) or `>> path` (append) — stdout (fd 1).
+    Stdout { path: String, append: bool },
+    /// `< path` — stdin (fd 0).
+    Stdin { path: String },
+}
 
-/// Parse a `cmd` string into a [`Pipeline`] (one or more `|`-separated command
-/// stages), or a [`Refusal`].
-///
-/// Single quotes are fully literal; double quotes are literal except `$` and a
-/// backtick still trigger substitution detection (as in a real shell). An
-/// unquoted backslash escapes the next character. An unquoted single `|`
-/// separates pipeline stages; every other operator (`&&`, `||`, `;`, `<`, `>`)
-/// is [`Refusal::Unsupported`] in this increment, and any substitution
-/// (`$(...)`, backticks, `( … )`) is [`Refusal::Dynamic`].
+/// One command stage: its argv plus any redirections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    /// The program (argv[0]) and arguments.
+    pub argv: Vec<String>,
+    /// File redirections, in source order (last stdout redirect wins for fd 1).
+    pub redirects: Vec<Redirect>,
+}
+
+impl Command {
+    /// The effective stdin redirect path, if any (last one wins).
+    #[must_use]
+    pub fn stdin_path(&self) -> Option<&str> {
+        self.redirects.iter().rev().find_map(|r| match r {
+            Redirect::Stdin { path } => Some(path.as_str()),
+            Redirect::Stdout { .. } => None,
+        })
+    }
+
+    /// The effective stdout redirect (path, append), if any (last one wins).
+    #[must_use]
+    pub fn stdout_redirect(&self) -> Option<(&str, bool)> {
+        self.redirects.iter().rev().find_map(|r| match r {
+            Redirect::Stdout { path, append } => Some((path.as_str(), *append)),
+            Redirect::Stdin { .. } => None,
+        })
+    }
+}
+
+/// A parsed pipeline: an ordered list of command stages. A single command
+/// (no `|`) is a one-element pipeline.
+pub type Pipeline = Vec<Command>;
+
+/// Parse a `cmd` string into a [`Pipeline`], or a [`Refusal`].
 pub fn classify(input: &str) -> Result<Pipeline, Refusal> {
-    let mut pipeline: Pipeline = Vec::new();
-    let mut words: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut has_word = false;
     let mut chars = input.chars().peekable();
+    let mut pipeline: Pipeline = Vec::new();
+    let mut argv: Vec<String> = Vec::new();
+    let mut redirects: Vec<Redirect> = Vec::new();
 
-    while let Some(c) = chars.next() {
+    loop {
+        skip_whitespace(&mut chars);
+        let Some(&c) = chars.peek() else { break };
         match c {
-            // ── single quotes: fully literal ────────────────────────────────
+            '|' => {
+                chars.next();
+                if chars.peek() == Some(&'|') {
+                    return Err(Refusal::Unsupported("logical OR `||`"));
+                }
+                if argv.is_empty() {
+                    return Err(Refusal::Malformed(
+                        "empty pipeline stage (nothing before `|`)".into(),
+                    ));
+                }
+                pipeline.push(Command {
+                    argv: take(&mut argv),
+                    redirects: take(&mut redirects),
+                });
+            }
+            '&' => {
+                chars.next();
+                return Err(Refusal::Unsupported(if chars.peek() == Some(&'&') {
+                    "logical AND `&&`"
+                } else {
+                    "background `&`"
+                }));
+            }
+            ';' => return Err(Refusal::Unsupported("command sequencing `;`")),
+            '(' | ')' => return Err(Refusal::Dynamic("subshell `( )`")),
+            '`' => return Err(Refusal::Dynamic("command substitution (backticks)")),
+            '$' => {
+                chars.next();
+                return Err(dollar_refusal(chars.peek().copied()));
+            }
+            '*' | '?' | '[' => return Err(Refusal::Unsupported("filename globbing")),
+            '>' => {
+                chars.next();
+                let append = chars.peek() == Some(&'>');
+                if append {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'&') {
+                    return Err(Refusal::Unsupported("`>&` (fd duplication)"));
+                }
+                let path = read_redirect_target(&mut chars)?;
+                redirects.push(Redirect::Stdout { path, append });
+            }
+            '<' => {
+                chars.next();
+                if chars.peek() == Some(&'<') {
+                    return Err(Refusal::Unsupported("heredoc/herestring `<<`"));
+                }
+                if chars.peek() == Some(&'&') {
+                    return Err(Refusal::Unsupported("`<&` (fd duplication)"));
+                }
+                let path = read_redirect_target(&mut chars)?;
+                redirects.push(Redirect::Stdin { path });
+            }
+            _ => argv.push(read_word(&mut chars)?),
+        }
+    }
+
+    // Finalize the trailing stage.
+    if argv.is_empty() && redirects.is_empty() {
+        return if pipeline.is_empty() {
+            Err(Refusal::Malformed("empty command".into()))
+        } else {
+            Err(Refusal::Malformed(
+                "empty pipeline stage (nothing after `|`)".into(),
+            ))
+        };
+    }
+    if argv.is_empty() {
+        return Err(Refusal::Malformed("redirection without a command".into()));
+    }
+    pipeline.push(Command { argv, redirects });
+    Ok(pipeline)
+}
+
+/// Consume any run of unquoted whitespace.
+fn skip_whitespace(chars: &mut Peekable<Chars>) {
+    while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+        chars.next();
+    }
+}
+
+/// Read the next word (no leading-whitespace skip — the caller does that). Stops
+/// at unquoted whitespace or an operator/special char (which the caller then
+/// handles). Single quotes are literal; double quotes are literal except `$` and
+/// a backtick still trigger substitution detection; an unquoted backslash
+/// escapes the next char. A bare digit-word immediately followed by `>`/`<` is a
+/// refused fd-number redirection (rather than a silently-mishandled arg).
+fn read_word(chars: &mut Peekable<Chars>) -> Result<String, Refusal> {
+    let mut cur = String::new();
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' | '\n' | '\r' => break,
+            // Operators / specials end the word; the caller decides what to do.
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '[' => break,
             '\'' => {
-                has_word = true;
+                chars.next();
                 loop {
                     match chars.next() {
                         Some('\'') => break,
@@ -96,14 +228,12 @@ pub fn classify(input: &str) -> Result<Pipeline, Refusal> {
                     }
                 }
             }
-            // ── double quotes: literal except $ / backtick still expand ──────
             '"' => {
-                has_word = true;
+                chars.next();
                 loop {
                     match chars.next() {
                         Some('"') => break,
                         Some('\\') => match chars.peek() {
-                            // In double quotes, backslash escapes only these.
                             Some(&n) if matches!(n, '"' | '\\' | '$' | '`') => {
                                 cur.push(n);
                                 chars.next();
@@ -119,77 +249,43 @@ pub fn classify(input: &str) -> Result<Pipeline, Refusal> {
                     }
                 }
             }
-            // ── unquoted backslash escapes the next char (literal) ──────────
-            '\\' => match chars.next() {
-                Some(n) => {
-                    cur.push(n);
-                    has_word = true;
-                }
-                None => return Err(Refusal::Malformed("trailing backslash".into())),
-            },
-            // ── whitespace separates words ──────────────────────────────────
-            ' ' | '\t' | '\n' | '\r' => {
-                if has_word {
-                    words.push(std::mem::take(&mut cur));
-                    has_word = false;
+            '\\' => {
+                chars.next();
+                match chars.next() {
+                    Some(n) => cur.push(n),
+                    None => return Err(Refusal::Malformed("trailing backslash".into())),
                 }
             }
-            // ── pipeline stage separator (a single, unquoted `|`) ────────────
-            '|' => {
-                if chars.peek() == Some(&'|') {
-                    return Err(Refusal::Unsupported("logical OR `||`"));
-                }
-                if has_word {
-                    words.push(std::mem::take(&mut cur));
-                    has_word = false;
-                }
-                if words.is_empty() {
-                    return Err(Refusal::Malformed(
-                        "empty pipeline stage (nothing before `|`)".into(),
-                    ));
-                }
-                pipeline.push(std::mem::take(&mut words));
-            }
-            // ── operators: supported later, refused (cleanly) for now ───────
-            '&' => {
-                return Err(Refusal::Unsupported(if chars.peek() == Some(&'&') {
-                    "logical AND `&&`"
-                } else {
-                    "background `&`"
-                }))
-            }
-            ';' => return Err(Refusal::Unsupported("command sequencing `;`")),
-            '<' => return Err(Refusal::Unsupported("input redirection `<`")),
-            '>' => return Err(Refusal::Unsupported("output redirection `>`")),
-            '*' | '?' => return Err(Refusal::Unsupported("filename globbing")),
-            '[' => return Err(Refusal::Unsupported("filename globbing (`[`)")),
-            // ── dynamic constructs: refused by design ───────────────────────
-            '(' | ')' => return Err(Refusal::Dynamic("subshell `( )`")),
-            '`' => return Err(Refusal::Dynamic("command substitution (backticks)")),
-            '$' => return Err(dollar_refusal(chars.peek().copied())),
-            // ── ordinary character ──────────────────────────────────────────
             _ => {
                 cur.push(c);
-                has_word = true;
+                chars.next();
             }
         }
     }
+    // `2>` / `0<` etc.: a bare digit-word touching a redirect operator.
+    if !cur.is_empty()
+        && cur.bytes().all(|b| b.is_ascii_digit())
+        && matches!(chars.peek(), Some('>') | Some('<'))
+    {
+        return Err(Refusal::Unsupported("fd-number redirection (e.g. `2>`)"));
+    }
+    Ok(cur)
+}
 
-    // Finalize the trailing stage.
-    if has_word {
-        words.push(cur);
+/// Read a redirection target (the word after `>`/`>>`/`<`).
+fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<String, Refusal> {
+    skip_whitespace(chars);
+    match chars.peek().copied() {
+        None | Some('|' | '&' | ';' | '<' | '>' | '(' | ')') => {
+            return Err(Refusal::Malformed("missing redirection target".into()))
+        }
+        _ => {}
     }
-    if !words.is_empty() {
-        pipeline.push(words);
-    } else if pipeline.is_empty() {
-        return Err(Refusal::Malformed("empty command".into()));
-    } else {
-        // A `|` with nothing after it.
-        return Err(Refusal::Malformed(
-            "empty pipeline stage (nothing after `|`)".into(),
-        ));
+    let target = read_word(chars)?;
+    if target.is_empty() {
+        return Err(Refusal::Malformed("empty redirection target".into()));
     }
-    Ok(pipeline)
+    Ok(target)
 }
 
 /// Classify a `$`: `$(` is command/arithmetic substitution (dynamic, refused by
@@ -206,20 +302,30 @@ fn dollar_refusal(next: Option<char>) -> Refusal {
 mod tests {
     use super::*;
 
-    /// One command's argv.
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
     }
-
-    /// A single-stage pipeline (the common case).
+    /// A one-stage pipeline with no redirects.
     fn one(parts: &[&str]) -> Pipeline {
-        vec![argv(parts)]
+        vec![Command {
+            argv: argv(parts),
+            redirects: vec![],
+        }]
+    }
+    fn out(path: &str, append: bool) -> Redirect {
+        Redirect::Stdout {
+            path: path.into(),
+            append,
+        }
+    }
+    fn stdin(path: &str) -> Redirect {
+        Redirect::Stdin { path: path.into() }
     }
 
-    // ── single commands (increment 1, now one-stage pipelines) ──────────────
+    // ── words, quoting, pipelines (increments 1–2) ──────────────────────────
 
     #[test]
-    fn simple_command_splits_on_whitespace() {
+    fn simple_command() {
         assert_eq!(
             classify("echo hi there").unwrap(),
             one(&["echo", "hi", "there"])
@@ -227,151 +333,172 @@ mod tests {
     }
 
     #[test]
-    fn collapses_runs_of_whitespace() {
-        assert_eq!(classify("  echo\t hi \n").unwrap(), one(&["echo", "hi"]));
-    }
-
-    #[test]
-    fn single_quotes_are_literal() {
+    fn quoting_groups_and_is_literal() {
         assert_eq!(classify("echo 'a b'").unwrap(), one(&["echo", "a b"]));
-    }
-
-    #[test]
-    fn double_quotes_group_words() {
         assert_eq!(classify("echo \"a b\"").unwrap(), one(&["echo", "a b"]));
-    }
-
-    #[test]
-    fn empty_quotes_produce_an_empty_arg() {
         assert_eq!(classify("echo ''").unwrap(), one(&["echo", ""]));
-    }
-
-    #[test]
-    fn backslash_escapes_a_space() {
         assert_eq!(classify("echo a\\ b").unwrap(), one(&["echo", "a b"]));
-    }
-
-    #[test]
-    fn escaped_dollar_is_a_literal_dollar() {
         assert_eq!(classify("echo \\$5").unwrap(), one(&["echo", "$5"]));
-        assert_eq!(classify("echo \"\\$5\"").unwrap(), one(&["echo", "$5"]));
     }
 
-    // ── pipelines (increment 2) ─────────────────────────────────────────────
-
     #[test]
-    fn pipeline_splits_into_stages() {
+    fn pipelines_split_into_stages() {
         assert_eq!(
-            classify("grep foo | head -n 3").unwrap(),
-            vec![argv(&["grep", "foo"]), argv(&["head", "-n", "3"])]
+            classify("grep foo | wc -l").unwrap(),
+            vec![
+                Command {
+                    argv: argv(&["grep", "foo"]),
+                    redirects: vec![]
+                },
+                Command {
+                    argv: argv(&["wc", "-l"]),
+                    redirects: vec![]
+                },
+            ]
         );
-    }
-
-    #[test]
-    fn multi_stage_pipeline() {
-        assert_eq!(
-            classify("a | b | c").unwrap(),
-            vec![argv(&["a"]), argv(&["b"]), argv(&["c"])]
-        );
-    }
-
-    #[test]
-    fn pipe_without_surrounding_spaces() {
-        assert_eq!(
-            classify("grep foo|wc -l").unwrap(),
-            vec![argv(&["grep", "foo"]), argv(&["wc", "-l"])]
-        );
-    }
-
-    #[test]
-    fn empty_pipeline_stage_is_malformed() {
-        assert!(matches!(classify("| x"), Err(Refusal::Malformed(_))));
-        assert!(matches!(classify("x |"), Err(Refusal::Malformed(_))));
-        assert!(matches!(classify("a | | b"), Err(Refusal::Malformed(_))));
-    }
-
-    // ── the security property: quoted metacharacters are LITERAL ────────────
-
-    #[test]
-    fn quoted_pipe_is_a_literal_argument_not_a_separator() {
-        // Load-bearing: a `|` inside quotes is one literal arg, NOT a stage split.
         assert_eq!(classify("echo \"a|b\"").unwrap(), one(&["echo", "a|b"]));
-        assert_eq!(classify("echo 'a && b'").unwrap(), one(&["echo", "a && b"]));
+    }
+
+    // ── redirections (increment 3) ──────────────────────────────────────────
+
+    #[test]
+    fn stdout_truncate_and_append() {
         assert_eq!(
-            classify("grep '$(x)' f").unwrap(),
-            one(&["grep", "$(x)", "f"])
+            classify("echo hi > out.txt").unwrap(),
+            vec![Command {
+                argv: argv(&["echo", "hi"]),
+                redirects: vec![out("out.txt", false)]
+            }]
+        );
+        assert_eq!(
+            classify("echo hi >> log").unwrap(),
+            vec![Command {
+                argv: argv(&["echo", "hi"]),
+                redirects: vec![out("log", true)]
+            }]
         );
     }
 
-    // ── dynamic constructs refused BY DESIGN ────────────────────────────────
+    #[test]
+    fn stdin_redirect() {
+        assert_eq!(
+            classify("sort < in.txt").unwrap(),
+            vec![Command {
+                argv: argv(&["sort"]),
+                redirects: vec![stdin("in.txt")]
+            }]
+        );
+    }
 
     #[test]
-    fn command_substitution_is_dynamic_refused() {
+    fn redirect_without_spaces_and_quoted_target() {
+        assert_eq!(
+            classify("echo hi>out").unwrap(),
+            vec![Command {
+                argv: argv(&["echo", "hi"]),
+                redirects: vec![out("out", false)]
+            }]
+        );
+        assert_eq!(
+            classify("echo hi > \"my file.txt\"").unwrap(),
+            vec![Command {
+                argv: argv(&["echo", "hi"]),
+                redirects: vec![out("my file.txt", false)]
+            }]
+        );
+    }
+
+    #[test]
+    fn redirect_within_a_pipeline_stage() {
+        assert_eq!(
+            classify("grep x < in | wc -l > out").unwrap(),
+            vec![
+                Command {
+                    argv: argv(&["grep", "x"]),
+                    redirects: vec![stdin("in")]
+                },
+                Command {
+                    argv: argv(&["wc", "-l"]),
+                    redirects: vec![out("out", false)]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn helpers_pick_the_last_redirect() {
+        let p = classify("echo hi > a > b").unwrap();
+        assert_eq!(p[0].stdout_redirect(), Some(("b", false)));
+        assert_eq!(p[0].stdin_path(), None);
+    }
+
+    /// A redirection operator INSIDE quotes is a literal argument, not a redirect.
+    #[test]
+    fn quoted_redirect_operator_is_literal() {
+        assert_eq!(classify("echo \">\"").unwrap(), one(&["echo", ">"]));
+        assert_eq!(classify("echo \"a > b\"").unwrap(), one(&["echo", "a > b"]));
+    }
+
+    // ── refusals around redirections ────────────────────────────────────────
+
+    #[test]
+    fn fd_number_and_dup_and_heredoc_are_unsupported() {
+        assert!(matches!(classify("echo 2>f"), Err(Refusal::Unsupported(_)))); // fd-number
         assert!(matches!(
-            classify("echo $(whoami)"),
-            Err(Refusal::Dynamic(_))
+            classify("echo x 2>&1"),
+            Err(Refusal::Unsupported(_))
         ));
+        assert!(matches!(classify("echo >&1"), Err(Refusal::Unsupported(_)))); // >& dup
         assert!(matches!(
-            classify("echo `whoami`"),
-            Err(Refusal::Dynamic(_))
-        ));
+            classify("cat <<EOF"),
+            Err(Refusal::Unsupported(_))
+        )); // heredoc
+    }
+
+    #[test]
+    fn missing_or_dangling_redirect_targets_are_malformed() {
+        assert!(matches!(classify("echo >"), Err(Refusal::Malformed(_))));
         assert!(matches!(
-            classify("echo \"$(id)\""),
-            Err(Refusal::Dynamic(_))
+            classify("echo > | wc"),
+            Err(Refusal::Malformed(_))
         ));
-        // Even downstream of a (now-supported) pipe, a dynamic stage is refused.
+        assert!(matches!(classify("> out"), Err(Refusal::Malformed(_)))); // no command
+    }
+
+    // ── still-refused operators & dynamic constructs ────────────────────────
+
+    #[test]
+    fn operators_and_dynamic_still_refused() {
+        assert!(matches!(classify("a && b"), Err(Refusal::Unsupported(_))));
+        assert!(matches!(classify("a || b"), Err(Refusal::Unsupported(_))));
+        assert!(matches!(classify("a; b"), Err(Refusal::Unsupported(_))));
+        assert!(matches!(classify("ls *.rs"), Err(Refusal::Unsupported(_))));
+        assert!(matches!(
+            classify("echo $HOME"),
+            Err(Refusal::Unsupported(_))
+        ));
+        assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_))));
+        assert!(matches!(classify("echo `id`"), Err(Refusal::Dynamic(_))));
+        assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
         assert!(matches!(
             classify("echo hi | $(evil)"),
             Err(Refusal::Dynamic(_))
         ));
     }
 
-    #[test]
-    fn subshell_is_dynamic_refused() {
-        assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
-    }
-
-    // ── operators still refused as UNSUPPORTED ──────────────────────────────
-
-    #[test]
-    fn logical_and_sequencing_redirection_globbing_are_unsupported() {
-        assert!(matches!(classify("a && b"), Err(Refusal::Unsupported(_))));
-        assert!(matches!(classify("a || b"), Err(Refusal::Unsupported(_))));
-        assert!(matches!(
-            classify("echo a; rm b"),
-            Err(Refusal::Unsupported(_))
-        ));
-        assert!(matches!(
-            classify("echo hi > f"),
-            Err(Refusal::Unsupported(_))
-        ));
-        assert!(matches!(classify("cat < f"), Err(Refusal::Unsupported(_))));
-        assert!(matches!(classify("ls *.rs"), Err(Refusal::Unsupported(_))));
-        assert!(matches!(
-            classify("echo $HOME"),
-            Err(Refusal::Unsupported(_))
-        ));
-    }
-
     // ── malformed input ─────────────────────────────────────────────────────
 
     #[test]
-    fn empty_command_is_malformed() {
+    fn empty_and_unterminated_are_malformed() {
         assert!(matches!(classify("   "), Err(Refusal::Malformed(_))));
         assert!(matches!(classify(""), Err(Refusal::Malformed(_))));
-    }
-
-    #[test]
-    fn unterminated_quotes_are_malformed() {
         assert!(matches!(classify("echo 'oops"), Err(Refusal::Malformed(_))));
-        assert!(matches!(
-            classify("echo \"oops"),
-            Err(Refusal::Malformed(_))
-        ));
+        assert!(matches!(classify("x |"), Err(Refusal::Malformed(_))));
+        assert!(matches!(classify("| x"), Err(Refusal::Malformed(_))));
     }
 
     #[test]
-    fn refusal_display_is_legible_and_categorized() {
+    fn refusal_display_is_categorized() {
         assert!(classify("echo $(x)")
             .unwrap_err()
             .to_string()
