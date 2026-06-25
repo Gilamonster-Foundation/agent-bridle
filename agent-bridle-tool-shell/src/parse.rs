@@ -2,18 +2,19 @@
 //!
 //! `agent-bridle` is the **exec funnel**: rather than hand a string to a shell
 //! interpreter, the engine parses it itself and runs only what it can confine.
-//! This is **increment 1** — a single command with quoted arguments. Pipelines,
-//! redirections, `&&`/`||`/`;`, globbing and variable expansion are added in
-//! later increments (tracked on agent-bridle#34); until then each is refused as
-//! [`Refusal::Unsupported`], kept distinct from the [`Refusal::Dynamic`]
-//! constructs refused **by design** — command/arithmetic substitution,
-//! backticks, subshells: the undecidable interiors ADR 0001 says may never be
-//! statically cleared.
+//! This covers **increments 1–2** — a pipeline of simple commands
+//! (`a | b | c`) with quoted arguments. Redirections, `&&`/`||`/`;`, globbing
+//! and variable expansion are added in later increments (tracked on
+//! agent-bridle#34); until then each is refused as [`Refusal::Unsupported`],
+//! kept distinct from the [`Refusal::Dynamic`] constructs refused **by design**
+//! — command/arithmetic substitution, backticks, subshells: the undecidable
+//! interiors ADR 0001 says may never be statically cleared.
 //!
 //! Quoting is honored, so a metacharacter **inside quotes is a literal
 //! argument** — only *unquoted* operators and constructs are recognized. That is
-//! the safety property the unit tests pin: `echo "a|b"` is the two-element argv
-//! `["echo", "a|b"]`, while `echo a|b` is refused.
+//! the safety property the unit tests pin: `echo "a|b"` is the single-stage argv
+//! `["echo", "a|b"]`, while `echo a | b` is the two-stage pipeline
+//! `[["echo", "a"], ["b"]]`.
 
 use std::fmt;
 
@@ -26,11 +27,11 @@ pub enum Refusal {
     /// shell, use the embedder's unbridled/`--yolo` allowance (ADR 0003 / 0005 D5).
     Dynamic(&'static str),
     /// A construct the safe-subset engine will support but **does not yet** in
-    /// this increment (pipelines, redirections, sequencing, globbing, variable
-    /// expansion). Tracked on agent-bridle#34.
+    /// this increment (redirections, sequencing, globbing, variable expansion).
+    /// Tracked on agent-bridle#34.
     Unsupported(&'static str),
     /// The input could not be parsed (unterminated quote, trailing backslash,
-    /// empty command).
+    /// empty command or pipeline stage).
     Malformed(String),
 }
 
@@ -62,14 +63,21 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Parse a `cmd` string into a **single command's argv**, or a [`Refusal`].
+/// A parsed pipeline: an ordered list of command stages, each its own argv.
+/// A single command (no `|`) is a one-element pipeline.
+pub type Pipeline = Vec<Vec<String>>;
+
+/// Parse a `cmd` string into a [`Pipeline`] (one or more `|`-separated command
+/// stages), or a [`Refusal`].
 ///
 /// Single quotes are fully literal; double quotes are literal except `$` and a
 /// backtick still trigger substitution detection (as in a real shell). An
-/// unquoted backslash escapes the next character. Any *unquoted* operator
-/// (`|`, `&&`, `;`, `<`, `>`) is [`Refusal::Unsupported`] in this increment, and
-/// any substitution (`$(...)`, backticks, `( … )`) is [`Refusal::Dynamic`].
-pub fn classify(input: &str) -> Result<Vec<String>, Refusal> {
+/// unquoted backslash escapes the next character. An unquoted single `|`
+/// separates pipeline stages; every other operator (`&&`, `||`, `;`, `<`, `>`)
+/// is [`Refusal::Unsupported`] in this increment, and any substitution
+/// (`$(...)`, backticks, `( … )`) is [`Refusal::Dynamic`].
+pub fn classify(input: &str) -> Result<Pipeline, Refusal> {
+    let mut pipeline: Pipeline = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut has_word = false;
@@ -126,14 +134,23 @@ pub fn classify(input: &str) -> Result<Vec<String>, Refusal> {
                     has_word = false;
                 }
             }
-            // ── operators: supported later, refused (cleanly) for now ───────
+            // ── pipeline stage separator (a single, unquoted `|`) ────────────
             '|' => {
-                return Err(Refusal::Unsupported(if chars.peek() == Some(&'|') {
-                    "logical OR `||`"
-                } else {
-                    "pipeline `|`"
-                }))
+                if chars.peek() == Some(&'|') {
+                    return Err(Refusal::Unsupported("logical OR `||`"));
+                }
+                if has_word {
+                    words.push(std::mem::take(&mut cur));
+                    has_word = false;
+                }
+                if words.is_empty() {
+                    return Err(Refusal::Malformed(
+                        "empty pipeline stage (nothing before `|`)".into(),
+                    ));
+                }
+                pipeline.push(std::mem::take(&mut words));
             }
+            // ── operators: supported later, refused (cleanly) for now ───────
             '&' => {
                 return Err(Refusal::Unsupported(if chars.peek() == Some(&'&') {
                     "logical AND `&&`"
@@ -158,13 +175,21 @@ pub fn classify(input: &str) -> Result<Vec<String>, Refusal> {
         }
     }
 
+    // Finalize the trailing stage.
     if has_word {
         words.push(cur);
     }
-    if words.is_empty() {
+    if !words.is_empty() {
+        pipeline.push(words);
+    } else if pipeline.is_empty() {
         return Err(Refusal::Malformed("empty command".into()));
+    } else {
+        // A `|` with nothing after it.
+        return Err(Refusal::Malformed(
+            "empty pipeline stage (nothing after `|`)".into(),
+        ));
     }
-    Ok(words)
+    Ok(pipeline)
 }
 
 /// Classify a `$`: `$(` is command/arithmetic substitution (dynamic, refused by
@@ -181,66 +206,100 @@ fn dollar_refusal(next: Option<char>) -> Refusal {
 mod tests {
     use super::*;
 
+    /// One command's argv.
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
     }
 
-    // ── the safe argv cases ─────────────────────────────────────────────────
+    /// A single-stage pipeline (the common case).
+    fn one(parts: &[&str]) -> Pipeline {
+        vec![argv(parts)]
+    }
+
+    // ── single commands (increment 1, now one-stage pipelines) ──────────────
 
     #[test]
     fn simple_command_splits_on_whitespace() {
         assert_eq!(
             classify("echo hi there").unwrap(),
-            argv(&["echo", "hi", "there"])
+            one(&["echo", "hi", "there"])
         );
     }
 
     #[test]
     fn collapses_runs_of_whitespace() {
-        assert_eq!(classify("  echo\t hi \n").unwrap(), argv(&["echo", "hi"]));
+        assert_eq!(classify("  echo\t hi \n").unwrap(), one(&["echo", "hi"]));
     }
 
     #[test]
     fn single_quotes_are_literal() {
-        assert_eq!(classify("echo 'a b'").unwrap(), argv(&["echo", "a b"]));
+        assert_eq!(classify("echo 'a b'").unwrap(), one(&["echo", "a b"]));
     }
 
     #[test]
     fn double_quotes_group_words() {
-        assert_eq!(classify("echo \"a b\"").unwrap(), argv(&["echo", "a b"]));
+        assert_eq!(classify("echo \"a b\"").unwrap(), one(&["echo", "a b"]));
     }
 
     #[test]
     fn empty_quotes_produce_an_empty_arg() {
-        assert_eq!(classify("echo ''").unwrap(), argv(&["echo", ""]));
+        assert_eq!(classify("echo ''").unwrap(), one(&["echo", ""]));
     }
 
     #[test]
     fn backslash_escapes_a_space() {
-        assert_eq!(classify("echo a\\ b").unwrap(), argv(&["echo", "a b"]));
+        assert_eq!(classify("echo a\\ b").unwrap(), one(&["echo", "a b"]));
     }
 
     #[test]
     fn escaped_dollar_is_a_literal_dollar() {
-        // The escape hatch for a literal `$`: refusal of bare `$` is escapable.
-        assert_eq!(classify("echo \\$5").unwrap(), argv(&["echo", "$5"]));
-        assert_eq!(classify("echo \"\\$5\"").unwrap(), argv(&["echo", "$5"]));
+        assert_eq!(classify("echo \\$5").unwrap(), one(&["echo", "$5"]));
+        assert_eq!(classify("echo \"\\$5\"").unwrap(), one(&["echo", "$5"]));
+    }
+
+    // ── pipelines (increment 2) ─────────────────────────────────────────────
+
+    #[test]
+    fn pipeline_splits_into_stages() {
+        assert_eq!(
+            classify("grep foo | head -n 3").unwrap(),
+            vec![argv(&["grep", "foo"]), argv(&["head", "-n", "3"])]
+        );
+    }
+
+    #[test]
+    fn multi_stage_pipeline() {
+        assert_eq!(
+            classify("a | b | c").unwrap(),
+            vec![argv(&["a"]), argv(&["b"]), argv(&["c"])]
+        );
+    }
+
+    #[test]
+    fn pipe_without_surrounding_spaces() {
+        assert_eq!(
+            classify("grep foo|wc -l").unwrap(),
+            vec![argv(&["grep", "foo"]), argv(&["wc", "-l"])]
+        );
+    }
+
+    #[test]
+    fn empty_pipeline_stage_is_malformed() {
+        assert!(matches!(classify("| x"), Err(Refusal::Malformed(_))));
+        assert!(matches!(classify("x |"), Err(Refusal::Malformed(_))));
+        assert!(matches!(classify("a | | b"), Err(Refusal::Malformed(_))));
     }
 
     // ── the security property: quoted metacharacters are LITERAL ────────────
 
     #[test]
-    fn quoted_pipe_is_a_literal_argument_not_an_operator() {
-        // Load-bearing: a metacharacter inside quotes must NOT be treated as an
-        // operator. `echo "a|b"` is a single literal arg, not a refused pipeline.
-        assert_eq!(classify("echo \"a|b\"").unwrap(), argv(&["echo", "a|b"]));
-        assert_eq!(
-            classify("echo 'a && b'").unwrap(),
-            argv(&["echo", "a && b"])
-        );
+    fn quoted_pipe_is_a_literal_argument_not_a_separator() {
+        // Load-bearing: a `|` inside quotes is one literal arg, NOT a stage split.
+        assert_eq!(classify("echo \"a|b\"").unwrap(), one(&["echo", "a|b"]));
+        assert_eq!(classify("echo 'a && b'").unwrap(), one(&["echo", "a && b"]));
         assert_eq!(
             classify("grep '$(x)' f").unwrap(),
-            argv(&["grep", "$(x)", "f"])
+            one(&["grep", "$(x)", "f"])
         );
     }
 
@@ -260,6 +319,11 @@ mod tests {
             classify("echo \"$(id)\""),
             Err(Refusal::Dynamic(_))
         ));
+        // Even downstream of a (now-supported) pipe, a dynamic stage is refused.
+        assert!(matches!(
+            classify("echo hi | $(evil)"),
+            Err(Refusal::Dynamic(_))
+        ));
     }
 
     #[test]
@@ -267,17 +331,7 @@ mod tests {
         assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
     }
 
-    // ── operators refused as UNSUPPORTED (this increment) ───────────────────
-
-    #[test]
-    fn pipeline_is_unsupported_and_the_second_command_never_runs() {
-        // The whole string is refused before any argv is produced, so `rm`
-        // downstream of the pipe is never reachable.
-        assert!(matches!(
-            classify("echo a | rm -rf x"),
-            Err(Refusal::Unsupported(_))
-        ));
-    }
+    // ── operators still refused as UNSUPPORTED ──────────────────────────────
 
     #[test]
     fn logical_and_sequencing_redirection_globbing_are_unsupported() {
@@ -322,7 +376,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("refused by design"));
-        assert!(classify("a | b")
+        assert!(classify("a && b")
             .unwrap_err()
             .to_string()
             .contains("not yet supported"));
