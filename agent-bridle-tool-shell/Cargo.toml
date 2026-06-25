@@ -1,10 +1,12 @@
 [package]
 name = "agent-bridle-tool-shell"
-# STUB RELEASE — full brush-backed shell is temporarily disabled pending
-# reubeno/brush#1184 (CommandInterceptor upstream PR). The tool registers in
-# the registry and documents its interface, but invoke() returns a clear error.
-# See https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
-description = "Capability-confined shell tool for agent-bridle (stub — pending reubeno/brush#1184)."
+# argv + safe-subset engine (ADR 0005): agent-bridle is the exec funnel — it
+# parses the request itself, checks the exec/fs leash, spawns directly, and
+# refuses the dynamic constructs by design. L2 convenience; the L3 boundary is
+# deferred (agent-bridle#35) so runs are honestly advisory (sandbox_kind=None).
+# Incremental build tracked on agent-bridle#34; brush-bridle-core is the
+# deferred, reversible full-bash alternative engine (ADR 0005 D4, #20).
+description = "Capability-confined shell tool for agent-bridle (argv + safe-subset engine)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,12 +14,12 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-# `shell` is on by default so agent-bridle's registry() includes the tool
-# (as a stub). The tool is listed, its schema is advertised, and invoke()
-# returns a clear explanation instead of silently absent.
+# `shell` is on by default so agent-bridle's registry() includes the tool.
+# It pulls tokio (spawn_blocking + timeout) for confined execution.
 default = ["shell"]
 shell = ["dep:tokio"]
-# linux-landlock forwarded for API compatibility — no-op in the stub.
+# linux-landlock forwarded for API compatibility — no-op until the L3 boundary
+# lands (agent-bridle#35); ADR 0005 keeps the engine cross-OS and advisory.
 linux-landlock = ["agent-bridle-core/linux-landlock"]
 
 [dependencies]
@@ -28,12 +30,10 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, optional = true }
 
-# brush deps — REMOVED pending reubeno/brush#1184.
-# Restore by re-adding to workspace Cargo.toml and uncommenting in the shell
-# feature above. See https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
-# brush-core              = { workspace = true, optional = true }
-# brush-builtins          = { workspace = true, optional = true }
-# brush-coreutils-builtins = { workspace = true, optional = true }
+# brush deps — intentionally absent. `brush-bridle-core` (a renamed brush fork
+# published to crates.io) is the DEFERRED, REVERSIBLE full-bash alternative
+# engine behind the same registry seam (ADR 0005 D4); it would be added under
+# its own optional feature when adopted, not restored here. See agent-bridle#20.
 
 [dev-dependencies]
 tokio = { workspace = true }

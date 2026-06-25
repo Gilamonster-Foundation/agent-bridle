@@ -1,31 +1,28 @@
-//! `agent-bridle-tool-shell` — capability-confined shell tool (stub release).
+//! `agent-bridle-tool-shell` — capability-confined shell tool (argv + safe-subset engine).
 //!
-//! The full brush-backed implementation with `CommandInterceptor` exec/open
-//! interception is temporarily disabled pending the upstream PR that adds the
-//! hook to `reubeno/brush`:
+//! Per **ADR 0005** the object-capability *boundary* is L3 (kernel) and this
+//! crate is the L2 *convenience* engine: `agent-bridle` is the **exec funnel**,
+//! parsing each request itself ([`crate::parse`]) and running only what it can
+//! confine. [`ShellTool`] accepts either argv form (`program` + `args`) or a
+//! free-form `cmd` string, checks the `exec`/`fs` leash, spawns the program
+//! directly, and **refuses the dynamic constructs by design** (`$(...)`,
+//! backticks, subshells — the undecidable interiors of ADR 0001). Until an L3
+//! backstop is active (deferred — agent-bridle#35), a run is honestly
+//! *advisory*: the result's `sandbox_kind` reports what actually enforced it
+//! (I9), today [`agent_bridle_core::SandboxKind::None`].
 //!
-//!   <https://github.com/reubeno/brush/pull/1184>
-//!
-//! In this stub release, [`ShellTool`] registers in the tool registry and
-//! advertises its complete JSON schema, but [`Tool::invoke`] returns a
-//! structured error explaining the situation. No functionality is silently
-//! missing — the error message links to the tracking issue.
-//!
-//! **Restoring full support:** once the upstream PR merges and brush ships a
-//! crates.io release containing `CommandInterceptor`, restore from git history:
-//!
-//! ```text
-//! git show <pre-stub-commit>:agent-bridle-tool-shell/src/shell_tool.rs
-//! git show <pre-stub-commit>:agent-bridle-tool-shell/src/caveat_interceptor.rs
-//! ```
-//!
-//! Then add brush back to `Cargo.toml` (see commented lines there) and publish
-//! a new agent-bridle version. See the tracking issue for the full checklist:
-//! <https://github.com/Gilamonster-Foundation/agent-bridle/issues/20>
+//! **Increment 1** of agent-bridle#34: a single command with quoted arguments.
+//! Pipelines, redirections, `&&`/`||`/`;` and globbing are added incrementally;
+//! until then they are refused as *unsupported* (distinct from the *dynamic*
+//! constructs refused by design). `brush-bridle-core` remains the deferred,
+//! reversible full-bash alternative engine behind the same registry seam
+//! (ADR 0005 D4 — tracked on agent-bridle#20).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "shell")]
+mod parse;
 #[cfg(feature = "shell")]
 mod shell_tool;
 
