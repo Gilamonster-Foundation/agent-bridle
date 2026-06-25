@@ -6,10 +6,14 @@
 //! confine. [`ShellTool`] accepts either argv form (`program` + `args`) or a
 //! free-form `cmd` string, checks the `exec`/`fs` leash, spawns the program
 //! directly, and **refuses the dynamic constructs by design** (`$(...)`,
-//! backticks, subshells — the undecidable interiors of ADR 0001). Until an L3
-//! backstop is active (deferred — agent-bridle#35), a run is honestly
-//! *advisory*: the result's `sandbox_kind` reports what actually enforced it
-//! (I9), today [`agent_bridle_core::SandboxKind::None`].
+//! backticks, subshells — the undecidable interiors of ADR 0001). The L3
+//! backstop is wired (agent-bridle#35): when it will actually confine the run —
+//! today the Landlock `fs_write` axis on a capable Linux build with `fs_write`
+//! restricted — children spawn inside a kernel-enforced ruleset and
+//! `sandbox_kind` reports [`agent_bridle_core::SandboxKind::Landlock`]; else the
+//! run is honestly *advisory* with [`agent_bridle_core::SandboxKind::None`]
+//! (I9, never overclaiming). Read/exec/net axes + macOS/Windows backends are
+//! follow-ups (ADR 0006).
 //!
 //! The engine (agent-bridle#34 Track A + #45): a sequence of pipelines joined by
 //! `&&`/`||`/`;` (short-circuit semantics), each pipeline simple commands with

@@ -3,7 +3,8 @@
 //! These exercise the *real* `OsSpawner` with actual processes (and, for
 //! redirections, real files), and are kept out of the unit tests (which mock the
 //! spawner) per the workspace norm: no real subprocesses/fs in unit tests. They
-//! use only universally-present tools (`echo`, `cat`, `sort`, `true`, `false`).
+//! use only universally-present tools (`echo`, `cat`, `sort`, `true`, `false`,
+//! and `touch` for the Linux-only Landlock test).
 #![cfg(feature = "shell")]
 
 use std::path::PathBuf;
@@ -387,4 +388,73 @@ async fn real_2to1_before_a_pipe_feeds_stderr_downstream() {
         !out["stdout"].as_str().unwrap_or("").is_empty(),
         "stderr merged into the pipe must reach the downstream stage: {out}"
     );
+}
+
+// ── L3 boundary: Landlock actually confines the spawned child (#35) ──────────
+//
+// This is the regression proof for ADR 0005's claim that L3 is the *boundary*: a
+// permitted program's OWN write (not a bridle-performed redirect) is blocked by
+// the kernel when it targets a path outside `fs_write` — something L2 cannot see
+// once the child has spawned. Linux + `linux-landlock` only; self-skips if the
+// kernel lacks Landlock.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+#[tokio::test]
+async fn real_landlock_confines_a_spawned_childs_own_write() {
+    use agent_bridle_core::landlock_is_supported;
+
+    if !landlock_is_supported() {
+        eprintln!("skipping: kernel lacks Landlock");
+        return;
+    }
+
+    let allowed = unique_temp("ll-allowed");
+    std::fs::create_dir_all(&allowed).unwrap();
+    let forbidden = unique_temp("ll-forbidden");
+    std::fs::create_dir_all(&forbidden).unwrap();
+
+    // exec `touch`, but only allow writes under `allowed` (fs_read stays open so
+    // the dynamic loader can map libc — the fs_write axis is what we confine).
+    let caveats = Caveats {
+        exec: Scope::only(["touch".to_string()]),
+        fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+
+    // `touch` itself opens the file for writing — bridle does NOT open it (it is
+    // an argument, not a redirect), so only L3 can stop it.
+    let inside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!("touch {}/ok", allowed.to_string_lossy())}),
+            &ctx(caveats.clone()),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(
+        inside["exit_code"], 0,
+        "write within fs_write must succeed: {inside}"
+    );
+    assert_eq!(
+        inside["sandbox_kind"], "landlock",
+        "must report kernel enforcement: {inside}"
+    );
+    assert!(allowed.join("ok").exists(), "the in-scope file must exist");
+
+    let outside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!("touch {}/escape", forbidden.to_string_lossy())}),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+    assert_ne!(
+        outside["exit_code"], 0,
+        "the kernel must deny a write outside fs_write scope: {outside}"
+    );
+    assert!(
+        !forbidden.join("escape").exists(),
+        "the out-of-scope file must NOT have been created"
+    );
+
+    let _ = std::fs::remove_dir_all(&allowed);
+    let _ = std::fs::remove_dir_all(&forbidden);
 }

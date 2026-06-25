@@ -18,8 +18,10 @@ authors.workspace = true
 # It pulls tokio (spawn_blocking + timeout) for confined execution.
 default = ["shell"]
 shell = ["dep:tokio"]
-# linux-landlock forwarded for API compatibility — no-op until the L3 boundary
-# lands (agent-bridle#35); ADR 0005 keeps the engine cross-OS and advisory.
+# Kernel-enforced L3 backstop (Linux). The engine applies the Landlock fs_write
+# ruleset before spawning when fs_write is restricted (agent-bridle#35); off this
+# build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Read/exec/net
+# axes (#31) and macOS/Windows backends (#50/#51) are follow-ups.
 linux-landlock = ["agent-bridle-core/linux-landlock"]
 
 [dependencies]

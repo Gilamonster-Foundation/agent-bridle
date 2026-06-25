@@ -4,9 +4,15 @@
 //! is the L2 *convenience*: `agent-bridle` is the exec funnel — it parses the
 //! request itself (see [`crate::parse`]), checks the `exec`/`fs` leash, spawns
 //! the program(s) directly, and **refuses the dynamic constructs by design**.
-//! Until an L3 backstop is active (deferred — agent-bridle#35), a run is honestly
-//! *advisory*: the result's `sandbox_kind` reports what actually enforced it (I9),
-//! today [`SandboxKind::None`].
+//! When an L3 backstop will actually confine the run — today the Landlock
+//! `fs_write` axis on a capable Linux build (`linux-landlock`), with `fs_write`
+//! restricted — the children spawn inside a kernel-enforced ruleset applied on a
+//! dedicated thread, and `sandbox_kind` reports [`SandboxKind::Landlock`]; this
+//! blocks a *permitted* program's own out-of-scope writes, which L2 cannot see
+//! once it has spawned. Otherwise the run is honestly *advisory* and
+//! `sandbox_kind` is [`SandboxKind::None`] — never overclaiming (I9). The
+//! `fs_read`/`exec`/`net` axes (#31) and the macOS/Windows backends (#50/#51)
+//! are follow-ups; see ADR 0006 for the per-OS backend design.
 //!
 //! The engine (agent-bridle#34 Track A + #45): a sequence of pipelines joined by
 //! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments,
@@ -28,7 +34,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_bridle_core::{
-    Denial, DenialKind, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    best_available_sandbox, Caveats, Denial, DenialKind, SandboxKind, Scope, Tool, ToolContext,
+    ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -63,18 +70,70 @@ pub(crate) struct Captured {
 /// that already passed the `exec` **and** `fs` (redirect + glob-dir) leash —
 /// admission happens in [`ShellTool::invoke`] *before* the spawner runs.
 pub(crate) trait Spawner: Send + Sync {
-    /// Run one leash-approved pipeline to completion, capturing its output.
-    fn run(&self, stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured>;
+    /// Run one leash-approved pipeline to completion, capturing its output. The
+    /// effective `caveats` are passed so the real spawner can apply the L3 OS
+    /// sandbox (Landlock) before spawning; the mock ignores them.
+    fn run(&self, stages: &[Command], cwd: Option<&str>, caveats: &Caveats)
+        -> ToolResult<Captured>;
 }
 
 /// The real spawner: a `std::process` pipeline wired with OS pipes + redirects,
-/// expanding globs against the real filesystem.
+/// expanding globs against the real filesystem, optionally inside an L3 sandbox.
 struct OsSpawner;
 
 impl Spawner for OsSpawner {
-    fn run(&self, stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
-        run_pipeline(stages, cwd)
+    fn run(
+        &self,
+        stages: &[Command],
+        cwd: Option<&str>,
+        caveats: &Caveats,
+    ) -> ToolResult<Captured> {
+        // When an OS sandbox (Landlock) will actually confine this run, apply it
+        // on a dedicated thread before spawning (ADR 0005 L3 / ADR 0006 D4).
+        // Otherwise run directly — no need to spend a thread.
+        if intended_sandbox_kind(caveats) == SandboxKind::None {
+            run_pipeline(stages, cwd)
+        } else {
+            run_confined(stages, cwd, caveats)
+        }
     }
+}
+
+/// The L3 `SandboxKind` that will actually be enforced for these caveats in this
+/// build, on this kernel — the value reported in the result envelope (I9 / ADR
+/// 0006 D3). [`best_available_sandbox`] already accounts for OS, feature, and
+/// kernel capability; we additionally report `None` when `fs_write` is
+/// unrestricted, because the current Landlock ruleset (the `fs_write` axis) then
+/// governs nothing — never overclaim.
+fn intended_sandbox_kind(caveats: &Caveats) -> SandboxKind {
+    match best_available_sandbox().kind() {
+        SandboxKind::Landlock if matches!(caveats.fs_write, Scope::Only(_)) => {
+            SandboxKind::Landlock
+        }
+        _ => SandboxKind::None,
+    }
+}
+
+/// Run the pipeline on a dedicated thread that first applies the OS sandbox.
+///
+/// `restrict_self` is per-thread, irreversible, and inherited across `fork`/
+/// `execve`, so it must run on a throwaway thread (never the shared blocking
+/// pool) immediately before spawning the children. `apply` is fail-closed (ADR
+/// 0006 D4): if the kernel does not enforce the ruleset, the run errors rather
+/// than proceeding unconfined.
+fn run_confined(stages: &[Command], cwd: Option<&str>, caveats: &Caveats) -> ToolResult<Captured> {
+    let stages = stages.to_vec();
+    let cwd = cwd.map(str::to_string);
+    let caveats = caveats.clone();
+    std::thread::Builder::new()
+        .name("agent-bridle-confined".to_string())
+        .spawn(move || {
+            best_available_sandbox().apply(&caveats)?;
+            run_pipeline(&stages, cwd.as_deref())
+        })
+        .map_err(ToolError::Exec)?
+        .join()
+        .map_err(|_| ToolError::Exec(std::io::Error::other("confined execution thread panicked")))?
 }
 
 /// The confined shell tool.
@@ -171,9 +230,11 @@ impl Tool for ShellTool {
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
         let parsed = ShellArgs::parse(&args)?;
-        // Honest reporting (ADR 0005 D1 / I9): L2 convenience, so the kind is
-        // whatever is actually in force — None until L3 (#35).
-        let sandbox_kind = cx.sandbox_kind();
+        // Honest reporting (ADR 0005 D1 / I9 / ADR 0006 D3): report the L3 kind
+        // that will actually be enforced for these caveats on this kernel —
+        // Landlock when `fs_write` is restricted on a capable Linux build, else
+        // None (advisory). `OsSpawner` applies exactly this, fail-closed.
+        let sandbox_kind = intended_sandbox_kind(cx.caveats());
 
         // Resolve to a script (sequence of pipelines), or surface a refusal.
         let script = match parsed.script() {
@@ -275,8 +336,10 @@ impl Tool for ShellTool {
         let spawner = Arc::clone(&self.spawner);
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
-        let run =
-            tokio::task::spawn_blocking(move || run_script(&*spawner, &script, cwd.as_deref()));
+        let caveats = cx.caveats().clone();
+        let run = tokio::task::spawn_blocking(move || {
+            run_script(&*spawner, &script, cwd.as_deref(), &caveats)
+        });
         match tokio::time::timeout(timeout, run).await {
             Ok(joined) => {
                 let captured = joined
@@ -303,6 +366,7 @@ fn run_script(
     spawner: &dyn Spawner,
     script: &[ScriptItem],
     cwd: Option<&str>,
+    caveats: &Caveats,
 ) -> ToolResult<Captured> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -315,7 +379,7 @@ fn run_script(
             Sep::Or => status != 0,
         };
         if run_it {
-            let captured = spawner.run(&item.pipeline, cwd)?;
+            let captured = spawner.run(&item.pipeline, cwd, caveats)?;
             stdout.push_str(&captured.stdout);
             stderr.push_str(&captured.stderr);
             status = captured.exit_code;
@@ -816,7 +880,12 @@ mod tests {
     }
 
     impl Spawner for MockSpawner {
-        fn run(&self, stages: &[Command], _cwd: Option<&str>) -> ToolResult<Captured> {
+        fn run(
+            &self,
+            stages: &[Command],
+            _cwd: Option<&str>,
+            _caveats: &Caveats,
+        ) -> ToolResult<Captured> {
             self.calls.lock().unwrap().push(stages.to_vec());
             if self.block_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.block_ms));
