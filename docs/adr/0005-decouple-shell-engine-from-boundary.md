@@ -1,6 +1,7 @@
 # ADR 0005 — Decouple the shell engine from the boundary: L3 is the boundary, L2 is convenience
 
-- Status: Accepted (ratified 2026-06-24)
+- Status: Accepted (ratified 2026-06-24); **extended by ADR 0006** (per-OS L3
+  backend selection + engines as opt-in cargo features)
 - Date: 2026-06-24
 - Context: `agent-bridle-tool-shell` (a fail-closed stub today — ADR 0003); the
   brush `CommandInterceptor` (L2) lives on a fork blocked by crates.io's git-dep
