@@ -32,7 +32,9 @@ use agent_bridle_core::{
 };
 use async_trait::async_trait;
 
-use crate::parse::{classify, Arg, Command, Redirect, Refusal, Script, ScriptItem, Sep, StderrTo};
+use crate::parse::{
+    classify, Arg, Command, Redirect, Refusal, Script, ScriptItem, Seg, Sep, StderrTo,
+};
 
 /// Maximum permitted (and default-clamped) wall-clock timeout.
 const MAX_TIMEOUT_SECS: u64 = 300;
@@ -141,11 +143,12 @@ impl Tool for ShellTool {
                         pipelines (a | b) joined by &&/||/;, with quoted arguments, redirections \
                         (> out, >> out, < in, 2> err, 2>&1; file targets gated by fs_write/fs_read), \
                         filename globbing (*, ?, [..]; gated by fs_read on the listed directory), \
-                        and whole-word $VAR/${VAR} expansion for an allowlisted, secret-free set \
-                        (HOME, PWD, USER, TMPDIR, ...). Dynamic constructs ($(...), backticks, \
-                        subshells) are refused by design; a $VAR mixed into a word, quoted, or \
-                        outside the allowlist, and fd redirections other than 1>/2>/0</2>&1, \
-                        are refused. Mutually exclusive with `program`."
+                        and $VAR/${VAR} expansion (incl. mixed words like $HOME/config and \
+                        inside double quotes) for an allowlisted, secret-free set (HOME, PWD, \
+                        USER, TMPDIR, ...). Dynamic constructs ($(...), backticks, subshells) are \
+                        refused by design; a $VAR outside the allowlist, a $VAR in a redirect \
+                        target or combined with a glob, and fd redirections other than \
+                        1>/2>/0</2>&1, are refused. Mutually exclusive with `program`."
                 },
                 "cwd": {
                     "type": "string",
@@ -199,11 +202,11 @@ impl Tool for ShellTool {
                             &ToolError::denied("a glob pattern is not allowed as a program name"),
                         ));
                     }
-                    Some(Arg::Var(name)) => {
+                    Some(Arg::Var(_segs)) => {
                         return Ok(deny(
                             sandbox_kind,
                             DenialKind::Exec,
-                            name,
+                            "$VAR",
                             &ToolError::denied("a variable is not allowed as a program name"),
                         ));
                     }
@@ -224,18 +227,25 @@ impl Tool for ShellTool {
                                 ));
                             }
                         }
-                        // A variable must be on the env allowlist (no secret leak).
-                        Arg::Var(name) if !is_allowed_var(name) => {
-                            return Ok(deny(
-                                sandbox_kind,
-                                DenialKind::Exec,
-                                &format!("${name}"),
-                                &ToolError::denied(format!(
-                                    "variable ${name} is not in the confined shell's allowlist"
-                                )),
-                            ));
+                        // Every variable referenced must be on the env allowlist
+                        // (no secret leak), checked by name before any spawn.
+                        Arg::Var(segs) => {
+                            for seg in segs {
+                                if let Seg::Var(name) = seg {
+                                    if !is_allowed_var(name) {
+                                        return Ok(deny(
+                                            sandbox_kind,
+                                            DenialKind::Exec,
+                                            &format!("${name}"),
+                                            &ToolError::denied(format!(
+                                                "variable ${name} is not in the confined shell's allowlist"
+                                            )),
+                                        ));
+                                    }
+                                }
+                            }
                         }
-                        Arg::Var(_) | Arg::Lit(_) => {}
+                        Arg::Lit(_) => {}
                     }
                 }
                 for redirect in &stage.redirects {
@@ -587,7 +597,19 @@ fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
         match arg {
             Arg::Lit(s) => argv.push(s.clone()),
             Arg::Glob(pattern) => argv.extend(expand_glob(pattern, cwd, &list_dir)),
-            Arg::Var(name) => argv.push(std::env::var(name).unwrap_or_default()),
+            // Concatenate the segments: literals as-is, variables (already
+            // allowlisted in `invoke`) read from the env as a single literal —
+            // no re-split / no re-glob of the value.
+            Arg::Var(segs) => {
+                let mut word = String::new();
+                for seg in segs {
+                    match seg {
+                        Seg::Lit(s) => word.push_str(s),
+                        Seg::Var(name) => word.push_str(&std::env::var(name).unwrap_or_default()),
+                    }
+                }
+                argv.push(word);
+            }
         }
     }
     argv
@@ -784,11 +806,12 @@ mod tests {
         }
     }
 
-    /// A stage's program word (argv[0]) for test assertions.
+    /// A stage's program word (argv[0]) for test assertions. (A variable in the
+    /// program position is denied in `invoke`, so it never reaches the spawner.)
     fn prog(stage: &Command) -> &str {
         match stage.argv.first() {
-            Some(Arg::Lit(s) | Arg::Glob(s) | Arg::Var(s)) => s,
-            None => "",
+            Some(Arg::Lit(s) | Arg::Glob(s)) => s,
+            Some(Arg::Var(_)) | None => "",
         }
     }
 
@@ -931,7 +954,10 @@ mod tests {
         let c = calls(&mock);
         assert_eq!(
             c[0][0].argv,
-            vec![Arg::Lit("echo".into()), Arg::Var("HOME".into())]
+            vec![
+                Arg::Lit("echo".into()),
+                Arg::Var(vec![Seg::Var("HOME".into())]),
+            ]
         );
     }
 
