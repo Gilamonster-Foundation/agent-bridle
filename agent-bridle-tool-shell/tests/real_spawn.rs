@@ -303,6 +303,35 @@ async fn real_allowlisted_var_expands_from_the_environment() {
 }
 
 #[tokio::test]
+async fn real_mixed_and_quoted_variable_words_expand() {
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    // Mixed word: `$HOME/sub` → "<home>/sub".
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "echo $HOME/sub"}),
+            &ctx(exec_only(&["echo"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["stdout"], format!("{home}/sub\n"), "mixed word: {out}");
+
+    // Inside double quotes the variable still expands.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "echo \"prefix-$HOME\""}),
+            &ctx(exec_only(&["echo"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(
+        out["stdout"],
+        format!("prefix-{home}\n"),
+        "quoted var: {out}"
+    );
+}
+
+#[tokio::test]
 async fn real_stderr_redirect_to_file() {
     // `cat <missing> 2> err` — cat's error goes to the file; captured stderr is
     // empty (it was redirected), stdout empty, exit non-zero.

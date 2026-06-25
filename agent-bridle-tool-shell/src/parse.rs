@@ -5,16 +5,17 @@
 //! This covers the safe-subset engine — a sequence of pipelines joined by `&&`,
 //! `||` and `;`, each pipeline simple commands (`a | b | c`) with quoted
 //! arguments, file redirections (`> out`, `>> out`, `< in`, `2> err`, `2>&1`),
-//! filename globbing (`*`, `?`, `[…]`), and **whole-word variable expansion**
-//! (`$VAR` / `${VAR}`). The parser only *marks* an argument ([`Arg::Glob`] /
-//! [`Arg::Var`]); the filesystem read (globbing) and the env read + allowlist
-//! check (variables) are the executor's job.
+//! filename globbing (`*`, `?`, `[…]`), and **variable expansion** (`$VAR` /
+//! `${VAR}`, including mixed words like `$HOME/config` and references inside
+//! double quotes). The parser only *marks* an argument ([`Arg::Glob`] /
+//! [`Arg::Var`] segments); the filesystem read (globbing) and the env read +
+//! allowlist check (variables) are the executor's job.
 //!
 //! Refused **by design** (security, [`Refusal::Dynamic`]): command/arithmetic
 //! substitution `$(…)`, backticks, subshells — the undecidable interiors ADR
 //! 0001 says may never be statically cleared. Refused for now
-//! ([`Refusal::Unsupported`]): `$VAR` mixed into a larger word (use a standalone
-//! `$VAR`) or inside double quotes, and fd redirections other than
+//! ([`Refusal::Unsupported`]): a word that is *both* a glob and variable-bearing
+//! (`$DIR/*.rs`), a `$VAR` in a redirect target, and fd redirections other than
 //! `1>`/`2>`/`0<`/`2>&1` (e.g. `3>`, `1>&2`).
 //!
 //! Quoting is honored, so a metacharacter **inside quotes is a literal
@@ -72,8 +73,18 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// One argument word: a literal, a glob pattern, or a variable reference. The
-/// executor lowers globs (a filesystem read) and variables (an env read +
+/// A piece of a variable-bearing word: a literal run or a `$NAME` reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seg {
+    /// A literal run of characters.
+    Lit(String),
+    /// A `$NAME` / `${NAME}` reference (the variable name only).
+    Var(String),
+}
+
+/// One argument word: a literal, a glob pattern, or a word that contains one or
+/// more `$VAR` references (possibly mixed with literals, e.g. `$HOME/config`).
+/// The executor lowers globs (a filesystem read) and variables (an env read +
 /// allowlist check) into literals — both leash-/policy-checked first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arg {
@@ -81,8 +92,8 @@ pub enum Arg {
     Lit(String),
     /// A word containing unquoted `*`/`?`/`[…]` — a glob pattern.
     Glob(String),
-    /// A standalone `$NAME` / `${NAME}` variable reference (the name only).
-    Var(String),
+    /// A word with `$VAR` reference(s) (segments concatenated at expansion time).
+    Var(Vec<Seg>),
 }
 
 /// A redirection on one command stage. `agent-bridle` performs the open, so each
@@ -369,25 +380,26 @@ fn skip_whitespace(chars: &mut Peekable<Chars>) {
 
 /// Read the next word as an [`Arg`]. Stops at unquoted whitespace or an operator.
 /// Single quotes are literal; double quotes are literal except `$`/backtick still
-/// trigger substitution detection; an unquoted backslash escapes the next char.
-/// An unquoted `*`/`?`/`[` marks the word a glob; an unquoted `$` at the start of
-/// a word begins a standalone variable reference (see [`read_variable`]).
+/// expand; an unquoted backslash escapes the next char. An unquoted `*`/`?`/`[`
+/// marks the word a glob; a `$NAME`/`${NAME}` (unquoted or inside double quotes)
+/// contributes a [`Seg::Var`] so a word can mix literals and variables
+/// (`$HOME/config`). A word that is BOTH a glob and variable-bearing is refused.
 fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
-    let mut cur = String::new();
+    let mut cur = String::new(); // current literal run
+    let mut segs: Vec<Seg> = Vec::new(); // pieces flushed when a `$VAR` appears
     let mut is_glob = false;
+
     while let Some(&c) = chars.peek() {
         match c {
             ' ' | '\t' | '\n' | '\r' => break,
             '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`' => break,
             '$' => {
-                // A variable is only allowed as a *standalone* word.
-                if !cur.is_empty() || is_glob {
-                    return Err(Refusal::Unsupported(
-                        "mixed variable expansion (use a standalone $VAR)",
-                    ));
-                }
                 chars.next(); // consume '$'
-                return read_variable(chars);
+                let name = read_var_name(chars)?;
+                if !cur.is_empty() {
+                    segs.push(Seg::Lit(std::mem::take(&mut cur)));
+                }
+                segs.push(Seg::Var(name));
             }
             '*' | '?' | '[' => {
                 cur.push(c);
@@ -416,12 +428,13 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
                             }
                             _ => cur.push('\\'),
                         },
-                        // `$VAR` inside double quotes is not expanded here — use a
-                        // bare `$VAR`. (Avoids the segment model; a documented gap.)
+                        // `$VAR` inside double quotes expands (a literal `$` is `\$`).
                         Some('$') => {
-                            return Err(Refusal::Unsupported(
-                                "variable expansion inside double quotes (use a bare $VAR)",
-                            ))
+                            let name = read_var_name(chars)?;
+                            if !cur.is_empty() {
+                                segs.push(Seg::Lit(std::mem::take(&mut cur)));
+                            }
+                            segs.push(Seg::Var(name));
                         }
                         Some('`') => {
                             return Err(Refusal::Dynamic("command substitution (backticks)"))
@@ -444,18 +457,30 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
             }
         }
     }
-    // A bare digit-word touching a redirect op (`2>`, `0<`, …) is handled by the
-    // caller as an fd redirect — it is returned here as a plain literal.
-    Ok(if is_glob {
-        Arg::Glob(cur)
-    } else {
-        Arg::Lit(cur)
-    })
+
+    if segs.is_empty() {
+        // Pure literal/glob word. (A bare digit-word touching a redirect op is
+        // handled by the caller as an fd redirect.)
+        return Ok(if is_glob {
+            Arg::Glob(cur)
+        } else {
+            Arg::Lit(cur)
+        });
+    }
+    // A variable-bearing word.
+    if is_glob {
+        return Err(Refusal::Unsupported("glob and variable in one word"));
+    }
+    if !cur.is_empty() {
+        segs.push(Seg::Lit(cur));
+    }
+    Ok(Arg::Var(segs))
 }
 
-/// Read a variable reference after a consumed `$`: `$NAME` or `${NAME}`. The
-/// variable must be a **whole word** (nothing else adjacent). `$(` is dynamic.
-fn read_variable(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
+/// Read a variable name after a consumed `$`: `NAME` (bare) or `{NAME}`. `$(` is
+/// command/arithmetic substitution (dynamic, refused); a `$` not followed by a
+/// name/brace is a refused bare `$` (escape as `\$` for a literal dollar).
+fn read_var_name(chars: &mut Peekable<Chars>) -> Result<String, Refusal> {
     let name = match chars.peek() {
         Some('(') => return Err(Refusal::Dynamic("command/arithmetic substitution `$(`")),
         Some('{') => {
@@ -491,17 +516,7 @@ fn read_variable(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
     if !is_valid_var_name(&name) {
         return Err(Refusal::Unsupported("unsupported variable name"));
     }
-    // Whole-word only: the variable must be the entire word.
-    match chars.peek() {
-        None => {}
-        Some(&(' ' | '\t' | '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')')) => {}
-        _ => {
-            return Err(Refusal::Unsupported(
-                "mixed variable expansion (use a standalone $VAR)",
-            ))
-        }
-    }
-    Ok(Arg::Var(name))
+    Ok(name)
 }
 
 /// A valid environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -610,8 +625,15 @@ mod tests {
     fn glob(s: &str) -> Arg {
         Arg::Glob(s.to_string())
     }
-    fn var(s: &str) -> Arg {
-        Arg::Var(s.to_string())
+    /// A single-variable word, e.g. `$HOME`.
+    fn var(name: &str) -> Arg {
+        Arg::Var(vec![Seg::Var(name.to_string())])
+    }
+    fn slit(s: &str) -> Seg {
+        Seg::Lit(s.to_string())
+    }
+    fn svar(s: &str) -> Seg {
+        Seg::Var(s.to_string())
     }
     fn stage(args: Vec<Arg>) -> Command {
         Command {
@@ -675,23 +697,43 @@ mod tests {
     }
 
     #[test]
-    fn mixed_or_quoted_or_invalid_variables_are_refused() {
-        assert!(matches!(
-            classify("echo $HOME/x"),
-            Err(Refusal::Unsupported(_))
-        )); // mixed
-        assert!(matches!(
-            classify("echo foo$HOME"),
-            Err(Refusal::Unsupported(_))
-        )); // mixed
-        assert!(matches!(
-            classify("echo \"$HOME\""),
-            Err(Refusal::Unsupported(_))
-        )); // quoted
+    fn mixed_and_quoted_variables_are_segments() {
+        // `$HOME/x` → variable + literal segments.
+        assert_eq!(
+            classify("echo $HOME/x").unwrap(),
+            one_stage(vec![lit("echo"), Arg::Var(vec![svar("HOME"), slit("/x")])])
+        );
+        // `foo$HOME` → literal + variable.
+        assert_eq!(
+            classify("echo foo$HOME").unwrap(),
+            one_stage(vec![lit("echo"), Arg::Var(vec![slit("foo"), svar("HOME")])])
+        );
+        // Inside double quotes the variable still expands.
+        assert_eq!(
+            classify("echo \"$HOME/x\"").unwrap(),
+            one_stage(vec![lit("echo"), Arg::Var(vec![svar("HOME"), slit("/x")])])
+        );
+        // Multiple segments: literal, var, literal.
+        assert_eq!(
+            classify("echo pre${X}.log").unwrap(),
+            one_stage(vec![
+                lit("echo"),
+                Arg::Var(vec![slit("pre"), svar("X"), slit(".log")]),
+            ])
+        );
+    }
+
+    #[test]
+    fn invalid_or_dynamic_variable_forms_are_refused() {
         assert!(matches!(classify("echo $1"), Err(Refusal::Unsupported(_)))); // positional/invalid
         assert!(matches!(classify("echo $"), Err(Refusal::Unsupported(_)))); // bare $
         assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_)))); // substitution
-                                                                             // Escaped `$` is a literal dollar, not a variable.
+                                                                             // A word that is BOTH a glob and variable-bearing is refused (deferred).
+        assert!(matches!(
+            classify("cat $DIR/*.rs"),
+            Err(Refusal::Unsupported(_))
+        ));
+        // Escaped `$` is a literal dollar, not a variable.
         assert_eq!(
             classify("echo \\$HOME").unwrap(),
             one_stage(vec![lit("echo"), lit("$HOME")])
