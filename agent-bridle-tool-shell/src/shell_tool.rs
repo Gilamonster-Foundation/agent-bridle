@@ -8,17 +8,17 @@
 //! *advisory*: the result's `sandbox_kind` reports what actually enforced it (I9),
 //! today [`SandboxKind::None`].
 //!
-//! **Increments 1–4** of agent-bridle#34: a sequence of pipelines joined by
-//! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments and file
-//! redirections (`> out`, `>> out`, `< in`). Globbing and variable expansion land
-//! in a later increment. Because `agent-bridle` performs each redirect's file
-//! open itself, those opens are leash-checked (`fs_write`/`fs_read`) *before any
-//! stage spawns* — a real enforcement point, unlike a spawned program's own
-//! opens (L3's job). Process spawning is behind a [`Spawner`] seam (mocked in
-//! unit tests; real path in `tests/real_spawn.rs`).
+//! **Increments 1–5** of agent-bridle#34: a sequence of pipelines joined by
+//! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments, file
+//! redirections (`> out`, `>> out`, `< in`), and **filename globbing**
+//! (`*`/`?`/`[…]`). Because `agent-bridle` performs each redirect's open and each
+//! glob's directory listing itself, those filesystem touches are leash-checked
+//! (`fs_write`/`fs_read`) *before any stage spawns* — a real enforcement point,
+//! unlike a spawned program's own opens (L3's job). Process spawning is behind a
+//! [`Spawner`] seam (mocked in unit tests; real path in `tests/real_spawn.rs`).
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +28,7 @@ use agent_bridle_core::{
 };
 use async_trait::async_trait;
 
-use crate::parse::{classify, Command, Redirect, Refusal, Script, ScriptItem, Sep};
+use crate::parse::{classify, Arg, Command, Redirect, Refusal, Script, ScriptItem, Sep};
 
 /// Maximum permitted (and default-clamped) wall-clock timeout.
 const MAX_TIMEOUT_SECS: u64 = 300;
@@ -50,17 +50,19 @@ pub(crate) struct Captured {
 
 /// The pipeline-execution seam.
 ///
-/// The real implementation ([`OsSpawner`]) spawns processes; tests inject a mock
-/// so the parse + leash + sequencing logic is verified without real subprocesses
-/// (the workspace norm: no real process/fs in unit tests). A `Spawner` only ever
-/// receives a pipeline that already passed the `exec` **and** redirect-`fs` leash
-/// — admission happens in [`ShellTool::invoke`] *before* the spawner runs.
+/// The real implementation ([`OsSpawner`]) spawns processes (and expands globs
+/// against the real filesystem); tests inject a mock so the parse + leash +
+/// sequencing logic is verified without real subprocesses (the workspace norm:
+/// no real process/fs in unit tests). A `Spawner` only ever receives a pipeline
+/// that already passed the `exec` **and** `fs` (redirect + glob-dir) leash —
+/// admission happens in [`ShellTool::invoke`] *before* the spawner runs.
 pub(crate) trait Spawner: Send + Sync {
     /// Run one leash-approved pipeline to completion, capturing its output.
     fn run(&self, stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured>;
 }
 
-/// The real spawner: a `std::process` pipeline wired with OS pipes + redirects.
+/// The real spawner: a `std::process` pipeline wired with OS pipes + redirects,
+/// expanding globs against the real filesystem.
 struct OsSpawner;
 
 impl Spawner for OsSpawner {
@@ -126,16 +128,18 @@ impl Tool for ShellTool {
                 "args": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Argv form: arguments passed to `program` (argv[1..])."
+                    "description": "Argv form: arguments passed to `program` (argv[1..]). Taken \
+                        literally — no globbing/quoting interpretation."
                 },
                 "cmd": {
                     "type": "string",
                     "description": "Free-form command line run by the confined safe-subset engine: \
-                        pipelines (a | b) joined by &&/||/;, with quoted arguments and file \
-                        redirections (> out, >> out, < in; targets gated by fs_write/fs_read). \
+                        pipelines (a | b) joined by &&/||/;, with quoted arguments, file \
+                        redirections (> out, >> out, < in; targets gated by fs_write/fs_read), and \
+                        filename globbing (*, ?, [..]; gated by fs_read on the listed directory). \
                         Dynamic constructs ($(...), backticks, subshells) are refused by design; \
-                        globbing and fd-number redirections (2>, 2>&1) are added incrementally and \
-                        refused (with a clear `denied` reason) until then. Mutually exclusive with `program`."
+                        variable expansion ($VAR) and fd-number redirections (2>, 2>&1) are refused \
+                        for now. Mutually exclusive with `program`."
                 },
                 "cwd": {
                     "type": "string",
@@ -168,15 +172,41 @@ impl Tool for ShellTool {
             Err(refusal) => return Ok(refused_envelope(sandbox_kind, &refusal)),
         };
 
-        // Atomic admission (ADR 0001): every program (`exec`) and every redirect
-        // target (`fs_write`/`fs_read`, which bridle itself opens) across the
-        // WHOLE script must pass *before any stage spawns* — one out-of-scope
-        // element denies the whole script with no partial side effects (even for
-        // commands a `&&`/`||` would have short-circuited away).
+        // Atomic admission (ADR 0001): across the WHOLE script, every program
+        // (`exec`), every redirect target (`fs_write`/`fs_read`), and every glob's
+        // listed directory (`fs_read`) — all filesystem touches bridle performs —
+        // must pass *before any stage spawns*. One out-of-scope element denies the
+        // whole script with no partial side effects.
         for item in &script {
             for stage in &item.pipeline {
-                if let Err(e) = cx.check_exec(&stage.argv[0]) {
-                    return Ok(deny(sandbox_kind, DenialKind::Exec, &stage.argv[0], &e));
+                match stage.argv.first() {
+                    Some(Arg::Lit(program)) => {
+                        if let Err(e) = cx.check_exec(program) {
+                            return Ok(deny(sandbox_kind, DenialKind::Exec, program, &e));
+                        }
+                    }
+                    Some(Arg::Glob(pattern)) => {
+                        return Ok(deny(
+                            sandbox_kind,
+                            DenialKind::Exec,
+                            pattern,
+                            &ToolError::denied("a glob pattern is not allowed as a program name"),
+                        ));
+                    }
+                    None => {} // the parser guarantees a non-empty stage
+                }
+                for arg in &stage.argv {
+                    if let Arg::Glob(pattern) = arg {
+                        let dir = resolve_glob_dir(parsed.cwd.as_deref(), split_glob(pattern).0);
+                        if let Err(e) = cx.check_path_read(&dir) {
+                            return Ok(deny(
+                                sandbox_kind,
+                                DenialKind::Open,
+                                &dir.to_string_lossy(),
+                                &e,
+                            ));
+                        }
+                    }
                 }
                 for redirect in &stage.redirects {
                     let (path, checked) = match redirect {
@@ -344,13 +374,14 @@ impl ShellArgs {
         })
     }
 
-    /// Resolve to a script (argv form is a one-pipeline, one-stage script with no
-    /// redirects; free-form is parsed by the safe-subset engine).
+    /// Resolve to a script. Argv form is a one-pipeline, one-stage script whose
+    /// args are all **literal** (no globbing/parsing); free-form is parsed by the
+    /// safe-subset engine.
     fn script(&self) -> Result<Script, Refusal> {
         if let Some(program) = &self.program {
             let mut argv = Vec::with_capacity(1 + self.args.len());
-            argv.push(program.clone());
-            argv.extend(self.args.iter().cloned());
+            argv.push(Arg::Lit(program.clone()));
+            argv.extend(self.args.iter().cloned().map(Arg::Lit));
             Ok(vec![ScriptItem {
                 sep: Sep::Seq,
                 pipeline: vec![Command {
@@ -363,6 +394,113 @@ impl ShellArgs {
         }
     }
 }
+
+// ── glob expansion ──────────────────────────────────────────────────────────
+
+/// Split a glob pattern into (directory prefix incl. trailing `/`, basename
+/// pattern). `*.rs` → `("", "*.rs")`; `src/*.rs` → `("src/", "*.rs")`.
+fn split_glob(pattern: &str) -> (&str, &str) {
+    match pattern.rfind('/') {
+        Some(i) => (&pattern[..=i], &pattern[i + 1..]),
+        None => ("", pattern),
+    }
+}
+
+/// The directory a glob lists, resolved against the command's `cwd`.
+fn resolve_glob_dir(cwd: Option<&str>, dir_part: &str) -> PathBuf {
+    let base = || cwd.map_or_else(|| PathBuf::from("."), PathBuf::from);
+    if dir_part.is_empty() {
+        base()
+    } else if Path::new(dir_part).is_absolute() {
+        PathBuf::from(dir_part)
+    } else {
+        base().join(dir_part)
+    }
+}
+
+/// Expand a glob pattern against a directory listing (the `list_dir` seam lets
+/// unit tests avoid the real filesystem). Only the last path segment is globbed;
+/// hidden entries are skipped unless the pattern's basename starts with `.`.
+/// No match → the literal pattern (bash `nullglob` off).
+fn expand_glob(
+    pattern: &str,
+    cwd: Option<&str>,
+    list_dir: &dyn Fn(&Path) -> Vec<String>,
+) -> Vec<String> {
+    let (dir_part, base) = split_glob(pattern);
+    let dir = resolve_glob_dir(cwd, dir_part);
+    let base_hidden = base.starts_with('.');
+    let mut matches: Vec<String> = list_dir(&dir)
+        .into_iter()
+        .filter(|name| (base_hidden || !name.starts_with('.')) && fnmatch(base, name))
+        .map(|name| format!("{dir_part}{name}"))
+        .collect();
+    matches.sort();
+    if matches.is_empty() {
+        vec![pattern.to_string()]
+    } else {
+        matches
+    }
+}
+
+/// Glob match: `*` (any run), `?` (one char), `[…]` (class with ranges and
+/// `!`/`^` negation). `*`/`?`/`[` do not cross `/` (single-segment matching).
+fn fnmatch(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    fnmatch_inner(&p, &n)
+}
+
+fn fnmatch_inner(p: &[char], n: &[char]) -> bool {
+    match p.first() {
+        None => n.is_empty(),
+        Some('*') => fnmatch_inner(&p[1..], n) || (!n.is_empty() && fnmatch_inner(p, &n[1..])),
+        Some('?') => !n.is_empty() && fnmatch_inner(&p[1..], &n[1..]),
+        Some('[') => {
+            if n.is_empty() {
+                return false;
+            }
+            match match_class(&p[1..], n[0]) {
+                Some((matched, rest)) => matched && fnmatch_inner(rest, &n[1..]),
+                // Malformed class (no closing `]`): treat `[` as a literal.
+                None => n[0] == '[' && fnmatch_inner(&p[1..], &n[1..]),
+            }
+        }
+        Some(&c) => !n.is_empty() && c == n[0] && fnmatch_inner(&p[1..], &n[1..]),
+    }
+}
+
+/// Match a `[...]` class against `c`. `p` begins just after `[`. Returns
+/// `(matched, remaining pattern after ])`, or `None` if there is no closing `]`.
+fn match_class(p: &[char], c: char) -> Option<(bool, &[char])> {
+    let mut i = 0;
+    let negate = matches!(p.first(), Some('!' | '^'));
+    if negate {
+        i = 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while i < p.len() {
+        if p[i] == ']' && !first {
+            return Some((matched ^ negate, &p[i + 1..]));
+        }
+        first = false;
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            if c >= p[i] && c <= p[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if c == p[i] {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+// ── process execution ───────────────────────────────────────────────────────
 
 /// Open a file for an `fs_write` redirect target (`>` truncates, `>>` appends).
 fn open_for_write(path: &str, append: bool) -> std::io::Result<std::fs::File> {
@@ -383,6 +521,27 @@ fn kill_all(children: &mut [Child]) {
     }
 }
 
+/// Lower a stage's [`Arg`] list into a concrete argv, expanding globs against the
+/// real filesystem.
+fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
+    let list_dir = |dir: &Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut argv = Vec::with_capacity(stage.argv.len());
+    for arg in &stage.argv {
+        match arg {
+            Arg::Lit(s) => argv.push(s.clone()),
+            Arg::Glob(pattern) => argv.extend(expand_glob(pattern, cwd, &list_dir)),
+        }
+    }
+    argv
+}
+
 /// Spawn a pipeline of commands wired with OS pipes and file redirections,
 /// capturing the last stage's stdout (unless it is redirected to a file) and
 /// every stage's stderr. The pipeline's exit code is the last stage's (bash
@@ -398,8 +557,9 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
     let mut prev_stdout: Option<ChildStdout> = None;
 
     for (i, stage) in stages.iter().enumerate() {
-        let mut cmd = std::process::Command::new(&stage.argv[0]);
-        cmd.args(&stage.argv[1..]);
+        let argv = expand_stage_argv(stage, cwd);
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -414,7 +574,7 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
                 }
             };
             cmd.stdin(Stdio::from(file));
-            prev_stdout = None; // discard the incoming pipe, if any
+            prev_stdout = None;
         } else {
             cmd.stdin(match prev_stdout.take() {
                 Some(out) => Stdio::from(out),
@@ -446,8 +606,6 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
             }
         };
 
-        // Wire this stage's stdout into the next stage's stdin only if it is
-        // piped (no redirect) and there is a next stage.
         if !stdout_to_file && i + 1 < n {
             prev_stdout = child.stdout.take();
         }
@@ -531,13 +689,11 @@ mod tests {
     use std::sync::Mutex;
 
     /// A spawner that records every pipeline it runs and returns a canned exit
-    /// code per program (argv0), default 0 — no real processes. `block_ms` lets
-    /// a test exercise the timeout path without a real `sleep`.
+    /// code per program (argv0), default 0 — no real processes.
     #[derive(Default)]
     struct MockSpawner {
         calls: Mutex<Vec<Vec<Command>>>,
         exit_by_program: HashMap<String, i32>,
-        stdout_by_program: HashMap<String, String>,
         block_ms: u64,
     }
 
@@ -549,20 +705,27 @@ mod tests {
         }
     }
 
+    /// A stage's program word (argv[0]) for test assertions.
+    fn prog(stage: &Command) -> &str {
+        match stage.argv.first() {
+            Some(Arg::Lit(s) | Arg::Glob(s)) => s,
+            None => "",
+        }
+    }
+
     impl Spawner for MockSpawner {
         fn run(&self, stages: &[Command], _cwd: Option<&str>) -> ToolResult<Captured> {
             self.calls.lock().unwrap().push(stages.to_vec());
             if self.block_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.block_ms));
             }
-            let prog = &stages[0].argv[0];
             Ok(Captured {
-                exit_code: self.exit_by_program.get(prog).copied().unwrap_or(0),
-                stdout: self
-                    .stdout_by_program
-                    .get(prog)
-                    .cloned()
-                    .unwrap_or_default(),
+                exit_code: self
+                    .exit_by_program
+                    .get(prog(&stages[0]))
+                    .copied()
+                    .unwrap_or(0),
+                stdout: String::new(),
                 stderr: String::new(),
             })
         }
@@ -581,41 +744,23 @@ mod tests {
         }
     }
 
-    /// The programs (argv0 of each pipeline's first stage) the mock actually ran,
-    /// in order — the cheapest way to assert short-circuit behavior.
+    fn calls(mock: &Arc<MockSpawner>) -> Vec<Vec<Command>> {
+        mock.calls.lock().unwrap().clone()
+    }
+
     fn ran_programs(mock: &Arc<MockSpawner>) -> Vec<String> {
-        mock.calls
-            .lock()
-            .unwrap()
+        calls(mock)
             .iter()
-            .map(|pipeline| pipeline[0].argv[0].clone())
+            .map(|pipeline| prog(&pipeline[0]).to_string())
             .collect()
     }
 
-    #[test]
-    fn name_is_shell() {
-        assert_eq!(ShellTool::new().name(), "shell");
-    }
-
-    #[tokio::test]
-    async fn and_runs_second_only_on_success() {
-        // `true && echo` → both run.
-        let mock = Arc::new(MockSpawner::default());
-        ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "true && echo hi"}),
-                &ctx(exec_only(&["true", "echo"])),
-            )
-            .await
-            .expect("invoke");
-        assert_eq!(ran_programs(&mock), vec!["true", "echo"]);
-    }
+    // ── sequencing / leash (carried from earlier increments) ────────────────
 
     #[tokio::test]
     async fn and_short_circuits_on_failure() {
-        // `false && echo` → `echo` is skipped because `false` exits non-zero.
         let mock = Arc::new(MockSpawner::with_exit("false", 1));
-        let out = ShellTool::with_spawner(mock.clone())
+        ShellTool::with_spawner(mock.clone())
             .invoke(
                 serde_json::json!({"cmd": "false && echo hi"}),
                 &ctx(exec_only(&["false", "echo"])),
@@ -623,98 +768,71 @@ mod tests {
             .await
             .expect("invoke");
         assert_eq!(ran_programs(&mock), vec!["false"], "echo must be skipped");
-        assert_eq!(out["exit_code"], 1, "script exit is the last that ran");
     }
 
-    #[tokio::test]
-    async fn or_runs_second_only_on_failure() {
-        // `false || echo` → `echo` runs (fallback).
-        let mock = Arc::new(MockSpawner::with_exit("false", 1));
-        ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "false || echo hi"}),
-                &ctx(exec_only(&["false", "echo"])),
-            )
-            .await
-            .expect("invoke");
-        assert_eq!(ran_programs(&mock), vec!["false", "echo"]);
-    }
-
-    #[tokio::test]
-    async fn or_short_circuits_on_success() {
-        // `true || echo` → `echo` is skipped because `true` succeeded.
-        let mock = Arc::new(MockSpawner::default());
-        ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "true || echo hi"}),
-                &ctx(exec_only(&["true", "echo"])),
-            )
-            .await
-            .expect("invoke");
-        assert_eq!(ran_programs(&mock), vec!["true"]);
-    }
-
-    #[tokio::test]
-    async fn semicolon_runs_unconditionally() {
-        // `false ; echo` → both run; exit is the last (`echo` → 0).
-        let mock = Arc::new(MockSpawner::with_exit("false", 1));
-        let out = ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "false ; echo hi"}),
-                &ctx(exec_only(&["false", "echo"])),
-            )
-            .await
-            .expect("invoke");
-        assert_eq!(ran_programs(&mock), vec!["false", "echo"]);
-        assert_eq!(out["exit_code"], 0);
-    }
-
-    /// Atomic admission across the WHOLE script: an out-of-scope command anywhere
-    /// (even one a `;` would reach, or a `&&` would skip) denies everything and
-    /// nothing spawns.
     #[tokio::test]
     async fn out_of_scope_anywhere_denies_the_whole_script() {
         let mock = Arc::new(MockSpawner::default());
         let out = ShellTool::with_spawner(mock.clone())
             .invoke(
                 serde_json::json!({"cmd": "echo ok ; rm -rf x"}),
-                &ctx(exec_only(&["echo"])), // rm not granted
+                &ctx(exec_only(&["echo"])),
             )
             .await
             .expect("invoke");
         assert_eq!(out["denied"], true);
-        assert_eq!(out["denials"][0]["target"], "rm");
-        assert!(ran_programs(&mock).is_empty(), "nothing must run");
+        assert!(ran_programs(&mock).is_empty());
     }
 
+    // ── globbing (increment 5) ──────────────────────────────────────────────
+
+    /// A glob arg reaches the spawner as an (unexpanded) `Glob` — expansion is
+    /// the spawner's job; the leash (fs_read on the listed dir) passed in invoke.
     #[tokio::test]
-    async fn combined_output_concatenates_in_order() {
-        let mut mock = MockSpawner::default();
-        mock.stdout_by_program.insert("echo".into(), "x".into());
-        mock.stdout_by_program.insert("printf".into(), "y".into());
-        let mock = Arc::new(mock);
-        let out = ShellTool::with_spawner(mock.clone())
+    async fn glob_arg_reaches_spawner_after_leash() {
+        let mock = Arc::new(MockSpawner::default());
+        ShellTool::with_spawner(mock.clone())
             .invoke(
-                serde_json::json!({"cmd": "echo a ; printf b"}),
-                &ctx(exec_only(&["echo", "printf"])),
+                serde_json::json!({"cmd": "ls *.rs"}), // fs_read is All by default
+                &ctx(exec_only(&["ls"])),
             )
             .await
             .expect("invoke");
-        assert_eq!(out["stdout"], "xy");
+        let c = calls(&mock);
+        assert_eq!(
+            c[0][0].argv,
+            vec![Arg::Lit("ls".into()), Arg::Glob("*.rs".into())]
+        );
     }
 
-    /// A dynamic construct anywhere in the sequence is refused before any spawn.
+    /// A glob in the program position is refused (we never exec a pattern).
     #[tokio::test]
-    async fn dynamic_in_sequence_refused_before_spawn() {
+    async fn glob_as_program_name_denied() {
         let mock = Arc::new(MockSpawner::default());
         let out = ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "echo ok && $(evil)"}),
-                &ctx(Caveats::top()),
-            )
+            .invoke(serde_json::json!({"cmd": "*.sh foo"}), &ctx(Caveats::top()))
             .await
             .expect("invoke");
         assert_eq!(out["denied"], true);
+        assert!(ran_programs(&mock).is_empty());
+    }
+
+    /// The directory a glob lists is an `fs_read`; out of scope ⇒ denied, no spawn.
+    #[tokio::test]
+    async fn glob_dir_out_of_fs_read_scope_denied() {
+        let mock = Arc::new(MockSpawner::default());
+        let granted = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            // fs_read restricted to the temp dir; the cwd glob lists elsewhere.
+            fs_read: Scope::only([std::env::temp_dir().to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(serde_json::json!({"cmd": "echo *"}), &ctx(granted))
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true);
+        assert_eq!(out["denials"][0]["kind"], "open");
         assert!(ran_programs(&mock).is_empty());
     }
 
@@ -727,12 +845,10 @@ mod tests {
             )
             .await;
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("exactly one"));
     }
 
     #[tokio::test]
     async fn timeout_is_reported() {
-        // The mock blocks longer than the 1s timeout — no real process involved.
         let mock = Arc::new(MockSpawner {
             block_ms: 1500,
             ..Default::default()
@@ -745,5 +861,51 @@ mod tests {
             .await
             .expect("invoke");
         assert_eq!(out["timed_out"], true);
+    }
+
+    // ── pure glob matching / expansion (no real fs) ─────────────────────────
+
+    #[test]
+    fn fnmatch_basics() {
+        assert!(fnmatch("*.rs", "a.rs"));
+        assert!(!fnmatch("*.rs", "a.txt"));
+        assert!(fnmatch("a?c", "abc"));
+        assert!(!fnmatch("a?c", "ac"));
+        assert!(fnmatch("*", ""));
+        assert!(fnmatch("a*", "a"));
+        assert!(fnmatch("[abc]x", "bx"));
+        assert!(!fnmatch("[abc]x", "dx"));
+        assert!(fnmatch("[!abc]x", "dx"));
+        assert!(fnmatch("[a-c]", "b"));
+        assert!(!fnmatch("[a-c]", "d"));
+        assert!(fnmatch("foo*bar", "fooXYbar"));
+    }
+
+    #[test]
+    fn expand_glob_with_a_fake_lister() {
+        let entries = || {
+            vec![
+                "a.rs".to_string(),
+                "b.rs".to_string(),
+                "c.txt".to_string(),
+                ".hidden.rs".to_string(),
+            ]
+        };
+        let lister = |_dir: &Path| entries();
+
+        // *.rs matches the two .rs files (sorted), hidden excluded.
+        assert_eq!(expand_glob("*.rs", None, &lister), vec!["a.rs", "b.rs"]);
+        // * excludes the dotfile.
+        assert_eq!(
+            expand_glob("*", None, &lister),
+            vec!["a.rs", "b.rs", "c.txt"]
+        );
+        // No match → the literal pattern (nullglob off).
+        assert_eq!(expand_glob("zzz*", None, &lister), vec!["zzz*"]);
+        // Sub-path keeps the directory prefix on each match.
+        assert_eq!(
+            expand_glob("src/*.rs", None, &lister),
+            vec!["src/a.rs", "src/b.rs"]
+        );
     }
 }

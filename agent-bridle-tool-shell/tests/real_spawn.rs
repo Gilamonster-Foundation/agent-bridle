@@ -245,3 +245,40 @@ async fn real_or_fallback_and_semicolon_sequence() {
         .expect("invoke");
     assert_eq!(out["stdout"], "a\nb\n");
 }
+
+#[tokio::test]
+async fn real_glob_expands_against_the_filesystem() {
+    // A unique temp dir with a.rs="A", b.rs="B", c.txt="C".
+    let dir = unique_temp("glob");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "A").unwrap();
+    std::fs::write(dir.join("b.rs"), "B").unwrap();
+    std::fs::write(dir.join("c.txt"), "C").unwrap();
+    let d = dir.to_string_lossy().into_owned();
+
+    // `cat *.rs` (cwd = the temp dir) → expands to `cat a.rs b.rs` (sorted) → "AB".
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "cat *.rs", "cwd": d}),
+            &ctx(exec_only(&["cat"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["exit_code"], 0);
+    assert_eq!(out["stdout"], "AB", "glob expanded + sorted: {out}");
+
+    // No match → the literal pattern; `cat zzz*` fails (no such file).
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "cat zzz*", "cwd": d}),
+            &ctx(exec_only(&["cat"])),
+        )
+        .await
+        .expect("invoke");
+    assert_ne!(
+        out["exit_code"], 0,
+        "unmatched glob → literal, cat fails: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
