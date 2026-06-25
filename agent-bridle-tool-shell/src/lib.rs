@@ -11,14 +11,15 @@
 //! *advisory*: the result's `sandbox_kind` reports what actually enforced it
 //! (I9), today [`agent_bridle_core::SandboxKind::None`].
 //!
-//! **Increments 1–2** of agent-bridle#34: a **pipeline** of simple commands
-//! (`a | b | c`) with quoted arguments. Redirections, `&&`/`||`/`;` and globbing
-//! are added incrementally; until then they are refused as *unsupported*
-//! (distinct from the *dynamic* constructs refused by design). The process
-//! spawning is behind a `Spawner` seam (mocked in unit tests; real path in
-//! `tests/real_spawn.rs`). `brush-bridle-core` remains the deferred, reversible
-//! full-bash alternative engine behind the same registry seam (ADR 0005 D4 —
-//! tracked on agent-bridle#20).
+//! **Increments 1–3** of agent-bridle#34: a **pipeline** of simple commands
+//! (`a | b | c`) with quoted arguments and **file redirections** (`> out`,
+//! `>> out`, `< in`) whose targets are leash-checked (`fs_write`/`fs_read`).
+//! `&&`/`||`/`;`, globbing and fd-number redirections are added incrementally;
+//! until then they are refused as *unsupported* (distinct from the *dynamic*
+//! constructs refused by design). The process spawning is behind a `Spawner`
+//! seam (mocked in unit tests; real path in `tests/real_spawn.rs`).
+//! `brush-bridle-core` remains the deferred, reversible full-bash alternative
+//! engine behind the same registry seam (ADR 0005 D4 — tracked on agent-bridle#20).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
