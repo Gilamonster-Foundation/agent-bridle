@@ -2,19 +2,20 @@
 //!
 //! `agent-bridle` is the **exec funnel**: rather than hand a string to a shell
 //! interpreter, the engine parses it itself and runs only what it can confine.
-//! This covers **increments 1–6** — a sequence of pipelines joined by `&&`,
+//! This covers the safe-subset engine — a sequence of pipelines joined by `&&`,
 //! `||` and `;`, each pipeline simple commands (`a | b | c`) with quoted
-//! arguments, file redirections (`> out`, `>> out`, `< in`), filename globbing
-//! (`*`, `?`, `[…]`), and **whole-word variable expansion** (`$VAR` / `${VAR}`).
-//! The parser only *marks* an argument ([`Arg::Glob`] / [`Arg::Var`]); the
-//! filesystem read (globbing) and the env read + allowlist check (variables) are
-//! the executor's job.
+//! arguments, file redirections (`> out`, `>> out`, `< in`, `2> err`, `2>&1`),
+//! filename globbing (`*`, `?`, `[…]`), and **whole-word variable expansion**
+//! (`$VAR` / `${VAR}`). The parser only *marks* an argument ([`Arg::Glob`] /
+//! [`Arg::Var`]); the filesystem read (globbing) and the env read + allowlist
+//! check (variables) are the executor's job.
 //!
 //! Refused **by design** (security, [`Refusal::Dynamic`]): command/arithmetic
 //! substitution `$(…)`, backticks, subshells — the undecidable interiors ADR
 //! 0001 says may never be statically cleared. Refused for now
 //! ([`Refusal::Unsupported`]): `$VAR` mixed into a larger word (use a standalone
-//! `$VAR`), `$VAR` inside double quotes, fd-number redirections (`2>`, `2>&1`).
+//! `$VAR`) or inside double quotes, and fd redirections other than
+//! `1>`/`2>`/`0<`/`2>&1` (e.g. `3>`, `1>&2`).
 //!
 //! Quoting is honored, so a metacharacter **inside quotes is a literal
 //! argument** — only *unquoted* operators and constructs are recognized:
@@ -84,15 +85,30 @@ pub enum Arg {
     Var(String),
 }
 
-/// A file redirection on one command stage. `agent-bridle` performs the open, so
-/// each is leash-checked (`fs_write` for stdout, `fs_read` for stdin) before the
-/// stage runs.
+/// A redirection on one command stage. `agent-bridle` performs the open, so each
+/// file target is leash-checked (`fs_write` for stdout/stderr, `fs_read` for
+/// stdin) before the stage runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redirect {
-    /// `> path` (truncate) or `>> path` (append) — stdout (fd 1).
+    /// `> path` / `>> path` (also `1>`/`1>>`) — stdout (fd 1).
     Stdout { path: String, append: bool },
-    /// `< path` — stdin (fd 0).
+    /// `< path` (also `0<`) — stdin (fd 0).
     Stdin { path: String },
+    /// `2> path` / `2>> path` — stderr (fd 2).
+    Stderr { path: String, append: bool },
+    /// `2>&1` — stderr is merged into stdout's destination.
+    StderrToStdout,
+}
+
+/// Where a stage's stderr goes (resolved from its redirects; last one wins).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StderrTo {
+    /// No stderr redirect — capture it separately.
+    Capture,
+    /// `2> path` / `2>> path`.
+    File { path: String, append: bool },
+    /// `2>&1` — merge into the stdout destination.
+    Stdout,
 }
 
 /// One command stage: its argv (literals/globs/variables) plus any redirections.
@@ -100,7 +116,7 @@ pub enum Redirect {
 pub struct Command {
     /// The program (argv[0]) and arguments.
     pub argv: Vec<Arg>,
-    /// File redirections, in source order (last stdout redirect wins for fd 1).
+    /// File redirections, in source order (last redirect for a given fd wins).
     pub redirects: Vec<Redirect>,
 }
 
@@ -110,7 +126,7 @@ impl Command {
     pub fn stdin_path(&self) -> Option<&str> {
         self.redirects.iter().rev().find_map(|r| match r {
             Redirect::Stdin { path } => Some(path.as_str()),
-            Redirect::Stdout { .. } => None,
+            _ => None,
         })
     }
 
@@ -119,8 +135,25 @@ impl Command {
     pub fn stdout_redirect(&self) -> Option<(&str, bool)> {
         self.redirects.iter().rev().find_map(|r| match r {
             Redirect::Stdout { path, append } => Some((path.as_str(), *append)),
-            Redirect::Stdin { .. } => None,
+            _ => None,
         })
+    }
+
+    /// The effective stderr disposition (last stderr-affecting redirect wins).
+    #[must_use]
+    pub fn stderr_disposition(&self) -> StderrTo {
+        self.redirects
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                Redirect::Stderr { path, append } => Some(StderrTo::File {
+                    path: path.clone(),
+                    append: *append,
+                }),
+                Redirect::StderrToStdout => Some(StderrTo::Stdout),
+                _ => None,
+            })
+            .unwrap_or(StderrTo::Capture)
     }
 }
 
@@ -239,8 +272,21 @@ pub fn classify(input: &str) -> Result<Script, Refusal> {
                 let path = read_redirect_target(&mut chars)?;
                 redirects.push(Redirect::Stdin { path });
             }
-            // Words (literals, globs, `$VAR`) are read by `read_word`.
-            _ => argv.push(read_word(&mut chars)?),
+            // Words (literals, globs, `$VAR`) are read by `read_word`. A bare
+            // number touching a redirect op (`2>`, `0<`, …) is an fd redirect.
+            _ => {
+                let arg = read_word(&mut chars)?;
+                if let Arg::Lit(s) = &arg {
+                    if !s.is_empty()
+                        && s.bytes().all(|b| b.is_ascii_digit())
+                        && matches!(chars.peek(), Some('>') | Some('<'))
+                    {
+                        read_fd_redirect(s, &mut chars, &mut redirects)?;
+                        continue;
+                    }
+                }
+                argv.push(arg);
+            }
         }
     }
 
@@ -398,14 +444,8 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
             }
         }
     }
-    // `2>` / `0<` etc.: a bare digit-word touching a redirect operator.
-    if !cur.is_empty()
-        && !is_glob
-        && cur.bytes().all(|b| b.is_ascii_digit())
-        && matches!(chars.peek(), Some('>') | Some('<'))
-    {
-        return Err(Refusal::Unsupported("fd-number redirection (e.g. `2>`)"));
-    }
+    // A bare digit-word touching a redirect op (`2>`, `0<`, …) is handled by the
+    // caller as an fd redirect — it is returned here as a plain literal.
     Ok(if is_glob {
         Arg::Glob(cur)
     } else {
@@ -490,6 +530,74 @@ fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<String, Refusal> 
         Arg::Glob(_) => Err(Refusal::Unsupported("glob in a redirection target")),
         Arg::Var(_) => Err(Refusal::Unsupported("variable in a redirection target")),
     }
+}
+
+/// Parse an fd-prefixed redirect, given the already-read fd digits and the
+/// upcoming `>`/`<`. Supported: `1>`/`1>>`/`0<` (aliases of the bare forms),
+/// `2>`/`2>>` (stderr to file), and `2>&1` (merge stderr into stdout). Other fds
+/// and dup forms (e.g. `1>&2`, `3>`) are refused.
+fn read_fd_redirect(
+    fd: &str,
+    chars: &mut Peekable<Chars>,
+    redirects: &mut Vec<Redirect>,
+) -> Result<(), Refusal> {
+    // Input redirect: only `0<` is supported.
+    if chars.peek() == Some(&'<') {
+        chars.next();
+        if fd != "0" {
+            return Err(Refusal::Unsupported("fd-number input redirection"));
+        }
+        if chars.peek() == Some(&'<') {
+            return Err(Refusal::Unsupported("heredoc/herestring `<<`"));
+        }
+        if chars.peek() == Some(&'&') {
+            return Err(Refusal::Unsupported("`<&` (fd duplication)"));
+        }
+        redirects.push(Redirect::Stdin {
+            path: read_redirect_target(chars)?,
+        });
+        return Ok(());
+    }
+
+    // Output redirect (`>` / `>>`).
+    chars.next(); // consume the first '>'
+    let append = chars.peek() == Some(&'>');
+    if append {
+        chars.next();
+    }
+
+    // Dup form: `N>&M` (only `2>&1` is supported).
+    if chars.peek() == Some(&'&') {
+        chars.next(); // consume '&'
+        let mut target = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                target.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if fd == "2" && target == "1" {
+            redirects.push(Redirect::StderrToStdout);
+            return Ok(());
+        }
+        return Err(Refusal::Unsupported(
+            "fd duplication (only `2>&1` is supported)",
+        ));
+    }
+
+    let path = read_redirect_target(chars)?;
+    match fd {
+        "1" => redirects.push(Redirect::Stdout { path, append }),
+        "2" => redirects.push(Redirect::Stderr { path, append }),
+        _ => {
+            return Err(Refusal::Unsupported(
+                "fd-number redirection (only 1>, 2>, 0<, 2>&1)",
+            ))
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -598,13 +706,64 @@ mod tests {
         ));
     }
 
+    // ── fd redirects (issue #45) ────────────────────────────────────────────
+
+    #[test]
+    fn stderr_to_file_and_append() {
+        let p = classify("cmd 2> err").unwrap();
+        assert_eq!(
+            p[0].pipeline[0].stderr_disposition(),
+            StderrTo::File {
+                path: "err".into(),
+                append: false
+            }
+        );
+        let p = classify("cmd 2>> err").unwrap();
+        assert_eq!(
+            p[0].pipeline[0].stderr_disposition(),
+            StderrTo::File {
+                path: "err".into(),
+                append: true
+            }
+        );
+    }
+
+    #[test]
+    fn merge_and_fd_aliases() {
+        // `2>&1` → merge into stdout.
+        assert_eq!(
+            classify("cmd 2>&1").unwrap()[0].pipeline[0].stderr_disposition(),
+            StderrTo::Stdout
+        );
+        // `1>`/`0<` are aliases of the bare forms.
+        let p = classify("cmd 1> out").unwrap();
+        assert_eq!(p[0].pipeline[0].stdout_redirect(), Some(("out", false)));
+        let p = classify("cmd 0< in").unwrap();
+        assert_eq!(p[0].pipeline[0].stdin_path(), Some("in"));
+        // `>file 2>&1` — both go to the file destination (common form).
+        let p = classify("cmd > out 2>&1").unwrap();
+        assert_eq!(p[0].pipeline[0].stdout_redirect(), Some(("out", false)));
+        assert_eq!(p[0].pipeline[0].stderr_disposition(), StderrTo::Stdout);
+        // A digit that is NOT touching a redirect op is a normal argument.
+        assert_eq!(
+            classify("head -2").unwrap(),
+            one_stage(vec![lit("head"), lit("-2")])
+        );
+    }
+
+    #[test]
+    fn unsupported_fd_forms_refused() {
+        assert!(matches!(classify("cmd 3> f"), Err(Refusal::Unsupported(_)))); // fd ≥ 3
+        assert!(matches!(classify("cmd 1>&2"), Err(Refusal::Unsupported(_)))); // other dup
+        assert!(matches!(classify("cmd 2<&1"), Err(Refusal::Unsupported(_)))); // fd input
+    }
+
     // ── other refusals still hold ───────────────────────────────────────────
 
     #[test]
-    fn dynamic_and_fd_and_malformed_still_refused() {
+    fn dynamic_and_malformed_still_refused() {
         assert!(matches!(classify("echo `id`"), Err(Refusal::Dynamic(_))));
         assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
-        assert!(matches!(classify("echo 2>f"), Err(Refusal::Unsupported(_))));
         assert!(matches!(classify(""), Err(Refusal::Malformed(_))));
         assert!(matches!(classify("a &&"), Err(Refusal::Malformed(_))));
     }
