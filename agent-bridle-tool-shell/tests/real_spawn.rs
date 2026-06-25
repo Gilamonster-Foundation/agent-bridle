@@ -282,3 +282,22 @@ async fn real_glob_expands_against_the_filesystem() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn real_allowlisted_var_expands_from_the_environment() {
+    // `echo $HOME` expands HOME from this process's env (the test reads the same
+    // env, so the assertion is deterministic regardless of the host value).
+    let expected = format!("{}\n", std::env::var("HOME").unwrap_or_default());
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "echo $HOME"}),
+            &ctx(exec_only(&["echo"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["exit_code"], 0);
+    assert_eq!(
+        out["stdout"], expected,
+        "$HOME must expand to the env value: {out}"
+    );
+}
