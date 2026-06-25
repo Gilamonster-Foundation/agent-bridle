@@ -30,6 +30,7 @@ mod error;
 mod gate;
 mod registry;
 mod sandbox;
+mod spawn;
 mod step_up;
 mod tool;
 
@@ -41,6 +42,7 @@ pub use registry::{Registry, RegistryBuilder};
 pub use sandbox::{best_available_sandbox, NoopSandbox, Sandbox, SandboxKind};
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, LandlockSandbox};
+pub use spawn::{spawn_confined_subprocess, ConfinedChild, ConfinedCommand};
 pub use step_up::{
     AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
     DischargeAttempt, DischargeVerifier, Presence, Rule, StepUpPolicy,
