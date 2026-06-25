@@ -2,23 +2,24 @@
 //!
 //! `agent-bridle` is the **exec funnel**: rather than hand a string to a shell
 //! interpreter, the engine parses it itself and runs only what it can confine.
-//! This covers **increments 1–5** — a sequence of pipelines joined by `&&`,
+//! This covers **increments 1–6** — a sequence of pipelines joined by `&&`,
 //! `||` and `;`, each pipeline simple commands (`a | b | c`) with quoted
-//! arguments, file redirections (`> out`, `>> out`, `< in`), and **filename
-//! globbing** (`*`, `?`, `[…]`). The parser only *marks* an argument as a glob
-//! ([`Arg::Glob`]); expansion (a filesystem read) is leash-checked and performed
-//! by the executor. Variable/parameter expansion is added in a later increment
-//! (tracked on agent-bridle#34); until then `$` is refused as
-//! [`Refusal::Unsupported`], kept distinct from the [`Refusal::Dynamic`]
-//! constructs refused **by design** — command/arithmetic substitution,
-//! backticks, subshells: the undecidable interiors ADR 0001 says may never be
-//! statically cleared. fd-number redirections (`2>`, `2>&1`) are refused as
-//! `Unsupported` for now (a focused follow-up).
+//! arguments, file redirections (`> out`, `>> out`, `< in`), filename globbing
+//! (`*`, `?`, `[…]`), and **whole-word variable expansion** (`$VAR` / `${VAR}`).
+//! The parser only *marks* an argument ([`Arg::Glob`] / [`Arg::Var`]); the
+//! filesystem read (globbing) and the env read + allowlist check (variables) are
+//! the executor's job.
+//!
+//! Refused **by design** (security, [`Refusal::Dynamic`]): command/arithmetic
+//! substitution `$(…)`, backticks, subshells — the undecidable interiors ADR
+//! 0001 says may never be statically cleared. Refused for now
+//! ([`Refusal::Unsupported`]): `$VAR` mixed into a larger word (use a standalone
+//! `$VAR`), `$VAR` inside double quotes, fd-number redirections (`2>`, `2>&1`).
 //!
 //! Quoting is honored, so a metacharacter **inside quotes is a literal
 //! argument** — only *unquoted* operators and constructs are recognized:
-//! `echo "a*b"` is one literal arg, while `echo a*` is a glob and `a && b` is two
-//! pipelines joined by `&&`.
+//! `echo "a*b"` is one literal arg, `echo a*` is a glob, `echo $HOME` is a
+//! variable, and `a && b` is two pipelines joined by `&&`.
 
 use std::fmt;
 use std::iter::Peekable;
@@ -34,8 +35,8 @@ pub enum Refusal {
     /// shell, use the embedder's unbridled/`--yolo` allowance (ADR 0003 / 0005 D5).
     Dynamic(&'static str),
     /// A construct the safe-subset engine will support but **does not yet** in
-    /// this increment (variable expansion, fd-number redirections). Tracked on
-    /// agent-bridle#34.
+    /// this increment (mixed/quoted variable expansion, fd-number redirections).
+    /// Tracked on agent-bridle#34.
     Unsupported(&'static str),
     /// The input could not be parsed (unterminated quote, trailing backslash,
     /// empty command/stage, missing redirection target, dangling separator).
@@ -70,14 +71,17 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// One argument word: a literal, or a glob pattern to be expanded by the
-/// executor (a filesystem read, leash-checked first).
+/// One argument word: a literal, a glob pattern, or a variable reference. The
+/// executor lowers globs (a filesystem read) and variables (an env read +
+/// allowlist check) into literals — both leash-/policy-checked first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arg {
     /// A literal word (quoting already resolved).
     Lit(String),
     /// A word containing unquoted `*`/`?`/`[…]` — a glob pattern.
     Glob(String),
+    /// A standalone `$NAME` / `${NAME}` variable reference (the name only).
+    Var(String),
 }
 
 /// A file redirection on one command stage. `agent-bridle` performs the open, so
@@ -91,10 +95,10 @@ pub enum Redirect {
     Stdin { path: String },
 }
 
-/// One command stage: its argv (literals + globs) plus any redirections.
+/// One command stage: its argv (literals/globs/variables) plus any redirections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
-    /// The program (argv[0]) and arguments, each a literal or a glob.
+    /// The program (argv[0]) and arguments.
     pub argv: Vec<Arg>,
     /// File redirections, in source order (last stdout redirect wins for fd 1).
     pub redirects: Vec<Redirect>,
@@ -212,10 +216,6 @@ pub fn classify(input: &str) -> Result<Script, Refusal> {
             }
             '(' | ')' => return Err(Refusal::Dynamic("subshell `( )`")),
             '`' => return Err(Refusal::Dynamic("command substitution (backticks)")),
-            '$' => {
-                chars.next();
-                return Err(dollar_refusal(chars.peek().copied()));
-            }
             '>' => {
                 chars.next();
                 let append = chars.peek() == Some(&'>');
@@ -239,14 +239,8 @@ pub fn classify(input: &str) -> Result<Script, Refusal> {
                 let path = read_redirect_target(&mut chars)?;
                 redirects.push(Redirect::Stdin { path });
             }
-            _ => {
-                let (word, is_glob) = read_word(&mut chars)?;
-                argv.push(if is_glob {
-                    Arg::Glob(word)
-                } else {
-                    Arg::Lit(word)
-                });
-            }
+            // Words (literals, globs, `$VAR`) are read by `read_word`.
+            _ => argv.push(read_word(&mut chars)?),
         }
     }
 
@@ -265,7 +259,6 @@ pub fn classify(input: &str) -> Result<Script, Refusal> {
                     "expected a command after `&&` or `||`".into(),
                 ));
             }
-            // A trailing `;` is fine.
         }
     }
     Ok(script)
@@ -328,21 +321,28 @@ fn skip_whitespace(chars: &mut Peekable<Chars>) {
     }
 }
 
-/// Read the next word (no leading-whitespace skip — the caller does that).
-/// Returns the word and whether it contained an *unquoted* glob metacharacter
-/// (`*`/`?`/`[`). Stops at unquoted whitespace or an operator char. Single quotes
-/// are literal; double quotes are literal except `$`/backtick still trigger
-/// substitution detection; an unquoted backslash escapes the next char. A bare
-/// digit-word immediately followed by `>`/`<` is a refused fd-number redirection.
-fn read_word(chars: &mut Peekable<Chars>) -> Result<(String, bool), Refusal> {
+/// Read the next word as an [`Arg`]. Stops at unquoted whitespace or an operator.
+/// Single quotes are literal; double quotes are literal except `$`/backtick still
+/// trigger substitution detection; an unquoted backslash escapes the next char.
+/// An unquoted `*`/`?`/`[` marks the word a glob; an unquoted `$` at the start of
+/// a word begins a standalone variable reference (see [`read_variable`]).
+fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
     let mut cur = String::new();
     let mut is_glob = false;
     while let Some(&c) = chars.peek() {
         match c {
             ' ' | '\t' | '\n' | '\r' => break,
-            // Operators / substitution starts end the word; the caller handles them.
-            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' => break,
-            // Unquoted glob metacharacters: part of the word, and mark it a glob.
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`' => break,
+            '$' => {
+                // A variable is only allowed as a *standalone* word.
+                if !cur.is_empty() || is_glob {
+                    return Err(Refusal::Unsupported(
+                        "mixed variable expansion (use a standalone $VAR)",
+                    ));
+                }
+                chars.next(); // consume '$'
+                return read_variable(chars);
+            }
             '*' | '?' | '[' => {
                 cur.push(c);
                 chars.next();
@@ -370,7 +370,13 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<(String, bool), Refusal> {
                             }
                             _ => cur.push('\\'),
                         },
-                        Some('$') => return Err(dollar_refusal(chars.peek().copied())),
+                        // `$VAR` inside double quotes is not expanded here — use a
+                        // bare `$VAR`. (Avoids the segment model; a documented gap.)
+                        Some('$') => {
+                            return Err(Refusal::Unsupported(
+                                "variable expansion inside double quotes (use a bare $VAR)",
+                            ))
+                        }
                         Some('`') => {
                             return Err(Refusal::Dynamic("command substitution (backticks)"))
                         }
@@ -400,11 +406,76 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<(String, bool), Refusal> {
     {
         return Err(Refusal::Unsupported("fd-number redirection (e.g. `2>`)"));
     }
-    Ok((cur, is_glob))
+    Ok(if is_glob {
+        Arg::Glob(cur)
+    } else {
+        Arg::Lit(cur)
+    })
 }
 
-/// Read a redirection target (the word after `>`/`>>`/`<`). The target is taken
-/// literally (redirect targets are not globbed in this engine).
+/// Read a variable reference after a consumed `$`: `$NAME` or `${NAME}`. The
+/// variable must be a **whole word** (nothing else adjacent). `$(` is dynamic.
+fn read_variable(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
+    let name = match chars.peek() {
+        Some('(') => return Err(Refusal::Dynamic("command/arithmetic substitution `$(`")),
+        Some('{') => {
+            chars.next(); // consume '{'
+            let mut name = String::new();
+            loop {
+                match chars.next() {
+                    Some('}') => break,
+                    Some(ch) => name.push(ch),
+                    None => return Err(Refusal::Malformed("unterminated `${`".into())),
+                }
+            }
+            name
+        }
+        Some(&c) if c == '_' || c.is_ascii_alphabetic() => {
+            let mut name = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch == '_' || ch.is_ascii_alphanumeric() {
+                    name.push(ch);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            name
+        }
+        _ => {
+            return Err(Refusal::Unsupported(
+                "bare `$` (escape as `\\$` for a literal dollar)",
+            ))
+        }
+    };
+    if !is_valid_var_name(&name) {
+        return Err(Refusal::Unsupported("unsupported variable name"));
+    }
+    // Whole-word only: the variable must be the entire word.
+    match chars.peek() {
+        None => {}
+        Some(&(' ' | '\t' | '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')')) => {}
+        _ => {
+            return Err(Refusal::Unsupported(
+                "mixed variable expansion (use a standalone $VAR)",
+            ))
+        }
+    }
+    Ok(Arg::Var(name))
+}
+
+/// A valid environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_valid_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Read a redirection target (the word after `>`/`>>`/`<`). The target must be a
+/// plain literal — globs and variables in a redirect target are refused.
 fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<String, Refusal> {
     skip_whitespace(chars);
     match chars.peek().copied() {
@@ -413,20 +484,11 @@ fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<String, Refusal> 
         }
         _ => {}
     }
-    let (target, _is_glob) = read_word(chars)?;
-    if target.is_empty() {
-        return Err(Refusal::Malformed("empty redirection target".into()));
-    }
-    Ok(target)
-}
-
-/// Classify a `$`: `$(` is command/arithmetic substitution (dynamic, refused by
-/// design); anything else is variable/parameter expansion (unsupported for now,
-/// escapable as `\$`).
-fn dollar_refusal(next: Option<char>) -> Refusal {
-    match next {
-        Some('(') => Refusal::Dynamic("command/arithmetic substitution `$(`"),
-        _ => Refusal::Unsupported("variable expansion `$`"),
+    match read_word(chars)? {
+        Arg::Lit(s) if !s.is_empty() => Ok(s),
+        Arg::Lit(_) => Err(Refusal::Malformed("empty redirection target".into())),
+        Arg::Glob(_) => Err(Refusal::Unsupported("glob in a redirection target")),
+        Arg::Var(_) => Err(Refusal::Unsupported("variable in a redirection target")),
     }
 }
 
@@ -440,109 +502,110 @@ mod tests {
     fn glob(s: &str) -> Arg {
         Arg::Glob(s.to_string())
     }
+    fn var(s: &str) -> Arg {
+        Arg::Var(s.to_string())
+    }
     fn stage(args: Vec<Arg>) -> Command {
         Command {
             argv: args,
             redirects: vec![],
         }
     }
-    fn lits(parts: &[&str]) -> Command {
-        stage(parts.iter().map(|s| lit(s)).collect())
-    }
-    /// A single-pipeline, single-stage, all-literal script.
-    fn one(parts: &[&str]) -> Script {
+    fn one_stage(args: Vec<Arg>) -> Script {
         vec![ScriptItem {
             sep: Sep::Seq,
-            pipeline: vec![lits(parts)],
+            pipeline: vec![stage(args)],
         }]
     }
 
-    // ── words / quoting / pipelines / redirects / sequencing (1–4) ───────────
+    // ── carried behavior (1–5) ──────────────────────────────────────────────
 
     #[test]
-    fn simple_and_quoting_and_sequencing() {
+    fn literals_globs_pipelines_redirects_sequencing() {
         assert_eq!(
-            classify("echo hi there").unwrap(),
-            one(&["echo", "hi", "there"])
+            classify("echo hi").unwrap(),
+            one_stage(vec![lit("echo"), lit("hi")])
         );
-        assert_eq!(classify("echo 'a b'").unwrap(), one(&["echo", "a b"]));
-        assert_eq!(
-            classify("a && b").unwrap(),
-            vec![
-                ScriptItem {
-                    sep: Sep::Seq,
-                    pipeline: vec![lits(&["a"])]
-                },
-                ScriptItem {
-                    sep: Sep::And,
-                    pipeline: vec![lits(&["b"])]
-                },
-            ]
-        );
-    }
-
-    // ── globbing (increment 5) ──────────────────────────────────────────────
-
-    #[test]
-    fn glob_words_are_marked() {
         assert_eq!(
             classify("ls *.rs").unwrap(),
-            vec![ScriptItem {
-                sep: Sep::Seq,
-                pipeline: vec![stage(vec![lit("ls"), glob("*.rs")])]
-            }]
+            one_stage(vec![lit("ls"), glob("*.rs")])
         );
         assert_eq!(
-            classify("cat foo?").unwrap(),
-            vec![ScriptItem {
-                sep: Sep::Seq,
-                pipeline: vec![stage(vec![lit("cat"), glob("foo?")])]
-            }]
+            classify("echo \"a*b\"").unwrap(),
+            one_stage(vec![lit("echo"), lit("a*b")])
+        );
+        assert!(classify("a && b").is_ok());
+        let p = classify("echo hi > out").unwrap();
+        assert_eq!(p[0].pipeline[0].stdout_redirect(), Some(("out", false)));
+    }
+
+    // ── variable expansion (increment 6) ────────────────────────────────────
+
+    #[test]
+    fn standalone_variables_are_marked() {
+        assert_eq!(
+            classify("echo $HOME").unwrap(),
+            one_stage(vec![lit("echo"), var("HOME")])
         );
         assert_eq!(
-            classify("ls [abc].txt").unwrap(),
-            vec![ScriptItem {
-                sep: Sep::Seq,
-                pipeline: vec![stage(vec![lit("ls"), glob("[abc].txt")])]
-            }]
+            classify("echo ${HOME}").unwrap(),
+            one_stage(vec![lit("echo"), var("HOME")])
         );
-        // Glob in a sub-path keeps the prefix in the pattern.
         assert_eq!(
-            classify("cat src/*.rs").unwrap(),
+            classify("ls $TMPDIR").unwrap(),
+            one_stage(vec![lit("ls"), var("TMPDIR")])
+        );
+        // A variable followed by an operator is still a whole word (here `|`,
+        // so this is a single pipeline with two stages).
+        assert_eq!(
+            classify("cat $FILE | wc").unwrap(),
             vec![ScriptItem {
                 sep: Sep::Seq,
-                pipeline: vec![stage(vec![lit("cat"), glob("src/*.rs")])]
+                pipeline: vec![stage(vec![lit("cat"), var("FILE")]), stage(vec![lit("wc")])],
             }]
         );
     }
 
-    /// A quoted metacharacter is a literal arg, NOT a glob.
     #[test]
-    fn quoted_glob_chars_are_literal() {
-        assert_eq!(classify("echo \"*.rs\"").unwrap(), one(&["echo", "*.rs"]));
-        assert_eq!(classify("echo '[abc]'").unwrap(), one(&["echo", "[abc]"]));
-        assert_eq!(classify("echo a\\*b").unwrap(), one(&["echo", "a*b"])); // escaped *
-    }
-
-    // ── refusals (now $ and fd; globbing is no longer refused) ───────────────
-
-    #[test]
-    fn dynamic_unsupported_and_fd_still_refused() {
-        assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_))));
-        assert!(matches!(classify("echo `id`"), Err(Refusal::Dynamic(_))));
-        assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
+    fn mixed_or_quoted_or_invalid_variables_are_refused() {
         assert!(matches!(
-            classify("echo $HOME"),
+            classify("echo $HOME/x"),
+            Err(Refusal::Unsupported(_))
+        )); // mixed
+        assert!(matches!(
+            classify("echo foo$HOME"),
+            Err(Refusal::Unsupported(_))
+        )); // mixed
+        assert!(matches!(
+            classify("echo \"$HOME\""),
+            Err(Refusal::Unsupported(_))
+        )); // quoted
+        assert!(matches!(classify("echo $1"), Err(Refusal::Unsupported(_)))); // positional/invalid
+        assert!(matches!(classify("echo $"), Err(Refusal::Unsupported(_)))); // bare $
+        assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_)))); // substitution
+                                                                             // Escaped `$` is a literal dollar, not a variable.
+        assert_eq!(
+            classify("echo \\$HOME").unwrap(),
+            one_stage(vec![lit("echo"), lit("$HOME")])
+        );
+    }
+
+    #[test]
+    fn variables_refused_in_redirect_targets() {
+        assert!(matches!(
+            classify("echo hi > $HOME"),
             Err(Refusal::Unsupported(_))
         ));
-        assert!(matches!(classify("echo 2>f"), Err(Refusal::Unsupported(_))));
-        assert!(matches!(classify("echo x &"), Err(Refusal::Unsupported(_))));
     }
 
+    // ── other refusals still hold ───────────────────────────────────────────
+
     #[test]
-    fn empty_and_unterminated_are_malformed() {
+    fn dynamic_and_fd_and_malformed_still_refused() {
+        assert!(matches!(classify("echo `id`"), Err(Refusal::Dynamic(_))));
+        assert!(matches!(classify("(echo hi)"), Err(Refusal::Dynamic(_))));
+        assert!(matches!(classify("echo 2>f"), Err(Refusal::Unsupported(_))));
         assert!(matches!(classify(""), Err(Refusal::Malformed(_))));
-        assert!(matches!(classify("echo 'oops"), Err(Refusal::Malformed(_))));
         assert!(matches!(classify("a &&"), Err(Refusal::Malformed(_))));
     }
 }

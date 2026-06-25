@@ -8,14 +8,17 @@
 //! *advisory*: the result's `sandbox_kind` reports what actually enforced it (I9),
 //! today [`SandboxKind::None`].
 //!
-//! **Increments 1–5** of agent-bridle#34: a sequence of pipelines joined by
-//! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments, file
-//! redirections (`> out`, `>> out`, `< in`), and **filename globbing**
-//! (`*`/`?`/`[…]`). Because `agent-bridle` performs each redirect's open and each
-//! glob's directory listing itself, those filesystem touches are leash-checked
-//! (`fs_write`/`fs_read`) *before any stage spawns* — a real enforcement point,
-//! unlike a spawned program's own opens (L3's job). Process spawning is behind a
-//! [`Spawner`] seam (mocked in unit tests; real path in `tests/real_spawn.rs`).
+//! **Increments 1–6** of agent-bridle#34 (Track A complete): a sequence of
+//! pipelines joined by `&&`/`||`/`;`, each pipeline simple commands with quoted
+//! arguments, file redirections (`> out`, `>> out`, `< in`), filename globbing
+//! (`*`/`?`/`[…]`), and **allowlisted `$VAR` expansion**. Because `agent-bridle`
+//! performs each redirect's open and each glob's directory listing itself, those
+//! filesystem touches are leash-checked (`fs_write`/`fs_read`) *before any stage
+//! spawns*; a `$VAR` is expanded only if its name is on a small secret-free
+//! allowlist ([`VAR_ALLOWLIST`]), checked before any spawn — a real enforcement
+//! point, unlike a spawned program's own opens (L3's job). Process spawning is
+//! behind a [`Spawner`] seam (mocked in unit tests; real path in
+//! `tests/real_spawn.rs`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -136,10 +139,12 @@ impl Tool for ShellTool {
                     "description": "Free-form command line run by the confined safe-subset engine: \
                         pipelines (a | b) joined by &&/||/;, with quoted arguments, file \
                         redirections (> out, >> out, < in; targets gated by fs_write/fs_read), and \
-                        filename globbing (*, ?, [..]; gated by fs_read on the listed directory). \
-                        Dynamic constructs ($(...), backticks, subshells) are refused by design; \
-                        variable expansion ($VAR) and fd-number redirections (2>, 2>&1) are refused \
-                        for now. Mutually exclusive with `program`."
+                        filename globbing (*, ?, [..]; gated by fs_read on the listed directory), \
+                        and whole-word $VAR/${VAR} expansion for an allowlisted, secret-free set \
+                        (HOME, PWD, USER, TMPDIR, ...). Dynamic constructs ($(...), backticks, \
+                        subshells) are refused by design; a $VAR mixed into a word, quoted, or \
+                        outside the allowlist, and fd-number redirections (2>, 2>&1), are refused. \
+                        Mutually exclusive with `program`."
                 },
                 "cwd": {
                     "type": "string",
@@ -193,19 +198,43 @@ impl Tool for ShellTool {
                             &ToolError::denied("a glob pattern is not allowed as a program name"),
                         ));
                     }
+                    Some(Arg::Var(name)) => {
+                        return Ok(deny(
+                            sandbox_kind,
+                            DenialKind::Exec,
+                            name,
+                            &ToolError::denied("a variable is not allowed as a program name"),
+                        ));
+                    }
                     None => {} // the parser guarantees a non-empty stage
                 }
                 for arg in &stage.argv {
-                    if let Arg::Glob(pattern) = arg {
-                        let dir = resolve_glob_dir(parsed.cwd.as_deref(), split_glob(pattern).0);
-                        if let Err(e) = cx.check_path_read(&dir) {
+                    match arg {
+                        // A glob lists a directory: that fs_read is leash-checked.
+                        Arg::Glob(pattern) => {
+                            let dir =
+                                resolve_glob_dir(parsed.cwd.as_deref(), split_glob(pattern).0);
+                            if let Err(e) = cx.check_path_read(&dir) {
+                                return Ok(deny(
+                                    sandbox_kind,
+                                    DenialKind::Open,
+                                    &dir.to_string_lossy(),
+                                    &e,
+                                ));
+                            }
+                        }
+                        // A variable must be on the env allowlist (no secret leak).
+                        Arg::Var(name) if !is_allowed_var(name) => {
                             return Ok(deny(
                                 sandbox_kind,
-                                DenialKind::Open,
-                                &dir.to_string_lossy(),
-                                &e,
+                                DenialKind::Exec,
+                                &format!("${name}"),
+                                &ToolError::denied(format!(
+                                    "variable ${name} is not in the confined shell's allowlist"
+                                )),
                             ));
                         }
+                        Arg::Var(_) | Arg::Lit(_) => {}
                     }
                 }
                 for redirect in &stage.redirects {
@@ -395,6 +424,22 @@ impl ShellArgs {
     }
 }
 
+// ── variable expansion (allowlist) ──────────────────────────────────────────
+
+/// The environment variables the confined engine will expand (ADR 0005 D3,
+/// allowlist-only). Deliberately small and secret-free: no `PATH`, no tokens.
+/// A `$VAR` outside this set is denied — so a confined run can never splice a
+/// secret (e.g. `$AWS_SECRET_KEY`) into an argument, even when `exec` is tight.
+const VAR_ALLOWLIST: &[&str] = &[
+    "HOME", "PWD", "OLDPWD", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "SHELL", "HOSTNAME",
+    "TERM",
+];
+
+/// Whether `name` may be expanded from the environment.
+fn is_allowed_var(name: &str) -> bool {
+    VAR_ALLOWLIST.contains(&name)
+}
+
 // ── glob expansion ──────────────────────────────────────────────────────────
 
 /// Split a glob pattern into (directory prefix incl. trailing `/`, basename
@@ -521,8 +566,10 @@ fn kill_all(children: &mut [Child]) {
     }
 }
 
-/// Lower a stage's [`Arg`] list into a concrete argv, expanding globs against the
-/// real filesystem.
+/// Lower a stage's [`Arg`] list into a concrete argv: literals as-is, globs
+/// expanded against the real filesystem, and (allowlisted) variables read from
+/// the environment as a single literal (no re-split / no re-glob of the value).
+/// The allowlist is enforced earlier in [`ShellTool::invoke`].
 fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
     let list_dir = |dir: &Path| -> Vec<String> {
         std::fs::read_dir(dir)
@@ -537,6 +584,7 @@ fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
         match arg {
             Arg::Lit(s) => argv.push(s.clone()),
             Arg::Glob(pattern) => argv.extend(expand_glob(pattern, cwd, &list_dir)),
+            Arg::Var(name) => argv.push(std::env::var(name).unwrap_or_default()),
         }
     }
     argv
@@ -708,7 +756,7 @@ mod tests {
     /// A stage's program word (argv[0]) for test assertions.
     fn prog(stage: &Command) -> &str {
         match stage.argv.first() {
-            Some(Arg::Lit(s) | Arg::Glob(s)) => s,
+            Some(Arg::Lit(s) | Arg::Glob(s) | Arg::Var(s)) => s,
             None => "",
         }
     }
@@ -833,6 +881,58 @@ mod tests {
             .expect("invoke");
         assert_eq!(out["denied"], true);
         assert_eq!(out["denials"][0]["kind"], "open");
+        assert!(ran_programs(&mock).is_empty());
+    }
+
+    // ── variable expansion / allowlist (increment 6) ────────────────────────
+
+    /// An allowlisted variable reaches the spawner as an (unexpanded) `Var`.
+    #[tokio::test]
+    async fn allowlisted_var_reaches_spawner() {
+        let mock = Arc::new(MockSpawner::default());
+        ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo $HOME"}),
+                &ctx(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        let c = calls(&mock);
+        assert_eq!(
+            c[0][0].argv,
+            vec![Arg::Lit("echo".into()), Arg::Var("HOME".into())]
+        );
+    }
+
+    /// A variable NOT on the allowlist is denied — the spawner is never called,
+    /// so a secret like `$AWS_SECRET_KEY` can never be spliced into an argument.
+    #[tokio::test]
+    async fn non_allowlisted_var_denied() {
+        let mock = Arc::new(MockSpawner::default());
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo $AWS_SECRET_KEY"}),
+                &ctx(Caveats::top()),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true);
+        assert_eq!(out["denials"][0]["target"], "$AWS_SECRET_KEY");
+        assert!(ran_programs(&mock).is_empty());
+    }
+
+    /// A variable in the program position is refused (we never exec a variable).
+    #[tokio::test]
+    async fn var_as_program_name_denied() {
+        let mock = Arc::new(MockSpawner::default());
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "$HOME foo"}),
+                &ctx(Caveats::top()),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true);
         assert!(ran_programs(&mock).is_empty());
     }
 
