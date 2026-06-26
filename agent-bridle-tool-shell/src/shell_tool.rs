@@ -102,14 +102,16 @@ impl Spawner for OsSpawner {
 /// The L3 `SandboxKind` that will actually be enforced for these caveats in this
 /// build, on this kernel — the value reported in the result envelope (I9 / ADR
 /// 0006 D3). [`best_available_sandbox`] already accounts for OS, feature, and
-/// kernel capability; we additionally report `None` when `fs_write` is
-/// unrestricted, because the current Landlock ruleset (the `fs_write` axis) then
-/// governs nothing — never overclaim.
+/// kernel capability; we additionally report `None` when no axis Landlock can
+/// enforce (`fs_write`/`fs_read`/`exec`) is restricted, because the ruleset would
+/// then govern nothing — never overclaim. (`net` is not yet enforceable, so it
+/// does not trigger Landlock on its own.)
 fn intended_sandbox_kind(caveats: &Caveats) -> SandboxKind {
+    let restricts_enforceable_axis = matches!(caveats.fs_write, Scope::Only(_))
+        || matches!(caveats.fs_read, Scope::Only(_))
+        || matches!(caveats.exec, Scope::Only(_));
     match best_available_sandbox().kind() {
-        SandboxKind::Landlock if matches!(caveats.fs_write, Scope::Only(_)) => {
-            SandboxKind::Landlock
-        }
+        SandboxKind::Landlock if restricts_enforceable_axis => SandboxKind::Landlock,
         _ => SandboxKind::None,
     }
 }
