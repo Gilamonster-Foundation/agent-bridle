@@ -5,8 +5,9 @@
 //! syscalls* once it has spawned — what neither the static decomposition (L1)
 //! nor the in-process brush interceptor (L2) can see. With the `linux-landlock`
 //! feature on a Landlock-capable kernel, [`LandlockSandbox`] builds and enforces
-//! a real ruleset from the effective [`Caveats`] (first increment: the
-//! `fs_write` axis). Without the feature, off-Linux, or on a kernel lacking
+//! a real ruleset from the effective [`Caveats`] (the `fs_write` axis, and the
+//! `fs_read` axis when reads are restricted — `exec`/`net` are follow-ups,
+//! agent-bridle#31). Without the feature, off-Linux, or on a kernel lacking
 //! Landlock, the sandbox is the advisory [`NoopSandbox`] reporting
 //! [`SandboxKind::None`] — the leash is then in-process only, honestly
 //! advertised, with no overclaiming.
@@ -112,17 +113,55 @@ mod landlock_impl {
             .is_ok()
     }
 
+    /// Read-only base allow-list: the loader/system paths a dynamically-linked
+    /// binary must read to start (the dynamic linker, shared libraries, the
+    /// linker cache, locale, name-resolution config, and the `/dev` and
+    /// `/proc/self` essentials). Added whenever `fs_read` is confined so a
+    /// *permitted* program still loads libc — while user data outside scope stays
+    /// unreadable. Note `/etc` is **not** granted wholesale: only the specific
+    /// files below, so e.g. `/etc/shadow` remains denied. Tuned for a glibc/FHS
+    /// layout (the CI target); a musl/Nix layout may need more entries — paths
+    /// that do not exist are skipped, so extra entries are harmless.
+    const BASE_READ_PATHS: &[&str] = &[
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/lib32",
+        "/libx32",
+        "/opt",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.preload",
+        "/etc/alternatives",
+        "/etc/nsswitch.conf",
+        "/etc/localtime",
+        "/etc/resolv.conf",
+        "/proc/self",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/urandom",
+        "/dev/random",
+        "/usr/share/locale",
+        "/usr/lib/locale",
+    ];
+
     /// A real, kernel-enforced Landlock sandbox (Linux).
     ///
-    /// **First increment — the `fs_write` axis.** The handled access set is the
-    /// write/modify-side filesystem rights only; reads and execute are left
-    /// ungoverned on purpose, so a dynamically-linked permitted binary can still
-    /// load its shared libraries and run. (Read/exec confinement is a documented
-    /// follow-up: it needs a base allow-list of loader/system paths — see ADR
-    /// 0001 and the crate TODOs — otherwise locking `fs_read` would break every
-    /// system binary.) This already closes the ADR-0001 gap on the write axis: a
-    /// permitted external program can no longer write outside `fs_write`, even
-    /// though L2 cannot see its syscalls once it has spawned.
+    /// **The `fs_write` and `fs_read` axes.** Writes are always governed (from
+    /// `fs_write`); reads are governed only when `fs_read` is *restricted*
+    /// (`Only(_)`), in which case the granted read roots plus [`BASE_READ_PATHS`]
+    /// are read-allowed and everything else is denied — so a permitted external
+    /// program cannot read user data outside `fs_read` (closing `grep -f
+    /// /etc/shadow`-style reads) yet can still load its libraries. `Execute` is
+    /// deliberately left ungoverned this increment, so dynamically-linked
+    /// binaries can mmap-exec their libraries without an execute allow-list; the
+    /// `exec` axis (blocking e.g. `find -exec curl`) and `net` are follow-ups
+    /// (agent-bridle#31). When `fs_read` is `All`, reads stay ambient (no base
+    /// list needed, nothing to confine). These close the ADR-0001 gap on the
+    /// read/write axes: confinement holds even though L2 cannot see the spawned
+    /// program's syscalls.
     ///
     /// `restrict_self` is per-thread and irreversible, and is inherited across
     /// `fork`/`execve`. Callers must therefore call [`Sandbox::apply`] on the
@@ -145,32 +184,41 @@ mod landlock_impl {
 
         fn apply(&self, effective: &Caveats) -> ToolResult<()> {
             let write = AccessFs::from_write(ABI_FLOOR);
+            // Pure read rights — `from_read` also includes `Execute`, which we
+            // intentionally leave ungoverned this increment so libraries can be
+            // mmap-exec'd without an execute allow-list.
+            let read = AccessFs::ReadFile | AccessFs::ReadDir;
 
-            // Which path roots may be written. `All` => the whole tree (the
-            // ruleset is still in force, but writes anywhere are permitted).
-            // `Only(set)` => exactly those roots; `Only(empty)` => nowhere, i.e.
-            // all writes denied. A scope path that does not exist cannot anchor a
-            // rule and is skipped — safe, because its parent is not granted, so
-            // writes beneath it stay denied.
-            let roots: Vec<String> = match &effective.fs_write {
-                Scope::All => vec!["/".to_string()],
-                Scope::Only(set) => set
-                    .iter()
-                    .filter(|p| std::path::Path::new(p).exists())
-                    .cloned()
-                    .collect(),
-            };
+            // Govern writes always; govern reads only when `fs_read` is actually
+            // restricted (`Only`) — `All` means no read confinement was asked
+            // for, so reads stay ambient and no base allow-list is needed.
+            let confine_read = matches!(effective.fs_read, Scope::Only(_));
+            let handled = if confine_read { write | read } else { write };
 
-            let status = Ruleset::default()
+            let write_roots = scope_roots(&effective.fs_write);
+            let ruleset = Ruleset::default()
                 .set_compatibility(CompatLevel::BestEffort)
-                .handle_access(write)
+                .handle_access(handled)
                 .map_err(landlock_denied)?
                 .create()
                 .map_err(landlock_denied)?
-                .add_rules(path_beneath_rules(&roots, write))
-                .map_err(landlock_denied)?
-                .restrict_self()
+                .add_rules(path_beneath_rules(&write_roots, write))
                 .map_err(landlock_denied)?;
+
+            let ruleset = if confine_read {
+                // Granted read roots plus the loader/system base list, so the
+                // permitted binary loads while out-of-scope reads stay denied.
+                let mut read_roots = scope_roots(&effective.fs_read);
+                read_roots.extend(BASE_READ_PATHS.iter().map(|p| (*p).to_string()));
+                read_roots.retain(|p| std::path::Path::new(p).exists());
+                ruleset
+                    .add_rules(path_beneath_rules(&read_roots, read))
+                    .map_err(landlock_denied)?
+            } else {
+                ruleset
+            };
+
+            let status = ruleset.restrict_self().map_err(landlock_denied)?;
 
             // Fail closed: if the kernel did not actually enforce the ruleset,
             // do not let the caller believe it is confined.
@@ -180,6 +228,21 @@ mod landlock_impl {
                 ));
             }
             Ok(())
+        }
+    }
+
+    /// The existing path roots a [`Scope`] grants: `All` => the whole tree
+    /// (`/`); `Only(set)` => exactly those paths that exist (a non-existent path
+    /// cannot anchor a Landlock rule and is skipped — safe, since its parent is
+    /// ungranted, so access beneath it stays denied).
+    fn scope_roots(scope: &Scope<String>) -> Vec<String> {
+        match scope {
+            Scope::All => vec!["/".to_string()],
+            Scope::Only(set) => set
+                .iter()
+                .filter(|p| std::path::Path::new(p).exists())
+                .cloned()
+                .collect(),
         }
     }
 
@@ -310,5 +373,129 @@ mod landlock_kernel_tests {
             std::io::ErrorKind::PermissionDenied
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_read_is_kernel_enforced_outside_scope_denied_inside_allowed() {
+        if !landlock_is_supported() {
+            eprintln!("skipping fs_read landlock test: kernel lacks Landlock");
+            return;
+        }
+        let allowed = unique_dir("read-allowed");
+        let forbidden = unique_dir("read-forbidden");
+        // Create both files BEFORE confining (afterwards the forbidden dir is
+        // unreadable, but it must already hold a file to attempt the read).
+        fs::write(allowed.join("ok.txt"), b"in-scope").unwrap();
+        fs::write(forbidden.join("secret.txt"), b"out-of-scope").unwrap();
+        let allowed_t = allowed.clone();
+        let forbidden_t = forbidden.clone();
+
+        let (inside, outside) = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            let inside = fs::read(allowed_t.join("ok.txt"));
+            let outside = fs::read(forbidden_t.join("secret.txt"));
+            (inside, outside)
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(inside.expect("in-scope read must succeed"), b"in-scope");
+        assert_eq!(
+            outside
+                .expect_err("reading outside fs_read scope must be denied by Landlock")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the denial must come from the kernel (EACCES)"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn read_confined_binary_still_loads_via_base_allowlist() {
+        if !landlock_is_supported() {
+            eprintln!("skipping read-confined binary test: kernel lacks Landlock");
+            return;
+        }
+        let allowed = unique_dir("rc-allowed");
+        let forbidden = unique_dir("rc-forbidden");
+        fs::write(allowed.join("ok.txt"), b"hello\n").unwrap();
+        fs::write(forbidden.join("secret.txt"), b"nope\n").unwrap();
+        let allowed_t = allowed.clone();
+        let forbidden_t = forbidden.clone();
+
+        // Confine reads, then run a *real* dynamically-linked binary (`cat`):
+        // it must still load (proving the base allow-list covers the loader and
+        // libc) and read the in-scope file, but be denied the out-of-scope one.
+        let (inside, outside) = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            let inside = std::process::Command::new("cat")
+                .arg(allowed_t.join("ok.txt"))
+                .output();
+            let outside = std::process::Command::new("cat")
+                .arg(forbidden_t.join("secret.txt"))
+                .output();
+            (inside, outside)
+        })
+        .join()
+        .unwrap();
+
+        let inside = inside.expect("cat must still load+run under read confinement");
+        assert!(
+            inside.status.success(),
+            "in-scope cat must succeed: {inside:?}"
+        );
+        assert_eq!(inside.stdout, b"hello\n");
+
+        let outside = outside.expect("cat launches (loader is allowed) even for a denied target");
+        assert!(
+            !outside.status.success(),
+            "cat of an out-of-scope file must fail (read denied): {outside:?}"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn fs_read_all_leaves_reads_ambient() {
+        if !landlock_is_supported() {
+            eprintln!("skipping fs_read-all test: kernel lacks Landlock");
+            return;
+        }
+        // With fs_read: All (only fs_write restricted), reads are NOT governed —
+        // a path outside the write scope is still readable.
+        let outside_dir = unique_dir("ambient-read");
+        fs::write(outside_dir.join("readable.txt"), b"still readable").unwrap();
+        let write_scope = unique_dir("ambient-write");
+        let outside_t = outside_dir.clone();
+        let write_t = write_scope.clone();
+
+        let read = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_write: Scope::only([write_t.to_string_lossy().into_owned()]),
+                ..Caveats::top() // fs_read stays All
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            fs::read(outside_t.join("readable.txt"))
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            read.expect("fs_read: All must leave reads ambient"),
+            b"still readable"
+        );
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&write_scope);
     }
 }
