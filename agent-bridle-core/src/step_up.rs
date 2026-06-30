@@ -267,8 +267,20 @@ pub struct Discharge {
     pub credential_id: Vec<u8>,
     /// The challenge bytes the authenticator signed.
     pub challenge: [u8; 32],
-    /// The assertion signature over the challenge.
+    /// The assertion signature. For the raw-Ed25519 path this signs the
+    /// `challenge` directly; for the WebAuthn path it signs
+    /// `authenticator_data ‖ SHA-256(client_data_json)`.
     pub signature: Vec<u8>,
+    /// WebAuthn `authenticatorData` (binary: `rpIdHash‖flags‖signCount‖…`), set
+    /// only when the proof is a WebAuthn/CTAP2 assertion ([`WebAuthnVerifier`]).
+    /// `None` for the raw-Ed25519 path. Backward-compatible on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticator_data: Option<Vec<u8>>,
+    /// WebAuthn `clientDataJSON` (the raw UTF-8 bytes the authenticator hashed),
+    /// set only for a WebAuthn assertion; carries the base64url-encoded
+    /// challenge the verifier binds against. `None` for the raw-Ed25519 path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_data_json: Option<Vec<u8>>,
 }
 
 /// A content-addressed, non-repudiable record that a human authorized a specific
@@ -355,9 +367,11 @@ pub trait DischargeVerifier {
 /// the challenge binding (anti-theater — the signed bytes must equal the bytes
 /// the gate recomputed), then `verify_strict` over the challenge.
 ///
-/// **Off by default.** Enable the `verifier-ed25519` cargo feature. WebAuthn /
-/// CTAP2 assertion parsing (attestation objects, USB/HID transport) is a
-/// separate, larger verifier — this is the raw-Ed25519 path only (ADR 0007).
+/// **Off by default.** Enable the `verifier-ed25519` cargo feature. This is the
+/// raw-Ed25519 path only; the WebAuthn/CTAP2 assertion path (clientDataJSON +
+/// authenticatorData + UP/UV flag bits) is the sibling [`WebAuthnVerifier`]
+/// (`verifier-webauthn` feature). Attestation-certificate chains / FIDO MDS and
+/// live USB/HID transport remain out of scope for both (ADR 0007).
 #[cfg(feature = "verifier-ed25519")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Ed25519Verifier;
@@ -397,6 +411,152 @@ impl DischargeVerifier for Ed25519Verifier {
         let sig = Signature::from_bytes(&sig_bytes);
         vk.verify_strict(expected.as_bytes(), &sig)
             .map_err(|e| e.to_string())
+    }
+}
+
+/// base64url **without padding** (RFC 4648 §5), the encoding WebAuthn uses for
+/// `clientDataJSON.challenge`. Encoding-only: we encode the gate-recomputed
+/// challenge and string-compare it to the assertion, so no decoder (and no
+/// malleable-input parsing) is needed.
+#[cfg(feature = "verifier-webauthn")]
+fn base64url_nopad(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(T[((n >> 18) & 0x3f) as usize] as char);
+        out.push(T[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[((n >> 6) & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(T[(n & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A production [`DischargeVerifier`] for **WebAuthn/CTAP2 assertions** — the
+/// format a hardware passkey (or a `navigator.credentials.get()` ceremony)
+/// produces. The opaque [`Discharge`] fields are read as a WebAuthn assertion:
+/// [`Discharge::credential_id`] is the 32-byte Ed25519 (COSE `EdDSA`/`-8`)
+/// verifying key, [`Discharge::authenticator_data`] and
+/// [`Discharge::client_data_json`] are the assertion's two signed structures, and
+/// [`Discharge::signature`] is the EdDSA signature over
+/// `authenticatorData ‖ SHA-256(clientDataJSON)` (the WebAuthn signing input).
+///
+/// It checks, in order (fail-closed; ADR 0007 D2):
+/// 1. the **presence floor** — `discharge.presence >= required.presence` —
+///    *before any crypto or parsing*;
+/// 2. the **flag bits** in `authenticatorData`: User-Presence (UP) must be set,
+///    and User-Verification (UV) must be set whenever the requirement is
+///    `Presence::Passkey` (the hardware-verified tier);
+/// 3. the **challenge binding** (anti-theater): `clientDataJSON.type` is
+///    `"webauthn.get"` and its `challenge` equals the base64url of the
+///    gate-recomputed [`Challenge`];
+/// 4. the **signature** over `authenticatorData ‖ SHA-256(clientDataJSON)`.
+///
+/// **Off by default.** Enable the `verifier-webauthn` cargo feature. Out of
+/// scope (ADR 0007): attestation-certificate chain validation / FIDO MDS, live
+/// USB/HID transport, and credential registration — this verifies a *presented*
+/// assertion, it does not run the ceremony (that is a [`DischargeProvider`]).
+#[cfg(feature = "verifier-webauthn")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WebAuthnVerifier;
+
+#[cfg(feature = "verifier-webauthn")]
+impl DischargeVerifier for WebAuthnVerifier {
+    fn verify(
+        &self,
+        discharge: &Discharge,
+        required: &AttestRequirement,
+        expected: &Challenge,
+    ) -> Result<(), String> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        use sha2::{Digest, Sha256};
+
+        // 1. Presence floor first — a too-weak gesture is rejected before any
+        // parsing or crypto (fail-closed; ADR 0007 D2).
+        if discharge.presence < required.presence {
+            return Err(format!(
+                "presence {:?} is below required {:?}",
+                discharge.presence, required.presence
+            ));
+        }
+
+        // The WebAuthn proof parts must be present.
+        let auth_data = discharge
+            .authenticator_data
+            .as_deref()
+            .ok_or("WebAuthn assertion is missing authenticatorData")?;
+        let client_data = discharge
+            .client_data_json
+            .as_deref()
+            .ok_or("WebAuthn assertion is missing clientDataJSON")?;
+
+        // 2. authenticatorData = rpIdHash[32] ‖ flags[1] ‖ signCount[4] ‖ …
+        if auth_data.len() < 37 {
+            return Err("authenticatorData is too short (need ≥ 37 bytes)".into());
+        }
+        let flags = auth_data[32];
+        let up = flags & 0x01 != 0; // bit 0: User Present
+        let uv = flags & 0x04 != 0; // bit 2: User Verified
+        if !up {
+            return Err("authenticatorData User-Presence (UP) flag is not set".into());
+        }
+        if required.presence >= Presence::Passkey && !uv {
+            return Err(
+                "authenticatorData User-Verification (UV) flag is required for Passkey but not set"
+                    .into(),
+            );
+        }
+
+        // 3. clientDataJSON: must be a `webauthn.get` answering THIS challenge.
+        #[derive(serde::Deserialize)]
+        struct ClientData {
+            #[serde(rename = "type")]
+            typ: String,
+            challenge: String,
+        }
+        let cd: ClientData = serde_json::from_slice(client_data)
+            .map_err(|e| format!("clientDataJSON does not parse: {e}"))?;
+        if cd.typ != "webauthn.get" {
+            return Err(format!(
+                "clientDataJSON.type is {:?}, expected \"webauthn.get\"",
+                cd.typ
+            ));
+        }
+        // Anti-theater: the signed challenge must equal the bytes the gate
+        // recomputed (constant-time-ish string compare on the base64url form).
+        if cd.challenge != base64url_nopad(expected.as_bytes()) {
+            return Err("assertion does not answer this action's challenge".into());
+        }
+        // Defense-in-depth: the discharge's own challenge field must agree too,
+        // so a recorded Attestation (built from these fields) stays consistent.
+        if &discharge.challenge != expected.as_bytes() {
+            return Err("discharge challenge does not match the gate-recomputed challenge".into());
+        }
+
+        // 4. Verify the EdDSA signature over authenticatorData ‖ SHA-256(clientDataJSON).
+        let vk_bytes: [u8; 32] = discharge
+            .credential_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| "credential id is not a 32-byte ed25519 key".to_string())?;
+        let vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|e| e.to_string())?;
+        let sig_bytes: [u8; 64] = discharge
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "signature is not 64 bytes".to_string())?;
+        let sig = Signature::from_bytes(&sig_bytes);
+        let mut signed = Vec::with_capacity(auth_data.len() + 32);
+        signed.extend_from_slice(auth_data);
+        signed.extend_from_slice(&Sha256::digest(client_data));
+        vk.verify_strict(&signed, &sig).map_err(|e| e.to_string())
     }
 }
 
@@ -559,7 +719,7 @@ mod tests {
     // its import too — otherwise `--no-default-features` flags it unused.
     #[cfg(feature = "verifier-ed25519")]
     use crate::ToolError;
-    #[cfg(feature = "verifier-ed25519")]
+    #[cfg(any(feature = "verifier-ed25519", feature = "verifier-webauthn"))]
     use ed25519_dalek::{Signer, SigningKey};
 
     /// A trivial tool, named so policy selectors can match it.
@@ -607,6 +767,8 @@ mod tests {
             credential_id: key.verifying_key().to_bytes().to_vec(),
             challenge: *challenge.as_bytes(),
             signature: sig.to_bytes().to_vec(),
+            authenticator_data: None,
+            client_data_json: None,
         }
     }
 
@@ -1173,5 +1335,152 @@ mod tests {
         // Unmatched tool falls through to the default.
         let other = CallRequest::new("email.read", serde_json::Value::Null, "inbox");
         assert_eq!(policy.required_for(&other).presence, Presence::None);
+    }
+
+    // ── WebAuthn verifier (#72, verifier-webauthn) ───────────────────────────
+
+    /// authenticatorData flag bits.
+    #[cfg(feature = "verifier-webauthn")]
+    const UP: u8 = 0x01; // User Present
+    #[cfg(feature = "verifier-webauthn")]
+    const UV: u8 = 0x04; // User Verified
+
+    /// Build a WebAuthn (EdDSA) assertion discharge over `challenge`: a
+    /// `webauthn.get` clientDataJSON carrying the base64url challenge, a 37-byte
+    /// authenticatorData whose flag byte is `flags`, and an Ed25519 signature
+    /// over `authData ‖ SHA-256(clientDataJSON)`. A fixture builder — no live
+    /// authenticator (acceptance criteria: canned vectors, no hardware).
+    #[cfg(feature = "verifier-webauthn")]
+    fn webauthn_discharge(
+        key: &SigningKey,
+        challenge: &Challenge,
+        presence: Presence,
+        flags: u8,
+    ) -> Discharge {
+        use sha2::{Digest, Sha256};
+        let client_data = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://example.org"}}"#,
+            base64url_nopad(challenge.as_bytes())
+        )
+        .into_bytes();
+        // rpIdHash[32] ‖ flags[1] ‖ signCount[4]
+        let mut auth_data = vec![0u8; 37];
+        auth_data[32] = flags;
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data));
+        let sig = key.sign(&signed);
+        Discharge {
+            presence,
+            credential_id: key.verifying_key().to_bytes().to_vec(),
+            challenge: *challenge.as_bytes(),
+            signature: sig.to_bytes().to_vec(),
+            authenticator_data: Some(auth_data),
+            client_data_json: Some(client_data),
+        }
+    }
+
+    #[cfg(feature = "verifier-webauthn")]
+    fn webauthn_challenge(nonce: u8) -> Challenge {
+        Challenge::bind(&push_request().content_id(), 0, &[nonce; 32])
+    }
+
+    #[cfg(feature = "verifier-webauthn")]
+    #[test]
+    fn webauthn_accepts_valid_passkey_assertion() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let challenge = webauthn_challenge(3);
+        let d = webauthn_discharge(&key, &challenge, Presence::Passkey, UP | UV);
+        assert!(WebAuthnVerifier
+            .verify(
+                &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &challenge
+            )
+            .is_ok());
+    }
+
+    #[cfg(feature = "verifier-webauthn")]
+    #[test]
+    fn webauthn_rejects_tampered_challenge() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        // Signed over one challenge; the gate recomputed a different one.
+        let d = webauthn_discharge(&key, &webauthn_challenge(3), Presence::Passkey, UP | UV);
+        let err = WebAuthnVerifier
+            .verify(
+                &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &webauthn_challenge(4),
+            )
+            .unwrap_err();
+        assert!(err.contains("challenge"), "{err}");
+    }
+
+    #[cfg(feature = "verifier-webauthn")]
+    #[test]
+    fn webauthn_rejects_cleared_up_flag() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let challenge = webauthn_challenge(3);
+        // UV set but UP cleared — UP is mandatory, so reject.
+        let d = webauthn_discharge(&key, &challenge, Presence::Passkey, UV);
+        let err = WebAuthnVerifier
+            .verify(
+                &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &challenge,
+            )
+            .unwrap_err();
+        assert!(err.contains("User-Presence"), "{err}");
+    }
+
+    #[cfg(feature = "verifier-webauthn")]
+    #[test]
+    fn webauthn_passkey_requires_uv() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let challenge = webauthn_challenge(3);
+        // UP set, UV clear: fine for a Prompt requirement, but a Passkey
+        // requirement demands the verified gesture.
+        let d = webauthn_discharge(&key, &challenge, Presence::Passkey, UP);
+        let err = WebAuthnVerifier
+            .verify(
+                &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &challenge,
+            )
+            .unwrap_err();
+        assert!(err.contains("User-Verification"), "{err}");
+    }
+
+    /// A `Prompt`-strength discharge can never satisfy a `Passkey` requirement —
+    /// rejected before any crypto (mirrors `presence_too_weak_fails_closed`).
+    #[cfg(feature = "verifier-webauthn")]
+    #[test]
+    fn webauthn_presence_too_weak_fails_closed() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let challenge = webauthn_challenge(3);
+        let d = webauthn_discharge(&key, &challenge, Presence::Prompt, UP | UV);
+        let err = WebAuthnVerifier
+            .verify(
+                &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &challenge,
+            )
+            .unwrap_err();
+        assert!(err.contains("presence"), "{err}");
+    }
+
+    #[cfg(feature = "verifier-webauthn")]
+    #[test]
+    fn webauthn_rejects_forged_signature() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let challenge = webauthn_challenge(3);
+        let mut d = webauthn_discharge(&key, &challenge, Presence::Passkey, UP | UV);
+        d.signature[0] ^= 0xff; // a one-bit-flipped (forged) signature
+        assert!(WebAuthnVerifier
+            .verify(
+                &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &challenge
+            )
+            .is_err());
     }
 }
