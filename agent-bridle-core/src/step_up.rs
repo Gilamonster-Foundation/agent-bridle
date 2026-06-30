@@ -251,7 +251,8 @@ impl AttestRequirement {
 
 /// A human-presence proof presented to the gate. Crypto-format-agnostic: the
 /// `signature` and `credential_id` are opaque bytes a [`DischargeVerifier`]
-/// interprets (the MVP software verifier reads them as ed25519).
+/// interprets (e.g. the `Ed25519Verifier` reads them as a raw ed25519 verifying
+/// key + assertion, under the `verifier-ed25519` feature).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discharge {
     /// The gesture strength actually achieved (e.g. user-presence vs. verified).
@@ -334,6 +335,63 @@ pub trait DischargeVerifier {
         required: &AttestRequirement,
         expected: &Challenge,
     ) -> Result<(), String>;
+}
+
+/// A production [`DischargeVerifier`] for **raw Ed25519** assertions — the format
+/// the OpenSSH `ed25519-sk` / software-passkey path produces. It interprets
+/// [`Discharge::credential_id`] as a 32-byte verifying key and
+/// [`Discharge::signature`] as a 64-byte assertion over the gate-recomputed
+/// [`Challenge`], and is **presence-agnostic about *how*** the gesture was
+/// achieved (it trusts the host-reported [`Presence`] only up to the floor the
+/// gate re-checks below).
+///
+/// It checks, in order: the presence floor (`discharge.presence >= required.presence`),
+/// the challenge binding (anti-theater — the signed bytes must equal the bytes
+/// the gate recomputed), then `verify_strict` over the challenge.
+///
+/// **Off by default.** Enable the `verifier-ed25519` cargo feature. WebAuthn /
+/// CTAP2 assertion parsing (attestation objects, USB/HID transport) is a
+/// separate, larger verifier — this is the raw-Ed25519 path only (ADR 0007).
+#[cfg(feature = "verifier-ed25519")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Ed25519Verifier;
+
+#[cfg(feature = "verifier-ed25519")]
+impl DischargeVerifier for Ed25519Verifier {
+    fn verify(
+        &self,
+        discharge: &Discharge,
+        required: &AttestRequirement,
+        expected: &Challenge,
+    ) -> Result<(), String> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        // Presence floor first — a too-weak gesture is rejected before any crypto
+        // (fail-closed; ADR 0007 D2).
+        if discharge.presence < required.presence {
+            return Err(format!(
+                "presence {:?} is below required {:?}",
+                discharge.presence, required.presence
+            ));
+        }
+        // Anti-theater: the discharge must answer THIS action's challenge.
+        if &discharge.challenge != expected.as_bytes() {
+            return Err("discharge does not answer this action's challenge".into());
+        }
+        let vk_bytes: [u8; 32] = discharge
+            .credential_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| "credential id is not a 32-byte ed25519 key".to_string())?;
+        let vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|e| e.to_string())?;
+        let sig_bytes: [u8; 64] = discharge
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "signature is not 64 bytes".to_string())?;
+        let sig = Signature::from_bytes(&sig_bytes);
+        vk.verify_strict(expected.as_bytes(), &sig)
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Runs the human-presence **ceremony** and returns a [`Discharge`] — the dual
@@ -490,8 +548,13 @@ impl Default for StepUpPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Caveats, CountBound, Gate, Tool, ToolError, ToolResult};
-    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+    use crate::{Caveats, CountBound, Gate, Tool, ToolResult};
+    // `ToolError` is only referenced by the crypto tests below (gated), so gate
+    // its import too — otherwise `--no-default-features` flags it unused.
+    #[cfg(feature = "verifier-ed25519")]
+    use crate::ToolError;
+    #[cfg(feature = "verifier-ed25519")]
+    use ed25519_dalek::{Signer, SigningKey};
 
     /// A trivial tool, named so policy selectors can match it.
     struct NamedTool(&'static str);
@@ -512,49 +575,18 @@ mod tests {
         }
     }
 
-    /// The MVP stub verifier: reads `credential_id`/`signature` as ed25519 and
-    /// checks the assertion over the gate-recomputed challenge. A real
-    /// WebAuthn/CTAP2 verifier (a host capability) lands in a later PR.
-    struct SoftwareVerifier;
-    impl DischargeVerifier for SoftwareVerifier {
-        fn verify(
-            &self,
-            discharge: &Discharge,
-            required: &AttestRequirement,
-            expected: &Challenge,
-        ) -> Result<(), String> {
-            if discharge.presence < required.presence {
-                return Err(format!(
-                    "presence {:?} is below required {:?}",
-                    discharge.presence, required.presence
-                ));
-            }
-            if &discharge.challenge != expected.as_bytes() {
-                return Err("discharge does not answer this action's challenge".into());
-            }
-            let vk_bytes: [u8; 32] = discharge
-                .credential_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| "credential id is not a 32-byte ed25519 key".to_string())?;
-            let vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|e| e.to_string())?;
-            let sig_bytes: [u8; 64] = discharge
-                .signature
-                .as_slice()
-                .try_into()
-                .map_err(|_| "signature is not 64 bytes".to_string())?;
-            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-            vk.verify_strict(expected.as_bytes(), &sig)
-                .map_err(|e| e.to_string())
-        }
-    }
-
-    /// Deterministic test key (a fixed seed — never a real secret).
+    /// Deterministic test key (a fixed seed — never a real secret). The step-up
+    /// crypto tests sign with this and verify with the production
+    /// [`Ed25519Verifier`], so they require the `verifier-ed25519` feature; the
+    /// lean `--no-default-features` build compiles them out (CI's `--all-features`
+    /// matrix runs them).
+    #[cfg(feature = "verifier-ed25519")]
     fn test_key() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])
     }
 
     /// Build a discharge by signing the challenge for `request` at `generation`.
+    #[cfg(feature = "verifier-ed25519")]
     fn sign_discharge(
         key: &SigningKey,
         request: &CallRequest,
@@ -649,6 +681,7 @@ mod tests {
 
     /// A valid discharge over the bound challenge mints the context and records
     /// the attestation; the context still carries least authority.
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn valid_discharge_mints_and_records() {
         let gate = Gate::new(0);
@@ -660,7 +693,7 @@ mod tests {
         let attempt = DischargeAttempt {
             nonce,
             discharge: &discharge,
-            verifier: &SoftwareVerifier,
+            verifier: &Ed25519Verifier,
         };
 
         let (cx, attestation) = gate
@@ -677,10 +710,12 @@ mod tests {
     /// A test [`DischargeProvider`] standing in for the host ceremony: it signs
     /// the bound challenge with a fixed key at a chosen presence (the gesture's
     /// effect, stubbed — no real authenticator).
+    #[cfg(feature = "verifier-ed25519")]
     struct MockProvider {
         key: SigningKey,
         presence: Presence,
     }
+    #[cfg(feature = "verifier-ed25519")]
     impl DischargeProvider for MockProvider {
         fn obtain(
             &self,
@@ -701,7 +736,9 @@ mod tests {
 
     /// A provider whose ceremony fails — the human declined, or no authenticator
     /// is present.
+    #[cfg(feature = "verifier-ed25519")]
     struct FailingProvider;
+    #[cfg(feature = "verifier-ed25519")]
     impl DischargeProvider for FailingProvider {
         fn obtain(
             &self,
@@ -717,6 +754,7 @@ mod tests {
     /// The #61 orchestration helper: a provider that produces a valid passkey
     /// discharge drives `evaluate→obtain→authorize` to a minted context and a
     /// recorded attestation in a single call.
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn provider_obtain_then_authorize_mints_and_records() {
         let gate = Gate::new(0);
@@ -733,7 +771,7 @@ mod tests {
                 &push_request(),
                 &push_policy(),
                 &provider,
-                &SoftwareVerifier,
+                &Ed25519Verifier,
                 [11u8; 32],
             )
             .expect("a valid provider discharge authorizes");
@@ -745,6 +783,7 @@ mod tests {
     /// Fail-closed: a provider whose ceremony errors makes the helper deny and
     /// mint/charge nothing — the single budgeted call survives (mirrors
     /// `needs_discharge_does_not_mint_or_charge`).
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn provider_error_fails_closed() {
         let gate = Gate::with_budget(0, CountBound::AtMost(1));
@@ -757,7 +796,7 @@ mod tests {
                 &push_request(),
                 &push_policy(),
                 &FailingProvider,
-                &SoftwareVerifier,
+                &Ed25519Verifier,
                 [12u8; 32],
             )
             .expect_err("a failed ceremony is fail-closed");
@@ -779,6 +818,7 @@ mod tests {
     /// `Prompt` cannot satisfy the policy's `Passkey` requirement, even though it
     /// returned `Ok`. The gate re-checks presence regardless of what the
     /// provider claimed (ADR 0007 D5).
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn provider_below_required_presence_is_denied() {
         let gate = Gate::new(0);
@@ -795,7 +835,7 @@ mod tests {
                 &push_request(),
                 &push_policy(),
                 &provider,
-                &SoftwareVerifier,
+                &Ed25519Verifier,
                 [13u8; 32],
             )
             .expect_err("a Prompt provider cannot satisfy a Passkey policy");
@@ -804,6 +844,7 @@ mod tests {
 
     /// When no step-up is owed, the helper degenerates to an ordinary authorize:
     /// it never runs the ceremony and returns no attestation.
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn authorize_step_up_without_gesture_degenerates_to_authorize() {
         let gate = Gate::new(0);
@@ -820,7 +861,7 @@ mod tests {
                 &CallRequest::unspecified("free.tool"),
                 &StepUpPolicy::EMPTY,
                 &provider,
-                &SoftwareVerifier,
+                &Ed25519Verifier,
                 [14u8; 32],
             )
             .expect("no gesture owed → ordinary authorize");
@@ -831,6 +872,7 @@ mod tests {
     /// Anti-theater: a discharge signed for a DIFFERENT action (different nonce)
     /// is rejected. This fails only because the challenge is bound to the exact
     /// action — a generic gesture would pass.
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn wrong_challenge_is_denied() {
         let gate = Gate::new(0);
@@ -842,7 +884,7 @@ mod tests {
         let attempt = DischargeAttempt {
             nonce: [2u8; 32], // gate's nonce differs → expected challenge differs
             discharge: &discharge,
-            verifier: &SoftwareVerifier,
+            verifier: &Ed25519Verifier,
         };
         let err = gate
             .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
@@ -852,6 +894,7 @@ mod tests {
 
     /// Fail-closed: a too-weak gesture (Prompt) cannot satisfy a Passkey
     /// requirement.
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn presence_too_weak_fails_closed() {
         let gate = Gate::new(0);
@@ -864,7 +907,7 @@ mod tests {
         let attempt = DischargeAttempt {
             nonce,
             discharge: &discharge,
-            verifier: &SoftwareVerifier,
+            verifier: &Ed25519Verifier,
         };
         let err = gate
             .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
@@ -880,6 +923,7 @@ mod tests {
     /// `presence_too_weak_fails_closed` (which covers `Prompt`): it proves the
     /// gate fails closed and never silently downgrades when *no* presence is
     /// achievable, rather than only when a weaker-but-nonzero one is.
+    #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn no_authenticator_presence_none_cannot_satisfy_passkey() {
         let gate = Gate::new(0);
@@ -893,11 +937,67 @@ mod tests {
         let attempt = DischargeAttempt {
             nonce,
             discharge: &discharge,
-            verifier: &SoftwareVerifier,
+            verifier: &Ed25519Verifier,
         };
         let err = gate
             .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
             .expect_err("Presence::None cannot satisfy Passkey");
+        assert!(matches!(err, ToolError::Denied { .. }));
+    }
+
+    /// #62 acceptance: the **production** [`Ed25519Verifier`] accepts a discharge
+    /// signed over the bound challenge (and mints), rejects one signed over a
+    /// different nonce (anti-theater), and rejects a `Prompt` gesture against a
+    /// `Passkey` requirement (fail-closed). This exercises the public, exported
+    /// type — no test-only verifier exists on this path.
+    #[cfg(feature = "verifier-ed25519")]
+    #[test]
+    fn ed25519_verifier_accepts_valid_and_rejects_wrong_challenge() {
+        let gate = Gate::new(0);
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+
+        // Accept: a passkey discharge over the gate-recomputed challenge mints.
+        let nonce = [21u8; 32];
+        let ok = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let attempt = DischargeAttempt {
+            nonce,
+            discharge: &ok,
+            verifier: &Ed25519Verifier,
+        };
+        let (cx, attestation) = gate
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
+            .expect("a valid ed25519 discharge authorizes");
+        assert!(cx.caveats().leq(&granted));
+        assert!(
+            attestation.is_some(),
+            "passkey+record produces an attestation"
+        );
+
+        // Reject: signed over a different nonce than the gate recomputes.
+        let bad = sign_discharge(&test_key(), &req, 0, &[99u8; 32], Presence::Passkey);
+        let bad_attempt = DischargeAttempt {
+            nonce: [22u8; 32], // gate's nonce differs → expected challenge differs
+            discharge: &bad,
+            verifier: &Ed25519Verifier,
+        };
+        let err = gate
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &bad_attempt)
+            .expect_err("wrong challenge is denied");
+        assert!(matches!(err, ToolError::Denied { .. }));
+
+        // Reject: a Prompt gesture cannot satisfy a Passkey requirement.
+        let weak_nonce = [23u8; 32];
+        let weak = sign_discharge(&test_key(), &req, 0, &weak_nonce, Presence::Prompt);
+        let weak_attempt = DischargeAttempt {
+            nonce: weak_nonce,
+            discharge: &weak,
+            verifier: &Ed25519Verifier,
+        };
+        let err = gate
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &weak_attempt)
+            .expect_err("Prompt cannot satisfy Passkey");
         assert!(matches!(err, ToolError::Denied { .. }));
     }
 

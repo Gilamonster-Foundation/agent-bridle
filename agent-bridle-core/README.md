@@ -14,7 +14,15 @@ construction.
 - `Tool` / `Registry` — declare required `Caveats`, dispatch through the gate
 - `Gate` + `ToolContext` — mint-token enforcement; no public constructor
 - `Sandbox` — advisory `NoopSandbox` everywhere; kernel-enforced `LandlockSandbox` on Linux under the `linux-landlock` feature
-- Deliberately tiny dependency budget (`anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol`); no tokio — heavy runtimes live in leaf tool crates
+- `step_up` — human-presence step-up (the `attest` outcome): `Gate::evaluate` / `authorize_with_discharge` / `authorize_step_up`, the `DischargeProvider` ceremony seam and `DischargeVerifier` proof check. The production `Ed25519Verifier` is behind the off-by-default `verifier-ed25519` feature (ADR 0007)
+- Deliberately tiny dependency budget (`anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol`); no tokio — heavy runtimes live in leaf tool crates. Optional, off-by-default deps: `landlock` (`linux-landlock`), `ed25519-dalek` (`verifier-ed25519`)
+
+## Features
+
+| Feature | Default | Pulls | Enables |
+|---|---|---|---|
+| `linux-landlock` | off | `landlock` (Linux only) | kernel-enforced `LandlockSandbox` (L3) |
+| `verifier-ed25519` | off | `ed25519-dalek` | production `Ed25519Verifier` for step-up discharges |
 
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
 the capability leash for agent tools — a shared, capability-governed tool

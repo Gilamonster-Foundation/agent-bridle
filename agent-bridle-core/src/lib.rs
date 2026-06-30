@@ -16,7 +16,9 @@
 //! `async-trait`, `agent-mesh-protocol`. No tokio. No brush. Heavy runtimes
 //! live in leaf tool crates only. The [`step_up`] module's content-addressing
 //! reuses `agent-mesh-protocol`'s BLAKE3 primitive (no new runtime dep); its
-//! test-only software verifier uses a dev-only `ed25519-dalek`.
+//! production `Ed25519Verifier` is gated behind the off-by-default
+//! `verifier-ed25519` feature (pulls `ed25519-dalek`), so the default build
+//! stays lean.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -43,6 +45,8 @@ pub use sandbox::{best_available_sandbox, NoopSandbox, Sandbox, SandboxKind};
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, LandlockSandbox};
 pub use spawn::{spawn_confined_subprocess, ConfinedChild, ConfinedCommand};
+#[cfg(feature = "verifier-ed25519")]
+pub use step_up::Ed25519Verifier;
 pub use step_up::{
     AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
     DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,

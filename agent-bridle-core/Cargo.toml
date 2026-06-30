@@ -17,6 +17,11 @@ default = []
 # confines the `fs_write` axis; without this feature (or off-Linux) the sandbox
 # is the advisory NoopSandbox reporting SandboxKind::None. ADR 0001 (L3).
 linux-landlock = ["dep:landlock"]
+# Production Ed25519 `DischargeVerifier` (`Ed25519Verifier`) for the step-up
+# surface. Off by default to keep core lean; enable it for the software /
+# OpenSSH `ed25519-sk`-style passkey verification path (raw Ed25519 assertions
+# over the step-up challenge). Pulls `ed25519-dalek`. ADR 0007.
+verifier-ed25519 = ["dep:ed25519-dalek"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -25,14 +30,15 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 agent-mesh-protocol = { workspace = true }
 
+# Optional: the production `Ed25519Verifier`, gated by `verifier-ed25519`. NOT in
+# the default build — core stays lean (`cargo build` with no features does not
+# compile it). Already in the lockfile (transitive via agent-mesh-protocol). The
+# step-up tests sign discharges with it too, so the step-up crypto tests compile
+# only under `--features verifier-ed25519` (CI's `--all-features` matrix runs them).
+ed25519-dalek = { version = "2", optional = true }
+
 # Landlock is Linux-only; gate the dep on the target so enabling the feature on
 # macOS/Windows does not try to build it. Used only under
 # cfg(all(target_os = "linux", feature = "linux-landlock")).
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4", optional = true }
-
-[dev-dependencies]
-# Test-only: the MVP software `DischargeVerifier` reads ed25519 assertions over
-# the step-up challenge. NOT a runtime dependency — real WebAuthn/CTAP2 verifiers
-# live in host crates. Already in the lockfile (transitive via agent-mesh-protocol).
-ed25519-dalek = "2"
