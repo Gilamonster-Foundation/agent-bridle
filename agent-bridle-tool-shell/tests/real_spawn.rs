@@ -465,6 +465,134 @@ async fn real_landlock_confines_a_spawned_childs_own_write() {
     let _ = std::fs::remove_dir_all(&forbidden);
 }
 
+// agent-bridle#35 — the "swamp tools die" spike. The proof above confines a
+// child bridle spawned directly (`touch`). This one closes the harder hole ADR
+// 0001 names: a GRANDCHILD a *permitted* tool forks on its own (`find -exec …`),
+// which never re-enters bridle's spawn funnel — exactly what L2 is blind to once
+// `find` runs. `touch` is NOT in the exec scope (find execs it itself); only the
+// kernel ruleset, inherited across find's fork/exec, can stop the grandchild's
+// write outside `fs_write`. Linux + `linux-landlock`; self-skips without Landlock.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+#[tokio::test]
+async fn real_landlock_confines_a_find_exec_grandchild_write() {
+    use agent_bridle_core::landlock_is_supported;
+    if !landlock_is_supported() {
+        eprintln!("skipping: kernel lacks Landlock");
+        return;
+    }
+
+    let allowed = unique_temp("ll-fe-allowed");
+    std::fs::create_dir_all(&allowed).unwrap();
+    // A file for `find` to walk and fire `-exec` on (its content is irrelevant).
+    std::fs::write(allowed.join("seed"), b"x").unwrap();
+    let forbidden = unique_temp("ll-fe-forbidden");
+    std::fs::create_dir_all(&forbidden).unwrap();
+
+    // Only `find` is permitted to exec; writes are confined to `allowed`. The
+    // `;` terminating `-exec` is single-quoted so the safe-subset parser treats
+    // it as a literal argument to find, not a stage separator.
+    let caveats = Caveats {
+        exec: Scope::only(["find".to_string()]),
+        fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+
+    // In scope: the grandchild writes under `allowed` → allowed.
+    let inside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!(
+                "find {a} -type f -exec touch {a}/ok ';'",
+                a = allowed.to_string_lossy()
+            )}),
+            &ctx(caveats.clone()),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(inside["sandbox_kind"], "landlock", "{inside}");
+    assert!(
+        allowed.join("ok").exists(),
+        "an in-scope grandchild write must succeed: {inside}"
+    );
+
+    // Out of scope: the grandchild's write to `forbidden` is denied by the
+    // inherited ruleset — even though `find` was permitted and bridle never saw
+    // the `touch` spawn.
+    let _ = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!(
+                "find {a} -type f -exec touch {f}/escape ';'",
+                a = allowed.to_string_lossy(),
+                f = forbidden.to_string_lossy()
+            )}),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+    assert!(
+        !forbidden.join("escape").exists(),
+        "the out-of-scope grandchild write must be denied by the kernel"
+    );
+
+    let _ = std::fs::remove_dir_all(&allowed);
+    let _ = std::fs::remove_dir_all(&forbidden);
+}
+
+// agent-bridle#35 — the read-injection spike (`grep -f FILE`, the `grep -f
+// /etc/shadow` shape). bridle admits the command because `grep` is permitted and
+// it cannot know `-f` means "read this file as control input" (the gap #58's
+// command packs would close at L1). Only the kernel `fs_read` ruleset stops grep
+// from reading the out-of-scope file. Linux + `linux-landlock`; self-skips.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+#[tokio::test]
+async fn real_landlock_confines_a_grep_dash_f_read_injection() {
+    use agent_bridle_core::landlock_is_supported;
+    if !landlock_is_supported() {
+        eprintln!("skipping: kernel lacks Landlock");
+        return;
+    }
+
+    let allowed = unique_temp("ll-ri-allowed");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::write(allowed.join("data"), b"hello\n").unwrap();
+    let forbidden = unique_temp("ll-ri-forbidden");
+    std::fs::create_dir_all(&forbidden).unwrap();
+    // The "secret" grep must not be able to read as its -f pattern file.
+    std::fs::write(forbidden.join("secret"), b"hello\n").unwrap();
+
+    // `grep` permitted; reads confined to `allowed` (fs_write stays open).
+    let caveats = Caveats {
+        exec: Scope::only(["grep".to_string()]),
+        fs_read: Scope::only([allowed.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!(
+                "grep -f {f}/secret {a}/data",
+                f = forbidden.to_string_lossy(),
+                a = allowed.to_string_lossy()
+            )}),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+    // grep cannot open the out-of-scope pattern file → it errors (non-zero), and
+    // no out-of-scope content reaches stdout.
+    assert_ne!(
+        out["exit_code"], 0,
+        "the kernel must deny grep reading the out-of-scope -f file: {out}"
+    );
+    assert_eq!(
+        out["sandbox_kind"], "landlock",
+        "must report kernel enforcement: {out}"
+    );
+    assert_eq!(out["stdout"], "", "no out-of-scope content may leak: {out}");
+
+    let _ = std::fs::remove_dir_all(&allowed);
+    let _ = std::fs::remove_dir_all(&forbidden);
+}
+
 // The macOS Seatbelt analog of the Landlock proof above: end to end through the
 // shell tool, a *permitted* program's OWN write/read of a path outside the
 // fs_write/fs_read scope is blocked by the kernel (`sandbox-exec`), and the
