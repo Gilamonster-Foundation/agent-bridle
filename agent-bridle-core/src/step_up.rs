@@ -682,6 +682,35 @@ mod tests {
         assert!(matches!(err, ToolError::Denied { .. }));
     }
 
+    /// ADR 0007 D2/D3 (design §10 Q3): the **no-authenticator** case. A
+    /// `Presence::None` discharge — "no hardware gesture was achievable" — over
+    /// the *correctly bound* challenge still cannot satisfy a `Passkey`
+    /// requirement. This isolates the presence floor (the challenge matches, so
+    /// the only reason to deny is presence), and is distinct from
+    /// `presence_too_weak_fails_closed` (which covers `Prompt`): it proves the
+    /// gate fails closed and never silently downgrades when *no* presence is
+    /// achievable, rather than only when a weaker-but-nonzero one is.
+    #[test]
+    fn no_authenticator_presence_none_cannot_satisfy_passkey() {
+        let gate = Gate::new(0);
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+        let nonce = [5u8; 32];
+        // Correctly bound challenge (same nonce the gate recomputes with), but
+        // the achieved presence is None — the "no authenticator available" case.
+        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::None);
+        let attempt = DischargeAttempt {
+            nonce,
+            discharge: &discharge,
+            verifier: &SoftwareVerifier,
+        };
+        let err = gate
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
+            .expect_err("Presence::None cannot satisfy Passkey");
+        assert!(matches!(err, ToolError::Denied { .. }));
+    }
+
     #[test]
     fn policy_most_specific_wins_and_default_applies() {
         let policy = StepUpPolicy::new(
