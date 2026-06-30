@@ -21,11 +21,19 @@ linux-landlock = [
     "agent-bridle-tool-shell?/linux-landlock",
     "agent-bridle-tool-web?/linux-landlock",
 ]
+macos-seatbelt = [
+    "agent-bridle-core/macos-seatbelt",
+    "agent-bridle-tool-shell?/macos-seatbelt",
+    "agent-bridle-tool-web?/macos-seatbelt",
+]
 windows-appcontainer = [
     "agent-bridle-core/windows-appcontainer",
     "agent-bridle-tool-shell?/windows-appcontainer",
 ]
-os-sandbox = ["linux-landlock", "windows-appcontainer"]
+# One-knob convenience (ADR 0006 D2): enable every OS L3 backend. Each is inert
+# off its target OS, so a build/CI matrix can turn them all on and let
+# `best_available_sandbox()` pick the right one at runtime.
+os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
 
 [dependencies]
 agent-bridle-core = { workspace = true }

@@ -23,8 +23,10 @@ shell = ["agent-bridle/shell"]
 # `--features web` (or `--all-features`) to serve web_fetch over MCP.
 web = ["agent-bridle/web"]
 linux-landlock = ["agent-bridle/linux-landlock"]
+macos-seatbelt = ["agent-bridle/macos-seatbelt"]
 windows-appcontainer = ["agent-bridle/windows-appcontainer"]
-os-sandbox = ["linux-landlock", "windows-appcontainer"]
+# One-knob convenience: every OS L3 backend (each inert off its target OS).
+os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
 
 [dependencies]
 # The facade: re-exports the leash + assembles the default tool registry. The

@@ -1,16 +1,28 @@
 //! OS-level sandbox plumbing.
 //!
-//! On Linux, Landlock is the *authoritative* boundary (DESIGN §6, ADR 0001 L3):
-//! it is the only layer that can confine a *permitted external program's own
-//! syscalls* once it has spawned — what neither the static decomposition (L1)
-//! nor the in-process brush interceptor (L2) can see. With the `linux-landlock`
-//! feature on a Landlock-capable kernel, [`LandlockSandbox`] builds and enforces
-//! a real ruleset from the effective [`Caveats`] (the `fs_write` axis, and the
-//! `fs_read` axis when reads are restricted — `exec`/`net` are follow-ups,
-//! agent-bridle#31). Without the feature, off-Linux, or on a kernel lacking
-//! Landlock, the sandbox is the advisory [`NoopSandbox`] reporting
-//! [`SandboxKind::None`] — the leash is then in-process only, honestly
-//! advertised, with no overclaiming.
+//! The L3 boundary is the only layer that can confine a *permitted external
+//! program's own syscalls* once it has spawned — what neither the static
+//! decomposition (L1) nor the in-process interceptor (L2) can see. It is
+//! OS-specific, so each operating system gets its own backend behind one
+//! [`Sandbox`] trait, selected in code by [`best_available_sandbox`] (one
+//! `cfg(target_os, feature)` arm per backend, with a runtime capability probe),
+//! never overclaiming: a build either compiles a real backend for its host or
+//! falls back to the advisory [`NoopSandbox`] reporting [`SandboxKind::None`]
+//! (DESIGN §6, ADR 0001 L3, **ADR 0006** per-OS backends, **ADR 0009** the
+//! cross-platform strategy).
+//!
+//! - **Linux** — [`LandlockSandbox`] (`linux-landlock`): a real Landlock ruleset
+//!   confining the `fs_write` axis, and `fs_read` when restricted. `restrict_self`
+//!   confines the calling thread (inherited across `fork`/`execve`).
+//! - **macOS** — [`SeatbeltSandbox`] (`macos-seatbelt`): an SBPL profile derived
+//!   from the effective [`Caveats`], applied by wrapping the spawned program in
+//!   `sandbox-exec(1)` (no FFI — core forbids `unsafe`). Confines the same
+//!   `fs_write` + `fs_read` axes; `exec`/`net` are follow-ups (agent-bridle#31/#57).
+//!
+//! A backend confines either by restricting the calling thread in [`Sandbox::apply`]
+//! (Landlock) **or** by wrapping the spawned command via
+//! [`Sandbox::command_prefix`] (Seatbelt); a spawn site honors both, so the
+//! mechanism is uniform at the call site.
 
 use crate::{Caveats, ToolResult};
 
@@ -24,10 +36,13 @@ use crate::{Caveats, ToolResult};
 pub enum SandboxKind {
     /// A real Landlock ruleset is active (Linux). Kernel-enforced.
     Landlock,
+    /// A real Seatbelt (`sandbox-exec` SBPL) profile is active (macOS).
+    /// Kernel-enforced against the spawned program's interior.
+    Seatbelt,
     /// A real AppContainer token is active (Windows). Kernel-enforced.
     AppContainer,
     /// No OS-level sandbox — the leash is in-process/advisory only. This is the
-    /// honest default until the Landlock ruleset (P3) lands.
+    /// honest default on a host with no compiled-and-capable backend.
     #[default]
     None,
 }
@@ -44,7 +59,28 @@ pub trait Sandbox: Send + Sync {
     /// Apply the confinement for the given effective caveats. Called by a tool
     /// *before* it does any privileged work, on the thread/process that will do
     /// it. A `Noop` implementation succeeds without restricting anything.
+    ///
+    /// This is the confinement mechanism for *thread-confining* backends
+    /// (Landlock's `restrict_self`). *Wrapper-based* backends (macOS Seatbelt)
+    /// confine via [`Sandbox::command_prefix`] instead and make this a no-op.
     fn apply(&self, effective: &Caveats) -> ToolResult<()>;
+
+    /// The argv prefix that wraps a child so a *wrapper-based* L3 backend
+    /// confines it (macOS `sandbox-exec`). The returned vector, prepended to a
+    /// `(program, args…)`, is the argv that must actually be spawned.
+    ///
+    /// Backends that confine the spawning thread in [`Sandbox::apply`]
+    /// (Landlock) or that do not confine ([`NoopSandbox`]) return an **empty**
+    /// prefix. A spawn site applies *both* `apply()` and this prefix, so either
+    /// mechanism is honored without the caller knowing which backend is active.
+    ///
+    /// **Fail-closed:** a backend that is selected but cannot build its wrapper
+    /// (e.g. the wrapper binary is missing) returns `Err` — never an empty
+    /// (silently unconfined) prefix. The default is the empty prefix.
+    fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+        let _ = effective;
+        Ok(Vec::new())
+    }
 }
 
 /// The P0 sandbox: applies nothing and reports [`SandboxKind::None`].
@@ -66,13 +102,41 @@ impl Sandbox for NoopSandbox {
     }
 }
 
-/// Return the strongest [`Sandbox`] available in this build on this kernel.
+/// `true` if either filesystem axis is actually restricted (`Only(_)`) — the
+/// condition under which the fs-confining backends (Landlock, Seatbelt) have
+/// something to enforce. When **no** fs axis is restricted, an fs-only backend
+/// governs nothing, so honest reporting downgrades the [`SandboxKind`] to
+/// [`SandboxKind::None`] rather than overclaiming a boundary that confines
+/// nothing (I9 / ADR 0006 D3). Used by every spawn site that reports a kind.
+#[must_use]
+pub(crate) fn restricts_fs(caveats: &Caveats) -> bool {
+    matches!(caveats.fs_write, crate::Scope::Only(_))
+        || matches!(caveats.fs_read, crate::Scope::Only(_))
+}
+
+/// The [`SandboxKind`] honestly in force for `caveats` given the strongest
+/// `available` backend: the backend's own kind when it will actually confine
+/// (an fs axis is restricted), else [`SandboxKind::None`]. This is the single
+/// honesty rule shared by the subprocess primitive ([`crate::ConfinedCommand`])
+/// and the shell engine, so neither overclaims.
+#[must_use]
+pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
+    match available {
+        SandboxKind::Landlock | SandboxKind::Seatbelt if restricts_fs(caveats) => available,
+        _ => SandboxKind::None,
+    }
+}
+
+/// Return the strongest [`Sandbox`] available in this build on this host.
 ///
-/// On Linux, with the `linux-landlock` feature **and** a Landlock-capable
-/// kernel, this is a [`LandlockSandbox`] (kernel-enforced). Otherwise it is the
-/// advisory [`NoopSandbox`] — so a caller that wants confinement gets the real
-/// thing where it exists and an honest [`SandboxKind::None`] where it does not,
-/// rather than silently overclaiming.
+/// One `cfg(target_os, feature)` arm per backend, each with a runtime capability
+/// probe (ADR 0006 D2): on Linux with `linux-landlock` and a capable kernel a
+/// [`LandlockSandbox`]; on macOS with `macos-seatbelt` and `sandbox-exec`
+/// present a [`SeatbeltSandbox`]. Otherwise the advisory [`NoopSandbox`] — so a
+/// caller that wants confinement gets the real thing where it exists and an
+/// honest [`SandboxKind::None`] where it does not, rather than silently
+/// overclaiming. Enabling a backend's feature off its target OS compiles nothing
+/// and selects nothing (the arm is `cfg`-gated away).
 pub fn best_available_sandbox() -> Box<dyn Sandbox> {
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
     {
@@ -87,12 +151,21 @@ pub fn best_available_sandbox() -> Box<dyn Sandbox> {
                 return Box::new(landlock_impl::LandlockSandbox::new());
             }
         }
+        #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+        {
+            if seatbelt_impl::seatbelt_is_supported() {
+                return Box::new(seatbelt_impl::SeatbeltSandbox::new());
+            }
+        }
         Box::new(NoopSandbox)
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use landlock_impl::{landlock_is_supported, LandlockSandbox};
+
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 
 #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
 pub(crate) mod appcontainer_impl {
@@ -297,9 +370,343 @@ mod landlock_impl {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+mod seatbelt_impl {
+    use super::{Sandbox, SandboxKind};
+    use crate::{Caveats, Scope, ToolError, ToolResult};
+    use std::path::Path;
+
+    /// The macOS sandbox wrapper. We invoke it by **absolute path** (never via
+    /// `PATH`) so the boundary cannot be shadowed by a `sandbox-exec` planted
+    /// earlier in a caller's `PATH`. `sandbox-exec(1)` is deprecated-but-present
+    /// on stock macOS; using it keeps the boundary FFI-free, which core requires
+    /// (`unsafe_code = "forbid"`).
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+    /// Read-side base allow-list (subpaths): the system/loader paths a
+    /// dynamically-linked Mach-O binary must read to *start and run* — the
+    /// dynamic linker and dyld shared cache (under `/System`, incl. the Cryptex
+    /// volume), system dylibs/frameworks, the binaries themselves, the
+    /// name-service and locale config (`/private/etc`, the real target of
+    /// `/etc`), the dyld closure db, and the `/dev` essentials. Added whenever
+    /// `fs_read` is confined, alongside the literal root entry (see
+    /// [`seatbelt_profile`]), so a *permitted* program still loads while user
+    /// data outside scope stays unreadable. Non-existent entries are dropped
+    /// during canonicalization, so extra entries are harmless across macOS
+    /// layouts (verified on Apple Silicon: `grep`/`cat`/`cp` load read-confined).
+    const BASE_READ_PATHS: &[&str] = &[
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/opt",
+        "/private/etc",
+        "/private/var/db/dyld",
+        "/dev",
+    ];
+
+    /// `true` if this host can enforce a Seatbelt profile — i.e. the
+    /// `sandbox-exec` wrapper is present. The wrapper itself is the boundary, so
+    /// its presence is the capability (the analog of `landlock_is_supported`).
+    #[must_use]
+    pub fn seatbelt_is_supported() -> bool {
+        Path::new(SANDBOX_EXEC).exists()
+    }
+
+    /// A real, kernel-enforced Seatbelt sandbox (macOS).
+    ///
+    /// **The `fs_write` and `fs_read` axes** — the same *axes* the Linux Landlock
+    /// backend governs (not necessarily the same path-level strictness; see
+    /// below). Confinement is applied by wrapping the spawned program in
+    /// `sandbox-exec -p <profile>`, where the SBPL profile is generated from the
+    /// effective [`Caveats`] (see [`seatbelt_profile`]): writes are denied
+    /// outside the granted `fs_write` roots, and — when `fs_read` is restricted —
+    /// reads are denied outside the granted roots plus the loader/system base
+    /// list. `exec`/`net` are intentionally left ambient this increment
+    /// (`(allow default)`), mirroring Landlock leaving them ungoverned; those
+    /// axes are follow-ups (agent-bridle#31/#57).
+    ///
+    /// Read confinement here is **content-level**: file *metadata* (stat,
+    /// existence, directory traversal) stays ambient so binaries can load through
+    /// symlink ancestors, and the system read base ([`BASE_READ_PATHS`], incl.
+    /// `/private/etc`) is broadly readable — looser than Landlock's file-level
+    /// `/etc` allow-list, but the protected resource (out-of-scope file
+    /// *contents*, the exfil threat) is denied identically. macOS keeps user
+    /// secrets in the Keychain and `$HOME`, not `/etc`.
+    ///
+    /// Unlike Landlock's per-thread `restrict_self`, Seatbelt confinement is
+    /// carried by the wrapper process and inherited by the child, so
+    /// [`Sandbox::apply`] is a no-op and the boundary lives entirely in
+    /// [`Sandbox::command_prefix`].
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct SeatbeltSandbox;
+
+    impl SeatbeltSandbox {
+        /// Construct the sandbox. (Stateless; capability comes from the OS.)
+        #[must_use]
+        pub fn new() -> Self {
+            Self
+        }
+    }
+
+    impl Sandbox for SeatbeltSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::Seatbelt
+        }
+
+        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+            // Deliberate no-op: Seatbelt confines via the `sandbox-exec` wrapper
+            // (see `command_prefix`), not by restricting the calling thread. The
+            // boundary is the wrapped spawn.
+            Ok(())
+        }
+
+        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            // Nothing restricted on an fs axis => nothing to confine; run
+            // unwrapped (coarse honesty falls to `None` upstream, and the
+            // per-axis report omits unrestricted axes).
+            if !super::restricts_fs(effective) {
+                return Ok(Vec::new());
+            }
+            // Fail-closed: if the wrapper is gone we cannot enforce, so refuse
+            // rather than hand back an empty (silently unconfined) prefix.
+            if !seatbelt_is_supported() {
+                return Err(ToolError::denied(
+                    "macOS seatbelt: /usr/bin/sandbox-exec is unavailable; cannot confine",
+                ));
+            }
+            Ok(vec![
+                SANDBOX_EXEC.to_string(),
+                "-p".to_string(),
+                seatbelt_profile(effective),
+            ])
+        }
+    }
+
+    /// Generate the SBPL profile for `effective`. **Pure** (modulo path
+    /// canonicalization against the real filesystem); no spawning.
+    ///
+    /// Model (the macOS analog of Landlock handling only the write/read access
+    /// rights and leaving the rest ambient): start from `(allow default)` so
+    /// unhandled operations — `exec`, `network`, mach lookups a normal process
+    /// needs — stay ambient, then `(deny file-write*)` / `(deny file-read*)` for
+    /// a restricted axis and re-allow exactly the granted roots (canonicalized,
+    /// so `/tmp` → `/private/tmp` matches). An empty `fs_write` scope emits the
+    /// deny with no re-allow — every write denied. SBPL evaluates last-match-wins,
+    /// so the trailing allow-roots override the deny.
+    #[must_use]
+    pub fn seatbelt_profile(effective: &Caveats) -> String {
+        let mut p = String::from("(version 1)\n(allow default)\n");
+
+        // fs_write: deny writes, then re-allow the granted roots.
+        if let Scope::Only(_) = &effective.fs_write {
+            p.push_str("(deny file-write*)\n");
+            let roots = confined_roots(&effective.fs_write);
+            if !roots.is_empty() {
+                p.push_str("(allow file-write*");
+                for r in &roots {
+                    p.push_str(&format!(" (subpath {})", sbpl_string(r)));
+                }
+                p.push_str(")\n");
+            }
+        }
+
+        // fs_read: deny reads, then re-allow. `(allow file-read-metadata)`
+        // permits path *traversal* and `stat` everywhere — without it, reaching
+        // an in-scope file through a symlink ancestor (`/tmp`, `/var`, `/etc` →
+        // `/private/…`) is denied at the symlink lookup. Metadata reveals only
+        // existence/size, never **content**; the data axis stays confined to the
+        // loader/system base, the root directory *entry* (dyld reads `/` itself),
+        // and the granted roots — so a permitted program loads and reads in-scope
+        // files while out-of-scope file *contents* (the exfil threat) stay denied.
+        if let Scope::Only(_) = &effective.fs_read {
+            p.push_str("(deny file-read*)\n");
+            p.push_str("(allow file-read-metadata)\n");
+            p.push_str("(allow file-read* (literal \"/\")");
+            for base in BASE_READ_PATHS {
+                if let Some(c) = canonical_path(base) {
+                    p.push_str(&format!(" (subpath {})", sbpl_string(&c)));
+                }
+            }
+            for r in confined_roots(&effective.fs_read) {
+                p.push_str(&format!(" (subpath {})", sbpl_string(&r)));
+            }
+            p.push_str(")\n");
+        }
+
+        p
+    }
+
+    /// The canonicalized, existing roots a restricted [`Scope`] grants. A path
+    /// that cannot be resolved to any existing ancestor is dropped (it cannot
+    /// anchor a rule — safe, since its parent is ungranted, so access beneath it
+    /// stays denied). `All` yields nothing (callers only pass a restricted axis).
+    fn confined_roots(scope: &Scope<String>) -> Vec<String> {
+        let Scope::Only(set) = scope else {
+            return Vec::new();
+        };
+        let mut roots: Vec<String> = set.iter().filter_map(|p| canonical_path(p)).collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Resolve `p` to an absolute, symlink-free path suitable for `(subpath …)`
+    /// matching, which the kernel performs against the *resolved* path (so a
+    /// granted `/tmp/x` must become `/private/tmp/x` or it never matches). If the
+    /// leaf does not yet exist, canonicalize the longest existing ancestor and
+    /// re-append the remainder. `None` if not even an ancestor resolves.
+    fn canonical_path(p: &str) -> Option<String> {
+        let path = Path::new(p);
+        if let Ok(c) = std::fs::canonicalize(path) {
+            return Some(c.to_string_lossy().into_owned());
+        }
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = path;
+        while let Some(parent) = cur.parent() {
+            if let Some(name) = cur.file_name() {
+                tail.push(name.to_owned());
+            }
+            if let Ok(c) = std::fs::canonicalize(parent) {
+                let mut resolved = c;
+                for seg in tail.iter().rev() {
+                    resolved.push(seg);
+                }
+                return Some(resolved.to_string_lossy().into_owned());
+            }
+            cur = parent;
+        }
+        None
+    }
+
+    /// Quote `s` as an SBPL string literal, escaping `\` and `"` so a crafted
+    /// path can never break out of the quotes and inject profile syntax.
+    fn sbpl_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '\\' || ch == '"' {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+        out
+    }
+
+    #[cfg(test)]
+    mod unit {
+        use super::*;
+        use crate::Scope;
+
+        #[test]
+        fn unrestricted_caveats_make_no_wrapper() {
+            assert!(SeatbeltSandbox::new()
+                .command_prefix(&Caveats::top())
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn restricted_write_yields_sandbox_exec_wrapper() {
+            let cav = Caveats {
+                fs_write: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            assert_eq!(prefix[0], SANDBOX_EXEC);
+            assert_eq!(prefix[1], "-p");
+            assert!(prefix[2].contains("(deny file-write*)"));
+        }
+
+        #[test]
+        fn profile_denies_then_reallows_write_roots() {
+            let cav = Caveats {
+                fs_write: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(allow default)"));
+            assert!(prof.contains("(deny file-write*)"));
+            // `/tmp` must be canonicalized to its real target for subpath match.
+            assert!(prof.contains("(subpath \"/private/tmp\")"), "{prof}");
+            // No read axis restricted => no read deny.
+            assert!(!prof.contains("(deny file-read*)"));
+        }
+
+        #[test]
+        fn empty_write_scope_denies_all_writes_no_allow() {
+            let cav = Caveats {
+                fs_write: Scope::none(),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny file-write*)"));
+            assert!(
+                !prof.contains("(allow file-write*"),
+                "an empty scope must grant no write roots: {prof}"
+            );
+        }
+
+        #[test]
+        fn restricted_read_includes_loader_base_and_root_entry() {
+            let cav = Caveats {
+                fs_read: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny file-read*)"));
+            assert!(prof.contains("(literal \"/\")"), "{prof}");
+            assert!(prof.contains("(subpath \"/usr\")"), "{prof}");
+            assert!(prof.contains("(subpath \"/System\")"), "{prof}");
+        }
+
+        #[test]
+        fn sbpl_string_escapes_quotes_and_backslashes() {
+            assert_eq!(sbpl_string("/a/b"), "\"/a/b\"");
+            assert_eq!(sbpl_string("/a\"b"), "\"/a\\\"b\"");
+            assert_eq!(sbpl_string("/a\\b"), "\"/a\\\\b\"");
+        }
+
+        /// Count double-quotes that are *not* backslash-escaped — the structural
+        /// quotes SBPL actually sees. Each `(subpath "…")` term I emit
+        /// contributes exactly two; any extra would mean a path broke out of its
+        /// literal.
+        fn unescaped_quotes(s: &str) -> usize {
+            let b = s.as_bytes();
+            (0..b.len())
+                .filter(|&i| b[i] == b'"' && (i == 0 || b[i - 1] != b'\\'))
+                .count()
+        }
+
+        #[test]
+        fn crafted_path_cannot_inject_profile_syntax() {
+            // A path crafted to close the string and add its own allow rule must
+            // stay inside one escaped literal — its quotes get backslash-escaped,
+            // so SBPL sees exactly the two structural quotes of the single term.
+            let cav = Caveats {
+                fs_write: Scope::only(["/tmp/x\") (allow file-write* (subpath \"/".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert_eq!(
+                unescaped_quotes(&prof),
+                2,
+                "exactly one structural (subpath \"…\") term — no breakout: {prof}"
+            );
+            assert!(
+                prof.contains("\\\""),
+                "the crafted quotes must be backslash-escaped: {prof}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Scope;
 
     #[test]
     fn noop_reports_none_and_never_fails() {
@@ -319,8 +726,59 @@ mod tests {
             "\"landlock\""
         );
         assert_eq!(
+            serde_json::to_string(&SandboxKind::Seatbelt).unwrap(),
+            "\"seatbelt\""
+        );
+        assert_eq!(
             serde_json::to_string(&SandboxKind::AppContainer).unwrap(),
             "\"app_container\""
+        );
+    }
+
+    #[test]
+    fn effective_kind_downgrades_to_none_when_no_fs_axis_restricted() {
+        // The honesty rule (I9): a backend that confines nothing must not be
+        // reported. With every axis `All`, even a real backend → None. (For
+        // AppContainer the rule keeps it `None` here regardless — its shell/spawn
+        // launcher is a follow-up, so it is not engaged via this path yet.)
+        for available in [
+            SandboxKind::Landlock,
+            SandboxKind::Seatbelt,
+            SandboxKind::AppContainer,
+            SandboxKind::None,
+        ] {
+            assert_eq!(
+                effective_sandbox_kind(available, &Caveats::top()),
+                SandboxKind::None,
+                "unrestricted fs must report None for {available:?}"
+            );
+        }
+        // With a restricted fs axis, the backend's own kind is reported …
+        let restricted = Caveats {
+            fs_write: Scope::only(["/w".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Landlock, &restricted),
+            SandboxKind::Landlock
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &restricted),
+            SandboxKind::Seatbelt
+        );
+        // … except a None host is always None (nothing to enforce with).
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::None, &restricted),
+            SandboxKind::None
+        );
+        // A restricted *read* axis also engages (Landlock/Seatbelt govern reads).
+        let read_only = Caveats {
+            fs_read: Scope::only(["/r".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &read_only),
+            SandboxKind::Seatbelt
         );
     }
 
@@ -608,5 +1066,211 @@ mod landlock_kernel_tests {
         );
         let _ = fs::remove_dir_all(&outside_dir);
         let _ = fs::remove_dir_all(&write_scope);
+    }
+}
+
+// Real kernel-enforcement proof for macOS Seatbelt. Only meaningful on macOS
+// with the feature; it asserts the leash is the *kernel's* (sandbox-exec's),
+// not ours — the spawned child's own out-of-scope writes/reads are denied even
+// though L2 cannot see its syscalls. Mirrors the Landlock proofs above.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt", test))]
+mod seatbelt_kernel_tests {
+    use super::*;
+    use crate::Scope;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Whether a proof should run, skip, or hard-**FAIL** — the same gate as the
+    /// Landlock proofs (#74): *required but unsupported is a FAILURE*, so a
+    /// macOS CI job that sets `BRIDLE_REQUIRE_SEATBELT` can never go green with
+    /// the kernel boundary unexercised.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ProofGate {
+        Run,
+        Skip,
+        Fail,
+    }
+
+    fn proof_gate(supported: bool, required: bool) -> ProofGate {
+        match (supported, required) {
+            (true, _) => ProofGate::Run,
+            (false, true) => ProofGate::Fail,
+            (false, false) => ProofGate::Skip,
+        }
+    }
+
+    /// `true` if the caller should skip the proof. **Panics** when Seatbelt is
+    /// *required* (`BRIDLE_REQUIRE_SEATBELT` set, as a macOS CI job does) but the
+    /// host lacks `sandbox-exec`. A local run without the flag legitimately skips.
+    fn skip_proof_unless_seatbelt() -> bool {
+        let required = std::env::var("BRIDLE_REQUIRE_SEATBELT")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        match proof_gate(seatbelt_is_supported(), required) {
+            ProofGate::Run => false,
+            ProofGate::Skip => {
+                eprintln!(
+                    "skipping Seatbelt proof: /usr/bin/sandbox-exec unavailable \
+                     (set BRIDLE_REQUIRE_SEATBELT=1 to require it, as macOS CI does)"
+                );
+                true
+            }
+            ProofGate::Fail => panic!(
+                "BRIDLE_REQUIRE_SEATBELT is set but /usr/bin/sandbox-exec is unavailable — \
+                 the fs_write/fs_read kernel-enforcement proofs cannot be verified"
+            ),
+        }
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "agent-bridle-sb-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Spawn `program args` through the real `sandbox-exec` wrapper that
+    /// [`SeatbeltSandbox::command_prefix`] builds for `cav`, and return its exit
+    /// status. This exercises the *production* profile path end to end.
+    fn run_wrapped(cav: &Caveats, program: &str, args: &[&str]) -> std::process::ExitStatus {
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(cav)
+            .expect("a restricted axis must yield a wrapper prefix");
+        assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
+        std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg(program)
+            .args(args)
+            .status()
+            .expect("spawn sandbox-exec")
+    }
+
+    #[test]
+    fn proof_gate_required_but_unsupported_is_a_failure() {
+        assert_eq!(proof_gate(true, false), ProofGate::Run);
+        assert_eq!(proof_gate(true, true), ProofGate::Run);
+        assert_eq!(proof_gate(false, false), ProofGate::Skip);
+        assert_eq!(proof_gate(false, true), ProofGate::Fail);
+    }
+
+    #[test]
+    fn fs_write_is_kernel_enforced_outside_scope_denied_inside_allowed() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let allowed = unique_dir("w-allowed");
+        let forbidden = unique_dir("w-forbidden");
+        let cav = Caveats {
+            fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+
+        let inside = run_wrapped(
+            &cav,
+            "/usr/bin/touch",
+            &[allowed.join("ok.txt").to_str().unwrap()],
+        );
+        assert!(
+            inside.success(),
+            "writing within fs_write scope must succeed"
+        );
+        assert!(
+            allowed.join("ok.txt").exists(),
+            "the in-scope file must exist"
+        );
+
+        let outside = run_wrapped(
+            &cav,
+            "/usr/bin/touch",
+            &[forbidden.join("escape.txt").to_str().unwrap()],
+        );
+        assert!(
+            !outside.success(),
+            "the kernel must deny a write outside fs_write scope"
+        );
+        assert!(
+            !forbidden.join("escape.txt").exists(),
+            "the out-of-scope file must NOT have been created"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn empty_fs_write_scope_denies_all_writes() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let dir = unique_dir("w-none");
+        let cav = Caveats {
+            fs_write: Scope::none(),
+            ..Caveats::top()
+        };
+        let target = dir.join("x.txt");
+        let prefix = SeatbeltSandbox::new().command_prefix(&cav).expect("prefix");
+        let out = std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg("/usr/bin/touch")
+            .arg(&target)
+            .output()
+            .expect("spawn sandbox-exec");
+        assert!(!out.status.success(), "empty fs_write must deny all writes");
+        // Positive control: the failure is the *kernel* denying the write (EPERM),
+        // not a spurious touch error — so this assertion cannot pass vacuously.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Operation not permitted"),
+            "denial must be a sandbox EPERM, got: {stderr:?}"
+        );
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_read_is_kernel_enforced_outside_scope_denied_inside_allowed() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let allowed = unique_dir("r-allowed");
+        let forbidden = unique_dir("r-forbidden");
+        fs::write(allowed.join("ok.txt"), b"in-scope").unwrap();
+        fs::write(forbidden.join("secret.txt"), b"out-of-scope").unwrap();
+        let cav = Caveats {
+            fs_read: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+
+        // A real dynamically-linked binary (`cat`) must still load (the base
+        // allow-list covers dyld) and read the in-scope file …
+        let inside = run_wrapped(
+            &cav,
+            "/bin/cat",
+            &[allowed.join("ok.txt").to_str().unwrap()],
+        );
+        assert!(
+            inside.success(),
+            "in-scope cat must load and read under read-confinement"
+        );
+        // … but be denied the out-of-scope one.
+        let outside = run_wrapped(
+            &cav,
+            "/bin/cat",
+            &[forbidden.join("secret.txt").to_str().unwrap()],
+        );
+        assert!(
+            !outside.success(),
+            "reading outside fs_read scope must be kernel-denied"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
     }
 }

@@ -21,11 +21,20 @@ default = []
 # confines the `fs_write` axis; without this feature (or off-Linux) the sandbox
 # is the advisory NoopSandbox reporting SandboxKind::None. ADR 0001 (L3).
 linux-landlock = ["dep:landlock"]
+# Real, kernel-enforced Seatbelt profile (macOS only). Enables the
+# `SeatbeltSandbox` (see src/sandbox.rs), which confines a spawned program via
+# the `sandbox-exec(1)` wrapper — no extra dependency and no FFI (core forbids
+# `unsafe`), so the feature is empty here. Confines `fs_write` + `fs_read`;
+# without it (or off-macOS) the sandbox is the advisory NoopSandbox reporting
+# SandboxKind::None. ADR 0006 (per-OS L3) / ADR 0009 (cross-platform).
+macos-seatbelt = []
 # Windows AppContainer process sandbox (Windows only). AppContainer is applied
 # at process creation via SECURITY_CAPABILITIES, not by restricting the current
 # thread; see src/sandbox.rs and agent-bridle#51.
 windows-appcontainer = []
-os-sandbox = ["linux-landlock", "windows-appcontainer"]
+# One-knob convenience (ADR 0006 D2): every OS L3 backend (each inert off its
+# target OS, so a CI matrix can turn them all on).
+os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
 # Production Ed25519 `DischargeVerifier` (`Ed25519Verifier`) for the step-up
 # surface. Off by default to keep core lean; enable it for the software /
 # OpenSSH `ed25519-sk`-style passkey verification path (raw Ed25519 assertions

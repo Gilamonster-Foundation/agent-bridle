@@ -26,6 +26,10 @@ web = [
 # through. (Landlock is port-based, not host-based, so the net leash is enforced
 # in-process here regardless; this only keeps the sandbox_kind plumbing aligned.)
 linux-landlock = ["agent-bridle-core/linux-landlock"]
+# Forwarded to core for sandbox_kind plumbing parity. The web tool makes no
+# subprocess, so Seatbelt (a process wrapper) does not apply; the net leash is
+# enforced in-process here regardless of the OS L3 backend.
+macos-seatbelt = ["agent-bridle-core/macos-seatbelt"]
 
 [dependencies]
 agent-bridle-core = { workspace = true }
