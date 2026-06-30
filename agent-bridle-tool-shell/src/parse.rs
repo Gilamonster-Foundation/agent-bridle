@@ -14,9 +14,10 @@
 //! Refused **by design** (security, [`Refusal::Dynamic`]): command/arithmetic
 //! substitution `$(…)`, backticks, subshells — the undecidable interiors ADR
 //! 0001 says may never be statically cleared. Refused for now
-//! ([`Refusal::Unsupported`]): a word that is *both* a glob and variable-bearing
-//! (`$DIR/*.rs`), a `$VAR` in a redirect target, and fd redirections other than
-//! `1>`/`2>`/`0<`/`2>&1` (e.g. `3>`, `1>&2`).
+//! ([`Refusal::Unsupported`]): a glob in a redirect target, and fd redirections
+//! other than `1>`/`2>`/`0<`/`2>&1` (e.g. `3>`, `1>&2`). Variable-bearing
+//! redirect targets (`> $TMPDIR/out`) and glob+variable words (`$DIR/*.rs`) ARE
+//! supported — expanded (allowlisted) + leash-checked at admission (#46).
 //!
 //! Quoting is honored, so a metacharacter **inside quotes is a literal
 //! argument** — only *unquoted* operators and constructs are recognized:
@@ -94,6 +95,12 @@ pub enum Arg {
     Glob(String),
     /// A word with `$VAR` reference(s) (segments concatenated at expansion time).
     Var(Vec<Seg>),
+    /// A word that is **both** variable-bearing **and** a glob (e.g. `$DIR/*.rs`).
+    /// Admission expands the `$VAR` (allowlisted) and lowers it to a [`Arg::Glob`]
+    /// over the resolved string — but only when every variable stays in the
+    /// directory *prefix* (a variable in the glob basename is refused, so a var
+    /// value can never inject a glob metachar; re-injection guard).
+    VarGlob(Vec<Seg>),
 }
 
 /// A redirection on one command stage. The target is a [`Seg`] list so it may
@@ -399,7 +406,8 @@ fn skip_whitespace(chars: &mut Peekable<Chars>) {
 /// expand; an unquoted backslash escapes the next char. An unquoted `*`/`?`/`[`
 /// marks the word a glob; a `$NAME`/`${NAME}` (unquoted or inside double quotes)
 /// contributes a [`Seg::Var`] so a word can mix literals and variables
-/// (`$HOME/config`). A word that is BOTH a glob and variable-bearing is refused.
+/// (`$HOME/config`). A word that is BOTH a glob and variable-bearing becomes an
+/// [`Arg::VarGlob`] (`$DIR/*.rs`), expanded + re-injection-guarded at admission.
 fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
     let mut cur = String::new(); // current literal run
     let mut segs: Vec<Seg> = Vec::new(); // pieces flushed when a `$VAR` appears
@@ -483,14 +491,16 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
             Arg::Lit(cur)
         });
     }
-    // A variable-bearing word.
-    if is_glob {
-        return Err(Refusal::Unsupported("glob and variable in one word"));
-    }
+    // A variable-bearing word. A trailing literal run (which may carry the glob
+    // metachars, e.g. the `/*.rs` in `$DIR/*.rs`) is the last segment.
     if !cur.is_empty() {
         segs.push(Seg::Lit(cur));
     }
-    Ok(Arg::Var(segs))
+    if is_glob {
+        Ok(Arg::VarGlob(segs))
+    } else {
+        Ok(Arg::Var(segs))
+    }
 }
 
 /// Read a variable name after a consumed `$`: `NAME` (bare) or `{NAME}`. `$(` is
@@ -560,7 +570,7 @@ fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<Vec<Seg>, Refusal
     match read_word(chars)? {
         Arg::Lit(s) if !s.is_empty() => Ok(vec![Seg::Lit(s)]),
         Arg::Lit(_) => Err(Refusal::Malformed("empty redirection target".into())),
-        Arg::Glob(_) => Err(Refusal::Unsupported("glob in a redirection target")),
+        Arg::Glob(_) | Arg::VarGlob(_) => Err(Refusal::Unsupported("glob in a redirection target")),
         Arg::Var(segs) => Ok(segs),
     }
 }
@@ -742,16 +752,22 @@ mod tests {
     }
 
     #[test]
+    fn glob_and_variable_in_one_word_parses_as_varglob() {
+        // `$DIR/*.rs` is now a VarGlob (was refused); admission expands the var
+        // and lowers it to a resolved glob, with the basename re-injection guard.
+        let p = classify("ls $DIR/*.rs").unwrap();
+        assert_eq!(
+            p[0].pipeline[0].argv,
+            vec![lit("ls"), Arg::VarGlob(vec![svar("DIR"), slit("/*.rs")])]
+        );
+    }
+
+    #[test]
     fn invalid_or_dynamic_variable_forms_are_refused() {
         assert!(matches!(classify("echo $1"), Err(Refusal::Unsupported(_)))); // positional/invalid
         assert!(matches!(classify("echo $"), Err(Refusal::Unsupported(_)))); // bare $
         assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_)))); // substitution
-                                                                             // A word that is BOTH a glob and variable-bearing is refused (deferred).
-        assert!(matches!(
-            classify("cat $DIR/*.rs"),
-            Err(Refusal::Unsupported(_))
-        ));
-        // Escaped `$` is a literal dollar, not a variable.
+                                                                             // Escaped `$` is a literal dollar, not a variable.
         assert_eq!(
             classify("echo \\$HOME").unwrap(),
             one_stage(vec![lit("echo"), lit("$HOME")])
