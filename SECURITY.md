@@ -11,6 +11,38 @@ Open a private security advisory on this repository (GitHub → Security → Rep
 vulnerability), or contact the maintainers out-of-band. Please do **not** file
 public issues for undisclosed vulnerabilities.
 
+## Hardening the host for L3 confinement
+
+On Linux, the `linux-landlock` backend kernel-confines a permitted program's
+filesystem reads/writes and denies a **direct** `execve` of an un-granted tool
+(ADR 0011). Two residual escapes are not closed by Landlock alone and have host
+mitigations an operator should apply:
+
+- **Bind-mount re-point** — `unshare(CLONE_NEWUSER|CLONE_NEWNS)` then
+  `mount --bind` a payload over a read-allowed path. This requires **unprivileged
+  user namespaces**; disable them on the host to close it:
+  - `sysctl -w kernel.unprivileged_userns_clone=0` (Debian/Ubuntu), and/or
+  - `sysctl -w user.max_user_namespaces=0`, and/or
+  - on Ubuntu ≥ 24.04, `sysctl -w kernel.apparmor_restrict_unprivileged_userns=1`.
+
+  Most hardened hosts already set one of these.
+- **Loader/interpreter trampoline** — `ld.so` `mmap`-execs any *readable* ELF, and
+  a granted interpreter (`sh`, `python`, …) runs arbitrary in-process code.
+  Landlock has no `mmap` hook, so this is **not** kernel-closed — which is exactly
+  why `agent-bridle` honestly reports the `exec` axis as `interceptor`, never
+  `kernel` (ADR 0011 D2/D7), and a strong principal **fails closed** on a
+  restricted `exec` (ADR 0012). The sound close is the Tier-2 micro-VM /
+  mount-namespace rootfs that physically excludes un-granted binaries (ADR 0009 /
+  #57) — keep the read scope tight in the meantime.
+
+> A future `linux-seccomp` backstop (ADR 0011 D4) could deny the mount/namespace
+> syscall family in-process as defense-in-depth for the bind-mount case. It needs
+> a hand-rolled, arch-guarded BPF filter — a single `seccompiler` `mismatch_action`
+> cannot keep the wrong-arch guard distinct from the permissive default a denylist
+> requires (the i386/x32 bypass) — so it must be authored and verified on a real
+> Landlock+seccomp host; tracked under #57/#35. The host-sysctl mitigation above
+> closes the same gap today, and a strong principal already fails closed regardless.
+
 ## Public-repository privacy rules (enforced)
 
 This repo is public. It must never contain the operational specifics of any real
