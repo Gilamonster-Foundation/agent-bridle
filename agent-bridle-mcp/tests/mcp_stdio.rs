@@ -27,16 +27,39 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-/// The restrictive grant: may exec only `echo`. This is the leash the server
-/// must enforce through MCP. Exact agent-mesh `Caveats` serde shape.
-const GRANT_JSON: &str = r#"{
+/// The in-scope **success** program for this integration test. On Windows `echo`
+/// is a `cmd` builtin (no `echo.exe`), so spawning `echo` fails "program not
+/// found"; use `cmd /c echo …`. On Unix use `echo`. (agent-bridle#84 — the same
+/// portability issue as #43, in the MCP stdio test.)
+#[cfg(not(windows))]
+const OK_PROGRAM: &str = "echo";
+#[cfg(windows)]
+const OK_PROGRAM: &str = "cmd";
+
+#[cfg(not(windows))]
+fn ok_args() -> Value {
+    serde_json::json!(["leashed-hello"])
+}
+#[cfg(windows)]
+fn ok_args() -> Value {
+    serde_json::json!(["/c", "echo leashed-hello"])
+}
+
+/// The restrictive grant: may exec only the host's success program
+/// ([`OK_PROGRAM`]). This is the leash the server must enforce through MCP.
+/// Exact agent-mesh `Caveats` serde shape.
+fn grant_json() -> String {
+    format!(
+        r#"{{
     "fs_read": "all",
     "fs_write": "all",
-    "exec": { "only": ["echo"] },
+    "exec": {{ "only": ["{OK_PROGRAM}"] }},
     "net": "all",
     "max_calls": "unlimited",
     "valid_for_generation": "all"
-}"#;
+}}"#
+    )
+}
 
 /// A live MCP child driven over stdio.
 struct McpChild {
@@ -102,7 +125,7 @@ impl McpChild {
 
 #[tokio::test]
 async fn leash_holds_through_the_mcp_boundary() {
-    let mut mcp = McpChild::spawn(GRANT_JSON);
+    let mut mcp = McpChild::spawn(&grant_json());
 
     // 1. initialize.
     let init = mcp
@@ -130,19 +153,19 @@ async fn leash_holds_through_the_mcp_boundary() {
         "tools/list missing shell: {names:?}"
     );
 
-    // 3. An in-scope `echo` runs: stdout comes back in an isError:false result.
+    // 3. An in-scope program runs: stdout comes back in an isError:false result.
     let allowed = mcp
         .call(&serde_json::json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {
                 "name": "shell",
-                "arguments": { "program": "echo", "args": ["leashed-hello"] }
+                "arguments": { "program": OK_PROGRAM, "args": ok_args() }
             }
         }))
         .await;
     assert_eq!(
         allowed["result"]["isError"], false,
-        "in-scope echo must succeed through the MCP boundary: {allowed}"
+        "in-scope program must succeed through the MCP boundary: {allowed}"
     );
     let allowed_text = allowed["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
