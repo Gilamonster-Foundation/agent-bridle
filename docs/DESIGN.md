@@ -60,6 +60,12 @@ impl Gate {
 }
 ```
 
+The gate has a **third outcome** between allow and deny — *attest* (human-presence
+step-up): "authorized, but only with a fresh, non-repudiable gesture." It adds no
+authority (still the `meet`); it sharpens the liveness condition. The consumability
+contract — fail-closed presence, the no-authenticator fallback, and fresh-per-act
+semantics — is **ADR 0007** (`docs/adr/0007-step-up-consumability-contract.md`).
+
 ## 3. Crate layout (dependency isolation = the leanness win)
 
 The single biggest verified leanness win: **heavy deps live in leaf tool crates
