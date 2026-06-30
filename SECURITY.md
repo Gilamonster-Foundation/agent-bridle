@@ -33,7 +33,16 @@ mitigations an operator should apply:
   `kernel` (ADR 0011 D2/D7), and a strong principal **fails closed** on a
   restricted `exec` (ADR 0012). The sound close is the Tier-2 micro-VM /
   mount-namespace rootfs that physically excludes un-granted binaries (ADR 0009 /
-  #57) — keep the read scope tight in the meantime.
+  #57) — keep the read scope tight in the meantime. On **macOS**, Seatbelt
+  `process-exec*` closes the axis at kernel grain by itself (no rootfs needed), so
+  it reports `exec → kernel` (ADR 0014).
+- **Reading `exec → kernel` (identity, not behavior).** Where the report does say
+  `exec → kernel` (macOS Seatbelt today; a Linux minimal-rootfs later), it means
+  **no un-granted program can run as a process** — *not* that a *granted* program,
+  especially a granted **interpreter** (`sh`, `python`), is constrained in what it
+  *does*. A granted interpreter's interior is governed only by the
+  `fs_read`/`fs_write`/`net` axes; keep those tight, and grant interpreters only
+  deliberately (they are the highest-authority `exec` choice — ADR 0012 D8).
 
 > A future `linux-seccomp` backstop (ADR 0011 D4) could deny the mount/namespace
 > syscall family in-process as defense-in-depth for the bind-mount case. It needs

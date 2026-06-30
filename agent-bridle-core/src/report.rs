@@ -24,6 +24,16 @@ use crate::{Caveats, SandboxKind, Scope};
 pub enum AxisEnforcement {
     /// An OS ruleset enforces this axis against the spawned program's
     /// **interior** (e.g. Landlock on `fs_write`). The strongest claim.
+    ///
+    /// **`exec → kernel` is about *identity*, not *behavior* (ADR 0013 D6 /
+    /// agent-bridle#114).** It means "no **un-granted program** can run as a
+    /// process" — via Seatbelt `process-exec*` (ADR 0014), or a Linux minimal
+    /// rootfs that physically excludes un-granted binaries (ADR 0013). It does
+    /// **NOT** mean a *granted* program — especially a granted **interpreter**
+    /// (`sh`, `python`, `perl`) — is constrained in what it *does*: its interior
+    /// logic is still bounded only by the `fs_read`/`fs_write`/`net` axes (read
+    /// those for the data-side guarantee). Do not read `exec → kernel` as "this
+    /// program will only do what I expect."
     Kernel,
     /// The in-process L2 leash gates this axis at the spawn/open chokepoint —
     /// it holds for the engine's own operations, **not** for a permitted
@@ -414,5 +424,29 @@ mod tests {
         };
         let r = enforcement_report(&caveats, SandboxKind::None);
         assert_eq!(fence_strength(&r), Some(AxisEnforcement::Interceptor));
+    }
+
+    /// #114 / ADR 0013 D6 report guard: `exec → kernel` is **identity, not
+    /// behavior**. A granted *interpreter* (`sh`) still earns `exec → kernel`
+    /// under Seatbelt — only un-granted *programs* are excluded — which must not
+    /// be misread as constraining the interpreter's interior (that is governed
+    /// only by the fs/net axes, absent here because they are unrestricted).
+    #[test]
+    fn exec_kernel_is_identity_not_interpreter_behavior() {
+        let interp = Caveats {
+            exec: Scope::only(["sh".to_string()]),
+            ..Caveats::top()
+        };
+        let r = enforcement_report(&interp, SandboxKind::Seatbelt);
+        assert_eq!(
+            r.exec,
+            Some(AxisEnforcement::Kernel),
+            "a granted interpreter still earns exec→kernel (identity, not behavior)"
+        );
+        // exec→kernel does NOT imply the interior is constrained: fs/net are All
+        // (unrestricted) here, so they are absent from the report.
+        assert_eq!(r.fs_read, None);
+        assert_eq!(r.fs_write, None);
+        assert_eq!(r.net, None);
     }
 }
