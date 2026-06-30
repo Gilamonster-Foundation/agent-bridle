@@ -5,7 +5,7 @@
 //! recorded [`crate::SandboxKind`] travels with every result (DESIGN §6: "the
 //! Gate records `sandbox_kind` in **every** `ToolResult`").
 
-use crate::SandboxKind;
+use crate::{EnforcementReport, SandboxKind};
 
 /// Which kind of capability operation the leash refused.
 ///
@@ -69,6 +69,12 @@ pub struct ToolEnvelope {
     /// The OS-level sandbox in force when this ran. Always present so callers
     /// can tell whether the leash was kernel-enforced or advisory.
     pub sandbox_kind: SandboxKind,
+    /// Per-axis confinement report (ADR 0004 D1): for each **restricted** axis,
+    /// whether it is `kernel` / `interceptor` / `advisory`. Refines the coarse
+    /// `sandbox_kind` (which stays the *minimum* claim) at axis grain. Omitted
+    /// from JSON when no axis is restricted.
+    #[serde(skip_serializing_if = "EnforcementReport::is_empty", default)]
+    pub enforcement: EnforcementReport,
 }
 
 /// `skip_serializing_if` helper: omit `denied` from JSON when it is `false`.
@@ -125,6 +131,13 @@ impl ToolEnvelope {
     pub fn with_denials(mut self, denials: Vec<Denial>) -> Self {
         self.denied = !denials.is_empty();
         self.denials = denials;
+        self
+    }
+
+    /// Attach the per-axis confinement report (builder style; ADR 0004 D1).
+    #[must_use]
+    pub fn with_enforcement(mut self, enforcement: EnforcementReport) -> Self {
+        self.enforcement = enforcement;
         self
     }
 
@@ -185,6 +198,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not within the granted"));
+    }
+
+    #[test]
+    fn enforcement_report_is_threaded_and_omitted_when_empty() {
+        use crate::{enforcement_report, AxisEnforcement, Caveats, Scope};
+        // Restricted fs_write under Landlock → the envelope carries a kernel claim.
+        let caveats = Caveats {
+            fs_write: Scope::only(["/w".to_string()]),
+            ..Caveats::top()
+        };
+        let report = enforcement_report(&caveats, SandboxKind::Landlock);
+        assert_eq!(report.fs_write, Some(AxisEnforcement::Kernel));
+        let v = ToolEnvelope::new(SandboxKind::Landlock)
+            .with_enforcement(report)
+            .with_exit_code(0)
+            .into_json();
+        assert_eq!(v["enforcement"]["fs_write"], "kernel");
+        assert!(
+            v["enforcement"].get("exec").is_none(),
+            "unrestricted axis omitted"
+        );
+
+        // An all-`All` grant produces an empty report → the field is omitted.
+        let empty = enforcement_report(&Caveats::top(), SandboxKind::None);
+        let v2 = ToolEnvelope::new(SandboxKind::None)
+            .with_enforcement(empty)
+            .into_json();
+        assert!(
+            v2.get("enforcement").is_none(),
+            "empty report omitted: {v2}"
+        );
     }
 
     #[test]
