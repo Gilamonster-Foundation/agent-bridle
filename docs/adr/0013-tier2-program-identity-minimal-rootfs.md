@@ -1,6 +1,6 @@
 # ADR 0013 — Tier-2 program-identity confinement (the trampoline close via a minimal rootfs)
 
-- Status: Proposed (2026-06-30)
+- Status: Accepted (2026-06-30)
 - Date: 2026-06-30
 - Context: ADR 0011 shipped the Landlock **exec boundary** — a permitted binary
   cannot *directly* `execve` an un-granted tool (`find -exec curl`, payloads,
