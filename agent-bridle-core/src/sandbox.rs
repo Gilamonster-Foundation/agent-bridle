@@ -1316,6 +1316,120 @@ mod landlock_kernel_tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// #57 adversarial sweep: with `exec` confined to `cat` and writes confined to
+    /// a scratch dir, EVERY classic "make the permitted program launch something
+    /// else" DIRECT-execve escape must be kernel-denied — an un-granted tool, a
+    /// payload the context could write+run, a shebang script (un-granted
+    /// interpreter), a symlink to an un-granted tool, and the real
+    /// shells/interpreters that live under `/usr/lib*` (which a recursive lib-dir
+    /// Execute grant — the narrowing this avoids — would have exposed). The
+    /// granted program still works (control). (Direct-execve boundary only; the
+    /// ld.so/interpreter trampoline is out of scope — `exec` stays `interceptor`.)
+    #[test]
+    fn exec_escape_attempts_are_all_denied() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let scratch = unique_dir("exec-escape"); // in fs_write scope
+        fs::write(scratch.join("data.txt"), b"ok\n").unwrap();
+
+        // A real ELF the confined context could try to run from the scratch dir (a
+        // "written payload"); copy an existing binary to avoid needing a compiler.
+        let payload = scratch.join("payload");
+        if let Ok(src) = std::fs::read("/bin/cat").or_else(|_| std::fs::read("/usr/bin/cat")) {
+            fs::write(&payload, src).unwrap();
+            fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A shebang script + a symlink to an un-granted interpreter.
+        let script = scratch.join("script.sh");
+        fs::write(&script, b"#!/bin/sh\necho pwned\n").unwrap();
+        fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = scratch.join("sh-link");
+        let _ = symlink("/bin/sh", &link);
+
+        // Real shells/interpreters that live UNDER the library tree (/usr/lib*):
+        // loader-only Execute must deny them. Tested only where present.
+        let lib_execs: Vec<PathBuf> = [
+            "/usr/lib/klibc/bin/sh",
+            "/usr/lib/initramfs-tools/bin/busybox",
+            "/usr/lib/git-core/git",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+
+        let scratch_t = scratch.clone();
+        let (attempts, control) = std::thread::spawn(move || {
+            let cav = Caveats {
+                exec: Scope::only(["cat".to_string()]),
+                fs_write: Scope::only([scratch_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+
+            let mut attempts = vec![
+                (
+                    "ungranted-tool".to_string(),
+                    std::process::Command::new("head")
+                        .arg("/etc/hostname")
+                        .output(),
+                ),
+                (
+                    "written-payload".to_string(),
+                    std::process::Command::new(scratch_t.join("payload")).output(),
+                ),
+                (
+                    "shebang-script".to_string(),
+                    std::process::Command::new(scratch_t.join("script.sh")).output(),
+                ),
+                (
+                    "symlink-to-sh".to_string(),
+                    std::process::Command::new(scratch_t.join("sh-link"))
+                        .arg("-c")
+                        .arg("echo pwned")
+                        .output(),
+                ),
+            ];
+            for p in &lib_execs {
+                attempts.push((
+                    format!("under-usr-lib:{}", p.display()),
+                    std::process::Command::new(p).arg("--version").output(),
+                ));
+            }
+            // Control: the granted program still runs.
+            let control = std::process::Command::new("cat")
+                .arg(scratch_t.join("data.txt"))
+                .output();
+            (attempts, control)
+        })
+        .join()
+        .unwrap();
+
+        for (label, res) in attempts {
+            match res {
+                Err(e) => assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "escape `{label}` failed for the wrong reason: {e:?}"
+                ),
+                Ok(out) => panic!(
+                    "escape `{label}` was NOT denied — it ran (status {:?}, stdout {:?})",
+                    out.status, out.stdout
+                ),
+            }
+        }
+        let control = control.expect("granted `cat` must still run");
+        assert!(
+            control.status.success() && control.stdout == b"ok\n",
+            "control: {control:?}"
+        );
+
+        let _ = fs::remove_dir_all(&scratch);
+    }
 }
 
 // Real kernel-enforcement proof for macOS Seatbelt. Only meaningful on macOS
