@@ -29,10 +29,6 @@
 //! As a non-root caller it fails closed with an error — never a panic, never a
 //! silent unconfined run.
 
-use std::ffi::OsStr;
-use std::io;
-use std::path::Path;
-
 /// The outcome of a jailed run: the child's exit status and captured output.
 #[derive(Debug)]
 pub struct JailRun {
@@ -57,28 +53,20 @@ mod linux;
 /// Requires `CAP_SYS_ADMIN`. Returns an error (never a panic, never an unconfined
 /// run) when the caller lacks privilege or the jail cannot be built.
 ///
-/// On non-Linux targets this is an honest "unsupported" error.
+/// **Linux-only**: the jail is built from a [`RootfsPlan`](agent_bridle_core::RootfsPlan),
+/// which `agent-bridle-core` exposes only on Linux, and uses mount namespaces, so
+/// this function exists only on Linux targets.
+#[cfg(target_os = "linux")]
 pub fn run_jailed<I, S>(
     plan: &agent_bridle_core::RootfsPlan,
-    program: &Path,
+    program: &std::path::Path,
     args: I,
-) -> io::Result<JailRun>
+) -> std::io::Result<JailRun>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
+    S: AsRef<std::ffi::OsStr>,
 {
-    #[cfg(target_os = "linux")]
-    {
-        linux::run_jailed(plan, program, args)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (plan, program, args);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the mount-namespace jail is Linux-only",
-        ))
-    }
+    linux::run_jailed(plan, program, args)
 }
 
 /// Whether the current process is effectively root (a quick precondition check for
