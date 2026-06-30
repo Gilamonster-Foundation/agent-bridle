@@ -49,6 +49,8 @@ pub use sandbox::{landlock_is_supported, LandlockSandbox};
 pub use spawn::{spawn_confined_subprocess, ConfinedChild, ConfinedCommand};
 #[cfg(feature = "verifier-ed25519")]
 pub use step_up::Ed25519Verifier;
+#[cfg(feature = "verifier-webauthn")]
+pub use step_up::WebAuthnVerifier;
 pub use step_up::{
     AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
     DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,

@@ -31,6 +31,13 @@ os-sandbox = ["linux-landlock", "windows-appcontainer"]
 # OpenSSH `ed25519-sk`-style passkey verification path (raw Ed25519 assertions
 # over the step-up challenge). Pulls `ed25519-dalek`. ADR 0007.
 verifier-ed25519 = ["dep:ed25519-dalek"]
+# Production WebAuthn/CTAP2 `DischargeVerifier` (`WebAuthnVerifier`) for the
+# Passkey step-up tier. Parses a WebAuthn assertion (clientDataJSON +
+# authenticatorData + EdDSA signature), checks the UP/UV flag bits and binds the
+# assertion to the gate-recomputed challenge. Off by default; pulls
+# `ed25519-dalek` (EdDSA assertions) + `sha2` (SHA-256 over clientDataJSON).
+# ADR 0007. agent-bridle#72.
+verifier-webauthn = ["dep:ed25519-dalek", "dep:sha2"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -45,6 +52,11 @@ agent-mesh-protocol = { workspace = true }
 # step-up tests sign discharges with it too, so the step-up crypto tests compile
 # only under `--features verifier-ed25519` (CI's `--all-features` matrix runs them).
 ed25519-dalek = { version = "2", optional = true }
+
+# Optional: SHA-256 over `clientDataJSON` for the WebAuthn verifier, gated by
+# `verifier-webauthn`. Already in the lockfile (transitive via ed25519-dalek), so
+# enabling the feature pulls nothing new.
+sha2 = { version = "0.10", optional = true }
 
 # Landlock is Linux-only; gate the dep on the target so enabling the feature on
 # macOS/Windows does not try to build it. Used only under
