@@ -1,6 +1,6 @@
 # ADR 0010 — Command packs: a data-driven L1 escape-surface layer for the leash
 
-- Status: Proposed (2026-06-30)
+- Status: Accepted (2026-06-30)
 - Date: 2026-06-30
 - Context: ADR 0001 defines the three OCAP layers — **L1** static decomposition / atomic
   admission + per-node sub-attenuation, **L2** the in-process `before_exec`/`before_open`
