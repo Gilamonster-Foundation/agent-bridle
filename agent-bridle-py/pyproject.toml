@@ -2,9 +2,8 @@
 #
 # `pip install agent-bridle` lays down a single native PyO3 extension module
 # (`import agent_bridle`) that calls the Caveats-confined tool registry
-# in-process. The maturin wheel compiles the Rust in — so the brush git-dep in
-# `agent-bridle-tool-shell` is fine for a wheel (unlike a crates.io crate);
-# Pillar A's PyPI path is NOT blocked by the upstream-brush gate.
+# in-process. The maturin wheel compiles the Rust in — including the confined
+# argv + safe-subset shell engine (ADR 0005); no brush dependency is involved.
 #
 # Distribution name on PyPI: `agent-bridle` (verified free). The import path is
 # `agent_bridle`.

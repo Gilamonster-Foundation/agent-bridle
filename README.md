@@ -5,8 +5,8 @@ capability-enforcement layer for the Gilamonster agent line (newt, gilamonster,
 Monty, hermes-thoon). It turns each host's hand-wired, ambient-authority tool
 surface into an extensible, **capability-governed registry**.
 
-> **brush** = the hands. **`Caveats`** = the leash. **bridle** = the enforcer
-> that binds them.
+> **the toolchain** (`git`, `cargo`, `python`, …) = the hands. **`Caveats`** =
+> the leash. **bridle** = the enforcer that binds them.
 
 > Governed by the [Steward's Charter](https://github.com/Gilamonster-Foundation/steward-charter).
 > agent-bridle realizes the **`writ`** invariant (authority is borrowed, scoped,
@@ -81,15 +81,18 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`echo` runs via brush's **carried** builtin even with an empty `PATH` — the
-shell runtime is baked in, not borrowed from the host.
+The engine spawns `echo` as an external program (resolved via `PATH`) **after**
+the `exec` leash admits it at the single spawn funnel; an out-of-scope program
+(`rm`) is denied there before anything runs. agent-bridle parses the command
+itself and refuses dynamic constructs by design — it is the argv + safe-subset
+engine (ADR 0005), not a full shell.
 
 ## Crates
 
 | Crate | Purpose | Heavy deps |
 |---|---|---|
 | `agent-bridle-core` | `Tool` trait, `Registry`, `Gate`, `Caveats` re-export, `Sandbox` trait, result envelope | none beyond `anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol` |
-| `agent-bridle-tool-shell` | brush-backed confined shell (carried coreutils), `shell` feature | brush-core/builtins/coreutils-builtins, tokio |
+| `agent-bridle-tool-shell` | confined shell — argv + safe-subset engine (ADR 0005), `shell` feature | tokio |
 | `agent-bridle-tool-web` | confined `web_fetch` (the `net` enforcer), `web` feature | reqwest+rustls, dom_smoothie, htmd, hickory-resolver, url, tokio |
 | `agent-bridle` | facade re-exporting a ready-to-use registry | — |
 | `agent-bridle-mcp` | MCP (Model Context Protocol) stdio server frontend over the registry (binary) | tokio, toml |
@@ -284,7 +287,8 @@ even under `net: "all"`).
 ## Status
 
 This is **P0** plus the **MCP frontend** (DESIGN §4 frontend 2): the core leash,
-a confined brush shell, and an `agent-bridle-mcp` stdio JSON-RPC server, with
+a confined argv + safe-subset shell (ADR 0005), and an `agent-bridle-mcp` stdio
+JSON-RPC server, with
 tests proving the leash *denies* out-of-scope exec, exhausted budgets,
 generation mismatch, and path-escape (`..` / symlink) attempts — including a
 through-MCP integration test that drives the real binary over stdio and proves
@@ -296,13 +300,16 @@ re-check, and DNS-rebinding IP pin are unit-tested in isolation and exercised
 end-to-end against a localhost mock server (a disallowed host, a private/loopback
 address, and a redirect to a disallowed host are all proven *denied*).
 
-Landlock enforcement, the brush exec/open hook, the Python pillars (sidecar +
-host tools dir), the browse tier (headless Chrome — subprocess), `web_search`,
-and scm tools are later phases (see `docs/DESIGN.md` §12).
+Landlock `fs_write`/`fs_read` kernel enforcement is landed (Linux,
+`linux-landlock`). The cross-OS L3 boundary — the `net`/`exec` axes (#35/#57) and
+the macOS/Windows backends (#50/#51), per the three-tier strategy in ADR 0009 —
+the optional full-bash `brush` engine (#20), the Python pillars (sidecar + host
+tools dir), the browse tier (headless Chrome — subprocess), `web_search`, and scm
+tools are later phases (see `docs/DESIGN.md` §12).
 
 ## License
 
-Apache-2.0. `brush` is vendored as a dependency under MIT; its notice is carried
-in [`NOTICE`](NOTICE).
+Apache-2.0 (see [`LICENSE`](LICENSE)). The deferred, optional `brush` engine
+(#20) is MIT; its notice is carried in [`NOTICE`](NOTICE) for when it is adopted.
 
 [`agent_mesh_protocol::Caveats`]: https://crates.io/crates/agent-mesh-protocol
