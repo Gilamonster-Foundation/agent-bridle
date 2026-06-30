@@ -55,6 +55,14 @@ pub struct ToolEnvelope {
     /// Whether the operation was cut short by a timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
+    /// Whether captured stdout was clipped at the output cap (more was produced
+    /// than was kept). Lets a consumer tell a complete result from a truncated
+    /// one. Omitted (treated as `false`) when output was not clipped.
+    #[serde(skip_serializing_if = "is_false")]
+    pub stdout_truncated: bool,
+    /// Whether captured stderr was clipped at the output cap. Omitted when not.
+    #[serde(skip_serializing_if = "is_false")]
+    pub stderr_truncated: bool,
     /// Whether the in-process leash recorded at least one denial during this
     /// invocation. This is a **structured** signal: it is set iff
     /// [`Self::denials`] is non-empty, so a consumer never has to string-match
@@ -118,6 +126,16 @@ impl ToolEnvelope {
     #[must_use]
     pub fn with_timed_out(mut self, timed_out: bool) -> Self {
         self.timed_out = Some(timed_out);
+        self
+    }
+
+    /// Mark whether captured stdout/stderr were clipped at the cap (builder
+    /// style). A truncated stream is a *bounded* read: peak buffering never
+    /// exceeds the cap regardless of how much the child produced.
+    #[must_use]
+    pub fn with_truncation(mut self, stdout_truncated: bool, stderr_truncated: bool) -> Self {
+        self.stdout_truncated = stdout_truncated;
+        self.stderr_truncated = stderr_truncated;
         self
     }
 
