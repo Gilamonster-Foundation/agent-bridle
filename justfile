@@ -37,6 +37,18 @@ cov-ci:
     fi
     exit "$status"
 
+# Publishability gate for the externally-consumed crate (ADR 0008). Fails if a
+# change makes `agent-bridle-core` unpublishable — a git dependency, or a
+# path-only required dep with no version — which would silently strand
+# out-of-tree consumers (e.g. newt-agent). `--dry-run` never uploads;
+# `--allow-dirty` so it runs regardless of working-tree state.
+#
+# HOOK PARITY: this recipe is run by .githooks/pre-push AND mirrored by the
+# "Publishability gate" step in .github/workflows/ci.yml. When editing it,
+# update both.
+publish-check:
+    cargo publish --dry-run --allow-dirty -p agent-bridle-core
+
 # Install the project's git hooks (points core.hooksPath at .githooks).
 install-hooks:
     git config core.hooksPath .githooks
