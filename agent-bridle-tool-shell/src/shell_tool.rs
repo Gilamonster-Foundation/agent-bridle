@@ -262,12 +262,29 @@ impl Tool for ShellTool {
             Err(refusal) => return Ok(refused_envelope(sandbox_kind, enforcement, &refusal)),
         };
 
-        // Lower redirect targets (#46): expand an allowlisted `$VAR` (e.g.
-        // `> $TMPDIR/out`) through the env seam so the RESOLVED path is what the
-        // fs leash checks below and the spawner opens — never the literal `$VAR`.
-        // A non-allowlisted variable denies before any spawn.
+        // Lower `$VAR` (#46) through the env seam so the RESOLVED value is what
+        // the fs leash checks below and the spawner opens — never a literal
+        // `$VAR`. Glob+variable words (`$DIR/*.rs`) lower to a resolved glob (with
+        // the re-injection guard); redirect targets (`> $TMPDIR/out`) to a literal
+        // path. A non-allowlisted (or basename-injected) variable denies pre-spawn.
         for item in &mut script {
             for stage in &mut item.pipeline {
+                for arg in &mut stage.argv {
+                    if let Arg::VarGlob(segs) = arg {
+                        match expand_varglob(segs, &*self.env) {
+                            Ok(pattern) => *arg = Arg::Glob(pattern),
+                            Err((target, e)) => {
+                                return Ok(deny(
+                                    sandbox_kind,
+                                    enforcement,
+                                    DenialKind::Exec,
+                                    &target,
+                                    &e,
+                                ))
+                            }
+                        }
+                    }
+                }
                 for redirect in &mut stage.redirects {
                     let segs = match redirect {
                         Redirect::Stdout { path, .. }
@@ -328,6 +345,17 @@ impl Tool for ShellTool {
                             &ToolError::denied("a variable is not allowed as a program name"),
                         ));
                     }
+                    // A glob+var word lowers to `Arg::Glob` above; this arm is for
+                    // exhaustiveness and mirrors the glob-program refusal.
+                    Some(Arg::VarGlob(_)) => {
+                        return Ok(deny(
+                            sandbox_kind,
+                            enforcement,
+                            DenialKind::Exec,
+                            "$VAR/glob",
+                            &ToolError::denied("a glob pattern is not allowed as a program name"),
+                        ));
+                    }
                     None => {} // the parser guarantees a non-empty stage
                 }
                 for arg in &stage.argv {
@@ -365,6 +393,8 @@ impl Tool for ShellTool {
                                 }
                             }
                         }
+                        // Lowered to `Arg::Glob` (or denied) in the pass above.
+                        Arg::VarGlob(_) => unreachable!("VarGlob lowered before admission leash"),
                         Arg::Lit(_) => {}
                     }
                 }
@@ -647,6 +677,63 @@ fn expand_redirect_target(
     Ok(out)
 }
 
+/// Expand a glob+variable word (e.g. `$DIR/*.rs`) into a resolved glob pattern,
+/// reading allowlisted `$VAR` through the env seam.
+///
+/// **Re-injection guard:** a variable may only contribute to the directory
+/// *prefix* (everything up to the last `/`), never to the glob *basename* — so a
+/// var value can never inject a glob metachar that widens the match. The existing
+/// single-segment globber then treats the (var-derived) directory as a literal
+/// path and globs only the source-literal basename. A variable in the basename is
+/// refused. `Err((target, reason))` names a non-allowlisted var or the refusal.
+fn expand_varglob(segs: &[Seg], env: &dyn EnvProvider) -> Result<String, (String, ToolError)> {
+    let mut out = String::new();
+    let mut last_var_byte: Option<usize> = None; // byte index of the last var-origin char
+    let mut last_slash_byte: Option<usize> = None; // byte index of the last '/'
+    for seg in segs {
+        match seg {
+            Seg::Lit(s) => {
+                for ch in s.chars() {
+                    if ch == '/' {
+                        last_slash_byte = Some(out.len());
+                    }
+                    out.push(ch);
+                }
+            }
+            Seg::Var(name) => {
+                if !is_allowed_var(name) {
+                    return Err((
+                        format!("${name}"),
+                        ToolError::denied(format!(
+                            "variable ${name} is not in the confined shell's allowlist"
+                        )),
+                    ));
+                }
+                for ch in env.get(name).unwrap_or_default().chars() {
+                    if ch == '/' {
+                        last_slash_byte = Some(out.len());
+                    }
+                    last_var_byte = Some(out.len());
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    // A var char in the basename (at/after the char following the last '/') could
+    // inject a glob metachar from its value — refuse (re-injection guard).
+    let basename_start = last_slash_byte.map_or(0, |i| i + 1);
+    if last_var_byte.is_some_and(|v| v >= basename_start) {
+        return Err((
+            "$VAR".to_string(),
+            ToolError::denied(
+                "a variable in a glob's basename is not supported (re-injection guard); \
+                 put the variable in the directory prefix, e.g. $DIR/*.rs",
+            ),
+        ));
+    }
+    Ok(out)
+}
+
 // ── glob expansion ──────────────────────────────────────────────────────────
 
 /// Split a glob pattern into (directory prefix incl. trailing `/`, basename
@@ -804,6 +891,9 @@ fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
                 }
                 argv.push(word);
             }
+            // A glob+var word is lowered to `Arg::Glob` at admission, before the
+            // (lowered) script reaches any spawner.
+            Arg::VarGlob(_) => unreachable!("VarGlob lowered before spawn"),
         }
     }
     argv
@@ -1030,7 +1120,7 @@ mod tests {
     fn prog(stage: &Command) -> &str {
         match stage.argv.first() {
             Some(Arg::Lit(s) | Arg::Glob(s)) => s,
-            Some(Arg::Var(_)) | None => "",
+            Some(Arg::Var(_) | Arg::VarGlob(_)) | None => "",
         }
     }
 
@@ -1153,6 +1243,82 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("SECRET"));
+    }
+
+    // ── glob + variable in one word (#46, $DIR/*.rs) ────────────────────────
+
+    /// The re-injection guard, unit-tested directly: a `*` in the VAR VALUE stays
+    /// in the (literal) directory prefix and never globs; a variable in the glob
+    /// BASENAME is refused.
+    #[test]
+    fn expand_varglob_keeps_value_metachars_literal_and_refuses_basename_var() {
+        // TMPDIR is allowlisted; give it a value containing a glob metachar.
+        let env = FakeEnv(HashMap::from([("TMPDIR".to_string(), "/a*b".to_string())]));
+        // `$TMPDIR/*.rs` → "/a*b/*.rs": the var's `*` is in the dir prefix
+        // (literal); only the source `*.rs` basename globs.
+        let pattern =
+            expand_varglob(&[Seg::Var("TMPDIR".into()), Seg::Lit("/*.rs".into())], &env).unwrap();
+        assert_eq!(pattern, "/a*b/*.rs");
+        // A variable in the glob basename is refused (would re-inject metachars).
+        let err = expand_varglob(&[Seg::Var("TMPDIR".into()), Seg::Lit("*.rs".into())], &env);
+        assert!(err.is_err(), "var in glob basename must be refused");
+    }
+
+    /// `$DIR/*.rs` lowers to a resolved `Arg::Glob` (var → literal dir) that the
+    /// spawner receives; the resolved glob directory was leash-checked.
+    #[tokio::test]
+    async fn glob_var_lowers_to_resolved_glob_and_reaches_spawner() {
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let mock = Arc::new(MockSpawner::default());
+        let tool = ShellTool::with_spawner_and_env(mock.clone(), fake_env(&[("TMPDIR", &tmp)]));
+        let out = tool
+            .invoke(
+                serde_json::json!({"cmd": "ls $TMPDIR/*.rs"}), // fs_read All by default
+                &ctx(exec_only(&["ls"])),
+            )
+            .await
+            .expect("invoke");
+        assert_ne!(
+            out["denied"],
+            serde_json::json!(true),
+            "in-scope glob var: {out}"
+        );
+        assert_eq!(
+            calls(&mock)[0][0].argv,
+            vec![Arg::Lit("ls".into()), Arg::Glob(format!("{tmp}/*.rs"))]
+        );
+    }
+
+    /// A variable in the glob basename (`$PREFIX*.rs`) is refused at admission.
+    #[tokio::test]
+    async fn glob_var_in_basename_is_denied() {
+        let mock = Arc::new(MockSpawner::default());
+        let tool = ShellTool::with_spawner_and_env(mock.clone(), fake_env(&[("PREFIX", "foo")]));
+        let out = tool
+            .invoke(
+                serde_json::json!({"cmd": "ls $PREFIX*.rs"}),
+                &ctx(exec_only(&["ls"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true, "var in glob basename refused: {out}");
+        assert!(ran_programs(&mock).is_empty());
+    }
+
+    /// A non-allowlisted variable in a glob word denies before any spawn.
+    #[tokio::test]
+    async fn glob_var_not_in_allowlist_is_denied() {
+        let mock = Arc::new(MockSpawner::default());
+        let tool = ShellTool::with_spawner_and_env(mock.clone(), fake_env(&[("SECRET", "/s")]));
+        let out = tool
+            .invoke(
+                serde_json::json!({"cmd": "ls $SECRET/*.rs"}),
+                &ctx(exec_only(&["ls"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true, "non-allowlisted glob var: {out}");
+        assert!(ran_programs(&mock).is_empty());
     }
 
     /// The RESOLVED redirect path is leash-checked: an allowlisted var whose value
