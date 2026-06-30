@@ -55,6 +55,32 @@ cov-ci:
 publish-check:
     cargo publish --dry-run --allow-dirty -p agent-bridle-core
 
+# Build the PyO3 extension into an isolated throwaway venv and run the Python
+# (Pillar A) tests (#71) — the leash invariant from the language it's published
+# for. Skips gracefully when python3/maturin are absent (like cov-ci), so a push
+# from a machine without the Python toolchain is not blocked. NEVER uses ~/venv.
+#
+# HOOK PARITY: mirrored by the `py-test` job in .github/workflows/ci.yml and run
+# by .githooks/pre-push. When editing, keep all three in sync.
+py-test:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 absent — skipping py-test"
+        exit 0
+    fi
+    if ! command -v maturin >/dev/null 2>&1; then
+        echo "maturin absent — skipping py-test (pip install 'maturin>=1.7,<2.0' pytest to enable)"
+        exit 0
+    fi
+    venv="$(mktemp -d)/abp-pytest"
+    python3 -m venv "$venv"
+    # shellcheck disable=SC1091
+    . "$venv/bin/activate"
+    pip install -q pytest
+    ( cd agent-bridle-py && maturin develop -q )
+    python -m pytest agent-bridle-py/tests/ -q
+
 # Install the project's git hooks (points core.hooksPath at .githooks).
 install-hooks:
     git config core.hooksPath .githooks

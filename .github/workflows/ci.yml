@@ -1,8 +1,8 @@
 # agent-bridle CI.
 #
 # HOOK PARITY: This pipeline is mirrored by .githooks/pre-push and the `check` /
-# `publish-check` recipes in justfile. When editing this file, update the push
-# hook to match.
+# `publish-check` / `py-test` recipes in justfile. When editing this file, update
+# the push hook to match.
 
 name: CI
 
@@ -62,3 +62,28 @@ jobs:
       # required dep), which would strand external consumers like newt-agent.
       - name: Publishability gate (agent-bridle-core dry-run)
         run: cargo publish --dry-run --allow-dirty -p agent-bridle-core
+
+  # Build the PyO3 wheel + run the Python (Pillar A) tests, so the leash
+  # invariant is verified from the language it's published for (agent-bridle#71).
+  # HOOK PARITY: mirrors `just py-test` run by .githooks/pre-push.
+  py-test:
+    name: python wheel + pytest (Pillar A)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build agent_bridle (maturin) into a venv + run pytest
+        run: |
+          python -m venv .venv-pytest
+          . .venv-pytest/bin/activate
+          python -m pip install --upgrade pip
+          pip install "maturin>=1.7,<2.0" pytest
+          ( cd agent-bridle-py && maturin develop )
+          python -m pytest agent-bridle-py/tests/ -q
