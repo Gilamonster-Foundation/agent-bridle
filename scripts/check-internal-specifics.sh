@@ -28,7 +28,9 @@ EXCLUDE_REGEX='^(scripts/check-internal-specifics\.sh|\.gitleaks\.toml|\.github/
 # RFC1918/CGNAT *network bases* (range identifiers, used to document the SSRF
 # deny-list) and the single SSRF probe target the web tests use. A real
 # operational host has a non-zero host part and will NOT match these.
-ALLOW_MATCH_REGEX='^(10\.0\.0\.0|172\.16\.0\.0|192\.168\.0\.0|100\.64\.0\.0|169\.254\.0\.0|10\.0\.0\.1)$'
+# Uses `[.]` (literal-dot class) rather than `\.` so awk's dynamic-regex lexer
+# does not warn about escape sequences.
+ALLOW_MATCH_REGEX='^(10[.]0[.]0[.]0|172[.]16[.]0[.]0|192[.]168[.]0[.]0|100[.]64[.]0[.]0|169[.]254[.]0[.]0|10[.]0[.]0[.]1)$'
 
 # Generic deny patterns (label|regex). RFC 5737 ranges and example.* are not here,
 # so they pass.
