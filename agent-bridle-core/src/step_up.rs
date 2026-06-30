@@ -207,8 +207,14 @@ pub struct AttestRequirement {
     /// [`Attestation`] (the `passkey+record` policy decision).
     pub record: bool,
     /// Maximum age, in causal generations (never wall-clock), a discharge may
-    /// have. `0` ⇒ it must be bound to the current generation. Enforced via the
-    /// [`Challenge`] generation binding.
+    /// have: the gate accepts a discharge bound to any generation in
+    /// `[current - freshness_generations, current]`. `0` ⇒ it must be bound to
+    /// the current generation (fresh-per-act, HIGH-consequence); `N` ⇒ a gesture
+    /// may be reused for up to `N` generations (LOW-consequence amortization).
+    /// Enforced in [`Gate::authorize_with_discharge`](crate::Gate) by recomputing
+    /// the bound [`Challenge`] across the window, combined with single-use
+    /// consumption so one gesture authorizes exactly one act (ADR 0007 D4). The
+    /// window is capped defensively (fail-closed) to bound the scan.
     pub freshness_generations: u64,
 }
 
@@ -999,6 +1005,148 @@ mod tests {
             .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &weak_attempt)
             .expect_err("Prompt cannot satisfy Passkey");
         assert!(matches!(err, ToolError::Denied { .. }));
+    }
+
+    /// #63 regression: a verified discharge is **single-use** — re-presenting the
+    /// same valid `DischargeAttempt` is denied as a replay, and the replay charges
+    /// no budget. This FAILS on the pre-ledger code (which minted twice).
+    #[cfg(feature = "verifier-ed25519")]
+    #[test]
+    fn discharge_is_single_use_replay_is_denied() {
+        let gate = Gate::with_budget(0, CountBound::AtMost(2));
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+        let nonce = [31u8; 32];
+        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let attempt = DischargeAttempt {
+            nonce,
+            discharge: &discharge,
+            verifier: &Ed25519Verifier,
+        };
+        // First presentation authorizes (spends 1 of 2 budget).
+        gate.authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
+            .expect("first discharge authorizes");
+        // Re-presenting the SAME discharge is a replay → denied.
+        let err = gate
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
+            .expect_err("replay of the same discharge is denied");
+        assert!(matches!(err, ToolError::Denied { .. }));
+        // The replay charged no budget: a budgeted call still remains.
+        let free = NamedTool("free.tool");
+        match gate.evaluate(
+            &free,
+            &granted,
+            &CallRequest::unspecified("free.tool"),
+            &StepUpPolicy::EMPTY,
+        ) {
+            Decision::Allow(_) => {}
+            other => panic!("expected Allow (budget survived the replay), got {other:?}"),
+        }
+    }
+
+    /// #63: `freshness_generations: 0` requires the *current* generation — a
+    /// discharge bound to an earlier generation is denied (the default
+    /// `passkey_recorded()` requirement is freshness 0).
+    #[cfg(feature = "verifier-ed25519")]
+    #[test]
+    fn freshness_generations_zero_requires_current_generation() {
+        let gate = Gate::new(1); // current generation is 1
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+        let nonce = [32u8; 32];
+        // Signed for generation 0 — one behind the gate, outside a zero window.
+        let stale = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let attempt = DischargeAttempt {
+            nonce,
+            discharge: &stale,
+            verifier: &Ed25519Verifier,
+        };
+        let err = gate
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
+            .expect_err("a stale discharge fails freshness_generations: 0");
+        assert!(matches!(err, ToolError::Denied { .. }));
+    }
+
+    /// #63: with `freshness_generations: 1`, a discharge bound to the previous
+    /// generation IS accepted — proving the field demonstrably affects behavior
+    /// (the window includes generation `g-1`).
+    #[cfg(feature = "verifier-ed25519")]
+    #[test]
+    fn freshness_generations_window_accepts_recent() {
+        let gate = Gate::new(1);
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+        let policy = StepUpPolicy::new(
+            vec![Rule {
+                selector: "git.push:github.com/org/*".to_string(),
+                requirement: AttestRequirement {
+                    presence: Presence::Passkey,
+                    record: true,
+                    freshness_generations: 1,
+                },
+            }],
+            AttestRequirement::NONE,
+        );
+        let nonce = [33u8; 32];
+        // Signed for generation 0; gate at 1, window = 1 → in range.
+        let recent = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let attempt = DischargeAttempt {
+            nonce,
+            discharge: &recent,
+            verifier: &Ed25519Verifier,
+        };
+        let (cx, attestation) = gate
+            .authorize_with_discharge(&tool, &granted, &req, &policy, &attempt)
+            .expect("a one-generation-old discharge is within the window");
+        assert!(cx.caveats().leq(&granted));
+        assert!(attestation.is_some());
+    }
+
+    /// #63: single-use is concurrency-safe — two threads presenting the SAME
+    /// discharge against one shared gate yield exactly one success.
+    #[cfg(feature = "verifier-ed25519")]
+    #[test]
+    fn discharge_single_use_is_concurrency_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let gate = Arc::new(Gate::with_budget(0, CountBound::AtMost(2)));
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+        let policy = push_policy();
+        let nonce = [34u8; 32];
+        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+
+        let (r1, r2) = thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                let attempt = DischargeAttempt {
+                    nonce,
+                    discharge: &discharge,
+                    verifier: &Ed25519Verifier,
+                };
+                gate.authorize_with_discharge(&tool, &granted, &req, &policy, &attempt)
+                    .is_ok()
+            });
+            let h2 = s.spawn(|| {
+                let attempt = DischargeAttempt {
+                    nonce,
+                    discharge: &discharge,
+                    verifier: &Ed25519Verifier,
+                };
+                gate.authorize_with_discharge(&tool, &granted, &req, &policy, &attempt)
+                    .is_ok()
+            });
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        assert_eq!(
+            [r1, r2].iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one of two concurrent identical discharges succeeds"
+        );
     }
 
     #[test]

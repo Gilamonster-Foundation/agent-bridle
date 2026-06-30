@@ -14,7 +14,9 @@
 //! Because `ToolContext` has no other constructor, step 4 is the only way a
 //! tool can ever obtain the proof it needs to run.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::step_up::{
     Attestation, CallRequest, Challenge, Decision, DischargeAttempt, DischargeProvider,
@@ -23,6 +25,13 @@ use crate::step_up::{
 use crate::{
     Caveats, CountBound, Sandbox, SandboxKind, Scope, Tool, ToolContext, ToolError, ToolResult,
 };
+
+/// Defensive cap on the freshness-window scan (ADR 0007 D4). The gate recomputes
+/// the bound challenge once per generation in the window, so an unbounded
+/// `freshness_generations` would be an unbounded loop. A discharge may be reused
+/// for at most this many generations regardless of a larger requested window —
+/// the cap **tightens** the window (fail-closed), never loosens it.
+const MAX_FRESHNESS_WINDOW: u64 = 4096;
 
 /// The leash enforcer. One gate backs a session (or a sub-delegation); it
 /// tracks the remaining call budget and the generation it is valid for.
@@ -38,6 +47,11 @@ pub struct Gate {
     generation: u64,
     /// The OS-level sandbox stamped into every context this gate mints.
     sandbox_kind: SandboxKind,
+    /// Bound challenges already consumed by an accepted [`crate::Discharge`].
+    /// Makes every verified human gesture **single-use** (replay-proof): a
+    /// discharge re-presented after it first succeeded is denied. Interior-mutable
+    /// like the budget so `authorize_with_discharge` keeps `&self`. ADR 0007 D4.
+    consumed: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl Gate {
@@ -50,6 +64,7 @@ impl Gate {
             remaining: None,
             generation,
             sandbox_kind: SandboxKind::None,
+            consumed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -66,6 +81,7 @@ impl Gate {
             remaining,
             generation,
             sandbox_kind: SandboxKind::None,
+            consumed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -221,12 +237,44 @@ impl Gate {
             return Ok((ToolContext::mint(effective, self.sandbox_kind), None));
         }
 
-        let expected = Challenge::bind(&request.content_id(), self.generation, &attempt.nonce);
+        // Freshness window (ADR 0007 D4): accept a discharge bound to any
+        // generation in `[generation - freshness_generations, generation]`.
+        // Recompute the bound challenge across the window (newest first) and use
+        // the one the discharge actually answers. If none match, fall back to the
+        // current-generation challenge so the verifier yields the canonical "does
+        // not answer this action's challenge" denial — which covers both a wrong
+        // action/nonce and a too-stale gesture. `freshness_generations: 0` ⇒ only
+        // the current generation is accepted (fresh-per-act). The window is
+        // capped (MAX_FRESHNESS_WINDOW) to bound the scan, fail-closed.
+        let content_id = request.content_id();
+        let window = required.freshness_generations.min(MAX_FRESHNESS_WINDOW);
+        let oldest = self.generation.saturating_sub(window);
+        let expected = (oldest..=self.generation)
+            .rev()
+            .map(|g| Challenge::bind(&content_id, g, &attempt.nonce))
+            .find(|c| c.as_bytes() == &attempt.discharge.challenge)
+            .unwrap_or_else(|| Challenge::bind(&content_id, self.generation, &attempt.nonce));
+
         if let Err(reason) = attempt
             .verifier
             .verify(attempt.discharge, &required, &expected)
         {
             return Err(ToolError::denied(reason));
+        }
+
+        // Single-use (ADR 0007 D4): consume the bound challenge atomically,
+        // *before* charging or minting, so a replay (same content_id+generation+
+        // nonce) is denied and charges nothing — one gesture authorizes exactly
+        // one act. The lock makes two concurrent identical discharges resolve to
+        // exactly one success.
+        {
+            let mut consumed = self
+                .consumed
+                .lock()
+                .expect("step-up consumed-challenge ledger mutex poisoned");
+            if !consumed.insert(*expected.as_bytes()) {
+                return Err(ToolError::denied("discharge already consumed (replay)"));
+            }
         }
 
         let attestation = required.record.then(|| {
