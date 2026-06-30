@@ -34,8 +34,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_bridle_core::{
-    best_available_sandbox, Caveats, Denial, DenialKind, SandboxKind, Scope, Tool, ToolContext,
-    ToolEnvelope, ToolError, ToolResult,
+    best_available_sandbox, enforcement_report, Caveats, Denial, DenialKind, EnforcementReport,
+    SandboxKind, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -235,11 +235,14 @@ impl Tool for ShellTool {
         // Landlock when `fs_write` is restricted on a capable Linux build, else
         // None (advisory). `OsSpawner` applies exactly this, fail-closed.
         let sandbox_kind = intended_sandbox_kind(cx.caveats());
+        // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
+        // returns carries the per-axis report alongside the coarse sandbox_kind.
+        let enforcement = enforcement_report(cx.caveats(), sandbox_kind);
 
         // Resolve to a script (sequence of pipelines), or surface a refusal.
         let script = match parsed.script() {
             Ok(s) => s,
-            Err(refusal) => return Ok(refused_envelope(sandbox_kind, &refusal)),
+            Err(refusal) => return Ok(refused_envelope(sandbox_kind, enforcement, &refusal)),
         };
 
         // Atomic admission (ADR 0001): across the WHOLE script, every program
@@ -252,12 +255,19 @@ impl Tool for ShellTool {
                 match stage.argv.first() {
                     Some(Arg::Lit(program)) => {
                         if let Err(e) = cx.check_exec(program) {
-                            return Ok(deny(sandbox_kind, DenialKind::Exec, program, &e));
+                            return Ok(deny(
+                                sandbox_kind,
+                                enforcement,
+                                DenialKind::Exec,
+                                program,
+                                &e,
+                            ));
                         }
                     }
                     Some(Arg::Glob(pattern)) => {
                         return Ok(deny(
                             sandbox_kind,
+                            enforcement,
                             DenialKind::Exec,
                             pattern,
                             &ToolError::denied("a glob pattern is not allowed as a program name"),
@@ -266,6 +276,7 @@ impl Tool for ShellTool {
                     Some(Arg::Var(_segs)) => {
                         return Ok(deny(
                             sandbox_kind,
+                            enforcement,
                             DenialKind::Exec,
                             "$VAR",
                             &ToolError::denied("a variable is not allowed as a program name"),
@@ -282,6 +293,7 @@ impl Tool for ShellTool {
                             if let Err(e) = cx.check_path_read(&dir) {
                                 return Ok(deny(
                                     sandbox_kind,
+                                    enforcement,
                                     DenialKind::Open,
                                     &dir.to_string_lossy(),
                                     &e,
@@ -296,6 +308,7 @@ impl Tool for ShellTool {
                                     if !is_allowed_var(name) {
                                         return Ok(deny(
                                             sandbox_kind,
+                                            enforcement,
                                             DenialKind::Exec,
                                             &format!("${name}"),
                                             &ToolError::denied(format!(
@@ -319,7 +332,7 @@ impl Tool for ShellTool {
                         Redirect::StderrToStdout => continue,
                     };
                     if let Err(e) = checked {
-                        return Ok(deny(sandbox_kind, DenialKind::Open, path, &e));
+                        return Ok(deny(sandbox_kind, enforcement, DenialKind::Open, path, &e));
                     }
                 }
             }
@@ -327,7 +340,7 @@ impl Tool for ShellTool {
         // Leash: a provided cwd must be within fs_read scope.
         if let Some(cwd) = &parsed.cwd {
             if let Err(e) = cx.check_path_read(Path::new(cwd)) {
-                return Ok(deny(sandbox_kind, DenialKind::Open, cwd, &e));
+                return Ok(deny(sandbox_kind, enforcement, DenialKind::Open, cwd, &e));
             }
         }
 
@@ -345,6 +358,7 @@ impl Tool for ShellTool {
                 let captured = joined
                     .map_err(|e| ToolError::Other(anyhow::anyhow!("shell task panicked: {e}")))??;
                 Ok(ToolEnvelope::new(sandbox_kind)
+                    .with_enforcement(enforcement)
                     .with_exit_code(captured.exit_code)
                     .with_stdout(captured.stdout)
                     .with_stderr(captured.stderr)
@@ -352,6 +366,7 @@ impl Tool for ShellTool {
                     .into_json())
             }
             Err(_elapsed) => Ok(ToolEnvelope::new(sandbox_kind)
+                .with_enforcement(enforcement)
                 .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
                 .with_timed_out(true)
                 .into_json()),
@@ -396,11 +411,13 @@ fn run_script(
 /// Build a structured `denied` envelope for a leash refusal.
 fn deny(
     sandbox_kind: SandboxKind,
+    enforcement: EnforcementReport,
     kind: DenialKind,
     target: &str,
     err: &ToolError,
 ) -> serde_json::Value {
     ToolEnvelope::new(sandbox_kind)
+        .with_enforcement(enforcement)
         .with_denials(vec![Denial {
             kind,
             target: target.to_string(),
@@ -410,8 +427,13 @@ fn deny(
 }
 
 /// Build a structured `denied` envelope for a parser [`Refusal`].
-fn refused_envelope(sandbox_kind: SandboxKind, refusal: &Refusal) -> serde_json::Value {
+fn refused_envelope(
+    sandbox_kind: SandboxKind,
+    enforcement: EnforcementReport,
+    refusal: &Refusal,
+) -> serde_json::Value {
     ToolEnvelope::new(sandbox_kind)
+        .with_enforcement(enforcement)
         .with_denials(vec![Denial {
             kind: DenialKind::Exec,
             target: refusal.construct(),

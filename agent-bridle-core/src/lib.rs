@@ -31,6 +31,7 @@ mod envelope;
 mod error;
 mod gate;
 mod registry;
+mod report;
 mod sandbox;
 mod spawn;
 mod step_up;
@@ -41,6 +42,7 @@ pub use envelope::{Denial, DenialKind, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use registry::{Registry, RegistryBuilder};
+pub use report::{enforcement_report, AxisEnforcement, EnforcementReport};
 pub use sandbox::{best_available_sandbox, NoopSandbox, Sandbox, SandboxKind};
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, LandlockSandbox};
