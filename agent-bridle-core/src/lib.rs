@@ -32,6 +32,8 @@ mod error;
 mod gate;
 mod registry;
 mod report;
+#[cfg(target_os = "linux")]
+mod rootfs;
 mod sandbox;
 mod spawn;
 mod step_up;
@@ -43,6 +45,8 @@ pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use registry::{Registry, RegistryBuilder};
 pub use report::{enforcement_report, fence_strength, AxisEnforcement, EnforcementReport};
+#[cfg(target_os = "linux")]
+pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsEntry, RootfsPlan};
 pub use sandbox::{
     best_available_sandbox, effective_sandbox_kind, NoopSandbox, Sandbox, SandboxKind,
 };
