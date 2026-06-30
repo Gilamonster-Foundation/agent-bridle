@@ -146,12 +146,34 @@ fn tool_error(reason: &str) -> Value {
 mod tests {
     use super::*;
 
-    /// A grant that allows only `echo` — used by the shell-tool tests.
+    /// The program + args for an in-scope **success** spawn that exists as a real
+    /// executable on the host. On Windows `echo` is a `cmd` builtin (there is no
+    /// `echo.exe`, so `std::process::Command::new("echo")` fails "program not
+    /// found"); spawn `cmd /c echo hi` instead. On Unix spawn `echo hi`. The
+    /// denial tests run an *out-of-scope* program, so the leash refuses them
+    /// before any spawn — those are portable as-is. (Fixes agent-bridle#43: the
+    /// nightly Windows `cargo test` failed on the `echo` spawn.)
+    #[cfg(all(feature = "shell", not(windows)))]
+    const OK_PROGRAM: &str = "echo";
+    #[cfg(all(feature = "shell", windows))]
+    const OK_PROGRAM: &str = "cmd";
+
+    #[cfg(all(feature = "shell", not(windows)))]
+    fn ok_args() -> serde_json::Value {
+        serde_json::json!(["hi"])
+    }
+    #[cfg(all(feature = "shell", windows))]
+    fn ok_args() -> serde_json::Value {
+        serde_json::json!(["/c", "echo hi"])
+    }
+
+    /// A grant that allows only the host's in-scope success program
+    /// ([`OK_PROGRAM`]) — used by the shell-tool tests.
     #[cfg(feature = "shell")]
     fn echo_grant() -> Caveats {
         use agent_bridle::{CountBound, Scope};
         Caveats {
-            exec: Scope::only(["echo".to_string()]),
+            exec: Scope::only([OK_PROGRAM.to_string()]),
             max_calls: CountBound::AtMost(4),
             ..Caveats::top()
         }
@@ -191,10 +213,10 @@ mod tests {
         let v = tools_call(
             &reg,
             &echo_grant(),
-            serde_json::json!({ "name": "shell", "arguments": { "program": "echo", "args": ["hi"] } }),
+            serde_json::json!({ "name": "shell", "arguments": { "program": OK_PROGRAM, "args": ok_args() } }),
         )
         .await;
-        assert_eq!(v["isError"], false, "in-scope echo must succeed: {v}");
+        assert_eq!(v["isError"], false, "in-scope program must succeed: {v}");
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("hi"), "stdout must carry through: {text}");
     }
