@@ -24,6 +24,8 @@ use crate::{Caveats, ToolResult};
 pub enum SandboxKind {
     /// A real Landlock ruleset is active (Linux). Kernel-enforced.
     Landlock,
+    /// A real AppContainer token is active (Windows). Kernel-enforced.
+    AppContainer,
     /// No OS-level sandbox — the leash is in-process/advisory only. This is the
     /// honest default until the Landlock ruleset (P3) lands.
     #[default]
@@ -72,17 +74,61 @@ impl Sandbox for NoopSandbox {
 /// thing where it exists and an honest [`SandboxKind::None`] where it does not,
 /// rather than silently overclaiming.
 pub fn best_available_sandbox() -> Box<dyn Sandbox> {
-    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
     {
-        if landlock_impl::landlock_is_supported() {
-            return Box::new(landlock_impl::LandlockSandbox::new());
-        }
+        Box::new(appcontainer_impl::AppContainerSandbox::new())
     }
-    Box::new(NoopSandbox)
+
+    #[cfg(not(all(target_os = "windows", feature = "windows-appcontainer")))]
+    {
+        #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+        {
+            if landlock_impl::landlock_is_supported() {
+                return Box::new(landlock_impl::LandlockSandbox::new());
+            }
+        }
+        Box::new(NoopSandbox)
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use landlock_impl::{landlock_is_supported, LandlockSandbox};
+
+#[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+pub(crate) mod appcontainer_impl {
+    use super::{Sandbox, SandboxKind};
+    use crate::{Caveats, ToolError, ToolResult};
+
+    /// A Windows AppContainer process sandbox.
+    ///
+    /// AppContainer is attached when creating a new process with
+    /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`; unlike Landlock, it cannot
+    /// be installed on the current thread and inherited by a later spawn via a
+    /// Rust `std::process::Command`. The process-spawn path must therefore use a
+    /// Windows-specific launcher. Calling [`Sandbox::apply`] directly fails
+    /// closed rather than pretending the current thread was confined.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct AppContainerSandbox;
+
+    impl AppContainerSandbox {
+        /// Construct the sandbox. (Stateless; capability comes from Windows.)
+        pub fn new() -> Self {
+            Self
+        }
+    }
+
+    impl Sandbox for AppContainerSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::AppContainer
+        }
+
+        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+            Err(ToolError::denied(
+                "AppContainer must be applied at Windows process creation",
+            ))
+        }
+    }
+}
 
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 mod landlock_impl {
@@ -272,6 +318,10 @@ mod tests {
             serde_json::to_string(&SandboxKind::Landlock).unwrap(),
             "\"landlock\""
         );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::AppContainer).unwrap(),
+            "\"app_container\""
+        );
     }
 
     #[test]
@@ -279,7 +329,20 @@ mod tests {
         // Always returns *some* sandbox; on a non-landlock build/kernel it is the
         // advisory Noop. Just exercise the trait object.
         let sb = best_available_sandbox();
-        assert!(sb.apply(&Caveats::top()).is_ok());
+        if sb.kind() == SandboxKind::AppContainer {
+            assert!(
+                sb.apply(&Caveats::top()).is_err(),
+                "AppContainer cannot be applied to the current thread"
+            );
+        } else {
+            assert!(sb.apply(&Caveats::top()).is_ok());
+        }
+    }
+
+    #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+    #[test]
+    fn windows_appcontainer_feature_selects_appcontainer_backend() {
+        assert_eq!(best_available_sandbox().kind(), SandboxKind::AppContainer);
     }
 }
 

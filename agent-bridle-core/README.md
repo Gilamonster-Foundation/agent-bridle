@@ -22,7 +22,14 @@ construction.
 | Feature | Default | Pulls | Enables |
 |---|---|---|---|
 | `linux-landlock` | off | `landlock` (Linux only) | kernel-enforced `LandlockSandbox` (L3) |
+| `windows-appcontainer` | off | none yet | selects `SandboxKind::AppContainer`; direct `Sandbox::apply` fails closed because AppContainer must be attached during Windows process creation |
+| `os-sandbox` | off | target-specific backend deps | convenience feature for every native OS sandbox backend |
 | `verifier-ed25519` | off | `ed25519-dalek` | production `Ed25519Verifier` for step-up discharges |
+
+On Windows, AppContainer is a process-launch boundary rather than a
+current-thread sandbox. The feature therefore exposes honest kind selection now;
+the launcher that attaches `SECURITY_CAPABILITIES` at `CreateProcessW` is the
+next #51 implementation step.
 
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
 the capability leash for agent tools — a shared, capability-governed tool

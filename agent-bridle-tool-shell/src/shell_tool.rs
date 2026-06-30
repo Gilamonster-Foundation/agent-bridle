@@ -28,6 +28,8 @@
 //! `tests/real_spawn.rs`).
 
 use std::io::{PipeReader, PipeWriter, Read};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Arc;
@@ -663,6 +665,17 @@ fn match_class(p: &[char], c: char) -> Option<(bool, &[char])> {
 
 /// Open a file for an `fs_write` redirect target (`>` truncates, `>>` appends).
 fn open_for_write(path: &str, append: bool) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    if append {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.seek(SeekFrom::End(0))?;
+        return Ok(file);
+    }
+
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)

@@ -29,7 +29,7 @@ alternative without making the default build depend on a fork?
 
 The Landlock wiring is the template and generalizes:
 
-- `linux-landlock` (exists), `macos-seatbelt` (#50), `windows-job-object` (#51),
+- `linux-landlock` (exists), `macos-seatbelt` (#50), `windows-appcontainer` (#51),
   and a Linux `netns`/`seccomp` feature for the net/exec axes (#31).
 - Each backend's OS-specific dependency lives under
   `[target.'cfg(target_os = "X")'.dependencies]` and is `optional = true`, gated
@@ -43,9 +43,9 @@ Because a feature can't be made OS-conditional, **do not try to build one toggle
 that "knows" the OS.** Instead:
 
 - An embedder (or CI matrix) may safely enable **all** backend features in one
-  build — `--features linux-landlock,macos-seatbelt,windows-job-object` — since
+  build — `--features linux-landlock,macos-seatbelt,windows-appcontainer` — since
   each is inert except on its target. A facade meta-feature
-  `os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-job-object"]` is the
+  `os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]` is the
   one-knob convenience.
 - `best_available_sandbox()` is the selector: one `cfg(all(target_os = "X",
   feature = "Y"))` arm per backend, each returning that backend's `Sandbox` (with
