@@ -96,19 +96,33 @@ pub enum Arg {
     Var(Vec<Seg>),
 }
 
-/// A redirection on one command stage. `agent-bridle` performs the open, so each
-/// file target is leash-checked (`fs_write` for stdout/stderr, `fs_read` for
-/// stdin) before the stage runs.
+/// A redirection on one command stage. The target is a [`Seg`] list so it may
+/// contain `$VAR` (e.g. `> $TMPDIR/out`); `agent-bridle` expands it (allowlisted,
+/// via the env seam) and performs the open itself, so the **resolved** file
+/// target is leash-checked (`fs_write` for stdout/stderr, `fs_read` for stdin)
+/// before the stage runs. After admission lowers the `$VAR`, the path is a single
+/// [`Seg::Lit`] — [`Command`]'s accessors surface that resolved literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redirect {
     /// `> path` / `>> path` (also `1>`/`1>>`) — stdout (fd 1).
-    Stdout { path: String, append: bool },
+    Stdout { path: Vec<Seg>, append: bool },
     /// `< path` (also `0<`) — stdin (fd 0).
-    Stdin { path: String },
+    Stdin { path: Vec<Seg> },
     /// `2> path` / `2>> path` — stderr (fd 2).
-    Stderr { path: String, append: bool },
+    Stderr { path: Vec<Seg>, append: bool },
     /// `2>&1` — stderr is merged into stdout's destination.
     StderrToStdout,
+}
+
+/// The resolved literal path of a redirect **after admission lowering** (a single
+/// [`Seg::Lit`]). `None` for an unexpanded multi-segment path — which the spawner
+/// never sees, because lowering resolves every redirect target first.
+#[must_use]
+pub(crate) fn seg_literal(segs: &[Seg]) -> Option<&str> {
+    match segs {
+        [Seg::Lit(s)] => Some(s.as_str()),
+        _ => None,
+    }
 }
 
 /// Where a stage's stderr goes (resolved from its redirects; last one wins).
@@ -132,20 +146,22 @@ pub struct Command {
 }
 
 impl Command {
-    /// The effective stdin redirect path, if any (last one wins).
+    /// The effective stdin redirect path, if any (last one wins). The path is the
+    /// resolved literal (post-lowering); an unexpanded `$VAR` redirect yields
+    /// `None` here and is never reached by the spawner.
     #[must_use]
     pub fn stdin_path(&self) -> Option<&str> {
         self.redirects.iter().rev().find_map(|r| match r {
-            Redirect::Stdin { path } => Some(path.as_str()),
+            Redirect::Stdin { path } => seg_literal(path),
             _ => None,
         })
     }
 
-    /// The effective stdout redirect (path, append), if any (last one wins).
+    /// The effective stdout redirect (resolved path, append), if any (last wins).
     #[must_use]
     pub fn stdout_redirect(&self) -> Option<(&str, bool)> {
         self.redirects.iter().rev().find_map(|r| match r {
-            Redirect::Stdout { path, append } => Some((path.as_str(), *append)),
+            Redirect::Stdout { path, append } => seg_literal(path).map(|p| (p, *append)),
             _ => None,
         })
     }
@@ -157,8 +173,8 @@ impl Command {
             .iter()
             .rev()
             .find_map(|r| match r {
-                Redirect::Stderr { path, append } => Some(StderrTo::File {
-                    path: path.clone(),
+                Redirect::Stderr { path, append } => seg_literal(path).map(|p| StderrTo::File {
+                    path: p.to_string(),
                     append: *append,
                 }),
                 Redirect::StderrToStdout => Some(StderrTo::Stdout),
@@ -529,9 +545,11 @@ fn is_valid_var_name(name: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// Read a redirection target (the word after `>`/`>>`/`<`). The target must be a
-/// plain literal — globs and variables in a redirect target are refused.
-fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<String, Refusal> {
+/// Read a redirection target (the word after `>`/`>>`/`<`) as a [`Seg`] list:
+/// a plain literal, or a word with `$VAR` (e.g. `$TMPDIR/out`), expanded
+/// (allowlisted) and leash-checked at admission. A **glob** in a redirect target
+/// is still refused (an ambiguous, multi-match target).
+fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<Vec<Seg>, Refusal> {
     skip_whitespace(chars);
     match chars.peek().copied() {
         None | Some('|' | '&' | ';' | '<' | '>' | '(' | ')') => {
@@ -540,10 +558,10 @@ fn read_redirect_target(chars: &mut Peekable<Chars>) -> Result<String, Refusal> 
         _ => {}
     }
     match read_word(chars)? {
-        Arg::Lit(s) if !s.is_empty() => Ok(s),
+        Arg::Lit(s) if !s.is_empty() => Ok(vec![Seg::Lit(s)]),
         Arg::Lit(_) => Err(Refusal::Malformed("empty redirection target".into())),
         Arg::Glob(_) => Err(Refusal::Unsupported("glob in a redirection target")),
-        Arg::Var(_) => Err(Refusal::Unsupported("variable in a redirection target")),
+        Arg::Var(segs) => Ok(segs),
     }
 }
 
@@ -741,9 +759,20 @@ mod tests {
     }
 
     #[test]
-    fn variables_refused_in_redirect_targets() {
+    fn variables_parse_in_redirect_targets() {
+        // $VAR in a redirect target now PARSES into segments (expanded +
+        // leash-checked at admission, #46) rather than being refused.
+        let p = classify("echo hi > $HOME/out").unwrap();
+        assert_eq!(
+            p[0].pipeline[0].redirects,
+            vec![Redirect::Stdout {
+                path: vec![svar("HOME"), slit("/out")],
+                append: false,
+            }]
+        );
+        // A glob in a redirect target is still refused (ambiguous target).
         assert!(matches!(
-            classify("echo hi > $HOME"),
+            classify("echo > *.log"),
             Err(Refusal::Unsupported(_))
         ));
     }

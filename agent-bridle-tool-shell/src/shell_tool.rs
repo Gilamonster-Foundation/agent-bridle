@@ -40,7 +40,7 @@ use agent_bridle_core::{
 use async_trait::async_trait;
 
 use crate::parse::{
-    classify, Arg, Command, Redirect, Refusal, Script, ScriptItem, Seg, Sep, StderrTo,
+    classify, seg_literal, Arg, Command, Redirect, Refusal, Script, ScriptItem, Seg, Sep, StderrTo,
 };
 
 /// Maximum permitted (and default-clamped) wall-clock timeout.
@@ -149,6 +149,7 @@ fn run_confined(stages: &[Command], cwd: Option<&str>, caveats: &Caveats) -> Too
 #[derive(Clone)]
 pub struct ShellTool {
     spawner: Arc<dyn Spawner>,
+    env: Arc<dyn EnvProvider>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -158,18 +159,30 @@ impl std::fmt::Debug for ShellTool {
 }
 
 impl ShellTool {
-    /// Construct the tool with the real OS spawner.
+    /// Construct the tool with the real OS spawner and the real environment.
     #[must_use]
     pub fn new() -> Self {
         Self {
             spawner: Arc::new(OsSpawner),
+            env: Arc::new(RealEnv),
         }
     }
 
-    /// Construct with an injected spawner (tests only).
+    /// Construct with an injected spawner and the real environment (tests only).
     #[cfg(test)]
     fn with_spawner(spawner: Arc<dyn Spawner>) -> Self {
-        Self { spawner }
+        Self {
+            spawner,
+            env: Arc::new(RealEnv),
+        }
+    }
+
+    /// Construct with an injected spawner **and** a fake environment (tests only),
+    /// so the `$VAR` allowlist + expansion + the resolved-path leash are
+    /// exercised without touching the real process environment.
+    #[cfg(test)]
+    fn with_spawner_and_env(spawner: Arc<dyn Spawner>, env: Arc<dyn EnvProvider>) -> Self {
+        Self { spawner, env }
     }
 }
 
@@ -244,10 +257,39 @@ impl Tool for ShellTool {
         let enforcement = enforcement_report(cx.caveats(), sandbox_kind);
 
         // Resolve to a script (sequence of pipelines), or surface a refusal.
-        let script = match parsed.script() {
+        let mut script = match parsed.script() {
             Ok(s) => s,
             Err(refusal) => return Ok(refused_envelope(sandbox_kind, enforcement, &refusal)),
         };
+
+        // Lower redirect targets (#46): expand an allowlisted `$VAR` (e.g.
+        // `> $TMPDIR/out`) through the env seam so the RESOLVED path is what the
+        // fs leash checks below and the spawner opens — never the literal `$VAR`.
+        // A non-allowlisted variable denies before any spawn.
+        for item in &mut script {
+            for stage in &mut item.pipeline {
+                for redirect in &mut stage.redirects {
+                    let segs = match redirect {
+                        Redirect::Stdout { path, .. }
+                        | Redirect::Stderr { path, .. }
+                        | Redirect::Stdin { path } => path,
+                        Redirect::StderrToStdout => continue,
+                    };
+                    match expand_redirect_target(segs, &*self.env) {
+                        Ok(resolved) => *segs = vec![Seg::Lit(resolved)],
+                        Err((target, e)) => {
+                            return Ok(deny(
+                                sandbox_kind,
+                                enforcement,
+                                DenialKind::Open,
+                                &target,
+                                &e,
+                            ))
+                        }
+                    }
+                }
+            }
+        }
 
         // Atomic admission (ADR 0001): across the WHOLE script, every program
         // (`exec`), every redirect target (`fs_write`/`fs_read`), and every glob's
@@ -327,11 +369,17 @@ impl Tool for ShellTool {
                     }
                 }
                 for redirect in &stage.redirects {
+                    // Redirect targets were lowered above, so each path is a
+                    // single resolved literal — leash-check that resolved path.
                     let (path, checked) = match redirect {
                         Redirect::Stdout { path, .. } | Redirect::Stderr { path, .. } => {
-                            (path, cx.check_path_write(Path::new(path)))
+                            let p = seg_literal(path).expect("redirect target lowered");
+                            (p, cx.check_path_write(Path::new(p)))
                         }
-                        Redirect::Stdin { path } => (path, cx.check_path_read(Path::new(path))),
+                        Redirect::Stdin { path } => {
+                            let p = seg_literal(path).expect("redirect target lowered");
+                            (p, cx.check_path_read(Path::new(p)))
+                        }
                         // `2>&1` opens no file — nothing to leash-check.
                         Redirect::StderrToStdout => continue,
                     };
@@ -552,6 +600,51 @@ const VAR_ALLOWLIST: &[&str] = &[
 /// Whether `name` may be expanded from the environment.
 fn is_allowed_var(name: &str) -> bool {
     VAR_ALLOWLIST.contains(&name)
+}
+
+/// The environment seam (#46): the engine reads `$VAR` values through this, so the
+/// allowlist + expansion + the resolved-path `fs` leash stay unit-testable
+/// without touching the real process environment (a fake map in tests). Only
+/// allowlisted names ([`VAR_ALLOWLIST`]) are ever read.
+pub(crate) trait EnvProvider: Send + Sync {
+    /// The value of `name`, or `None` if unset.
+    fn get(&self, name: &str) -> Option<String>;
+}
+
+/// The real process environment (`std::env::var`).
+pub(crate) struct RealEnv;
+impl EnvProvider for RealEnv {
+    fn get(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+}
+
+/// Expand a redirect target's segments to a literal path, reading allowlisted
+/// `$VAR` through the env seam. Single-literal substitution: the value is **not**
+/// re-split or re-globbed (no re-injection). `Err((target, reason))` names a
+/// non-allowlisted variable for a structured denial.
+fn expand_redirect_target(
+    segs: &[Seg],
+    env: &dyn EnvProvider,
+) -> Result<String, (String, ToolError)> {
+    let mut out = String::new();
+    for seg in segs {
+        match seg {
+            Seg::Lit(s) => out.push_str(s),
+            Seg::Var(name) => {
+                if !is_allowed_var(name) {
+                    return Err((
+                        format!("${name}"),
+                        ToolError::denied(format!(
+                            "variable ${name} is not in the confined shell's allowlist"
+                        )),
+                    ));
+                }
+                out.push_str(&env.get(name).unwrap_or_default());
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ── glob expansion ──────────────────────────────────────────────────────────
@@ -987,6 +1080,103 @@ mod tests {
             .iter()
             .map(|pipeline| prog(&pipeline[0]).to_string())
             .collect()
+    }
+
+    /// A fake environment for the `$VAR` tests — exercises the allowlist +
+    /// expansion + resolved-path leash without touching the real process env.
+    struct FakeEnv(HashMap<String, String>);
+    impl EnvProvider for FakeEnv {
+        fn get(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+    }
+    fn fake_env(pairs: &[(&str, &str)]) -> Arc<dyn EnvProvider> {
+        Arc::new(FakeEnv(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        ))
+    }
+
+    // ── $VAR in redirect targets (#46, via the env seam) ────────────────────
+
+    /// `> $TMPDIR/out` expands the allowlisted var through the seam and the
+    /// spawner receives the RESOLVED path (never a literal `$VAR`); the resolved
+    /// path is what the fs leash checked.
+    #[tokio::test]
+    async fn redirect_var_is_expanded_and_reaches_spawner_resolved() {
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let mock = Arc::new(MockSpawner::default());
+        let tool = ShellTool::with_spawner_and_env(mock.clone(), fake_env(&[("TMPDIR", &tmp)]));
+        // fs_write is All (default), so the resolved path passes the leash.
+        let out = tool
+            .invoke(
+                serde_json::json!({"cmd": "echo hi > $TMPDIR/out"}),
+                &ctx(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_ne!(
+            out["denied"],
+            serde_json::json!(true),
+            "in-scope var: {out}"
+        );
+        let redir = &calls(&mock)[0][0].redirects[0];
+        assert_eq!(
+            *redir,
+            Redirect::Stdout {
+                path: vec![Seg::Lit(format!("{tmp}/out"))],
+                append: false,
+            }
+        );
+    }
+
+    /// A non-allowlisted variable in a redirect target denies before any spawn.
+    #[tokio::test]
+    async fn redirect_var_not_in_allowlist_is_denied() {
+        let mock = Arc::new(MockSpawner::default());
+        let tool = ShellTool::with_spawner_and_env(mock.clone(), fake_env(&[("SECRET", "/x")]));
+        let out = tool
+            .invoke(
+                serde_json::json!({"cmd": "echo hi > $SECRET"}),
+                &ctx(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true, "non-allowlisted redirect var: {out}");
+        assert!(
+            ran_programs(&mock).is_empty(),
+            "no spawn on a denied redirect"
+        );
+        assert!(out["denials"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("SECRET"));
+    }
+
+    /// The RESOLVED redirect path is leash-checked: an allowlisted var whose value
+    /// lands outside `fs_write` scope denies (proving the leash sees the resolved
+    /// path, not the literal `$VAR`).
+    #[tokio::test]
+    async fn redirect_var_resolved_path_out_of_fs_write_scope_denied() {
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let mock = Arc::new(MockSpawner::default());
+        let tool = ShellTool::with_spawner_and_env(mock.clone(), fake_env(&[("TMPDIR", &tmp)]));
+        let granted = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            fs_write: Scope::only(["/nonexistent-grant-root".to_string()]),
+            ..Caveats::top()
+        };
+        let out = tool
+            .invoke(
+                serde_json::json!({"cmd": "echo hi > $TMPDIR/out"}),
+                &ctx(granted),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(out["denied"], true, "resolved path outside fs_write: {out}");
+        assert!(ran_programs(&mock).is_empty());
     }
 
     // ── sequencing / leash (carried from earlier increments) ────────────────
