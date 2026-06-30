@@ -43,9 +43,13 @@ pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use registry::{Registry, RegistryBuilder};
 pub use report::{enforcement_report, AxisEnforcement, EnforcementReport};
-pub use sandbox::{best_available_sandbox, NoopSandbox, Sandbox, SandboxKind};
+pub use sandbox::{
+    best_available_sandbox, effective_sandbox_kind, NoopSandbox, Sandbox, SandboxKind,
+};
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, LandlockSandbox};
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
 pub use spawn::{spawn_confined_subprocess, ConfinedChild, ConfinedCommand};
 #[cfg(feature = "verifier-ed25519")]
 pub use step_up::Ed25519Verifier;

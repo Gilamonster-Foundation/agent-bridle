@@ -464,3 +464,174 @@ async fn real_landlock_confines_a_spawned_childs_own_write() {
     let _ = std::fs::remove_dir_all(&allowed);
     let _ = std::fs::remove_dir_all(&forbidden);
 }
+
+// The macOS Seatbelt analog of the Landlock proof above: end to end through the
+// shell tool, a *permitted* program's OWN write/read of a path outside the
+// fs_write/fs_read scope is blocked by the kernel (`sandbox-exec`), and the
+// envelope honestly reports `sandbox_kind: seatbelt`. macOS + `macos-seatbelt`
+// only; self-skips if `sandbox-exec` is unavailable.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_seatbelt_confines_a_spawned_childs_own_write() {
+    use agent_bridle_core::seatbelt_is_supported;
+
+    if !seatbelt_is_supported() {
+        eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+        return;
+    }
+
+    let allowed = unique_temp("sb-allowed");
+    std::fs::create_dir_all(&allowed).unwrap();
+    let forbidden = unique_temp("sb-forbidden");
+    std::fs::create_dir_all(&forbidden).unwrap();
+
+    // exec `touch`, but only allow writes under `allowed`. `touch` opens the
+    // target itself (an argument, not a bridle redirect), so only L3 can stop it.
+    let caveats = Caveats {
+        exec: Scope::only(["touch".to_string()]),
+        fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+
+    let inside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!("touch {}/ok", allowed.to_string_lossy())}),
+            &ctx(caveats.clone()),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(
+        inside["sandbox_kind"], "seatbelt",
+        "must report kernel enforcement: {inside}"
+    );
+    assert_eq!(
+        inside["exit_code"], 0,
+        "write within fs_write must succeed: {inside}"
+    );
+    assert!(allowed.join("ok").exists(), "the in-scope file must exist");
+
+    let outside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!("touch {}/escape", forbidden.to_string_lossy())}),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+    assert_ne!(
+        outside["exit_code"], 0,
+        "the kernel must deny a write outside fs_write scope: {outside}"
+    );
+    assert!(
+        !forbidden.join("escape").exists(),
+        "the out-of-scope file must NOT have been created"
+    );
+
+    let _ = std::fs::remove_dir_all(&allowed);
+    let _ = std::fs::remove_dir_all(&forbidden);
+}
+
+// Every stage of a pipeline is wrapped in its own `sandbox-exec`; the wrapper is
+// transparent to the OS pipes, so data still flows stage→stage. Restricting
+// `fs_write` engages the Seatbelt wrapper even though neither stage writes.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_seatbelt_wrapped_pipeline_pipes_data_between_stages() {
+    use agent_bridle_core::seatbelt_is_supported;
+
+    if !seatbelt_is_supported() {
+        eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+        return;
+    }
+    let scope = unique_temp("sb-pipe");
+    std::fs::create_dir_all(&scope).unwrap();
+    let caveats = Caveats {
+        exec: Scope::only(["echo".to_string(), "cat".to_string()]),
+        fs_write: Scope::only([scope.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "echo wrapped | cat"}),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
+    assert_eq!(out["exit_code"], 0, "{out}");
+    assert_eq!(
+        out["stdout"], "wrapped\n",
+        "data must flow through both wrapped stages: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&scope);
+}
+
+// Read confinement end to end: a permitted program (`cat`) can read in-scope but
+// the kernel denies its read of a file *outside* `fs_read` — the `grep -f
+// /etc/shadow`-style exfil, blocked at L3 where L2 cannot see the child's open.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_seatbelt_confines_a_spawned_childs_own_read() {
+    use agent_bridle_core::seatbelt_is_supported;
+
+    if !seatbelt_is_supported() {
+        eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+        return;
+    }
+
+    let allowed = unique_temp("sb-r-allowed");
+    std::fs::create_dir_all(&allowed).unwrap();
+    let forbidden = unique_temp("sb-r-forbidden");
+    std::fs::create_dir_all(&forbidden).unwrap();
+    std::fs::write(allowed.join("ok.txt"), b"in-scope\n").unwrap();
+    std::fs::write(forbidden.join("secret.txt"), b"top-secret\n").unwrap();
+
+    // Confine reads to `allowed`; `cat`'s own open of an out-of-scope file is what
+    // L3 must stop (the path is an argument, not a bridle-checked redirect).
+    let caveats = Caveats {
+        exec: Scope::only(["cat".to_string()]),
+        fs_read: Scope::only([allowed.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+
+    let inside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!("cat {}/ok.txt", allowed.to_string_lossy())}),
+            &ctx(caveats.clone()),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(inside["sandbox_kind"], "seatbelt", "{inside}");
+    assert_eq!(
+        inside["exit_code"], 0,
+        "in-scope read must succeed (binary loads + reads): {inside}"
+    );
+    assert!(
+        inside["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("in-scope"),
+        "must read the in-scope file's contents: {inside}"
+    );
+
+    let outside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": format!("cat {}/secret.txt", forbidden.to_string_lossy())}),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+    assert_ne!(
+        outside["exit_code"], 0,
+        "the kernel must deny reading a file outside fs_read scope: {outside}"
+    );
+    assert!(
+        !outside["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("top-secret"),
+        "out-of-scope file contents must NOT leak: {outside}"
+    );
+
+    let _ = std::fs::remove_dir_all(&allowed);
+    let _ = std::fs::remove_dir_all(&forbidden);
+}

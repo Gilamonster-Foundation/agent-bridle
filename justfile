@@ -16,6 +16,12 @@ default:
 # `BRIDLE_REQUIRE_LANDLOCK=1` (see .github/workflows/ci.yml) so the proofs
 # hard-FAIL rather than silently no-op there — never a green build with the
 # boundary unverified. Set it locally too if you want the same strictness.
+#
+# The macOS Seatbelt backend (agent-bridle#50) is the mirror image: on a Mac,
+# `--all-features` builds it and `BRIDLE_REQUIRE_SEATBELT=1` makes its proofs
+# hard-FAIL if `sandbox-exec` is missing (the `check-macos` CI job sets it). The
+# `seatbelt_impl` module only compiles on macOS, so run `just check` on a Mac to
+# exercise it.
 check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings

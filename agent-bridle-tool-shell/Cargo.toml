@@ -20,14 +20,19 @@ default = ["shell"]
 shell = ["dep:tokio"]
 # Kernel-enforced L3 backstop (Linux). The engine applies the Landlock fs_write
 # ruleset before spawning when fs_write is restricted (agent-bridle#35); off this
-# build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Read/exec/net
-# axes (#31) and macOS/Windows backends (#50/#51) are follow-ups.
+# build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Exec/net axes
+# (#31/#57) and the Windows backend (#51) are follow-ups.
 linux-landlock = ["agent-bridle-core/linux-landlock"]
+# Kernel-enforced L3 backstop (macOS). When a filesystem axis is restricted the
+# engine wraps each spawned stage in `sandbox-exec` with an SBPL profile derived
+# from the caveats (agent-bridle#50, ADR 0006/0009); off this build/OS it is the
+# honest advisory None. Confines fs_write + fs_read; exec/net are follow-ups.
+macos-seatbelt = ["agent-bridle-core/macos-seatbelt"]
 # Windows AppContainer backend marker (agent-bridle#51). Process-launch wiring
 # requires a Windows CreateProcess launcher because AppContainer is a startup
 # attribute, not a current-thread sandbox like Landlock.
 windows-appcontainer = ["agent-bridle-core/windows-appcontainer"]
-os-sandbox = ["linux-landlock", "windows-appcontainer"]
+os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
 
 [dependencies]
 agent-bridle-core = { workspace = true }

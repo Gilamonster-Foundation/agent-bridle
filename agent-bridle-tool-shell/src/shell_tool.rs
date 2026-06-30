@@ -4,15 +4,17 @@
 //! is the L2 *convenience*: `agent-bridle` is the exec funnel — it parses the
 //! request itself (see [`crate::parse`]), checks the `exec`/`fs` leash, spawns
 //! the program(s) directly, and **refuses the dynamic constructs by design**.
-//! When an L3 backstop will actually confine the run — today the Landlock
-//! `fs_write` axis on a capable Linux build (`linux-landlock`), with `fs_write`
-//! restricted — the children spawn inside a kernel-enforced ruleset applied on a
-//! dedicated thread, and `sandbox_kind` reports [`SandboxKind::Landlock`]; this
-//! blocks a *permitted* program's own out-of-scope writes, which L2 cannot see
-//! once it has spawned. Otherwise the run is honestly *advisory* and
-//! `sandbox_kind` is [`SandboxKind::None`] — never overclaiming (I9). The
-//! `fs_read`/`exec`/`net` axes (#31) and the macOS/Windows backends (#50/#51)
-//! are follow-ups; see ADR 0006 for the per-OS backend design.
+//! When an L3 backstop will actually confine the run — the Landlock `fs_write`
+//! (and restricted `fs_read`) axes on a capable Linux build (`linux-landlock`),
+//! or the macOS Seatbelt equivalent (`macos-seatbelt`), with a filesystem axis
+//! restricted — the children spawn inside a kernel-enforced boundary (a Landlock
+//! ruleset applied on a dedicated thread, or a `sandbox-exec` profile wrapping
+//! each stage), and `sandbox_kind` reports [`SandboxKind::Landlock`] /
+//! [`SandboxKind::Seatbelt`]; this blocks a *permitted* program's own
+//! out-of-scope reads/writes, which L2 cannot see once it has spawned. Otherwise
+//! the run is honestly *advisory* and `sandbox_kind` is [`SandboxKind::None`] —
+//! never overclaiming (I9). The `exec`/`net` axes (#31/#57) and the Windows
+//! backend (#51) are follow-ups; see ADR 0006/0009 for the per-OS backend design.
 //!
 //! The engine (agent-bridle#34 Track A + #45): a sequence of pipelines joined by
 //! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments,
@@ -36,8 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_bridle_core::{
-    best_available_sandbox, enforcement_report, Caveats, Denial, DenialKind, EnforcementReport,
-    SandboxKind, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    best_available_sandbox, effective_sandbox_kind, enforcement_report, Caveats, Denial,
+    DenialKind, EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError,
+    ToolResult,
 };
 use async_trait::async_trait;
 
@@ -94,11 +97,11 @@ impl Spawner for OsSpawner {
         cwd: Option<&str>,
         caveats: &Caveats,
     ) -> ToolResult<Captured> {
-        // When an OS sandbox (Landlock) will actually confine this run, apply it
-        // on a dedicated thread before spawning (ADR 0005 L3 / ADR 0006 D4).
-        // Otherwise run directly — no need to spend a thread.
+        // When an OS sandbox (Landlock/Seatbelt) will actually confine this run,
+        // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
+        // 0006 D4). Otherwise run directly — no need to spend a thread.
         if intended_sandbox_kind(caveats) == SandboxKind::None {
-            run_pipeline(stages, cwd)
+            run_pipeline(stages, cwd, &[])
         } else {
             run_confined(stages, cwd, caveats)
         }
@@ -106,28 +109,28 @@ impl Spawner for OsSpawner {
 }
 
 /// The L3 `SandboxKind` that will actually be enforced for these caveats in this
-/// build, on this kernel — the value reported in the result envelope (I9 / ADR
-/// 0006 D3). [`best_available_sandbox`] already accounts for OS, feature, and
-/// kernel capability; we additionally report `None` when `fs_write` is
-/// unrestricted, because the current Landlock ruleset (the `fs_write` axis) then
-/// governs nothing — never overclaim.
+/// build, on this host — the value reported in the result envelope (I9 / ADR
+/// 0006 D3). [`effective_sandbox_kind`] is the shared honesty rule: the strongest
+/// available backend's kind when a filesystem axis is restricted (so it confines
+/// something), else `None` — the fs-only ruleset governs nothing, so never
+/// overclaim. The same rule backs the subprocess primitive in core.
 fn intended_sandbox_kind(caveats: &Caveats) -> SandboxKind {
-    match best_available_sandbox().kind() {
-        SandboxKind::Landlock if matches!(caveats.fs_write, Scope::Only(_)) => {
-            SandboxKind::Landlock
-        }
-        _ => SandboxKind::None,
-    }
+    effective_sandbox_kind(best_available_sandbox().kind(), caveats)
 }
 
 /// Run the pipeline on a dedicated thread that first applies the OS sandbox.
 ///
-/// `restrict_self` is per-thread, irreversible, and inherited across `fork`/
-/// `execve`, so it must run on a throwaway thread (never the shared blocking
-/// pool) immediately before spawning the children. `apply` is fail-closed (ADR
-/// 0006 D4): if the kernel does not enforce the ruleset, the run errors rather
-/// than proceeding unconfined.
+/// Two confinement mechanisms, honored uniformly (ADR 0006): a thread-confining
+/// backend (Landlock) restricts this very thread in `apply` — per-thread,
+/// irreversible, inherited across `fork`/`execve`, so it must run on a throwaway
+/// thread (never the shared blocking pool) immediately before spawning the
+/// children. A wrapper backend (macOS Seatbelt) returns a `sandbox-exec` argv
+/// prefix from `command_prefix`, prepended to every stage so the child is
+/// spawned already confined. Both are fail-closed (ADR 0006 D4): if confinement
+/// cannot be established the run errors rather than proceeding unconfined.
 fn run_confined(stages: &[Command], cwd: Option<&str>, caveats: &Caveats) -> ToolResult<Captured> {
+    // Computed before the spawn so a fail-closed wrapper error aborts the run.
+    let prefix = best_available_sandbox().command_prefix(caveats)?;
     let stages = stages.to_vec();
     let cwd = cwd.map(str::to_string);
     let caveats = caveats.clone();
@@ -135,7 +138,7 @@ fn run_confined(stages: &[Command], cwd: Option<&str>, caveats: &Caveats) -> Too
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox().apply(&caveats)?;
-            run_pipeline(&stages, cwd.as_deref())
+            run_pipeline(&stages, cwd.as_deref(), &prefix)
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -1062,7 +1065,11 @@ fn expand_stage_argv(stage: &Command, _cwd: Option<&str>) -> Vec<String> {
 ///
 /// Deadlock-free: every stage's stderr and the last stage's stdout are drained by
 /// their own threads, so no pipe can fill while we `wait()` the children.
-fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
+///
+/// `wrap` is the OS-sandbox command prefix (macOS Seatbelt's `sandbox-exec -p
+/// <profile>`), prepended to **every** stage so each spawned program is confined;
+/// it is empty for thread-confining (Landlock) and unconfined runs.
+fn run_pipeline(stages: &[Command], cwd: Option<&str>, wrap: &[String]) -> ToolResult<Captured> {
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
     let last = n - 1;
@@ -1078,7 +1085,16 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
 
     for (i, stage) in stages.iter().enumerate() {
         let is_last = i == last;
-        let argv = expand_stage_argv(stage, cwd);
+        let stage_argv = expand_stage_argv(stage, cwd);
+        // Prepend the sandbox wrapper (Seatbelt) so the program is spawned
+        // confined: `sandbox-exec -p <profile> <program> <args…>`. Empty wrap is
+        // the identity. `sandbox-exec` forwards stdio + cwd to the child, so the
+        // pipe/redirect plumbing below is unchanged.
+        let argv: Vec<String> = if wrap.is_empty() {
+            stage_argv
+        } else {
+            wrap.iter().cloned().chain(stage_argv).collect()
+        };
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         if let Some(dir) = cwd {

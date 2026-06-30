@@ -3,6 +3,11 @@
 # HOOK PARITY: This pipeline is mirrored by .githooks/pre-push and the `check` /
 # `publish-check` / `py-test` recipes in justfile. When editing this file, update
 # the push hook to match.
+#
+# The `check` job (ubuntu) is the primary matrix. The `check-macos` job
+# (macos-latest, free for public repos) is the ONLY place the macOS-only
+# `SeatbeltSandbox` is compiled and its kernel-enforcement proofs run (ADR 0006 /
+# agent-bridle#50) — it cannot be built or tested from the Linux box.
 
 name: CI
 
@@ -87,3 +92,34 @@ jobs:
           pip install "maturin>=1.7,<2.0" pytest
           ( cd agent-bridle-py && maturin develop )
           python -m pytest agent-bridle-py/tests/ -q
+
+  check-macos:
+    name: macOS — Seatbelt L3 backend (clippy + kernel proofs)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `--all-features` turns on `macos-seatbelt` (and `linux-landlock`, which is
+      # inert here — its dep is `cfg(target_os = "linux")`). This is the only job
+      # that actually compiles the macOS `seatbelt_impl` module. `agent-bridle-py`
+      # is excluded (its PyO3 arm64 wheel link is handled separately; see justfile).
+      - name: Clippy (compiles the macOS-only SeatbeltSandbox)
+        run: cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
+
+      # BRIDLE_REQUIRE_SEATBELT turns the Seatbelt kernel-enforcement proofs from
+      # silent-skip into hard-FAIL when `sandbox-exec` is unavailable, so CI cannot
+      # go green without exercising the fs_write/fs_read boundary (mirrors
+      # BRIDLE_REQUIRE_LANDLOCK on ubuntu; agent-bridle#74). macOS runners ship
+      # `/usr/bin/sandbox-exec`.
+      - name: Test (require the Seatbelt kernel proofs)
+        env:
+          BRIDLE_REQUIRE_SEATBELT: "1"
+        run: cargo test --workspace --exclude agent-bridle-py --all-features

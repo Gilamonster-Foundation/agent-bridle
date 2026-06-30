@@ -98,7 +98,12 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
     // must decide its mapping rather than silently defaulting.
     let fs = |scope: &Scope<String>| {
         is_restricted(scope).then_some(match active {
-            SandboxKind::Landlock | SandboxKind::AppContainer => AxisEnforcement::Kernel,
+            // Real OS sandboxes that govern the filesystem axes — Landlock
+            // (Linux), Seatbelt (macOS), AppContainer (Windows) — enforce them in
+            // the kernel.
+            SandboxKind::Landlock | SandboxKind::Seatbelt | SandboxKind::AppContainer => {
+                AxisEnforcement::Kernel
+            }
             SandboxKind::None => AxisEnforcement::Interceptor,
         })
     };
@@ -107,8 +112,12 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(AxisEnforcement::Interceptor),
         net: is_restricted(&effective.net).then_some(match active {
+            // AppContainer's capability model governs network too; the others do
+            // not gate a spawned program's egress this increment (#31/#57).
             SandboxKind::AppContainer => AxisEnforcement::Kernel,
-            SandboxKind::Landlock | SandboxKind::None => AxisEnforcement::Advisory,
+            SandboxKind::Landlock | SandboxKind::Seatbelt | SandboxKind::None => {
+                AxisEnforcement::Advisory
+            }
         }),
     }
 }
@@ -133,6 +142,17 @@ mod tests {
     #[test]
     fn landlock_marks_fs_kernel_exec_interceptor_net_advisory() {
         let r = enforcement_report(&fully_restricted(), SandboxKind::Landlock);
+        assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
+        assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    /// Seatbelt (macOS) governs the same fs axes as Landlock: kernel fs,
+    /// interceptor exec, advisory net.
+    #[test]
+    fn seatbelt_marks_fs_kernel_exec_interceptor_net_advisory() {
+        let r = enforcement_report(&fully_restricted(), SandboxKind::Seatbelt);
         assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
