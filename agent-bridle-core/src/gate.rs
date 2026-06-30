@@ -17,7 +17,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::step_up::{
-    Attestation, CallRequest, Challenge, Decision, DischargeAttempt, StepUpPolicy,
+    Attestation, CallRequest, Challenge, Decision, DischargeAttempt, DischargeProvider,
+    DischargeVerifier, StepUpPolicy,
 };
 use crate::{
     Caveats, CountBound, Sandbox, SandboxKind, Scope, Tool, ToolContext, ToolError, ToolResult,
@@ -239,6 +240,53 @@ impl Gate {
 
         self.charge_one(granted)?;
         Ok((ToolContext::mint(effective, self.sandbox_kind), attestation))
+    }
+
+    /// Orchestrate the whole step-up sequence — evaluate, run the host ceremony,
+    /// and authorize — so a host needs **one** call for the gated path.
+    ///
+    /// Computes the requirement for `request`; if no gesture is owed this
+    /// degenerates to an ordinary [`Gate::authorize`] (with `None` for the
+    /// attestation). Otherwise it runs the host's `provider` ceremony, supplying
+    /// the gate's generation and the caller's single-use `nonce`, then forwards
+    /// the produced proof to [`Gate::authorize_with_discharge`] — reusing that
+    /// single verified mint path (this adds **no** second mint site).
+    ///
+    /// Fail-closed: a provider error (the human declined, no authenticator, a
+    /// transport failure) returns [`ToolError::denied`] and mints/charges
+    /// nothing. The gate still verifies the proof itself via `verifier` (the
+    /// presence floor and the challenge binding); the provider is never trusted
+    /// to self-attest (ADR 0007 D5), so a `verifier` that rejects a too-weak or
+    /// mismatched proof still denies even when the provider returned `Ok`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_step_up(
+        &self,
+        tool: &dyn Tool,
+        granted: &Caveats,
+        request: &CallRequest,
+        policy: &StepUpPolicy,
+        provider: &dyn DischargeProvider,
+        verifier: &dyn DischargeVerifier,
+        nonce: [u8; 32],
+    ) -> ToolResult<(ToolContext, Option<Attestation>)> {
+        let required = policy.required_for(request);
+        if !required.demands_gesture() {
+            // No step-up owed: the base authorize is the whole story.
+            return self.authorize(tool, granted).map(|cx| (cx, None));
+        }
+        // Run the host ceremony. A failure is fail-closed — nothing minted or
+        // charged, because we have not reached the mint path yet.
+        let discharge = provider
+            .obtain(request, &required, self.generation, &nonce)
+            .map_err(ToolError::denied)?;
+        let attempt = DischargeAttempt {
+            nonce,
+            discharge: &discharge,
+            verifier,
+        };
+        // Reuse the single verified mint path. The gate re-checks presence and
+        // the challenge binding regardless of what the provider claimed.
+        self.authorize_with_discharge(tool, granted, request, policy, &attempt)
     }
 }
 

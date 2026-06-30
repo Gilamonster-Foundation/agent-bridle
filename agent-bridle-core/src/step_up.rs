@@ -13,8 +13,9 @@
 //!
 //! - The [`Gate`](crate::Gate) stays pure and synchronous: it **verifies a
 //!   proof** ([`Discharge`]) — it never performs the gesture. A host capability
-//!   (a future `DischargeProvider`, sibling of [`Sandbox`](crate::Sandbox)) runs
-//!   the ceremony.
+//!   ([`DischargeProvider`], sibling of [`Sandbox`](crate::Sandbox)) runs the
+//!   ceremony; [`Gate::authorize_step_up`](crate::Gate) orchestrates
+//!   evaluate→obtain→authorize so the host needs a single call.
 //! - The proof is bound to the *exact* action by a content-addressed
 //!   [`Challenge`] — what-you-see-is-what-you-sign — so a gesture cannot be
 //!   harvested and replayed for a different action.
@@ -335,6 +336,41 @@ pub trait DischargeVerifier {
     ) -> Result<(), String>;
 }
 
+/// Runs the human-presence **ceremony** and returns a [`Discharge`] — the dual
+/// of [`DischargeVerifier`] (a provider *produces* a proof; a verifier *checks*
+/// one).
+///
+/// This is a **host capability**, a sibling of [`Sandbox`](crate::Sandbox): it
+/// performs IO/UI (prompts a passkey, drives an authenticator) and lives in the
+/// host, not the gate. The [`Gate`](crate::Gate) never calls it during
+/// verification — only [`Gate::authorize_step_up`](crate::Gate) calls it, to
+/// orchestrate the evaluate→obtain→authorize sequence on the host's behalf.
+///
+/// **It is not trusted to self-attest presence.** A provider returns whatever
+/// [`Presence`] it claims to have achieved, but the gate (via the
+/// [`DischargeVerifier`]) still re-checks `discharge.presence >= required.presence`
+/// and that the discharge answers the gate-recomputed [`Challenge`]. A lying or
+/// buggy provider can only get its discharge *rejected*, never over-admitted
+/// (ADR 0007 D5).
+pub trait DischargeProvider {
+    /// Run the ceremony for `request` at `required` strength and return a
+    /// [`Discharge`] whose `challenge` answers
+    /// [`Challenge::bind`]`(&request.content_id(), generation, nonce)`.
+    ///
+    /// `generation` and the single-use `nonce` are supplied by the caller (the
+    /// gate) so the produced proof binds to this exact action, generation, and
+    /// nonce — what-you-see-is-what-you-sign. An `Err(reason)` (the human
+    /// declined, no authenticator present, a transport failure) becomes a
+    /// fail-closed leash denial; the reason is safe to surface to the agent.
+    fn obtain(
+        &self,
+        request: &CallRequest,
+        required: &AttestRequirement,
+        generation: u64,
+        nonce: &[u8; 32],
+    ) -> Result<Discharge, String>;
+}
+
 /// A presented step-up proof, bundled: the single-use `nonce` the challenge was
 /// bound with, the [`Discharge`] itself, and the [`DischargeVerifier`] that
 /// checks it. Grouping the "proof" inputs keeps
@@ -636,6 +672,160 @@ mod tests {
         assert_eq!(attestation.resource, "github.com/org/repo");
         // The record is content-addressed and stable.
         assert_eq!(attestation.content_id(), attestation.content_id());
+    }
+
+    /// A test [`DischargeProvider`] standing in for the host ceremony: it signs
+    /// the bound challenge with a fixed key at a chosen presence (the gesture's
+    /// effect, stubbed — no real authenticator).
+    struct MockProvider {
+        key: SigningKey,
+        presence: Presence,
+    }
+    impl DischargeProvider for MockProvider {
+        fn obtain(
+            &self,
+            request: &CallRequest,
+            _required: &AttestRequirement,
+            generation: u64,
+            nonce: &[u8; 32],
+        ) -> Result<Discharge, String> {
+            Ok(sign_discharge(
+                &self.key,
+                request,
+                generation,
+                nonce,
+                self.presence,
+            ))
+        }
+    }
+
+    /// A provider whose ceremony fails — the human declined, or no authenticator
+    /// is present.
+    struct FailingProvider;
+    impl DischargeProvider for FailingProvider {
+        fn obtain(
+            &self,
+            _request: &CallRequest,
+            _required: &AttestRequirement,
+            _generation: u64,
+            _nonce: &[u8; 32],
+        ) -> Result<Discharge, String> {
+            Err("ceremony failed: human declined".into())
+        }
+    }
+
+    /// The #61 orchestration helper: a provider that produces a valid passkey
+    /// discharge drives `evaluate→obtain→authorize` to a minted context and a
+    /// recorded attestation in a single call.
+    #[test]
+    fn provider_obtain_then_authorize_mints_and_records() {
+        let gate = Gate::new(0);
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let provider = MockProvider {
+            key: test_key(),
+            presence: Presence::Passkey,
+        };
+        let (cx, attestation) = gate
+            .authorize_step_up(
+                &tool,
+                &granted,
+                &push_request(),
+                &push_policy(),
+                &provider,
+                &SoftwareVerifier,
+                [11u8; 32],
+            )
+            .expect("a valid provider discharge authorizes");
+        assert!(cx.caveats().leq(&granted));
+        let attestation = attestation.expect("passkey+record must produce an attestation");
+        assert_eq!(attestation.tool, "git.push");
+    }
+
+    /// Fail-closed: a provider whose ceremony errors makes the helper deny and
+    /// mint/charge nothing — the single budgeted call survives (mirrors
+    /// `needs_discharge_does_not_mint_or_charge`).
+    #[test]
+    fn provider_error_fails_closed() {
+        let gate = Gate::with_budget(0, CountBound::AtMost(1));
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let err = gate
+            .authorize_step_up(
+                &tool,
+                &granted,
+                &push_request(),
+                &push_policy(),
+                &FailingProvider,
+                &SoftwareVerifier,
+                [12u8; 32],
+            )
+            .expect_err("a failed ceremony is fail-closed");
+        assert!(matches!(err, ToolError::Denied { .. }));
+        // The single budgeted call is untouched — proving nothing was charged.
+        let free = NamedTool("free.tool");
+        match gate.evaluate(
+            &free,
+            &granted,
+            &CallRequest::unspecified("free.tool"),
+            &StepUpPolicy::EMPTY,
+        ) {
+            Decision::Allow(cx) => assert!(cx.caveats().leq(&granted)),
+            other => panic!("expected Allow, got {other:?}"),
+        }
+    }
+
+    /// The verifier — not the provider — decides: a provider that only achieves
+    /// `Prompt` cannot satisfy the policy's `Passkey` requirement, even though it
+    /// returned `Ok`. The gate re-checks presence regardless of what the
+    /// provider claimed (ADR 0007 D5).
+    #[test]
+    fn provider_below_required_presence_is_denied() {
+        let gate = Gate::new(0);
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let provider = MockProvider {
+            key: test_key(),
+            presence: Presence::Prompt,
+        };
+        let err = gate
+            .authorize_step_up(
+                &tool,
+                &granted,
+                &push_request(),
+                &push_policy(),
+                &provider,
+                &SoftwareVerifier,
+                [13u8; 32],
+            )
+            .expect_err("a Prompt provider cannot satisfy a Passkey policy");
+        assert!(matches!(err, ToolError::Denied { .. }));
+    }
+
+    /// When no step-up is owed, the helper degenerates to an ordinary authorize:
+    /// it never runs the ceremony and returns no attestation.
+    #[test]
+    fn authorize_step_up_without_gesture_degenerates_to_authorize() {
+        let gate = Gate::new(0);
+        let granted = Caveats::top();
+        let free = NamedTool("free.tool");
+        let provider = MockProvider {
+            key: test_key(),
+            presence: Presence::Passkey,
+        };
+        let (cx, attestation) = gate
+            .authorize_step_up(
+                &free,
+                &granted,
+                &CallRequest::unspecified("free.tool"),
+                &StepUpPolicy::EMPTY,
+                &provider,
+                &SoftwareVerifier,
+                [14u8; 32],
+            )
+            .expect("no gesture owed → ordinary authorize");
+        assert!(cx.caveats().leq(&granted));
+        assert!(attestation.is_none(), "no step-up → no attestation");
     }
 
     /// Anti-theater: a discharge signed for a DIFFERENT action (different nonce)

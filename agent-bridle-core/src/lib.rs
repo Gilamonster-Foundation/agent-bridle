@@ -45,7 +45,7 @@ pub use sandbox::{landlock_is_supported, LandlockSandbox};
 pub use spawn::{spawn_confined_subprocess, ConfinedChild, ConfinedCommand};
 pub use step_up::{
     AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
-    DischargeAttempt, DischargeVerifier, Presence, Rule, StepUpPolicy,
+    DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,
 };
 pub use tool::Tool;
 
