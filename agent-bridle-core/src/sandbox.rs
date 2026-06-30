@@ -251,38 +251,63 @@ mod landlock_impl {
             .is_ok()
     }
 
-    /// Read-only base allow-list: the loader/system paths a dynamically-linked
-    /// binary must read to start (the dynamic linker, shared libraries, the
-    /// linker cache, locale, name-resolution config, and the `/dev` and
-    /// `/proc/self` essentials). Added whenever `fs_read` is confined so a
-    /// *permitted* program still loads libc — while user data outside scope stays
-    /// unreadable. Note `/etc` is **not** granted wholesale: only the specific
-    /// files below, so e.g. `/etc/shadow` remains denied. Tuned for a glibc/FHS
-    /// layout (the CI target); a musl/Nix layout may need more entries — paths
-    /// that do not exist are skipped, so extra entries are harmless.
+    /// Read base allow-list: the loader/library trees + the system DATA and
+    /// runtime files a permitted, dynamically-linked program needs to start and
+    /// resolve names — but **NOT** the executable directories (`/usr/bin`, `/bin`,
+    /// `/sbin`). Keeping the bin dirs out of the read set shrinks the
+    /// loader-trampoline corpus (ADR 0011 D3): `/usr/bin/curl` is then unreadable
+    /// and so cannot be `mmap`-exec'd via `ld.so`. The granted program's OWN
+    /// binary is added back in `apply` ([`BIN_READ_PATHS`] when `exec` is ambient,
+    /// or the resolved granted paths when `exec` is confined).
+    ///
+    /// This *shrinks* the corpus, it does not *close* the trampoline — `/usr/lib`
+    /// (the `.so` tree) still hides some interpreters, so `exec` stays
+    /// `interceptor`, never `kernel` (ADR 0011 D7). `/etc` is never granted
+    /// wholesale (so `/etc/shadow` stays denied) — only the specific resolver /
+    /// loader files below. glibc/FHS-tuned; non-existent paths are skipped, so
+    /// extra entries are harmless.
     const BASE_READ_PATHS: &[&str] = &[
-        "/usr",
-        "/bin",
-        "/sbin",
+        // Library / loader trees: the dynamic linker + shared objects.
         "/lib",
         "/lib64",
         "/lib32",
         "/libx32",
-        "/opt",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/libexec",
+        // System DATA a program reads at runtime (none of these are bin dirs):
+        // locale, timezone, terminfo, gconv, CA-cert bundles, package data, …
+        "/usr/share",
         "/etc/ld.so.cache",
         "/etc/ld.so.preload",
         "/etc/alternatives",
         "/etc/nsswitch.conf",
         "/etc/localtime",
         "/etc/resolv.conf",
+        "/etc/ssl",
+        "/etc/ca-certificates",
         "/proc/self",
         "/dev/null",
         "/dev/zero",
         "/dev/full",
         "/dev/urandom",
         "/dev/random",
-        "/usr/share/locale",
-        "/usr/lib/locale",
+    ];
+
+    /// Executable directories a program's OWN binary loads from. Read-allowed only
+    /// when `exec` is **ambient** (`All`) — then the program is arbitrary and its
+    /// path unknown, so the bin dirs must be readable for it to load. When `exec`
+    /// is confined (`Only`), these are deliberately NOT read-allowed (the granted
+    /// binaries are added by resolved path instead), shrinking the trampoline
+    /// corpus to exactly the granted programs (ADR 0011 D3).
+    const BIN_READ_PATHS: &[&str] = &[
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/opt",
     ];
 
     /// Execute base allow-list: the dynamic linker(s) only — specific **files**,
@@ -389,10 +414,21 @@ mod landlock_impl {
                 .map_err(landlock_denied)?;
 
             let ruleset = if confine_read {
-                // Granted read roots plus the loader/system base list, so the
+                // Granted read roots + the loader/library/data base list, so a
                 // permitted binary loads while out-of-scope reads stay denied.
                 let mut read_roots = scope_roots(&effective.fs_read);
                 read_roots.extend(BASE_READ_PATHS.iter().map(|p| (*p).to_string()));
+                // The program's own binary must be readable to load. When `exec`
+                // is confined, read-allow ONLY the resolved granted programs — so
+                // the bin dirs stay OUT of the trampoline corpus (`/usr/bin/curl`
+                // unreadable ⇒ not `ld.so`-trampolinable; ADR 0011 D3). When `exec`
+                // is ambient the program is unknown, so the bin dirs are
+                // read-allowed wholesale.
+                if confine_exec {
+                    read_roots.extend(resolve_exec_paths(&effective.exec));
+                } else {
+                    read_roots.extend(BIN_READ_PATHS.iter().map(|p| (*p).to_string()));
+                }
                 read_roots.retain(|p| std::path::Path::new(p).exists());
                 ruleset
                     .add_rules(path_beneath_rules(&read_roots, read))
@@ -1429,6 +1465,52 @@ mod landlock_kernel_tests {
         );
 
         let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// #57 / ADR 0011 D3: when BOTH `exec` and `fs_read` are confined, the read
+    /// base excludes the bin dirs — the granted program (and its libs) still
+    /// loads, but an un-granted system binary is NOT readable, so it cannot be
+    /// `ld.so`-trampolined (the trampoline corpus is shrunk to the granted set).
+    #[test]
+    fn read_base_excludes_bin_dirs_when_exec_confined() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let dir = unique_dir("read-narrow");
+        fs::write(dir.join("data.txt"), b"payload\n").unwrap();
+        let dir_t = dir.clone();
+
+        let (granted, head_bytes) = std::thread::spawn(move || {
+            let cav = Caveats {
+                exec: Scope::only(["cat".to_string()]),
+                fs_read: Scope::only([dir_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            // Granted `cat` loads (its binary + libs are read-allowed) and reads
+            // the in-scope file.
+            let granted = std::process::Command::new("cat")
+                .arg(dir_t.join("data.txt"))
+                .output();
+            // Reading an un-granted bin-dir binary's bytes (a would-be trampoline
+            // payload) is denied — the bin dirs are not in the read set.
+            let head_bytes = std::fs::read("/usr/bin/head").or_else(|_| std::fs::read("/bin/head"));
+            (granted, head_bytes)
+        })
+        .join()
+        .unwrap();
+
+        let granted = granted.expect("granted `cat` must load + run under narrowed reads");
+        assert!(
+            granted.status.success() && granted.stdout == b"payload\n",
+            "granted cat under narrowed reads: {granted:?}"
+        );
+        assert!(
+            head_bytes.is_err(),
+            "an un-granted bin-dir binary must be unreadable (trampoline corpus shrunk): {head_bytes:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
