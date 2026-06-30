@@ -285,21 +285,59 @@ mod landlock_impl {
         "/usr/lib/locale",
     ];
 
+    /// Execute base allow-list: the dynamic linker(s) only — specific **files**,
+    /// never directories. The kernel `execve`s the program and `open_exec`s its
+    /// `PT_INTERP` (the loader), so both need `Execute`; shared libraries are
+    /// `open(O_RDONLY)`+`mmap`'d (governed by the read axis, not `Execute`), so the
+    /// `.so` directories do **not** need execute.
+    ///
+    /// Security-critical narrowing: a *directory* grant here would be recursive
+    /// (`path_beneath`), and `/lib`→`/usr/lib` is a merged-usr symlink, so allowing
+    /// any lib directory would make every executable beneath `/usr/lib` runnable
+    /// (`/usr/lib/klibc/bin/sh`, busybox, `git`, `go`), defeating the axis. Allow
+    /// only the loader file (plus the resolved granted programs). Non-existent
+    /// entries are skipped, so listing several arches is safe.
+    const LOADER_PATHS: &[&str] = &[
+        "/lib64/ld-linux-x86-64.so.2",
+        "/lib/ld-linux-x86-64.so.2",
+        "/lib/ld-linux.so.2",
+        "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        "/lib64/ld64.so.2",
+        "/lib/ld-linux-aarch64.so.1",
+        "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+        "/lib/ld-linux-armhf.so.3",
+        "/lib/ld-musl-x86-64.so.1",
+        "/lib/ld-musl-aarch64.so.1",
+    ];
+
     /// A real, kernel-enforced Landlock sandbox (Linux).
     ///
-    /// **The `fs_write` and `fs_read` axes.** Writes are always governed (from
-    /// `fs_write`); reads are governed only when `fs_read` is *restricted*
+    /// **The `fs_write`, `fs_read`, and `exec` axes.** Writes are always governed
+    /// (from `fs_write`); reads are governed only when `fs_read` is *restricted*
     /// (`Only(_)`), in which case the granted read roots plus [`BASE_READ_PATHS`]
     /// are read-allowed and everything else is denied — so a permitted external
     /// program cannot read user data outside `fs_read` (closing `grep -f
-    /// /etc/shadow`-style reads) yet can still load its libraries. `Execute` is
-    /// deliberately left ungoverned this increment, so dynamically-linked
-    /// binaries can mmap-exec their libraries without an execute allow-list; the
-    /// `exec` axis (blocking e.g. `find -exec curl`) and `net` are follow-ups
-    /// (agent-bridle#31). When `fs_read` is `All`, reads stay ambient (no base
-    /// list needed, nothing to confine). These close the ADR-0001 gap on the
-    /// read/write axes: confinement holds even though L2 cannot see the spawned
-    /// program's syscalls.
+    /// /etc/shadow`-style reads) yet can still load its libraries.
+    ///
+    /// `Execute` is governed only when `exec` is restricted: the *resolved*
+    /// granted program files plus [`LOADER_PATHS`] (the dynamic linker only — never
+    /// library directories, which `path_beneath` would make recursively executable
+    /// and expose `/usr/lib`'s interpreters) are execute-allowed and all else
+    /// denied. This kernel-denies a **direct** `execve` of a different, un-granted
+    /// tool (`find -exec curl`, a written/symlinked payload, a shebang to an
+    /// un-granted interpreter) — the ADR 0011 boundary increment.
+    ///
+    /// It does **not** close the loader/interpreter *trampoline*: with reads
+    /// allow-listed, `ld.so` can `mmap`-exec any readable ELF, and a granted
+    /// interpreter runs arbitrary in-process code — neither is an `execve` the
+    /// `Execute` rule sees (ADR 0011 D2; Landlock has no `mmap` hook). So this is
+    /// the filesystem **boundary** + direct-execve denial, **not** program
+    /// identity — the per-axis report therefore keeps `exec → interceptor`, never
+    /// `kernel` (ADR 0011 D7); a strong principal still fails closed on a
+    /// restricted `exec` (ADR 0012 D4, already wired). The trampoline-tight close
+    /// (narrowed read base + W^X + seccomp `execve`/namespace deny, or a
+    /// micro-VM rootfs) is the Tier-2 follow-up (#57 / ADR 0009). When an axis is
+    /// `All` it stays ambient. `net` remains a follow-up (#35).
     ///
     /// `restrict_self` is per-thread and irreversible, and is inherited across
     /// `fork`/`execve`. Callers must therefore call [`Sandbox::apply`] on the
@@ -322,16 +360,23 @@ mod landlock_impl {
 
         fn apply(&self, effective: &Caveats) -> ToolResult<()> {
             let write = AccessFs::from_write(ABI_FLOOR);
-            // Pure read rights — `from_read` also includes `Execute`, which we
-            // intentionally leave ungoverned this increment so libraries can be
-            // mmap-exec'd without an execute allow-list.
+            // Pure read rights — `from_read` also bundles `Execute`, which we
+            // govern separately (only when `exec` is restricted), never via the
+            // read axis.
             let read = AccessFs::ReadFile | AccessFs::ReadDir;
 
-            // Govern writes always; govern reads only when `fs_read` is actually
-            // restricted (`Only`) — `All` means no read confinement was asked
-            // for, so reads stay ambient and no base allow-list is needed.
+            // Govern writes always; govern reads / execute only when their axis is
+            // actually restricted (`Only`). `All` means no confinement was asked
+            // for, so that axis stays ambient and needs no base allow-list.
             let confine_read = matches!(effective.fs_read, Scope::Only(_));
-            let handled = if confine_read { write | read } else { write };
+            let confine_exec = matches!(effective.exec, Scope::Only(_));
+            let mut handled = write;
+            if confine_read {
+                handled |= read;
+            }
+            if confine_exec {
+                handled |= AccessFs::Execute;
+            }
 
             let write_roots = scope_roots(&effective.fs_write);
             let ruleset = Ruleset::default()
@@ -356,6 +401,22 @@ mod landlock_impl {
                 ruleset
             };
 
+            let ruleset = if confine_exec {
+                // Execute-allow ONLY the resolved granted program files plus the
+                // dynamic linker(s) — never library directories (recursive +
+                // expose `/usr/lib`'s interpreters). A permitted binary still runs
+                // (its own execve + the loader + .so reads), but cannot DIRECTLY
+                // execve a different, un-granted program.
+                let mut exec_roots = resolve_exec_paths(&effective.exec);
+                exec_roots.extend(LOADER_PATHS.iter().map(|p| (*p).to_string()));
+                exec_roots.retain(|p| std::path::Path::new(p).exists());
+                ruleset
+                    .add_rules(path_beneath_rules(&exec_roots, AccessFs::Execute))
+                    .map_err(landlock_denied)?
+            } else {
+                ruleset
+            };
+
             let status = ruleset.restrict_self().map_err(landlock_denied)?;
 
             // Fail closed: if the kernel did not actually enforce the ruleset,
@@ -367,6 +428,62 @@ mod landlock_impl {
             }
             Ok(())
         }
+    }
+
+    /// Resolve the granted `exec` scope to absolute, existing program **files**
+    /// for the `Execute` allow-list: a path-bearing entry is taken as-is (if it
+    /// exists); a bare name is resolved against the exec search dirs. Canonicalized
+    /// so the rule anchors the real inode. `All` => empty (exec stays ambient).
+    fn resolve_exec_paths(scope: &Scope<String>) -> Vec<String> {
+        let set = match scope {
+            Scope::All => return Vec::new(),
+            Scope::Only(set) => set,
+        };
+        let dirs = exec_search_dirs();
+        let mut out = Vec::new();
+        for entry in set {
+            let candidate = if entry.contains('/') {
+                let p = std::path::PathBuf::from(entry);
+                p.exists().then_some(p)
+            } else {
+                dirs.iter()
+                    .map(|d| std::path::Path::new(d).join(entry))
+                    .find(|c| c.is_file())
+            };
+            if let Some(p) = candidate {
+                if let Ok(canon) = p.canonicalize() {
+                    out.push(canon.to_string_lossy().into_owned());
+                }
+            }
+        }
+        out
+    }
+
+    /// The directories a bare program name is resolved against: `$PATH` if set,
+    /// else a conventional fallback. Used only to anchor the `Execute` allow-list
+    /// (the spawn itself still resolves the program normally).
+    fn exec_search_dirs() -> Vec<String> {
+        if let Ok(path) = std::env::var("PATH") {
+            let dirs: Vec<String> = path
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            if !dirs.is_empty() {
+                return dirs;
+            }
+        }
+        [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/local/sbin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
     }
 
     /// The existing path roots a [`Scope`] grants: `All` => the whole tree
@@ -1148,6 +1265,56 @@ mod landlock_kernel_tests {
         );
         let _ = fs::remove_dir_all(&outside_dir);
         let _ = fs::remove_dir_all(&write_scope);
+    }
+
+    /// #57 boundary: with `exec` confined to `cat`, the granted program (and its
+    /// libraries) still runs, but a DIRECT `execve` of an un-granted tool (`head`)
+    /// — the `find -exec curl` escape in miniature — is kernel-denied by the
+    /// `Execute` allow-list. (This is the boundary/direct-execve close, NOT the
+    /// trampoline; `exec` stays reported `interceptor`, ADR 0011 D7.)
+    #[test]
+    fn exec_direct_execve_of_ungranted_tool_is_kernel_denied() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let dir = unique_dir("exec");
+        fs::write(dir.join("data.txt"), b"payload\n").unwrap();
+        let dir_t = dir.clone();
+
+        let (granted, ungranted) = std::thread::spawn(move || {
+            let cav = Caveats {
+                exec: Scope::only(["cat".to_string()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            let granted = std::process::Command::new("cat")
+                .arg(dir_t.join("data.txt"))
+                .output();
+            let ungranted = std::process::Command::new("head")
+                .arg(dir_t.join("data.txt"))
+                .output();
+            (granted, ungranted)
+        })
+        .join()
+        .unwrap();
+
+        let granted = granted.expect("granted `cat` must still load and run");
+        assert!(
+            granted.status.success(),
+            "granted cat must succeed: {granted:?}"
+        );
+        assert_eq!(granted.stdout, b"payload\n");
+
+        // execve of the un-granted binary is kernel-denied: std surfaces the
+        // post-fork exec failure as a PermissionDenied spawn error.
+        let err = ungranted.expect_err("un-granted `head` must be exec-denied by Landlock");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the denial must come from the kernel (EACCES on execve)"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
