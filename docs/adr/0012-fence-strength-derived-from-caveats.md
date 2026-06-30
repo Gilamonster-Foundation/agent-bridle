@@ -1,6 +1,6 @@
 # ADR 0012 — Fence strength is derived from Caveats, never domain-keyed
 
-- Status: Proposed (2026-06-30)
+- Status: Accepted (2026-06-30)
 - Date: 2026-06-30
 - Context: ADR 0004 D3 decided *that* "fence strength" is **derived** from the
   declared `Caveats` and the available backend, that presets are curated lattice

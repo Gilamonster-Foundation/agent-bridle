@@ -1,6 +1,6 @@
 # ADR 0011 — Landlock exec-axis co-confinement (the combined exec+read pass)
 
-- Status: Proposed (2026-06-30)
+- Status: Accepted (2026-06-30)
 - Date: 2026-06-30
 - Context: `agent-bridle-core` `LandlockSandbox::apply()` requests **`fs_write` only**
   today (`AccessFs::from_write(ABI_FLOOR)`, `sandbox.rs:147`); reads and execute are
