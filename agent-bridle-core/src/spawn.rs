@@ -570,18 +570,41 @@ mod seatbelt_child_tests {
         let _ = fs::remove_dir_all(&forbidden);
     }
 
-    /// Honesty (I9): with no fs axis restricted, the Seatbelt wrapper applies
-    /// *nothing*, so the child must be reported as `None`, never `Seatbelt`. This
-    /// is the regression for the overclaim where `sandbox_kind` was the raw
-    /// backend kind regardless of whether anything was confined.
+    /// Honesty (I9): a fully permissive grant confines *nothing*, so the Seatbelt
+    /// wrapper applies nothing and the child must be reported `None`, never the raw
+    /// backend kind. This is the regression for the original overclaim where
+    /// `sandbox_kind` was the backend kind regardless of whether anything was
+    /// confined.
     #[test]
-    fn unrestricted_fs_reports_none_not_seatbelt() {
+    fn top_grant_confines_nothing_reports_none() {
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
         }
-        // exec restricted but both fs axes `All` — a permissive grant a host might
-        // give an MCP server. Nothing fs to confine.
+        let cx = ctx(Caveats::top());
+        let child = ConfinedCommand::new("/usr/bin/true")
+            .spawn(&cx)
+            .expect("spawn");
+        assert_eq!(
+            child.sandbox_kind,
+            SandboxKind::None,
+            "nothing restricted => nothing confined => None, not the raw backend kind"
+        );
+    }
+
+    /// A restricted `exec` axis engages Seatbelt **even when both fs axes are
+    /// `All`**: `process-exec*` kernel-confines the exec axis (ADR 0013), so
+    /// reporting `Seatbelt` is honest, not an overclaim — the inverse of the
+    /// `top_grant…` guard above. Before ADR 0013 this same grant reported `None`
+    /// (the exec axis was left ambient).
+    #[test]
+    fn restricted_exec_engages_seatbelt() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        // exec restricted, both fs axes `All` — a grant a host might give an MCP
+        // server: confine *what may run*, leave the filesystem ambient.
         let cx = ctx(Caveats {
             exec: Scope::only(["/usr/bin/true".to_string()]),
             ..Caveats::top()
@@ -591,8 +614,8 @@ mod seatbelt_child_tests {
             .expect("spawn");
         assert_eq!(
             child.sandbox_kind,
-            SandboxKind::None,
-            "no fs restriction => nothing confined => must report None, not Seatbelt"
+            SandboxKind::Seatbelt,
+            "a restricted exec axis is kernel-confined by process-exec* (ADR 0013)"
         );
     }
 }

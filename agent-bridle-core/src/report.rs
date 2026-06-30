@@ -114,10 +114,16 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 /// - **`fs_read` / `fs_write`** — `kernel` when a real OS sandbox is active
 ///   (Landlock governs writes always and reads when restricted), otherwise
 ///   `interceptor` (the in-process leash gates the engine's own opens).
-/// - **`exec`** — `interceptor`: the spawn funnel (`before_exec` /
-///   `check_exec`) gates each spawn the engine makes, but no OS execute
-///   allow-list confines a permitted child's *own* `exec` (the Landlock exec
-///   axis is held — agent-bridle#31/#57), so it is never `kernel` yet.
+/// - **`exec`** — `kernel` under **Seatbelt** (macOS): the profile emits
+///   `(deny process-exec*)` + an allow-list of the granted programs, and
+///   `process-exec*` is kernel-checked on the confined process *and everything it
+///   spawns*, so a permitted child's own `exec` is confined too. Apple-Silicon
+///   hardware W^X + code signing close the `mmap(PROT_EXEC)` / loader-trampoline
+///   bypass with no seccomp backstop (ADR 0013). Under **Landlock** and a
+///   **Noop** host it stays `interceptor`: the spawn funnel (`before_exec` /
+///   `check_exec`) gates the engine's own spawns, but no OS execute allow-list
+///   confines a child's interior (the Landlock exec axis is held —
+///   agent-bridle#31/#57).
 /// - **`net`** — `advisory`: no kernel net rules are wired (agent-bridle#31) and
 ///   the shell engine does not gate a spawned program's egress. Reported
 ///   conservatively as advisory so the axis is never described as confined when
@@ -142,7 +148,18 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
     EnforcementReport {
         fs_read: fs(&effective.fs_read),
         fs_write: fs(&effective.fs_write),
-        exec: is_restricted(&effective.exec).then_some(AxisEnforcement::Interceptor),
+        exec: is_restricted(&effective.exec).then_some(match active {
+            // Seatbelt (macOS) confines the exec axis in the kernel via
+            // `process-exec*` — interior-covering, with no trampoline bypass on
+            // Apple Silicon (ADR 0013). Landlock's exec axis is held
+            // (agent-bridle#31/#57) and a Noop host has no OS allow-list, so both
+            // fall to the in-process interceptor. AppContainer's exec story is not
+            // wired this increment, so it stays interceptor (never overclaimed).
+            SandboxKind::Seatbelt => AxisEnforcement::Kernel,
+            SandboxKind::Landlock | SandboxKind::AppContainer | SandboxKind::None => {
+                AxisEnforcement::Interceptor
+            }
+        }),
         net: is_restricted(&effective.net).then_some(match active {
             // AppContainer's capability model governs network too.
             SandboxKind::AppContainer => AxisEnforcement::Kernel,
@@ -201,15 +218,41 @@ mod tests {
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
     }
 
-    /// Seatbelt (macOS) governs the same fs axes as Landlock: kernel fs,
-    /// interceptor exec, advisory net.
+    /// Seatbelt (macOS) governs the fs axes in the kernel like Landlock, **and**
+    /// the `exec` axis via `process-exec*` (ADR 0013) — so exec is `kernel`, not
+    /// `interceptor`. `net` here is a non-empty host allowlist, which SBPL cannot
+    /// express, so it stays advisory (the empty-net kernel case is covered by
+    /// [`seatbelt_net_is_kernel_only_when_fully_denied`]).
     #[test]
-    fn seatbelt_marks_fs_kernel_exec_interceptor_net_advisory() {
+    fn seatbelt_marks_fs_and_exec_kernel_net_advisory() {
         let r = enforcement_report(&fully_restricted(), SandboxKind::Seatbelt);
         assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
-        assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
+        assert_eq!(r.exec, Some(AxisEnforcement::Kernel));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    /// The macOS exec-axis honesty distinction from Landlock: a restricted `exec`
+    /// is `kernel` under Seatbelt but only `interceptor` under Landlock (its exec
+    /// axis is held) and a Noop host. ADR 0013.
+    #[test]
+    fn exec_is_kernel_under_seatbelt_interceptor_elsewhere() {
+        let cav = Caveats {
+            exec: Scope::only(["git".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            enforcement_report(&cav, SandboxKind::Seatbelt).exec,
+            Some(AxisEnforcement::Kernel)
+        );
+        assert_eq!(
+            enforcement_report(&cav, SandboxKind::Landlock).exec,
+            Some(AxisEnforcement::Interceptor)
+        );
+        assert_eq!(
+            enforcement_report(&cav, SandboxKind::None).exec,
+            Some(AxisEnforcement::Interceptor)
+        );
     }
 
     #[test]
