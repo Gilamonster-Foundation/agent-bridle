@@ -12,7 +12,8 @@ out-of-scope dispatch is refused *before the tool runs* and surfaces as
 
 This is **Pillar A** of the agent-bridle Python story (see `docs/DESIGN.md` §8):
 use the leashed tool registry as an ordinary library. The maturin wheel compiles
-the Rust in, so the confined brush-backed shell ships inside the wheel.
+the Rust in, so the confined **argv + safe-subset** shell (ADR 0005) ships inside
+the wheel.
 
 ## Usage
 
@@ -22,8 +23,8 @@ import agent_bridle
 # A grant that authorizes executing ONLY `echo` — nothing else.
 grant = {"exec": {"only": ["echo"]}}
 
-# ALLOWED: `echo` is within the granted `exec` scope. The brush-carried
-# builtin runs (even with an empty PATH) and stdout is captured.
+# ALLOWED: `echo` is within the granted `exec` scope, so it is spawned as an
+# external program (after the exec leash admits it) and stdout is captured.
 r = agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, grant)
 print(r["exit_code"], repr(r["stdout"]))   # -> 0 'hi\n'
 print(r["sandbox_kind"])                    # -> 'none' (advisory off-Linux; P0)
@@ -95,5 +96,5 @@ python3 -m venv /tmp/abp-venv
 
 ## License
 
-Apache-2.0. `brush` (vendored into the wheel) is MIT — its notice is carried in
-the workspace `NOTICE`.
+Apache-2.0. The deferred, optional `brush` engine (#20) is MIT — its notice is
+carried in the workspace `NOTICE` for when it is adopted.

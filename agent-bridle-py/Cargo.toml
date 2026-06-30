@@ -7,9 +7,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 # This crate ships ONLY as a PyPI wheel (built by maturin), never to crates.io:
-# it depends transitively on `agent-bridle-tool-shell`, which git-deps our brush
-# fork. A maturin wheel compiles the Rust *in* (the brush git-dep is fine for a
-# wheel), so Pillar A's PyPI path is NOT blocked by the upstream-brush gate.
+# it is a PyO3 extension module (`cdylib`), and the maturin wheel compiles the
+# Rust *in*. (It is not part of the crates.io publish set; see the justfile.)
 publish = false
 
 [lib]
@@ -19,8 +18,8 @@ name = "agent_bridle"
 crate-type = ["cdylib"]
 
 [dependencies]
-# The facade — with `shell` on, so the confined brush-backed shell is callable
-# (the Pillar-A demo tool). The wheel carries the shell runtime in.
+# The facade — with `shell` on, so the confined argv + safe-subset shell (ADR
+# 0005) is callable (the Pillar-A demo tool). The wheel compiles the engine in.
 agent-bridle = { workspace = true, features = ["shell"] }
 agent-mesh-protocol = { workspace = true }
 serde_json = { workspace = true }

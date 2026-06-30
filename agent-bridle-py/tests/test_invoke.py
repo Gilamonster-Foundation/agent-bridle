@@ -12,12 +12,14 @@ the built-in ``PermissionError``).
 
 Note on the ``shell`` arg shape: the tool takes **two** shapes. **Argv form**
 (``{"program": ..., "args": [...]}``) is gated *before the command runs* by an
-``exec`` pre-check on the named program. **Free-form** (``{"cmd": "..."}``) is an
-``sh -c``-style string confined in-process by the brush ``CommandInterceptor``
-hook (DESIGN §6) — a path-separator command like ``/bin/rm`` cannot bypass it.
-A free-form denial returns from dispatch with the structured ``denied: true``
-field set, which ``invoke()`` turns into ``BridleDenied`` just like an argv-form
-denial. The tests exercise both contracts.
+``exec`` pre-check on the named program. **Free-form** (``{"cmd": "..."}``) is a
+**safe-subset** string parsed by agent-bridle itself (ADR 0005): pipelines,
+redirects, ``&&``/``||``/``;``, globbing, and allowlisted ``$VAR`` — with the
+dynamic constructs refused by design. Every program is ``exec``-checked at the
+spawn funnel before it runs, so a path-separator command like ``/bin/rm`` cannot
+bypass it. A free-form denial returns from dispatch with the structured
+``denied: true`` field set, which ``invoke()`` turns into ``BridleDenied`` just
+like an argv-form denial. The tests exercise both contracts.
 """
 
 from __future__ import annotations
@@ -32,14 +34,14 @@ ECHO_ONLY = {"exec": {"only": ["echo"]}}
 
 def test_shell_is_registered() -> None:
     """The wheel is built with the ``shell`` feature, so the confined
-    brush-backed shell tool is present in the registry."""
+    argv + safe-subset shell tool (ADR 0005) is present in the registry."""
     names = agent_bridle.tool_names()
     assert "shell" in names, f"shell missing from tool_names(): {names}"
 
 
 def test_in_scope_echo_runs_and_captures_stdout() -> None:
     """An allowed dispatch passes the leash and runs: ``echo`` is within the
-    granted ``exec`` scope, so the brush-carried builtin runs and stdout is
+    granted ``exec`` scope, so it is spawned as an external program and stdout is
     captured. (Equivalent to the spec's ``echo hi`` in argv form.)"""
     r = agent_bridle.invoke(
         "shell",
@@ -120,36 +122,34 @@ def test_freeform_path_separator_denial_raises() -> None:
 
 
 def test_exec_builtin_cannot_bypass_the_leash(tmp_path) -> None:
-    """Security regression (exec-builtin bypass).
+    """Security regression: a free-form ``exec`` cannot bypass the leash.
 
-    The brush ``exec`` builtin used to call ``cmd.exec()`` directly — bypassing
-    the ``before_exec`` interceptor funnel and even replacing the host process.
-    Under ``echo``-only, ``exec /usr/bin/touch MARKER`` ran ``touch`` (the marker
-    appeared) with the leash never firing. The fix removes ``exec`` from the
-    confined shell's builtin set, so it is now "command not found": the carried
-    program must NOT run (no marker), and ``invoke`` returns cleanly rather than
-    replacing the interpreter.
+    The safe-subset engine (ADR 0005) has **no** ``exec`` builtin — ``exec`` is
+    an ordinary, un-granted command name under the ``echo``-only grant — so
+    ``exec /usr/bin/touch MARKER`` is denied at the spawn funnel: ``touch`` never
+    runs (no marker), the host process is never replaced, and the free-form
+    denial surfaces as ``BridleDenied``. (Historically a brush-era bug where the
+    ``exec`` builtin called ``cmd.exec()`` directly and bypassed the funnel; the
+    safe-subset engine has no such builtin.)
     """
     marker = tmp_path / "exec-bypass-marker"
     assert not marker.exists()
-    r = agent_bridle.invoke(
-        "shell",
-        {"cmd": f"exec /usr/bin/touch {marker}"},
-        ECHO_ONLY,
-    )
-    # The shell returned (process not replaced) and exec is gone (non-zero).
-    assert r["exit_code"] != 0, r
-    assert not marker.exists(), f"exec builtin ran the program: {r}"
+    with pytest.raises(agent_bridle.BridleDenied):
+        agent_bridle.invoke(
+            "shell",
+            {"cmd": f"exec /usr/bin/touch {marker}"},
+            ECHO_ONLY,
+        )
+    assert not marker.exists(), "exec must not run the un-granted program"
 
 
 def test_command_substitution_denial_does_not_panic(tmp_path) -> None:
-    """Security regression ($() IO panic).
+    """Security regression: a ``$(...)`` command substitution is refused.
 
-    The confined runtime previously enabled only the time driver, so a ``$(...)``
-    command substitution panicked ("IO is disabled") and surfaced as an opaque
-    error rather than a clean denial. With IO enabled, the inner ``/bin/rm`` flows
-    through ``before_exec`` and is denied — ``invoke`` raises ``BridleDenied``
-    (structured ``denied: true``), and the victim file is untouched.
+    The safe-subset engine (ADR 0005) **refuses dynamic constructs by design** —
+    command substitution ``$(...)`` is rejected at parse time, before anything
+    runs. ``invoke`` raises ``BridleDenied`` (structured ``denied: true``) and the
+    victim file is untouched. (No interpreter ever evaluates the inner command.)
     """
     victim = tmp_path / "victim.txt"
     victim.write_text("keep me")
