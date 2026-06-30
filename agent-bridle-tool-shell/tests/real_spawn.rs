@@ -465,13 +465,15 @@ async fn real_landlock_confines_a_spawned_childs_own_write() {
     let _ = std::fs::remove_dir_all(&forbidden);
 }
 
-// agent-bridle#35 — the "swamp tools die" spike. The proof above confines a
+// agent-bridle#35/#57 — the "swamp tools die" spike. The proof above confines a
 // child bridle spawned directly (`touch`). This one closes the harder hole ADR
 // 0001 names: a GRANDCHILD a *permitted* tool forks on its own (`find -exec …`),
 // which never re-enters bridle's spawn funnel — exactly what L2 is blind to once
-// `find` runs. `touch` is NOT in the exec scope (find execs it itself); only the
-// kernel ruleset, inherited across find's fork/exec, can stop the grandchild's
-// write outside `fs_write`. Linux + `linux-landlock`; self-skips without Landlock.
+// `find` runs. Both `find` and `touch` are exec-granted (so the grandchild RUNS —
+// the #57 Execute axis would otherwise kernel-deny `touch`'s execve); the point
+// here is that the kernel `fs_write` ruleset, inherited across find's fork/exec,
+// still stops the grandchild's WRITE outside scope. Linux + `linux-landlock`;
+// self-skips without Landlock.
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 #[tokio::test]
 async fn real_landlock_confines_a_find_exec_grandchild_write() {
@@ -488,11 +490,11 @@ async fn real_landlock_confines_a_find_exec_grandchild_write() {
     let forbidden = unique_temp("ll-fe-forbidden");
     std::fs::create_dir_all(&forbidden).unwrap();
 
-    // Only `find` is permitted to exec; writes are confined to `allowed`. The
-    // `;` terminating `-exec` is single-quoted so the safe-subset parser treats
-    // it as a literal argument to find, not a stage separator.
+    // `find` and `touch` are exec-permitted (so the grandchild runs); writes are
+    // confined to `allowed`. The `;` terminating `-exec` is single-quoted so the
+    // safe-subset parser treats it as a literal argument to find, not a separator.
     let caveats = Caveats {
-        exec: Scope::only(["find".to_string()]),
+        exec: Scope::only(["find".to_string(), "touch".to_string()]),
         fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
         ..Caveats::top()
     };
