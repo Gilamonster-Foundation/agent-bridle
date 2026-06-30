@@ -38,9 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_bridle_core::{
-    best_available_sandbox, effective_sandbox_kind, enforcement_report, Caveats, Denial,
-    DenialKind, EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError,
-    ToolResult,
+    best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
+    Caveats, Denial, DenialKind, EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope,
+    ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -476,6 +476,33 @@ impl Tool for ShellTool {
             if let Err(e) = cx.check_path_read(Path::new(cwd)) {
                 return Ok(deny(sandbox_kind, enforcement, DenialKind::Open, cwd, &e));
             }
+        }
+
+        // Fail closed (ADR 0012 D4) — AFTER L2 admission (so a specific
+        // out-of-scope glob/redirect/exec denial is reported first) but before any
+        // spawn: refuse when a restricted axis cannot be enforced on this host at
+        // the principal's strength floor. Decided against `sandbox_kind` — the kind
+        // that ACTUALLY governs the spawn (`effective_sandbox_kind`, what
+        // `OsSpawner` routes through), NOT the raw probe: a backend the run path
+        // does not route through (AppContainer today — its shell launcher is #51)
+        // collapses to `None` here, so an fs-restricted run on it fails closed
+        // instead of executing unconfined via `run_pipeline` (the adversarial-review
+        // fix — the check and the routing must agree). The filesystem axes always
+        // fail closed when restricted-but-unenforceable (closing the run-unconfined
+        // gap the shell shared with ConfinedCommand); exec/net fail closed only for
+        // a strong principal (the default floor is permissive).
+        if confinement_unenforceable(sandbox_kind, cx.caveats(), cx.strength_floor()) {
+            return Ok(deny(
+                sandbox_kind,
+                enforcement,
+                DenialKind::Exec,
+                "confinement",
+                &ToolError::denied(format!(
+                    "a restricted filesystem/exec/net axis cannot be enforced on this host \
+                     at the required strength floor ({:?}); refusing to run unconfined",
+                    cx.strength_floor()
+                )),
+            ));
         }
 
         // Run on a blocking thread, bounded by the timeout. On timeout the
@@ -1326,6 +1353,15 @@ mod tests {
             .expect("authorize")
     }
 
+    /// A context for a **strong** principal (fence-strength floor = `Kernel`):
+    /// any restricted axis the real backend can't kernel-confine fails closed.
+    fn ctx_strong(granted: Caveats) -> ToolContext {
+        Gate::new(0)
+            .with_strength_floor(agent_bridle_core::AxisEnforcement::Kernel)
+            .authorize(&ShellTool::new(), &granted)
+            .expect("authorize")
+    }
+
     fn exec_only(names: &[&str]) -> Caveats {
         Caveats {
             exec: Scope::only(names.iter().map(|s| (*s).to_string())),
@@ -1335,6 +1371,42 @@ mod tests {
 
     fn calls(mock: &Arc<MockSpawner>) -> Vec<Vec<Command>> {
         mock.calls.lock().unwrap().clone()
+    }
+
+    /// ADR 0012 D4/D8: a STRONG principal (floor = Kernel) fails closed *before
+    /// any spawn* when a restricted axis can't be kernel-confined. `exec` is not
+    /// kernel-enforceable yet (#57), so an `exec:Only` run is refused; the default
+    /// (permissive) principal still runs it. This closes the shell's
+    /// run-unconfined gap and matches `ConfinedCommand`'s fail-closed posture.
+    #[tokio::test]
+    async fn strong_principal_fails_closed_on_unenforceable_exec() {
+        let mock = Arc::new(MockSpawner::default());
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo hi"}),
+                &ctx_strong(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(
+            out["denied"], true,
+            "strong principal must fail closed on unenforceable exec: {out}"
+        );
+        assert!(ran_programs(&mock).is_empty(), "nothing may spawn: {out}");
+
+        // The default (permissive, Advisory-floor) principal runs the same command.
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo hi"}),
+                &ctx(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_ne!(
+            out["denied"],
+            serde_json::json!(true),
+            "default principal still runs: {out}"
+        );
     }
 
     fn ran_programs(mock: &Arc<MockSpawner>) -> Vec<String> {

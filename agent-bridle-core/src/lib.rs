@@ -50,7 +50,9 @@ pub use sandbox::{
 pub use sandbox::{landlock_is_supported, LandlockSandbox};
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
-pub use spawn::{spawn_confined_subprocess, ConfinedChild, ConfinedCommand};
+pub use spawn::{
+    confinement_unenforceable, spawn_confined_subprocess, ConfinedChild, ConfinedCommand,
+};
 #[cfg(feature = "verifier-ed25519")]
 pub use step_up::Ed25519Verifier;
 #[cfg(feature = "verifier-webauthn")]
@@ -111,16 +113,20 @@ mod tests {
     /// proves the cross-crate boundary.)
     ///
     /// ```compile_fail
-    /// use agent_bridle_core::ToolContext;
+    /// use agent_bridle_core::{AxisEnforcement, ToolContext};
     /// // No public constructor:
     /// let _ = ToolContext::mint(agent_bridle_core::Caveats::top(),
-    ///     agent_bridle_core::SandboxKind::None);
+    ///     agent_bridle_core::SandboxKind::None, AxisEnforcement::Advisory);
     /// ```
     ///
     /// ```compile_fail
-    /// use agent_bridle_core::{Caveats, SandboxKind, ToolContext};
+    /// use agent_bridle_core::{AxisEnforcement, Caveats, SandboxKind, ToolContext};
     /// // No public fields, no struct literal possible:
-    /// let _ = ToolContext { effective: Caveats::top(), sandbox_kind: SandboxKind::None };
+    /// let _ = ToolContext {
+    ///     effective: Caveats::top(),
+    ///     sandbox_kind: SandboxKind::None,
+    ///     strength_floor: AxisEnforcement::Advisory,
+    /// };
     /// ```
     fn _mint_token_is_unconstructible_doctests() {}
 }
