@@ -308,10 +308,62 @@ mod landlock_kernel_tests {
         d
     }
 
+    /// Whether a kernel-enforcement proof should run, skip, or hard-**FAIL** — a
+    /// pure decision over (Landlock supported?, enforcement required?). Required
+    /// but unsupported is a FAILURE: a security library must not ship a green
+    /// build in which its kernel boundary was never exercised (#74).
+    #[derive(Debug, PartialEq, Eq)]
+    enum ProofGate {
+        Run,
+        Skip,
+        Fail,
+    }
+
+    fn proof_gate(supported: bool, required: bool) -> ProofGate {
+        match (supported, required) {
+            (true, _) => ProofGate::Run,
+            (false, true) => ProofGate::Fail,
+            (false, false) => ProofGate::Skip,
+        }
+    }
+
+    /// `true` if the caller should `return` (skip the proof). **Panics** when
+    /// Landlock is *required* (`BRIDLE_REQUIRE_LANDLOCK` set, as CI does) but the
+    /// kernel lacks it — so a flagged run cannot pass without actually exercising
+    /// the boundary. A local run without the flag legitimately skips (#74).
+    fn skip_proof_unless_landlock() -> bool {
+        let required = std::env::var("BRIDLE_REQUIRE_LANDLOCK")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        match proof_gate(landlock_is_supported(), required) {
+            ProofGate::Run => false,
+            ProofGate::Skip => {
+                eprintln!(
+                    "skipping Landlock proof: kernel lacks Landlock \
+                     (set BRIDLE_REQUIRE_LANDLOCK=1 to require it, as CI does)"
+                );
+                true
+            }
+            ProofGate::Fail => panic!(
+                "BRIDLE_REQUIRE_LANDLOCK is set but this kernel lacks Landlock — the \
+                 fs_write/fs_read kernel-enforcement proofs cannot be verified (#74)"
+            ),
+        }
+    }
+
+    #[test]
+    fn proof_gate_required_but_unsupported_is_a_failure() {
+        assert_eq!(proof_gate(true, false), ProofGate::Run);
+        assert_eq!(proof_gate(true, true), ProofGate::Run);
+        assert_eq!(proof_gate(false, false), ProofGate::Skip);
+        // The crux (#74): required + unsupported must FAIL, never silently skip,
+        // so CI cannot pass without exercising the kernel boundary.
+        assert_eq!(proof_gate(false, true), ProofGate::Fail);
+    }
+
     #[test]
     fn fs_write_is_kernel_enforced_outside_scope_denied_inside_allowed() {
-        if !landlock_is_supported() {
-            eprintln!("skipping fs_write landlock test: kernel lacks Landlock");
+        if skip_proof_unless_landlock() {
             return;
         }
 
@@ -350,8 +402,7 @@ mod landlock_kernel_tests {
 
     #[test]
     fn empty_fs_write_scope_denies_all_writes() {
-        if !landlock_is_supported() {
-            eprintln!("skipping empty-scope landlock test: kernel lacks Landlock");
+        if skip_proof_unless_landlock() {
             return;
         }
         let dir = unique_dir("none");
@@ -377,8 +428,7 @@ mod landlock_kernel_tests {
 
     #[test]
     fn fs_read_is_kernel_enforced_outside_scope_denied_inside_allowed() {
-        if !landlock_is_supported() {
-            eprintln!("skipping fs_read landlock test: kernel lacks Landlock");
+        if skip_proof_unless_landlock() {
             return;
         }
         let allowed = unique_dir("read-allowed");
@@ -418,8 +468,7 @@ mod landlock_kernel_tests {
 
     #[test]
     fn read_confined_binary_still_loads_via_base_allowlist() {
-        if !landlock_is_supported() {
-            eprintln!("skipping read-confined binary test: kernel lacks Landlock");
+        if skip_proof_unless_landlock() {
             return;
         }
         let allowed = unique_dir("rc-allowed");
@@ -468,8 +517,7 @@ mod landlock_kernel_tests {
 
     #[test]
     fn fs_read_all_leaves_reads_ambient() {
-        if !landlock_is_supported() {
-            eprintln!("skipping fs_read-all test: kernel lacks Landlock");
+        if skip_proof_unless_landlock() {
             return;
         }
         // With fs_read: All (only fs_write restricted), reads are NOT governed —

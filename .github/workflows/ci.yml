@@ -44,6 +44,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
       - name: Test (all features)
+        # BRIDLE_REQUIRE_LANDLOCK turns the Landlock kernel-enforcement proofs
+        # from silent-skip into hard-FAIL when the kernel lacks Landlock, so CI
+        # cannot go green without actually exercising the fs_write/fs_read
+        # boundary (agent-bridle#74). ubuntu-latest ships a Landlock-capable
+        # kernel; a local run without this flag legitimately skips.
+        env:
+          BRIDLE_REQUIRE_LANDLOCK: "1"
         run: cargo test --workspace --all-features
 
       - name: Test (no default features)
