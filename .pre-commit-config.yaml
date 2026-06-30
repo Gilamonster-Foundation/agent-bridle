@@ -1,0 +1,22 @@
+# Local mirror of the security-audit CI gate. Install with:
+#   pip install pre-commit && pre-commit install
+# Then every commit runs the same secret-scan + internal-specifics checks that CI
+# enforces, catching leaks before they leave your machine.
+#
+# PIPELINE PARITY: mirrors .github/workflows/security-audit.yml (gitleaks +
+# scripts/check-internal-specifics.sh). When editing one, update the other.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: internal-specifics
+        name: internal-specifics linter
+        entry: bash scripts/check-internal-specifics.sh
+        language: system
+        pass_filenames: false
+        always_run: true

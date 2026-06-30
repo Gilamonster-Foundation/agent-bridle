@@ -1,0 +1,33 @@
+# gitleaks configuration for agent-bridle (public repo).
+# Extends the default ruleset and allowlists documentation placeholders so the
+# RFC 5737 / example.* values used in the docs do not trip secret rules.
+#
+# PIPELINE PARITY: consumed by .github/workflows/security-audit.yml and
+# .pre-commit-config.yaml. When editing, keep both in sync.
+
+title = "agent-bridle gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documentation placeholders (RFC 5737 TEST-NET, example.* domains) and non-secret fixtures."
+regexes = [
+  '''example\.(com|lan|org)''',
+  '''(^|[^0-9])192\.0\.2\.''',
+  '''(^|[^0-9])198\.51\.100\.''',
+  '''(^|[^0-9])203\.0\.113\.''',
+  '''EXAMPLE\.LAN''',
+  '''dc=example,dc=lan''',
+  '''user@example\.com''',
+  # The step-up tests sign with a FIXED, non-secret ed25519 seed (a literal
+  # `[7u8; 32]` / `[N u8; 32]` byte array, never a real key) — see step_up.rs.
+  '''\[[0-9]+u8; 32\]''',
+]
+paths = [
+  '''LICENSE''',
+  '''NOTICE''',
+  # Cargo.lock pins crates.io checksums (sha256 of published crates) and the
+  # pinned brush git rev — public integrity hashes, not secrets.
+  '''Cargo\.lock''',
+]
