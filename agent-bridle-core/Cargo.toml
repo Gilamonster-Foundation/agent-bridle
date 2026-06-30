@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# crates.io front-page metadata (ADR 0008 — the externally-consumed crate).
+# `readme` defaults to the crate-root README.md (present).
+keywords = ["capability", "ocap", "security", "sandbox", "agent"]
+categories = ["development-tools"]
 
 [lints.rust]
 unsafe_code = "forbid"

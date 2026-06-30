@@ -1,7 +1,8 @@
 # agent-bridle CI.
 #
-# HOOK PARITY: This pipeline is mirrored by .githooks/pre-push and the `check`
-# recipe in justfile. When editing this file, update the push hook to match.
+# HOOK PARITY: This pipeline is mirrored by .githooks/pre-push and the `check` /
+# `publish-check` recipes in justfile. When editing this file, update the push
+# hook to match.
 
 name: CI
 
@@ -47,3 +48,10 @@ jobs:
 
       - name: Test (no default features)
         run: cargo test --workspace --no-default-features
+
+      # HOOK PARITY: mirrors `just publish-check` run by .githooks/pre-push.
+      # Guards the out-of-tree dependency boundary (ADR 0008): fails if
+      # agent-bridle-core stops being publishable (a git dep, a path-only
+      # required dep), which would strand external consumers like newt-agent.
+      - name: Publishability gate (agent-bridle-core dry-run)
+        run: cargo publish --dry-run --allow-dirty -p agent-bridle-core
