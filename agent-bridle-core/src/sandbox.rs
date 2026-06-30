@@ -120,7 +120,7 @@ pub(crate) fn restricts_fs(caveats: &Caveats) -> bool {
 /// under which an exec-confining backend has an allow-list to enforce. Today only
 /// the macOS Seatbelt backend acts on this: `process-exec*` is a kernel-checked
 /// operation that confines the spawned program's **interior** execs (covering the
-/// loader trampoline that Landlock cannot — ADR 0013), so an `exec:Only` grant
+/// loader trampoline that Landlock cannot — ADR 0014), so an `exec:Only` grant
 /// engages Seatbelt even when no fs/net axis is restricted. Landlock's exec axis
 /// stays held (agent-bridle#31/#57), so it does **not** engage on this alone.
 #[must_use]
@@ -148,7 +148,7 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
 /// governs the filesystem axes; Seatbelt governs those, kernel-denies all egress
 /// when `net` is empty ([`net_fully_denied`]), **and** confines the `exec` axis
 /// via `process-exec*` ([`restricts_exec`]) — a confinement Landlock cannot
-/// supply (ADR 0013). Landlock's exec axis stays held (agent-bridle#31/#57), so a
+/// supply (ADR 0014). Landlock's exec axis stays held (agent-bridle#31/#57), so a
 /// Landlock host does not engage on `exec` alone.
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
@@ -628,7 +628,7 @@ mod seatbelt_impl {
     /// `mmap(PROT_EXEC)` read-as-code path is closed by Apple-Silicon hardware
     /// W^X + code signing — so "the readable set equals the runnable set" (the
     /// fact that forces the Linux seccomp filter) does **not** hold here. The axis
-    /// is therefore honestly reported `Kernel` (ADR 0013; agent-bridle#31/#57).
+    /// is therefore honestly reported `Kernel` (ADR 0014; agent-bridle#31/#57).
     ///
     /// Read confinement here is **content-level**: file *metadata* (stat,
     /// existence, directory traversal) stays ambient so binaries can load through
@@ -756,7 +756,7 @@ mod seatbelt_impl {
         // kernel-checked on the confined process AND everything it spawns, so this
         // is the `exec` axis at interior grain — no seccomp backstop needed (the
         // dyld trampoline is itself a governed `process-exec`, and `mmap(PROT_EXEC)`
-        // read-as-code is closed by hardware W^X + code signing; ADR 0013). An
+        // read-as-code is closed by hardware W^X + code signing; ADR 0014). An
         // empty/unresolvable grant emits the deny with no re-allow — every exec
         // (including the wrapped program's own launch) denied: fail-closed, never
         // ambient. SBPL is last-match-wins, so the trailing allow overrides.
@@ -792,7 +792,7 @@ mod seatbelt_impl {
     /// System binary directories searched to resolve a **bare-name** `exec` grant
     /// (e.g. `["git"]`) to absolute path(s) for the `process-exec*` allow-list.
     /// SIP-protected, read-only system locations — a trustworthy pin. Bare names
-    /// resolve through this *fixed* list, never the ambient `$PATH` (ADR 0013 /
+    /// resolve through this *fixed* list, never the ambient `$PATH` (ADR 0014 /
     /// ADR 0011 D5), so a binary planted earlier on a caller's `$PATH` cannot
     /// widen the kernel allow-list. An absolute-path grant is honored verbatim
     /// (then canonicalized); a basename collision outside these dirs is not.
@@ -1955,7 +1955,7 @@ mod seatbelt_kernel_tests {
 
     /// The exec allow-list is kernel-enforced at the **interior**: a granted shell
     /// runs, may exec a *listed* binary, but is kernel-denied an *unlisted* one —
-    /// the L3 gap a path allow-list alone cannot reach (ADR 0013). The discriminator
+    /// the L3 gap a path allow-list alone cannot reach (ADR 0014). The discriminator
     /// is exact: the unlisted `/usr/bin/false` must fail at **exec** (status 127),
     /// not run-and-return-1 — so this cannot pass vacuously.
     #[test]

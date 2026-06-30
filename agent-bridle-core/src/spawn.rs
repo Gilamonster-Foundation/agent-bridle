@@ -698,9 +698,9 @@ mod seatbelt_child_tests {
     }
 
     /// A restricted `exec` axis engages Seatbelt **even when both fs axes are
-    /// `All`**: `process-exec*` kernel-confines the exec axis (ADR 0013), so
+    /// `All`**: `process-exec*` kernel-confines the exec axis (ADR 0014), so
     /// reporting `Seatbelt` is honest, not an overclaim — the inverse of the
-    /// `top_grant…` guard above. Before ADR 0013 this same grant reported `None`
+    /// `top_grant…` guard above. Before ADR 0014 this same grant reported `None`
     /// (the exec axis was left ambient).
     #[test]
     fn restricted_exec_engages_seatbelt() {
@@ -720,7 +720,7 @@ mod seatbelt_child_tests {
         assert_eq!(
             child.sandbox_kind,
             SandboxKind::Seatbelt,
-            "a restricted exec axis is kernel-confined by process-exec* (ADR 0013)"
+            "a restricted exec axis is kernel-confined by process-exec* (ADR 0014)"
         );
     }
 }

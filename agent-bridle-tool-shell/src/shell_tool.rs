@@ -1448,10 +1448,10 @@ mod tests {
         mock.envs.lock().unwrap().clone()
     }
 
-    /// ADR 0012 D4/D8 + ADR 0013: a STRONG principal (floor = `Kernel`) refuses to
+    /// ADR 0012 D4/D8 + ADR 0014: a STRONG principal (floor = `Kernel`) refuses to
     /// run unconfined when a restricted axis cannot be kernel-confined on this host.
     ///
-    /// For the `exec` axis the outcome is **backend-dependent** since ADR 0013
+    /// For the `exec` axis the outcome is **backend-dependent** since ADR 0014
     /// closed #57 for macOS: under an active Seatbelt backend `exec` is
     /// kernel-confined via `process-exec*`, so the strong principal *runs*
     /// (reporting `exec → kernel`); under Landlock or a Noop host the exec axis is
@@ -1465,7 +1465,7 @@ mod tests {
     async fn strong_principal_fails_closed_on_unenforceable_exec() {
         let granted = exec_only(&["echo"]);
         // Does the backend that will actually govern this run kernel-confine `exec`?
-        // Seatbelt does (`process-exec*`, ADR 0013); Landlock/Noop do not (#31/#57).
+        // Seatbelt does (`process-exec*`, ADR 0014); Landlock/Noop do not (#31/#57).
         let exec_is_kernel_confined = enforcement_report(&granted, intended_sandbox_kind(&granted))
             .exec
             == Some(agent_bridle_core::AxisEnforcement::Kernel);

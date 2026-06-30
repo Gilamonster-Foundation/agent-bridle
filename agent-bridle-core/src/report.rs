@@ -119,7 +119,7 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 ///   `process-exec*` is kernel-checked on the confined process *and everything it
 ///   spawns*, so a permitted child's own `exec` is confined too. Apple-Silicon
 ///   hardware W^X + code signing close the `mmap(PROT_EXEC)` / loader-trampoline
-///   bypass with no seccomp backstop (ADR 0013). Under **Landlock** and a
+///   bypass with no seccomp backstop (ADR 0014). Under **Landlock** and a
 ///   **Noop** host it stays `interceptor`: the spawn funnel (`before_exec` /
 ///   `check_exec`) gates the engine's own spawns, but no OS execute allow-list
 ///   confines a child's interior (the Landlock exec axis is held —
@@ -151,7 +151,7 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
         exec: is_restricted(&effective.exec).then_some(match active {
             // Seatbelt (macOS) confines the exec axis in the kernel via
             // `process-exec*` — interior-covering, with no trampoline bypass on
-            // Apple Silicon (ADR 0013). Landlock's exec axis is held
+            // Apple Silicon (ADR 0014). Landlock's exec axis is held
             // (agent-bridle#31/#57) and a Noop host has no OS allow-list, so both
             // fall to the in-process interceptor. AppContainer's exec story is not
             // wired this increment, so it stays interceptor (never overclaimed).
@@ -219,7 +219,7 @@ mod tests {
     }
 
     /// Seatbelt (macOS) governs the fs axes in the kernel like Landlock, **and**
-    /// the `exec` axis via `process-exec*` (ADR 0013) — so exec is `kernel`, not
+    /// the `exec` axis via `process-exec*` (ADR 0014) — so exec is `kernel`, not
     /// `interceptor`. `net` here is a non-empty host allowlist, which SBPL cannot
     /// express, so it stays advisory (the empty-net kernel case is covered by
     /// [`seatbelt_net_is_kernel_only_when_fully_denied`]).
@@ -234,7 +234,7 @@ mod tests {
 
     /// The macOS exec-axis honesty distinction from Landlock: a restricted `exec`
     /// is `kernel` under Seatbelt but only `interceptor` under Landlock (its exec
-    /// axis is held) and a Noop host. ADR 0013.
+    /// axis is held) and a Noop host. ADR 0014.
     #[test]
     fn exec_is_kernel_under_seatbelt_interceptor_elsewhere() {
         let cav = Caveats {

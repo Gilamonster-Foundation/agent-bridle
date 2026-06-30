@@ -303,7 +303,7 @@ address, and a redirect to a disallowed host are all proven *denied*).
 Landlock `fs_write`/`fs_read` kernel enforcement is landed (Linux,
 `linux-landlock`). On **macOS** (`macos-seatbelt`) the Seatbelt backend
 kernel-confines `fs_write`/`fs_read`, denies all egress for `net: none`, and —
-per ADR 0013 — kernel-confines the **`exec` axis** via `process-exec*` (closing
+per ADR 0014 — kernel-confines the **`exec` axis** via `process-exec*` (closing
 the loader trampoline with no seccomp backstop, by hardware W^X + code signing).
 The remaining cross-OS L3 boundary — the Linux `net`/`exec` axes (#35/#57) and
 the Windows backend (#51), per the three-tier strategy in ADR 0009 —

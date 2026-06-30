@@ -1,4 +1,4 @@
-# ADR 0013 — macOS Seatbelt exec axis (the sibling of ADR 0011, closed without a backstop)
+# ADR 0014 — macOS Seatbelt exec axis (the sibling of ADR 0011, closed without a backstop)
 
 - Status: Accepted (2026-06-30)
 - Date: 2026-06-30
