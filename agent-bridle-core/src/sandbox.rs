@@ -16,8 +16,10 @@
 //!   confines the calling thread (inherited across `fork`/`execve`).
 //! - **macOS** — [`SeatbeltSandbox`] (`macos-seatbelt`): an SBPL profile derived
 //!   from the effective [`Caveats`], applied by wrapping the spawned program in
-//!   `sandbox-exec(1)` (no FFI — core forbids `unsafe`). Confines the same
-//!   `fs_write` + `fs_read` axes; `exec`/`net` are follow-ups (agent-bridle#31/#57).
+//!   `sandbox-exec(1)` (no FFI — core forbids `unsafe`). Confines the `fs_write`
+//!   and `fs_read` axes, and kernel-denies **all** network egress when `net` is
+//!   empty (a confinement Landlock cannot provide); `exec` and non-empty `net`
+//!   host allowlists are follow-ups (agent-bridle#31/#57).
 //!
 //! A backend confines either by restricting the calling thread in [`Sandbox::apply`]
 //! (Landlock) **or** by wrapping the spawned command via
@@ -114,15 +116,32 @@ pub(crate) fn restricts_fs(caveats: &Caveats) -> bool {
         || matches!(caveats.fs_read, crate::Scope::Only(_))
 }
 
+/// `true` if the `net` axis is restricted to the **empty** set — i.e. *all*
+/// network egress is denied. This is the one network policy SBPL can soundly
+/// express (`(deny network*)`); a non-empty host allowlist filters by socket,
+/// not hostname, so it is **not** expressible and stays advisory (never silently
+/// dropped). Only the macOS Seatbelt backend acts on this today.
+#[must_use]
+pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
+}
+
 /// The [`SandboxKind`] honestly in force for `caveats` given the strongest
 /// `available` backend: the backend's own kind when it will actually confine
-/// (an fs axis is restricted), else [`SandboxKind::None`]. This is the single
-/// honesty rule shared by the subprocess primitive ([`crate::ConfinedCommand`])
-/// and the shell engine, so neither overclaims.
+/// *something*, else [`SandboxKind::None`]. The single honesty rule shared by the
+/// subprocess primitive ([`crate::ConfinedCommand`]) and the shell engine, so
+/// neither overclaims.
+///
+/// Capabilities differ per backend, so the engaging condition does too: Landlock
+/// governs the filesystem axes; Seatbelt governs those **and** kernel-denies all
+/// egress when `net` is empty ([`net_fully_denied`]).
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
-        SandboxKind::Landlock | SandboxKind::Seatbelt if restricts_fs(caveats) => available,
+        SandboxKind::Landlock if restricts_fs(caveats) => SandboxKind::Landlock,
+        SandboxKind::Seatbelt if restricts_fs(caveats) || net_fully_denied(caveats) => {
+            SandboxKind::Seatbelt
+        }
         _ => SandboxKind::None,
     }
 }
@@ -423,9 +442,12 @@ mod seatbelt_impl {
     /// effective [`Caveats`] (see [`seatbelt_profile`]): writes are denied
     /// outside the granted `fs_write` roots, and — when `fs_read` is restricted —
     /// reads are denied outside the granted roots plus the loader/system base
-    /// list. `exec`/`net` are intentionally left ambient this increment
-    /// (`(allow default)`), mirroring Landlock leaving them ungoverned; those
-    /// axes are follow-ups (agent-bridle#31/#57).
+    /// list. It also kernel-denies **all** network egress when `net` is empty
+    /// (`(deny network*)`) — a confinement Landlock cannot provide, closing the
+    /// `find -exec curl` egress path at L3. A non-empty `net` host allowlist is
+    /// not expressible in SBPL (it filters by socket, not hostname) and stays
+    /// advisory; `exec` is left ambient (`(allow default)`) — follow-ups
+    /// (agent-bridle#31/#57).
     ///
     /// Read confinement here is **content-level**: file *metadata* (stat,
     /// existence, directory traversal) stays ambient so binaries can load through
@@ -463,10 +485,10 @@ mod seatbelt_impl {
         }
 
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // Nothing restricted on an fs axis => nothing to confine; run
-            // unwrapped (coarse honesty falls to `None` upstream, and the
-            // per-axis report omits unrestricted axes).
-            if !super::restricts_fs(effective) {
+            // Nothing on a governed axis (fs, or all-egress-denied net) => nothing
+            // to confine; run unwrapped (coarse honesty falls to `None` upstream,
+            // and the per-axis report omits unrestricted axes).
+            if !super::restricts_fs(effective) && !super::net_fully_denied(effective) {
                 return Ok(Vec::new());
             }
             // Fail-closed: if the wrapper is gone we cannot enforce, so refuse
@@ -533,6 +555,15 @@ mod seatbelt_impl {
                 p.push_str(&format!(" (subpath {})", sbpl_string(&r)));
             }
             p.push_str(")\n");
+        }
+
+        // net: deny *all* egress when the net scope is empty — the only network
+        // policy SBPL can soundly express (see `net_fully_denied`). This confines
+        // the spawned interior's network the way no Landlock increment can: a
+        // permitted child's `curl`/`connect` is kernel-denied. A non-empty host
+        // allowlist is left ambient (reported advisory), never silently dropped.
+        if super::net_fully_denied(effective) {
+            p.push_str("(deny network*)\n");
         }
 
         p
@@ -606,6 +637,40 @@ mod seatbelt_impl {
                 .command_prefix(&Caveats::top())
                 .unwrap()
                 .is_empty());
+        }
+
+        #[test]
+        fn empty_net_denies_all_egress_and_engages_the_wrapper() {
+            // net:none with fs unrestricted still confines (network), so the
+            // wrapper must engage and the profile must deny all egress.
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny network*)"), "{prof}");
+            assert!(
+                !SeatbeltSandbox::new()
+                    .command_prefix(&cav)
+                    .unwrap()
+                    .is_empty(),
+                "net:none must engage the sandbox-exec wrapper"
+            );
+        }
+
+        #[test]
+        fn nonempty_net_allowlist_is_not_denied() {
+            // A host allowlist is not expressible in SBPL, so no `(deny network*)`
+            // is emitted — left ambient (advisory), never silently dropped.
+            let cav = Caveats {
+                net: Scope::only(["example.com".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(
+                !prof.contains("network"),
+                "non-empty net must stay ambient: {prof}"
+            );
         }
 
         #[test]
@@ -779,6 +844,23 @@ mod tests {
         assert_eq!(
             effective_sandbox_kind(SandboxKind::Seatbelt, &read_only),
             SandboxKind::Seatbelt
+        );
+        // An empty net scope (all egress denied), even with fs unrestricted,
+        // engages Seatbelt (it kernel-denies network) but NOT Landlock (which
+        // cannot gate net) — capabilities differ, so honesty differs.
+        let net_denied = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &net_denied),
+            SandboxKind::Seatbelt,
+            "Seatbelt kernel-denies egress, so net:none engages it"
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Landlock, &net_denied),
+            SandboxKind::None,
+            "Landlock cannot gate net, so net:none must NOT report Landlock"
         );
     }
 
@@ -1272,5 +1354,41 @@ mod seatbelt_kernel_tests {
 
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn net_fully_denied_kernel_blocks_egress() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let curl = "/usr/bin/curl";
+        if !std::path::Path::new(curl).exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let cav = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        // Positive control: a benign NON-network command under the SAME net:none
+        // profile must succeed — proving the profile parsed and only egress is
+        // denied. Without this, a malformed `(deny network*)` (sandbox-exec exit
+        // 65, child never launches) would let the denial assertion pass vacuously.
+        let benign = run_wrapped(&cav, "/bin/echo", &["ok"]);
+        assert!(
+            benign.success(),
+            "net:none must still allow non-network commands (profile must parse)"
+        );
+        // Egress denied: curl to a literal IP (no DNS) exits **7** ("couldn't
+        // connect") because the socket is kernel-denied immediately. Asserting
+        // exactly 7 — not merely non-zero — rules out the vacuous passes: a
+        // no-egress host times out (28), a broken profile never launches the child
+        // (65). `--max-time` bounds it regardless.
+        let confined = run_wrapped(&cav, curl, &["-sS", "--max-time", "5", "http://1.1.1.1/"]);
+        assert_eq!(
+            confined.code(),
+            Some(7),
+            "egress under net:none must be kernel-denied at the socket (curl exit 7)"
+        );
     }
 }

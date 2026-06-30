@@ -763,3 +763,47 @@ async fn real_seatbelt_confines_a_spawned_childs_own_read() {
     let _ = std::fs::remove_dir_all(&allowed);
     let _ = std::fs::remove_dir_all(&forbidden);
 }
+
+// The issue #50 "find -exec curl blocked" scenario, end to end: with `net` empty
+// (no egress granted), a permitted program's OWN network connection is denied by
+// the kernel (`(deny network*)`) — egress L2 cannot see, that Landlock cannot
+// gate at all. The envelope honestly reports net=kernel.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_seatbelt_denies_egress_when_net_is_empty() {
+    use agent_bridle_core::seatbelt_is_supported;
+
+    if !seatbelt_is_supported() || !std::path::Path::new("/usr/bin/curl").exists() {
+        eprintln!("skipping: sandbox-exec or curl unavailable");
+        return;
+    }
+
+    // Allow exec of curl, deny ALL network (net: none). fs stays open.
+    let caveats = Caveats {
+        exec: Scope::only(["curl".to_string()]),
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+    // Literal IP (no DNS); --max-time bounds it. Under net:none the socket is
+    // kernel-denied immediately, so curl exits non-zero without reaching the net.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({ "cmd": "curl -sS --max-time 5 http://1.1.1.1/" }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+
+    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
+    assert_eq!(
+        out["enforcement"]["net"], "kernel",
+        "net:none must report kernel-enforced egress denial: {out}"
+    );
+    // curl exits 7 ("couldn't connect") — the socket was kernel-denied. Asserting
+    // exactly 7 (not merely non-zero) keeps this non-vacuous: a timeout (28) or a
+    // child that never launched under a broken profile (65) would not be 7.
+    assert_eq!(
+        out["exit_code"], 7,
+        "egress under net:none must be denied at the socket (curl exit 7): {out}"
+    );
+}
