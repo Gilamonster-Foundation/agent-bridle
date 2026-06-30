@@ -32,6 +32,15 @@ import agent_bridle
 ECHO_ONLY = {"exec": {"only": ["echo"]}}
 
 
+def test_consumer_contract_is_pinned() -> None:
+    """#71: the published Pillar-A consumer contract, pinned in one place so a
+    PyO3-layer regression is caught by CI: ``BridleDenied`` is a subclass of the
+    built-in ``PermissionError`` (so ``except PermissionError`` catches a leash
+    denial), and the ``shell`` tool is exposed by ``tool_names()``."""
+    assert issubclass(agent_bridle.BridleDenied, PermissionError)
+    assert "shell" in agent_bridle.tool_names()
+
+
 def test_shell_is_registered() -> None:
     """The wheel is built with the ``shell`` feature, so the confined
     argv + safe-subset shell tool (ADR 0005) is present in the registry."""

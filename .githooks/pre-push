@@ -2,9 +2,9 @@
 # agent-bridle pre-push hook — the local equivalent of CI gates.
 #
 # PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml and the `check` /
-# `publish-check` recipes in justfile. When editing the lint/format/test/publish
-# steps here, verify it still matches the CI workflow and the justfile (HOOK
-# PARITY rule).
+# `publish-check` / `py-test` recipes in justfile. When editing the
+# lint/format/test/publish/python steps here, verify it still matches the CI
+# workflow and the justfile (HOOK PARITY rule).
 #
 # Do NOT bypass with --no-verify. If this fails, fix the issue.
 
@@ -18,5 +18,8 @@ just cov-ci
 
 echo "[pre-push] running publishability gate (agent-bridle-core dry-run, ADR 0008)"
 just publish-check
+
+echo "[pre-push] running Python wheel + pytest (skips gracefully if maturin absent)"
+just py-test
 
 echo "[pre-push] OK"
