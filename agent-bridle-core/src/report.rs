@@ -34,6 +34,38 @@ pub enum AxisEnforcement {
     Advisory,
 }
 
+impl AxisEnforcement {
+    /// Ascending confinement strength: `Advisory (0) < Interceptor (1) <
+    /// Kernel (2)`.
+    ///
+    /// The variants are *declared* strongest-first (`Kernel` first) so the type
+    /// reads top-down — which means a naive `#[derive(PartialOrd, Ord)]` would
+    /// order them DESCENDING (`Kernel < Advisory`) and silently invert every
+    /// `min` / [`fence_strength`] into a **fail-open** (ADR 0012 D2). The order is
+    /// therefore defined **explicitly** here, never derived; this hand-written
+    /// `impl` also turns a future stray `#[derive(Ord)]` into a hard compile error
+    /// (conflicting impls) rather than a silent security bug.
+    fn rank(self) -> u8 {
+        match self {
+            AxisEnforcement::Advisory => 0,
+            AxisEnforcement::Interceptor => 1,
+            AxisEnforcement::Kernel => 2,
+        }
+    }
+}
+
+impl Ord for AxisEnforcement {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for AxisEnforcement {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Per-axis confinement report for the four OS-confinement Caveat axes
 /// (`fs_read`, `fs_write`, `exec`, `net`).
 ///
@@ -120,6 +152,22 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             }
         }),
     }
+}
+
+/// The fence's overall strength: the greatest-lower-bound (weakest) enforcement
+/// across the **restricted** axes of `report` — a fence is only as strong as its
+/// weakest confined axis (ADR 0012 D1). Returns `None` when no axis is restricted
+/// (an empty report: a top grant confining nothing — a vacuous top with nothing
+/// to enforce). **Pure**: recomputed from the report on every call, never stored,
+/// so it cannot diverge from the lattice it summarizes (ADR 0004 D3 / ADR 0012's
+/// rejection of a parallel strength enum). Consumers that need to know *which*
+/// axis dropped the strength still read the per-axis [`EnforcementReport`].
+#[must_use]
+pub fn fence_strength(report: &EnforcementReport) -> Option<AxisEnforcement> {
+    [report.fs_read, report.fs_write, report.exec, report.net]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 #[cfg(test)]
@@ -226,5 +274,72 @@ mod tests {
             serde_json::to_value(AxisEnforcement::Advisory).unwrap(),
             serde_json::json!("advisory")
         );
+    }
+
+    /// ADR 0012 D2 regression: the order is **ascending** `Advisory < Interceptor
+    /// < Kernel`, NOT the descending declaration order. A naive `#[derive(Ord)]`
+    /// would invert this — making `Kernel < Advisory` — and silently fail
+    /// `fence_strength` OPEN (picking the strongest axis as the floor).
+    #[test]
+    fn axis_enforcement_orders_ascending_advisory_to_kernel() {
+        use AxisEnforcement::{Advisory, Interceptor, Kernel};
+        assert!(Advisory < Interceptor);
+        assert!(Interceptor < Kernel);
+        assert!(
+            Advisory < Kernel,
+            "the fail-open footgun: Advisory must be < Kernel"
+        );
+        // The strongest claim is the MAX; the weakest (the GLB the fence takes) is
+        // the MIN.
+        assert_eq!(
+            [Interceptor, Kernel, Advisory].into_iter().max(),
+            Some(Kernel)
+        );
+        assert_eq!(
+            [Interceptor, Kernel, Advisory].into_iter().min(),
+            Some(Advisory)
+        );
+    }
+
+    /// A fence is only as strong as its weakest restricted axis: fully restricted
+    /// under Landlock is fs=Kernel, exec=Interceptor, net=Advisory ⇒ `Advisory`.
+    #[test]
+    fn fence_strength_is_the_weakest_restricted_axis() {
+        let r = enforcement_report(&fully_restricted(), SandboxKind::Landlock);
+        assert_eq!(fence_strength(&r), Some(AxisEnforcement::Advisory));
+    }
+
+    /// Only the fs axes restricted under Landlock ⇒ both `Kernel`, nothing weaker
+    /// present ⇒ the fence is `Kernel`.
+    #[test]
+    fn fence_strength_all_kernel_when_only_fs_restricted() {
+        let caveats = Caveats {
+            fs_read: Scope::only(["/r".to_string()]),
+            fs_write: Scope::only(["/w".to_string()]),
+            ..Caveats::top()
+        };
+        let r = enforcement_report(&caveats, SandboxKind::Landlock);
+        assert_eq!(fence_strength(&r), Some(AxisEnforcement::Kernel));
+    }
+
+    /// An empty report (top grant, nothing restricted) has no strength — there is
+    /// nothing to confine (ADR 0012 D1: a vacuous top ⇒ `None`, never a hole).
+    #[test]
+    fn fence_strength_empty_report_is_none() {
+        let r = enforcement_report(&Caveats::top(), SandboxKind::Landlock);
+        assert!(r.is_empty());
+        assert_eq!(fence_strength(&r), None);
+    }
+
+    /// One restricted axis with no kernel backend ⇒ the fence is that axis's
+    /// (interceptor) strength.
+    #[test]
+    fn fence_strength_single_axis_no_backend() {
+        let caveats = Caveats {
+            fs_write: Scope::only(["/w".to_string()]),
+            ..Caveats::top()
+        };
+        let r = enforcement_report(&caveats, SandboxKind::None);
+        assert_eq!(fence_strength(&r), Some(AxisEnforcement::Interceptor));
     }
 }

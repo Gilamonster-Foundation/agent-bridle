@@ -42,7 +42,7 @@ pub use envelope::{Denial, DenialKind, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use registry::{Registry, RegistryBuilder};
-pub use report::{enforcement_report, AxisEnforcement, EnforcementReport};
+pub use report::{enforcement_report, fence_strength, AxisEnforcement, EnforcementReport};
 pub use sandbox::{
     best_available_sandbox, effective_sandbox_kind, NoopSandbox, Sandbox, SandboxKind,
 };
