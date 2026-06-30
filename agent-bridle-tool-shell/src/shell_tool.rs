@@ -54,11 +54,15 @@ const MAX_OUTPUT_BYTES: usize = 1 << 20; // 1 MiB
 
 /// What a finished pipeline produced (the last stage's exit code; concatenated
 /// output). The unit of the [`Spawner`] seam.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Captured {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// Whether stdout was clipped at [`MAX_OUTPUT_BYTES`] (more was produced).
+    pub stdout_truncated: bool,
+    /// Whether stderr was clipped at [`MAX_OUTPUT_BYTES`] (more was produced).
+    pub stderr_truncated: bool,
 }
 
 /// The pipeline-execution seam.
@@ -360,6 +364,7 @@ impl Tool for ShellTool {
                 Ok(ToolEnvelope::new(sandbox_kind)
                     .with_enforcement(enforcement)
                     .with_exit_code(captured.exit_code)
+                    .with_truncation(captured.stdout_truncated, captured.stderr_truncated)
                     .with_stdout(captured.stdout)
                     .with_stderr(captured.stderr)
                     .with_timed_out(false)
@@ -386,6 +391,8 @@ fn run_script(
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut status: i32 = 0;
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
 
     for item in script {
         let run_it = match item.sep {
@@ -397,14 +404,22 @@ fn run_script(
             let captured = spawner.run(&item.pipeline, cwd, caveats)?;
             stdout.push_str(&captured.stdout);
             stderr.push_str(&captured.stderr);
+            stdout_truncated |= captured.stdout_truncated;
+            stderr_truncated |= captured.stderr_truncated;
             status = captured.exit_code;
         }
     }
+
+    // The concatenation across pipelines may itself exceed the cap; flag that.
+    let stdout_truncated = stdout_truncated || stdout.len() > MAX_OUTPUT_BYTES;
+    let stderr_truncated = stderr_truncated || stderr.len() > MAX_OUTPUT_BYTES;
 
     Ok(Captured {
         exit_code: status,
         stdout: cap_string(stdout),
         stderr: cap_string(stderr),
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
@@ -718,8 +733,9 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
     let mut prev_stdin: Option<PipeReader> = None;
     // The read end capturing final stdout (last stage, when not redirected).
     let mut stdout_capture: Option<PipeReader> = None;
-    // Reader threads for stages whose stderr is captured separately.
-    let mut stderr_threads: Vec<std::thread::JoinHandle<Vec<u8>>> = Vec::new();
+    // Reader threads for stages whose stderr is captured separately. Each yields
+    // (captured bytes ≤ cap, truncated?).
+    let mut stderr_threads: Vec<std::thread::JoinHandle<(Vec<u8>, bool)>> = Vec::new();
 
     for (i, stage) in stages.iter().enumerate() {
         let is_last = i == last;
@@ -790,25 +806,17 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
         let mut child = ok_or_kill(cmd.spawn(), &mut children)?;
 
         if matches!(stage.stderr_disposition(), StderrTo::Capture) {
-            let mut err = child.stderr.take().expect("stderr is piped");
-            stderr_threads.push(std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = err.read_to_end(&mut buf);
-                buf
-            }));
+            let err = child.stderr.take().expect("stderr is piped");
+            stderr_threads.push(std::thread::spawn(move || read_capped(err)));
         }
         children.push(child);
     }
 
     // The parent now holds no pipe writers, so a captured reader sees EOF once
-    // the child(ren) exit. Drain stdout concurrently with waiting.
-    let stdout_thread = stdout_capture.map(|mut reader| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        })
-    });
+    // the child(ren) exit. Read stdout (bounded by the cap) concurrently with
+    // waiting; a child producing past the cap is cut off via EPIPE.
+    let stdout_thread =
+        stdout_capture.map(|reader| std::thread::spawn(move || read_capped(reader)));
 
     // Wait all stages; the pipeline's exit code is the last stage's.
     let mut exit_code = -1;
@@ -819,16 +827,25 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>) -> ToolResult<Captured> {
         }
     }
 
-    let stdout = stdout_thread.map_or_else(Vec::new, |h| h.join().unwrap_or_default());
+    let (stdout, stdout_truncated) =
+        stdout_thread.map_or((Vec::new(), false), |h| h.join().unwrap_or_default());
     let mut stderr = Vec::new();
+    let mut stderr_truncated = false;
     for h in stderr_threads {
-        stderr.extend(h.join().unwrap_or_default());
+        let (buf, trunc) = h.join().unwrap_or_default();
+        stderr.extend(buf);
+        stderr_truncated |= trunc;
     }
+    // Concatenated stderr across stages may itself exceed the cap; `capped_utf8`
+    // clips it and we flag that too.
+    let stderr_truncated = stderr_truncated || stderr.len() > MAX_OUTPUT_BYTES;
 
     Ok(Captured {
         exit_code,
         stdout: capped_utf8(&stdout),
         stderr: capped_utf8(&stderr),
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
@@ -847,8 +864,31 @@ fn ok_or_kill<T>(result: std::io::Result<T>, children: &mut [Child]) -> ToolResu
     })
 }
 
-/// Lossy-decode at most [`MAX_OUTPUT_BYTES`] of captured output. Truncation at a
-/// byte boundary is safe: [`String::from_utf8_lossy`] replaces any partial
+/// Read **at most** [`MAX_OUTPUT_BYTES`] from `reader` into memory, then probe one
+/// more byte to decide whether the source had more. Returns the captured bytes
+/// (≤ cap) and whether it was truncated.
+///
+/// Crucially, peak buffering is bounded by the cap **regardless of how much the
+/// child produces** — closing the DoS where a fast producer (`yes`,
+/// `cat /dev/zero`) balloons host memory up to the timeout window (#73). The
+/// remainder is **not** drained: dropping `reader` closes the pipe read end, so a
+/// still-writing child gets `EPIPE`/`SIGPIPE` on its next write (the `| head`
+/// model) rather than blocking us — and we never read past `cap + 1` bytes.
+fn read_capped(mut reader: impl Read) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    // `take` bounds total bytes read into `buf` to the cap.
+    let _ = (&mut reader)
+        .take(MAX_OUTPUT_BYTES as u64)
+        .read_to_end(&mut buf);
+    // One probe read: any byte beyond the cap means the source was truncated.
+    let mut probe = [0u8; 1];
+    let truncated = matches!(reader.read(&mut probe), Ok(n) if n > 0);
+    (buf, truncated)
+}
+
+/// Lossy-decode captured output (already bounded to ≤ [`MAX_OUTPUT_BYTES`] by
+/// [`read_capped`]). The `min` is a defensive belt-and-suspenders. Truncation at
+/// a byte boundary is safe: [`String::from_utf8_lossy`] replaces any partial
 /// trailing sequence rather than panicking.
 fn capped_utf8(bytes: &[u8]) -> String {
     let slice = &bytes[..bytes.len().min(MAX_OUTPUT_BYTES)];
@@ -920,6 +960,7 @@ mod tests {
                     .unwrap_or(0),
                 stdout: String::new(),
                 stderr: String::new(),
+                ..Default::default()
             })
         }
     }
@@ -1166,6 +1207,46 @@ mod tests {
         assert!(fnmatch("[a-c]", "b"));
         assert!(!fnmatch("[a-c]", "d"));
         assert!(fnmatch("foo*bar", "fooXYbar"));
+    }
+
+    /// #73 regression: `read_capped` bounds peak buffering to the cap and flags
+    /// truncation, without slurping the whole stream. The reader panics if asked
+    /// for far more than the cap — which `read_to_end` (the old path) would do on
+    /// an endless producer.
+    #[test]
+    fn read_capped_bounds_buffering_and_flags_truncation() {
+        // An endless 'x' source that asserts it is never asked for more than the
+        // cap plus a small probe/pipe slack.
+        struct Endless {
+            served: usize,
+        }
+        impl Read for Endless {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.served = self.served.saturating_add(b.len());
+                assert!(
+                    self.served <= MAX_OUTPUT_BYTES + 64 * 1024,
+                    "read_capped over-read {} bytes (cap {MAX_OUTPUT_BYTES})",
+                    self.served
+                );
+                b.fill(b'x');
+                Ok(b.len())
+            }
+        }
+        let (buf, truncated) = read_capped(Endless { served: 0 });
+        assert_eq!(
+            buf.len(),
+            MAX_OUTPUT_BYTES,
+            "peak buffering bounded by the cap"
+        );
+        assert!(
+            truncated,
+            "a source longer than the cap is flagged truncated"
+        );
+
+        // A short source is captured whole and NOT flagged.
+        let (buf2, trunc2) = read_capped(&b"hello"[..]);
+        assert_eq!(buf2, b"hello");
+        assert!(!trunc2, "a sub-cap source is not truncated");
     }
 
     #[test]
