@@ -1448,33 +1448,64 @@ mod tests {
         mock.envs.lock().unwrap().clone()
     }
 
-    /// ADR 0012 D4/D8: a STRONG principal (floor = Kernel) fails closed *before
-    /// any spawn* when a restricted axis can't be kernel-confined. `exec` is not
-    /// kernel-enforceable yet (#57), so an `exec:Only` run is refused; the default
-    /// (permissive) principal still runs it. This closes the shell's
-    /// run-unconfined gap and matches `ConfinedCommand`'s fail-closed posture.
+    /// ADR 0012 D4/D8 + ADR 0013: a STRONG principal (floor = `Kernel`) refuses to
+    /// run unconfined when a restricted axis cannot be kernel-confined on this host.
+    ///
+    /// For the `exec` axis the outcome is **backend-dependent** since ADR 0013
+    /// closed #57 for macOS: under an active Seatbelt backend `exec` is
+    /// kernel-confined via `process-exec*`, so the strong principal *runs*
+    /// (reporting `exec → kernel`); under Landlock or a Noop host the exec axis is
+    /// still held (#31/#57), so it fails closed *before any spawn*. The default
+    /// (permissive, Advisory-floor) principal runs in either case. This closes the
+    /// shell's run-unconfined gap and matches `ConfinedCommand`'s fail-closed
+    /// posture. The test's expectation is derived from the *same* honesty rule the
+    /// production path uses (`intended_sandbox_kind` + `enforcement_report`), so the
+    /// two cannot disagree across platforms/features.
     #[tokio::test]
     async fn strong_principal_fails_closed_on_unenforceable_exec() {
+        let granted = exec_only(&["echo"]);
+        // Does the backend that will actually govern this run kernel-confine `exec`?
+        // Seatbelt does (`process-exec*`, ADR 0013); Landlock/Noop do not (#31/#57).
+        let exec_is_kernel_confined = enforcement_report(&granted, intended_sandbox_kind(&granted))
+            .exec
+            == Some(agent_bridle_core::AxisEnforcement::Kernel);
+
         let mock = Arc::new(MockSpawner::default());
         let out = ShellTool::with_spawner(mock.clone())
             .invoke(
                 serde_json::json!({"cmd": "echo hi"}),
-                &ctx_strong(exec_only(&["echo"])),
+                &ctx_strong(granted.clone()),
             )
             .await
             .expect("invoke");
-        assert_eq!(
-            out["denied"], true,
-            "strong principal must fail closed on unenforceable exec: {out}"
-        );
-        assert!(ran_programs(&mock).is_empty(), "nothing may spawn: {out}");
+        if exec_is_kernel_confined {
+            // Seatbelt confines `exec` in the kernel, so the strong principal runs —
+            // kernel-confined, not refused.
+            assert_ne!(
+                out["denied"],
+                serde_json::json!(true),
+                "kernel-confined exec must run for a strong principal: {out}"
+            );
+            assert_eq!(
+                out["enforcement"]["exec"], "kernel",
+                "exec is reported kernel-confined: {out}"
+            );
+            assert_eq!(ran_programs(&mock), ["echo"], "the program spawned: {out}");
+        } else {
+            // The exec axis is held (Landlock/Noop): a Kernel floor cannot be met, so
+            // refuse before any spawn.
+            assert_eq!(
+                out["denied"], true,
+                "strong principal must fail closed on unenforceable exec: {out}"
+            );
+            assert!(ran_programs(&mock).is_empty(), "nothing may spawn: {out}");
+        }
 
-        // The default (permissive, Advisory-floor) principal runs the same command.
+        // The default (permissive, Advisory-floor) principal runs the same command
+        // regardless of backend.
+        let mock = Arc::new(MockSpawner::default());
         let out = ShellTool::with_spawner(mock.clone())
-            .invoke(
-                serde_json::json!({"cmd": "echo hi"}),
-                &ctx(exec_only(&["echo"])),
-            )
+            .invoke(serde_json::json!({"cmd": "echo hi"}), &ctx(granted))
             .await
             .expect("invoke");
         assert_ne!(
