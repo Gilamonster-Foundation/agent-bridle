@@ -29,6 +29,7 @@
 //! is behind a [`Spawner`] seam (mocked in unit tests; real path in
 //! `tests/real_spawn.rs`).
 
+use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter, Read};
 #[cfg(windows)]
 use std::io::{Seek, SeekFrom};
@@ -38,9 +39,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_bridle_core::{
-    best_available_sandbox, effective_sandbox_kind, enforcement_report, Caveats, Denial,
-    DenialKind, EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError,
-    ToolResult,
+    best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
+    Caveats, Denial, DenialKind, EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope,
+    ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -81,9 +82,18 @@ pub(crate) struct Captured {
 pub(crate) trait Spawner: Send + Sync {
     /// Run one leash-approved pipeline to completion, capturing its output. The
     /// effective `caveats` are passed so the real spawner can apply the L3 OS
-    /// sandbox (Landlock) before spawning; the mock ignores them.
-    fn run(&self, stages: &[Command], cwd: Option<&str>, caveats: &Caveats)
-        -> ToolResult<Captured>;
+    /// sandbox (Landlock) before spawning; the mock ignores them. `env` is the
+    /// host/operator-supplied environment (the env seam, newt #783): the real
+    /// spawner sets these vars on each spawned child (additive over the inherited
+    /// ambient env). `env` is structured host input, never model-authored command
+    /// text, so it grants no new authority — the exec/fs leash is unaffected.
+    fn run(
+        &self,
+        stages: &[Command],
+        cwd: Option<&str>,
+        caveats: &Caveats,
+        env: &BTreeMap<String, String>,
+    ) -> ToolResult<Captured>;
 }
 
 /// The real spawner: a `std::process` pipeline wired with OS pipes + redirects,
@@ -96,14 +106,15 @@ impl Spawner for OsSpawner {
         stages: &[Command],
         cwd: Option<&str>,
         caveats: &Caveats,
+        env: &BTreeMap<String, String>,
     ) -> ToolResult<Captured> {
         // When an OS sandbox (Landlock/Seatbelt) will actually confine this run,
         // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
         // 0006 D4). Otherwise run directly — no need to spend a thread.
         if intended_sandbox_kind(caveats) == SandboxKind::None {
-            run_pipeline(stages, cwd, &[])
+            run_pipeline(stages, cwd, &[], env)
         } else {
-            run_confined(stages, cwd, caveats)
+            run_confined(stages, cwd, caveats, env)
         }
     }
 }
@@ -128,17 +139,23 @@ fn intended_sandbox_kind(caveats: &Caveats) -> SandboxKind {
 /// prefix from `command_prefix`, prepended to every stage so the child is
 /// spawned already confined. Both are fail-closed (ADR 0006 D4): if confinement
 /// cannot be established the run errors rather than proceeding unconfined.
-fn run_confined(stages: &[Command], cwd: Option<&str>, caveats: &Caveats) -> ToolResult<Captured> {
+fn run_confined(
+    stages: &[Command],
+    cwd: Option<&str>,
+    caveats: &Caveats,
+    env: &BTreeMap<String, String>,
+) -> ToolResult<Captured> {
     // Computed before the spawn so a fail-closed wrapper error aborts the run.
     let prefix = best_available_sandbox().command_prefix(caveats)?;
     let stages = stages.to_vec();
     let cwd = cwd.map(str::to_string);
     let caveats = caveats.clone();
+    let env = env.clone();
     std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox().apply(&caveats)?;
-            run_pipeline(&stages, cwd.as_deref(), &prefix)
+            run_pipeline(&stages, cwd.as_deref(), &prefix, &env)
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -257,6 +274,17 @@ impl Tool for ShellTool {
                 "cwd": {
                     "type": "string",
                     "description": "Working directory for the command (must be within fs_read scope)."
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Host/operator-supplied environment variables (string \
+                        values) set on the spawned child process(es), additive over the \
+                        inherited ambient environment. Pass real env vars here instead of \
+                        prepending `export VAR=…;` statements to `cmd` — an `export` builtin \
+                        is not a program and the confined engine refuses it. These values are \
+                        host input, not model-authored command text, and do NOT widen the \
+                        leash: the exec/fs check is on the real program, never on env."
                 },
                 "timeout_secs": {
                     "type": "integer",
@@ -478,14 +506,44 @@ impl Tool for ShellTool {
             }
         }
 
+        // Fail closed (ADR 0012 D4) — AFTER L2 admission (so a specific
+        // out-of-scope glob/redirect/exec denial is reported first) but before any
+        // spawn: refuse when a restricted axis cannot be enforced on this host at
+        // the principal's strength floor. Decided against `sandbox_kind` — the kind
+        // that ACTUALLY governs the spawn (`effective_sandbox_kind`, what
+        // `OsSpawner` routes through), NOT the raw probe: a backend the run path
+        // does not route through (AppContainer today — its shell launcher is #51)
+        // collapses to `None` here, so an fs-restricted run on it fails closed
+        // instead of executing unconfined via `run_pipeline` (the adversarial-review
+        // fix — the check and the routing must agree). The filesystem axes always
+        // fail closed when restricted-but-unenforceable (closing the run-unconfined
+        // gap the shell shared with ConfinedCommand); exec/net fail closed only for
+        // a strong principal (the default floor is permissive).
+        if confinement_unenforceable(sandbox_kind, cx.caveats(), cx.strength_floor()) {
+            return Ok(deny(
+                sandbox_kind,
+                enforcement,
+                DenialKind::Exec,
+                "confinement",
+                &ToolError::denied(format!(
+                    "a restricted filesystem/exec/net axis cannot be enforced on this host \
+                     at the required strength floor ({:?}); refusing to run unconfined",
+                    cx.strength_floor()
+                )),
+            ));
+        }
+
         // Run on a blocking thread, bounded by the timeout. On timeout the
         // blocking task is detached and a timeout envelope is returned.
         let spawner = Arc::clone(&self.spawner);
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
+        // Host/operator-supplied environment (the env seam, newt #783): carried
+        // through to the child processes. Empty when the dispatch omits `env`.
+        let env = parsed.env;
         let caveats = cx.caveats().clone();
         let run = tokio::task::spawn_blocking(move || {
-            run_script(&*spawner, &script, cwd.as_deref(), &caveats)
+            run_script(&*spawner, &script, cwd.as_deref(), &caveats, &env)
         });
         match tokio::time::timeout(timeout, run).await {
             Ok(joined) => {
@@ -517,6 +575,7 @@ fn run_script(
     script: &[ScriptItem],
     cwd: Option<&str>,
     caveats: &Caveats,
+    env: &BTreeMap<String, String>,
 ) -> ToolResult<Captured> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -531,7 +590,7 @@ fn run_script(
             Sep::Or => status != 0,
         };
         if run_it {
-            let captured = spawner.run(&item.pipeline, cwd, caveats)?;
+            let captured = spawner.run(&item.pipeline, cwd, caveats, env)?;
             stdout.push_str(&captured.stdout);
             stderr.push_str(&captured.stderr);
             stdout_truncated |= captured.stdout_truncated;
@@ -593,6 +652,10 @@ struct ShellArgs {
     args: Vec<String>,
     cmd: Option<String>,
     cwd: Option<String>,
+    /// Host/operator-supplied environment for the spawned child(ren) (the env
+    /// seam, newt #783). Empty when the dispatch omits `env` (back-compat). Only
+    /// string values are taken; non-string entries are ignored.
+    env: BTreeMap<String, String>,
     timeout: Duration,
 }
 
@@ -617,6 +680,18 @@ impl ShellArgs {
             })
             .unwrap_or_default();
         let cwd = obj.get("cwd").and_then(|x| x.as_str()).map(String::from);
+        // The env seam (newt #783): a `"env": { "KEY": "VALUE", … }` object whose
+        // string values are set on the spawned child(ren). Absent → empty map
+        // (back-compat). Non-string values are dropped (the schema is string-only).
+        let env = obj
+            .get("env")
+            .and_then(|x| x.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect::<BTreeMap<String, String>>()
+            })
+            .unwrap_or_default();
         let timeout_secs = obj
             .get("timeout_secs")
             .and_then(serde_json::Value::as_u64)
@@ -643,6 +718,7 @@ impl ShellArgs {
             args,
             cmd,
             cwd,
+            env,
             timeout: Duration::from_secs(timeout_secs),
         })
     }
@@ -1069,7 +1145,12 @@ fn expand_stage_argv(stage: &Command, _cwd: Option<&str>) -> Vec<String> {
 /// `wrap` is the OS-sandbox command prefix (macOS Seatbelt's `sandbox-exec -p
 /// <profile>`), prepended to **every** stage so each spawned program is confined;
 /// it is empty for thread-confining (Landlock) and unconfined runs.
-fn run_pipeline(stages: &[Command], cwd: Option<&str>, wrap: &[String]) -> ToolResult<Captured> {
+fn run_pipeline(
+    stages: &[Command],
+    cwd: Option<&str>,
+    wrap: &[String],
+    env: &BTreeMap<String, String>,
+) -> ToolResult<Captured> {
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
     let last = n - 1;
@@ -1099,6 +1180,17 @@ fn run_pipeline(stages: &[Command], cwd: Option<&str>, wrap: &[String]) -> ToolR
         cmd.args(&argv[1..]);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
+        }
+        // Host/operator-supplied environment (the env seam, newt #783): set the
+        // provided vars on the child, additive over the inherited ambient env.
+        // The values are structured host input (never model-authored command
+        // text), so they grant no new authority — the exec/fs leash that already
+        // admitted this stage checked the *real* program (argv[0]), not env. When
+        // a Seatbelt `wrap` prefix is present, `sandbox-exec` forwards its own
+        // environment to the wrapped program, so setting it here still reaches the
+        // confined child.
+        for (k, v) in env {
+            cmd.env(k, v);
         }
 
         // ── stdin: a `< file` redirect wins over the incoming pipe ──────────
@@ -1275,6 +1367,9 @@ mod tests {
     #[derive(Default)]
     struct MockSpawner {
         calls: Mutex<Vec<Vec<Command>>>,
+        /// The env map handed to each `run` call (parallel to `calls`), so the env
+        /// seam (newt #783) is verified without a real process.
+        envs: Mutex<Vec<BTreeMap<String, String>>>,
         exit_by_program: HashMap<String, i32>,
         block_ms: u64,
     }
@@ -1302,8 +1397,10 @@ mod tests {
             stages: &[Command],
             _cwd: Option<&str>,
             _caveats: &Caveats,
+            env: &BTreeMap<String, String>,
         ) -> ToolResult<Captured> {
             self.calls.lock().unwrap().push(stages.to_vec());
+            self.envs.lock().unwrap().push(env.clone());
             if self.block_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.block_ms));
             }
@@ -1326,6 +1423,15 @@ mod tests {
             .expect("authorize")
     }
 
+    /// A context for a **strong** principal (fence-strength floor = `Kernel`):
+    /// any restricted axis the real backend can't kernel-confine fails closed.
+    fn ctx_strong(granted: Caveats) -> ToolContext {
+        Gate::new(0)
+            .with_strength_floor(agent_bridle_core::AxisEnforcement::Kernel)
+            .authorize(&ShellTool::new(), &granted)
+            .expect("authorize")
+    }
+
     fn exec_only(names: &[&str]) -> Caveats {
         Caveats {
             exec: Scope::only(names.iter().map(|s| (*s).to_string())),
@@ -1337,11 +1443,137 @@ mod tests {
         mock.calls.lock().unwrap().clone()
     }
 
+    /// The env map handed to each `run` call, in order (the env seam, newt #783).
+    fn envs(mock: &Arc<MockSpawner>) -> Vec<BTreeMap<String, String>> {
+        mock.envs.lock().unwrap().clone()
+    }
+
+    /// ADR 0012 D4/D8: a STRONG principal (floor = Kernel) fails closed *before
+    /// any spawn* when a restricted axis can't be kernel-confined. `exec` is not
+    /// kernel-enforceable yet (#57), so an `exec:Only` run is refused; the default
+    /// (permissive) principal still runs it. This closes the shell's
+    /// run-unconfined gap and matches `ConfinedCommand`'s fail-closed posture.
+    #[tokio::test]
+    async fn strong_principal_fails_closed_on_unenforceable_exec() {
+        let mock = Arc::new(MockSpawner::default());
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo hi"}),
+                &ctx_strong(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(
+            out["denied"], true,
+            "strong principal must fail closed on unenforceable exec: {out}"
+        );
+        assert!(ran_programs(&mock).is_empty(), "nothing may spawn: {out}");
+
+        // The default (permissive, Advisory-floor) principal runs the same command.
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo hi"}),
+                &ctx(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_ne!(
+            out["denied"],
+            serde_json::json!(true),
+            "default principal still runs: {out}"
+        );
+    }
+
     fn ran_programs(mock: &Arc<MockSpawner>) -> Vec<String> {
         calls(mock)
             .iter()
             .map(|pipeline| prog(&pipeline[0]).to_string())
             .collect()
+    }
+
+    // ── the env seam (newt #783) ────────────────────────────────────────────
+
+    /// A dispatch carrying `"env": { "FOO": "bar" }` reaches the spawner with that
+    /// var on the child's environment map — the seam newt #783 needs so it can
+    /// pass the venv environment as real env instead of an `export …;` prefix.
+    #[tokio::test]
+    async fn env_map_is_passed_to_the_spawner() {
+        let mock = Arc::new(MockSpawner::default());
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({
+                    "program": "echo",
+                    "args": ["hi"],
+                    "env": { "FOO": "bar", "VIRTUAL_ENV": "/venv" },
+                }),
+                &ctx(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_ne!(out["denied"], serde_json::json!(true), "must run: {out}");
+        let envs = envs(&mock);
+        assert_eq!(envs.len(), 1, "one pipeline ran");
+        assert_eq!(envs[0].get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(
+            envs[0].get("VIRTUAL_ENV").map(String::as_str),
+            Some("/venv"),
+            "every env entry reaches the child: {:?}",
+            envs[0]
+        );
+    }
+
+    /// The env map is NEVER part of the leash decision: the leash still checks the
+    /// real program. A compound command (`hostname; uname`) with `env` set must
+    /// check `hostname` first — never `export`/`env`/an env KEY. This is the exact
+    /// newt #783 root cause: prepending `export VIRTUAL_ENV=…;` made the first
+    /// stage's argv[0] the literal `export` builtin, which the leash denied. With
+    /// env carried as a real map there is no `export` stage at all.
+    #[tokio::test]
+    async fn env_does_not_change_the_program_the_leash_checks() {
+        let mock = Arc::new(MockSpawner::default());
+        // Grant exactly the two real programs; `export`/`env`/the env keys are NOT
+        // granted, so if any of them were checked the run would be denied.
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({
+                    "cmd": "hostname; uname -s",
+                    "env": { "FOO": "bar" },
+                }),
+                &ctx(exec_only(&["hostname", "uname"])),
+            )
+            .await
+            .expect("invoke");
+        assert_ne!(out["denied"], serde_json::json!(true), "must run: {out}");
+        // The FIRST program the spawner saw is the real `hostname`, not `export`.
+        let programs = ran_programs(&mock);
+        assert_eq!(
+            programs,
+            vec!["hostname".to_string(), "uname".to_string()],
+            "the leash/spawner see the real programs, never `export`/env keys: {programs:?}"
+        );
+        // And the env still reached each child.
+        for e in envs(&mock) {
+            assert_eq!(e.get("FOO").map(String::as_str), Some("bar"));
+        }
+    }
+
+    /// `ShellArgs::parse`: the `env` field is populated from the dispatch JSON
+    /// `"env"` object when present, and is empty (back-compat) when absent.
+    #[test]
+    fn parse_env_field_present_and_absent() {
+        // Present → populated (string values only).
+        let parsed = ShellArgs::parse(&serde_json::json!({
+            "program": "echo",
+            "env": { "FOO": "bar", "BAZ": "qux" },
+        }))
+        .expect("parse");
+        assert_eq!(parsed.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(parsed.env.get("BAZ").map(String::as_str), Some("qux"));
+        assert_eq!(parsed.env.len(), 2);
+
+        // Absent → empty map (existing dispatches are unaffected).
+        let parsed = ShellArgs::parse(&serde_json::json!({ "program": "echo" })).expect("parse");
+        assert!(parsed.env.is_empty(), "absent env defaults to empty");
     }
 
     /// A fake environment for the `$VAR` tests — exercises the allowlist +

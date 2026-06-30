@@ -32,9 +32,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use crate::{
-    best_available_sandbox, effective_sandbox_kind, Caveats, SandboxKind, Scope, ToolContext,
-    ToolError, ToolResult,
+    best_available_sandbox, effective_sandbox_kind, enforcement_report, fence_strength,
+    AxisEnforcement, Caveats, SandboxKind, ToolContext, ToolError, ToolResult,
 };
+// Used only by the test modules below (each `use super::*`); kept here so all
+// three (`tests`, `landlock_child_tests`, `seatbelt_child_tests`) see it without
+// an unused-import warning in the non-test build.
+#[cfg(test)]
+use crate::Scope;
 
 /// A spawned child together with the OS sandbox actually in force around it.
 ///
@@ -149,13 +154,27 @@ impl ConfinedCommand {
         let effective = cx.caveats().clone();
         let sandbox = best_available_sandbox();
         let kind = sandbox.kind();
+        // The kind that actually GOVERNS this spawn: the backend's kind only when
+        // an fs axis is restricted (so it confines something), else `None`. A
+        // backend the spawn path does not route through collapses to `None` here
+        // (e.g. AppContainer, whose launcher is unbuilt — #51). The fail-closed
+        // check is decided against THIS, not the raw probe, so the check and the
+        // routing cannot disagree (the adversarial-review fix: a raw
+        // `enforcement_report` claim of fs→Kernel for a backend that is not
+        // actually applied would otherwise pass a run the path executes
+        // unconfined). Also the honest kind reported on the child (I9 / ADR 0006 D3).
+        let reported_kind = effective_sandbox_kind(kind, &effective);
 
-        // (2) Fail closed: a restrictive write grant we cannot enforce is a lie.
-        if confinement_unenforceable(kind, &effective) {
+        // (2) Fail closed: a restricted axis the governing backend cannot enforce
+        // at the principal's strength floor is a grant we'd be lying about.
+        if confinement_unenforceable(reported_kind, &effective, cx.strength_floor()) {
             return Err(ToolError::denied(format!(
-                "refusing to spawn {:?}: fs_write is restricted but no OS sandbox is \
-                 available to enforce it on a subprocess (sandbox_kind = none)",
-                self.program
+                "refusing to spawn {:?}: a restricted filesystem/exec/net axis cannot be \
+                 enforced on a subprocess at the required strength floor ({:?}) by the \
+                 governing sandbox ({:?})",
+                self.program,
+                cx.strength_floor(),
+                reported_kind
             )));
         }
 
@@ -164,13 +183,6 @@ impl ConfinedCommand {
         // thread-confining backends (Landlock, via `apply`) and Noop. Computed
         // here so a fail-closed wrapper error aborts *before* we spawn the thread.
         let prefix = sandbox.command_prefix(&effective)?;
-
-        // The honest kind to report on the child: the backend's kind only when an
-        // fs axis is actually restricted (so it confines something), else `None`.
-        // Without an fs restriction a wrapper backend applies *nothing* (empty
-        // prefix + no-op `apply`), so reporting its kind would overclaim (I9 /
-        // ADR 0006 D3). Mirrors the shell engine's `intended_sandbox_kind`.
-        let reported_kind = effective_sandbox_kind(kind, &effective);
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
         //     child inherits the OS confinement — the per-thread, fork/exec-
@@ -262,14 +274,40 @@ fn wrap_argv(prefix: &[String], program: &str, args: &[OsString]) -> (OsString, 
     (OsString::from(&prefix[0]), argv)
 }
 
-/// Would confining this child be a *lie*? True iff the kernel/OS cannot enforce a
-/// meaningfully-restricted `fs_write` grant.
+/// Would confining this child be a *lie*? Decided against the **real** backend
+/// `kind` (the probe the spawn actually confines through — not a stale gate
+/// stamp; ADR 0012 D4) and the principal's `floor`.
 ///
-/// Only `fs_write` is L3-enforceable today, so it is the only axis that
-/// participates in the fail-closed decision; `fs_read`/`exec`/`net` confinement
-/// of a subprocess is advisory until those L3 backends land (ADR 0001).
-fn confinement_unenforceable(kind: SandboxKind, caveats: &Caveats) -> bool {
-    kind == SandboxKind::None && matches!(caveats.fs_write, Scope::Only(_))
+/// Two parts:
+/// 1. **The filesystem floor (always).** `fs_read` and `fs_write` *are*
+///    kernel-enforceable (Landlock/Seatbelt/AppContainer); a restricted fs axis
+///    the active backend cannot kernel-confine is a grant we cannot honor, so we
+///    refuse regardless of strength. This keeps the ADR 0003 stub floor for
+///    `fs_write` **and** extends it to `fs_read` — closing the spawn-boundary
+///    fail-open ADR 0012 D4 found (a restricted `fs_read` was run unconfined
+///    under `None` because the old check looked at `fs_write` only).
+/// 2. **The strength floor (`exec`/`net`).** Those axes are not yet
+///    kernel-enforceable on a subprocess (#31/#57), so they refuse only when the
+///    principal's `floor` demands more than the real backend delivers
+///    (`fence_strength(report) < floor`). With the default floor
+///    ([`AxisEnforcement::Advisory`]) this is a no-op; a strong principal
+///    (`floor = Kernel`) fails closed on a restricted `exec`/`net` it cannot
+///    kernel-confine (ADR 0012 D3/D10).
+#[must_use]
+pub fn confinement_unenforceable(
+    kind: SandboxKind,
+    caveats: &Caveats,
+    floor: AxisEnforcement,
+) -> bool {
+    let report = enforcement_report(caveats, kind);
+    let below_kernel = |e: Option<AxisEnforcement>| e.is_some_and(|e| e != AxisEnforcement::Kernel);
+    // (1) Filesystem axes: kernel-enforceable, so a restricted-but-not-kernel fs
+    // axis is always unenforceable.
+    if below_kernel(report.fs_write) || below_kernel(report.fs_read) {
+        return true;
+    }
+    // (2) exec/net: refuse only when the strength floor is not met by reality.
+    fence_strength(&report).is_some_and(|s| s < floor)
 }
 
 #[cfg(test)]
@@ -312,22 +350,89 @@ mod tests {
     }
 
     #[test]
-    fn unenforceable_predicate_only_trips_on_restricted_write_without_sandbox() {
-        let restricted = Caveats {
+    fn unenforceable_predicate_fs_axes_always_strength_floor_for_exec() {
+        use AxisEnforcement::{Advisory, Kernel};
+        let fs_write = Caveats {
             fs_write: Scope::only(["/tmp/x".to_string()]),
             ..Caveats::top()
         };
-        // Restricted write + no OS sandbox => unenforceable (must refuse).
-        assert!(confinement_unenforceable(SandboxKind::None, &restricted));
-        // Same grant, but the kernel can enforce it => fine.
+        let fs_read = Caveats {
+            fs_read: Scope::only(["/tmp/x".to_string()]),
+            ..Caveats::top()
+        };
+        let exec = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+
+        // (1) FS floor — always, regardless of strength: a restricted fs axis with
+        // no OS sandbox is unenforceable, for BOTH fs_write and fs_read (the
+        // latter is the ADR 0012 D4 spawn-boundary fail-open this closes).
+        assert!(confinement_unenforceable(
+            SandboxKind::None,
+            &fs_write,
+            Advisory
+        ));
+        assert!(confinement_unenforceable(
+            SandboxKind::None,
+            &fs_read,
+            Advisory
+        ));
+        // The kernel can enforce the fs axes => fine.
         assert!(!confinement_unenforceable(
             SandboxKind::Landlock,
-            &restricted
+            &fs_write,
+            Advisory
         ));
-        // Unrestricted write => nothing to enforce, even with no sandbox.
+        assert!(!confinement_unenforceable(
+            SandboxKind::Landlock,
+            &fs_read,
+            Advisory
+        ));
+
+        // (2) exec is not kernel-enforceable: the default (Advisory) floor permits
+        // it; a strong (Kernel) floor fails closed (the opt-in un-stub posture).
         assert!(!confinement_unenforceable(
             SandboxKind::None,
-            &Caveats::top()
+            &exec,
+            Advisory
+        ));
+        assert!(confinement_unenforceable(SandboxKind::None, &exec, Kernel));
+
+        // Unrestricted grant => nothing to enforce, even under a Kernel floor.
+        assert!(!confinement_unenforceable(
+            SandboxKind::None,
+            &Caveats::top(),
+            Kernel
+        ));
+    }
+
+    /// Regression (adversarial review of ADR 0012 D4): the fail-closed check must
+    /// be decided against the kind the spawn path ACTUALLY applies
+    /// (`effective_sandbox_kind`), never the raw probe. A backend whose
+    /// `enforcement_report` claims fs→Kernel but which the run path does not route
+    /// through — AppContainer today, whose shell launcher is unbuilt (#51) — must
+    /// fail closed on a restricted-fs run, not execute it unconfined.
+    #[test]
+    fn fs_floor_uses_the_governing_kind_not_the_raw_probe_for_appcontainer() {
+        let fs = Caveats {
+            fs_write: Scope::only(["/tmp/x".to_string()]),
+            ..Caveats::top()
+        };
+        // The spawn path collapses AppContainer → None (not yet routed).
+        let governing = effective_sandbox_kind(SandboxKind::AppContainer, &fs);
+        assert_eq!(governing, SandboxKind::None);
+        // Fed the GOVERNING kind (what spawn.rs/shell now pass), the fs floor trips
+        // → fail closed. Fed the RAW probe (the bug), it would WRONGLY pass.
+        assert!(confinement_unenforceable(
+            governing,
+            &fs,
+            AxisEnforcement::Advisory
+        ));
+        assert!(!confinement_unenforceable(
+            SandboxKind::AppContainer,
+            &fs,
+            AxisEnforcement::Advisory
         ));
     }
 
