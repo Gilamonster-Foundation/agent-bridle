@@ -23,8 +23,20 @@ use crate::step_up::{
     DischargeVerifier, StepUpPolicy,
 };
 use crate::{
-    Caveats, CountBound, Sandbox, SandboxKind, Scope, Tool, ToolContext, ToolError, ToolResult,
+    AxisEnforcement, Caveats, CountBound, Sandbox, SandboxKind, Scope, Tool, ToolContext,
+    ToolError, ToolResult,
 };
+
+/// The fence-strength floor a gate stamps into every context it mints when the
+/// host does not set one (ADR 0012 D3). It is **[`AxisEnforcement::Advisory`]**
+/// (permissive — accept down to advisory) so this mechanism lands non-breaking:
+/// every existing grant keeps running. ADR 0012 D3 specifies the *eventual*
+/// strict default is `Kernel` ("fail-closed by omission"); flipping it there is
+/// the un-stub gate's job (#31), because a `Kernel` default refuses every
+/// `exec:Only` / `net:Only` run today (exec/net are not yet kernel-enforceable)
+/// and must land together with the call-site/test updates that behavior change
+/// requires. A strong principal opts in now via [`Gate::with_strength_floor`].
+const DEFAULT_STRENGTH_FLOOR: AxisEnforcement = AxisEnforcement::Advisory;
 
 /// Defensive cap on the freshness-window scan (ADR 0007 D4). The gate recomputes
 /// the bound challenge once per generation in the window, so an unbounded
@@ -47,6 +59,10 @@ pub struct Gate {
     generation: u64,
     /// The OS-level sandbox stamped into every context this gate mints.
     sandbox_kind: SandboxKind,
+    /// The required fence-strength floor stamped into every context (ADR 0012 D3):
+    /// the weakest per-axis enforcement this principal accepts before a
+    /// confinement site fails closed. Defaults to [`DEFAULT_STRENGTH_FLOOR`].
+    strength_floor: AxisEnforcement,
     /// Bound challenges already consumed by an accepted [`crate::Discharge`].
     /// Makes every verified human gesture **single-use** (replay-proof): a
     /// discharge re-presented after it first succeeded is denied. Interior-mutable
@@ -64,6 +80,7 @@ impl Gate {
             remaining: None,
             generation,
             sandbox_kind: SandboxKind::None,
+            strength_floor: DEFAULT_STRENGTH_FLOOR,
             consumed: Mutex::new(HashSet::new()),
         }
     }
@@ -81,6 +98,7 @@ impl Gate {
             remaining,
             generation,
             sandbox_kind: SandboxKind::None,
+            strength_floor: DEFAULT_STRENGTH_FLOOR,
             consumed: Mutex::new(HashSet::new()),
         }
     }
@@ -91,6 +109,20 @@ impl Gate {
     #[must_use]
     pub fn with_sandbox(mut self, sandbox: &dyn Sandbox) -> Self {
         self.sandbox_kind = sandbox.kind();
+        self
+    }
+
+    /// Set the required fence-strength floor for every context this gate mints
+    /// (ADR 0012 D3) — the weakest per-axis enforcement the principal accepts
+    /// before a confinement site refuses to spawn. A **strong** principal raises
+    /// it to [`AxisEnforcement::Kernel`] (fail closed on any restricted axis the
+    /// real backend cannot kernel-confine); the default is the permissive
+    /// [`AxisEnforcement::Advisory`]. The floor only ever *raises* on delegation
+    /// (it cannot be lowered from inside a running tool — it has no setter on the
+    /// minted [`ToolContext`]).
+    #[must_use]
+    pub fn with_strength_floor(mut self, floor: AxisEnforcement) -> Self {
+        self.strength_floor = floor;
         self
     }
 
@@ -127,7 +159,11 @@ impl Gate {
         self.charge_one(granted)?;
 
         // (4) The single mint site.
-        Ok(ToolContext::mint(effective, self.sandbox_kind))
+        Ok(ToolContext::mint(
+            effective,
+            self.sandbox_kind,
+            self.strength_floor,
+        ))
     }
 
     /// Deny unless this gate's generation is in the grant's
@@ -206,7 +242,11 @@ impl Gate {
             return Decision::NeedsDischarge(required);
         }
         match self.charge_one(granted) {
-            Ok(()) => Decision::Allow(ToolContext::mint(effective, self.sandbox_kind)),
+            Ok(()) => Decision::Allow(ToolContext::mint(
+                effective,
+                self.sandbox_kind,
+                self.strength_floor,
+            )),
             Err(e) => Decision::Deny(e),
         }
     }
@@ -234,7 +274,10 @@ impl Gate {
         let required = policy.required_for(request);
         if !required.demands_gesture() {
             self.charge_one(granted)?;
-            return Ok((ToolContext::mint(effective, self.sandbox_kind), None));
+            return Ok((
+                ToolContext::mint(effective, self.sandbox_kind, self.strength_floor),
+                None,
+            ));
         }
 
         // Freshness window (ADR 0007 D4): accept a discharge bound to any
@@ -287,7 +330,10 @@ impl Gate {
         });
 
         self.charge_one(granted)?;
-        Ok((ToolContext::mint(effective, self.sandbox_kind), attestation))
+        Ok((
+            ToolContext::mint(effective, self.sandbox_kind, self.strength_floor),
+            attestation,
+        ))
     }
 
     /// Orchestrate the whole step-up sequence — evaluate, run the host ceremony,
@@ -370,6 +416,23 @@ mod tests {
         NoopTool {
             required: Caveats::top(),
         }
+    }
+
+    /// ADR 0012 D3: the fence-strength floor defaults to the permissive
+    /// `Advisory` (non-breaking) and is stamped, immutable, into every context;
+    /// a strong principal raises it via `with_strength_floor`.
+    #[test]
+    fn strength_floor_defaults_advisory_and_rides_into_the_context() {
+        let cx = Gate::new(0)
+            .authorize(&top_tool(), &Caveats::top())
+            .expect("authorize");
+        assert_eq!(cx.strength_floor(), AxisEnforcement::Advisory);
+
+        let strong = Gate::new(0)
+            .with_strength_floor(AxisEnforcement::Kernel)
+            .authorize(&top_tool(), &Caveats::top())
+            .expect("authorize");
+        assert_eq!(strong.strength_floor(), AxisEnforcement::Kernel);
     }
 
     #[test]
