@@ -310,6 +310,31 @@ async fn real_allowlisted_var_expands_from_the_environment() {
 }
 
 #[tokio::test]
+async fn real_env_map_reaches_the_child() {
+    // The env seam (newt #783): a `"env"` map on the dispatch is set on the real
+    // child. `env` (coreutils) with no args prints its environment; the var we
+    // injected must appear — proof it crossed into the spawned process, not just
+    // the recording mock. A unique value so a stray host `FOO` can't false-pass.
+    let marker = format!("ab-env-seam-{}", std::process::id());
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({
+                "program": "env",
+                "env": { "AB_ENV_SEAM_PROOF": marker },
+            }),
+            &ctx(exec_only(&["env"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["exit_code"], 0, "env must run: {out}");
+    let stdout = out["stdout"].as_str().unwrap_or_default();
+    assert!(
+        stdout.contains(&format!("AB_ENV_SEAM_PROOF={marker}")),
+        "the injected env var must reach the child: {out}"
+    );
+}
+
+#[tokio::test]
 async fn real_mixed_and_quoted_variable_words_expand() {
     let home = std::env::var("HOME").unwrap_or_default();
 
