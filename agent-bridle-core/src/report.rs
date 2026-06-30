@@ -144,9 +144,14 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(AxisEnforcement::Interceptor),
         net: is_restricted(&effective.net).then_some(match active {
-            // AppContainer's capability model governs network too; the others do
-            // not gate a spawned program's egress this increment (#31/#57).
+            // AppContainer's capability model governs network too.
             SandboxKind::AppContainer => AxisEnforcement::Kernel,
+            // Seatbelt kernel-denies *all* egress when the net scope is empty
+            // (`(deny network*)`); a non-empty host allowlist it cannot express,
+            // so that stays advisory. Landlock does not gate net this increment.
+            SandboxKind::Seatbelt if crate::sandbox::net_fully_denied(effective) => {
+                AxisEnforcement::Kernel
+            }
             SandboxKind::Landlock | SandboxKind::Seatbelt | SandboxKind::None => {
                 AxisEnforcement::Advisory
             }
@@ -214,6 +219,31 @@ mod tests {
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
         assert_eq!(r.net, Some(AxisEnforcement::Kernel));
+    }
+
+    /// Seatbelt's net honesty is emptiness-dependent: an **empty** net scope is
+    /// kernel-denied (`(deny network*)`), but a non-empty host allowlist is not
+    /// expressible in SBPL, so it stays advisory — never claimed as confined.
+    #[test]
+    fn seatbelt_net_is_kernel_only_when_fully_denied() {
+        // Empty net (all egress denied) → kernel.
+        let denied = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            enforcement_report(&denied, SandboxKind::Seatbelt).net,
+            Some(AxisEnforcement::Kernel)
+        );
+        // Non-empty host allowlist → advisory (cannot be enforced in SBPL).
+        let allowlist = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            enforcement_report(&allowlist, SandboxKind::Seatbelt).net,
+            Some(AxisEnforcement::Advisory)
+        );
     }
 
     /// The honesty oracle for a Noop host: NO restricted axis is ever `kernel`.
