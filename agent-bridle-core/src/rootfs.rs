@@ -258,6 +258,77 @@ pub fn materialize_copy(plan: &RootfsPlan, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A content-addressed cache of materialized minimal rootfs trees (#112 / ADR
+/// 0013 D7). Building a rootfs (resolving the `ldd` closure + assembling the
+/// tree) is the expensive step; keying it by the *(granted-binaries + resolved
+/// closure)* identity lets repeated runs of the same toolchain reuse the build.
+///
+/// The cache stores [`materialize_copy`] trees keyed by [`RootfsCache::key`];
+/// production keys the read-only bind-mount jail by the *same* key.
+pub struct RootfsCache {
+    root: PathBuf,
+}
+
+impl RootfsCache {
+    /// A cache rooted at `root` (created on first store).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The content key for `plan`: a BLAKE3 [`crate::ContentId`] (hex) over each
+    /// file entry's `(path, ro/rw, len, mtime)` and each directory mount-point's
+    /// `(path, ro/rw)`. A changed granted binary or `.so` (different len/mtime) ⇒
+    /// a different key ⇒ a rebuild; a changed exec scope ⇒ different paths ⇒ a
+    /// different key. Directory mount-points key by path only — their contents are
+    /// bind-mounted at run time, not part of the built tree.
+    #[must_use]
+    pub fn key(plan: &RootfsPlan) -> String {
+        let mut buf = String::new();
+        for e in &plan.entries {
+            buf.push_str(&e.src.to_string_lossy());
+            buf.push('\u{0}');
+            buf.push_str(if e.writable { "rw" } else { "ro" });
+            buf.push('\u{0}');
+            buf.push_str(if e.is_dir { "d" } else { "f" });
+            if !e.is_dir {
+                if let Ok(m) = e.src.metadata() {
+                    buf.push_str(&format!("\u{0}{}", m.len()));
+                    if let Ok(mtime) = m.modified() {
+                        if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                            buf.push_str(&format!("\u{0}{}", d.as_nanos()));
+                        }
+                    }
+                }
+            }
+            buf.push('\n');
+        }
+        crate::ContentId::of_bytes(buf.as_bytes())
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The cached rootfs directory for `plan`, materializing it (copy) exactly
+    /// once. Returns `(dir, hit)` — `hit == true` ⇒ a complete prior build was
+    /// reused. A partial (interrupted) build is detected by the absence of the
+    /// completion marker and rebuilt from scratch.
+    pub fn get_or_materialize(&self, plan: &RootfsPlan) -> std::io::Result<(PathBuf, bool)> {
+        let dir = self.root.join(Self::key(plan));
+        let marker = dir.join(".bridle-rootfs-complete");
+        if marker.is_file() {
+            return Ok((dir, true));
+        }
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?; // clear a partial/stale build
+        }
+        materialize_copy(plan, &dir)?;
+        std::fs::create_dir_all(&dir)?; // ensure the root exists even for an empty plan
+        std::fs::write(&marker, b"")?;
+        Ok((dir, false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +432,58 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&work);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// #112: the cache key is stable for the same grant and varies with the
+    /// granted-program set (the D7 content-key).
+    #[test]
+    fn cache_key_is_stable_and_varies_with_grant() {
+        let work = unique_dir("ck");
+        let mk = |prog: &str| Caveats {
+            exec: Scope::only([prog.to_string()]),
+            fs_read: Scope::only([work.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let k_cat = RootfsCache::key(&build_rootfs_plan(&mk("cat")).unwrap());
+        let k_cat2 = RootfsCache::key(&build_rootfs_plan(&mk("cat")).unwrap());
+        let k_grep = RootfsCache::key(&build_rootfs_plan(&mk("grep")).unwrap());
+        assert_eq!(k_cat, k_cat2, "same grant ⇒ stable key");
+        assert_ne!(k_cat, k_grep, "different exec scope ⇒ different key");
+        assert_eq!(k_cat.len(), 64, "hex of a 32-byte BLAKE3 content id");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// #112: the cache materializes a plan once, then reports a hit (reuse).
+    #[test]
+    fn cache_materializes_once_then_hits() {
+        let work = unique_dir("cm");
+        std::fs::write(work.join("data"), b"x").unwrap();
+        let cav = Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            fs_read: Scope::only([work.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([work.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let plan = build_rootfs_plan(&cav).expect("plan");
+        let cache_root = unique_dir("cache");
+        let cache = RootfsCache::new(&cache_root);
+
+        let (dir1, hit1) = cache.get_or_materialize(&plan).expect("build");
+        assert!(!hit1, "first build is a miss");
+        assert!(
+            dir1.join(".bridle-rootfs-complete").is_file(),
+            "completion marker written"
+        );
+        assert!(
+            dir1.join("usr/bin/cat").exists() || dir1.join("bin/cat").exists(),
+            "cached tree contains the granted program"
+        );
+
+        let (dir2, hit2) = cache.get_or_materialize(&plan).expect("reuse");
+        assert!(hit2, "second build is a cache hit");
+        assert_eq!(dir1, dir2, "same keyed directory");
+
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&cache_root);
     }
 }
