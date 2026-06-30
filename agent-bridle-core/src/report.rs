@@ -98,7 +98,7 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
     // must decide its mapping rather than silently defaulting.
     let fs = |scope: &Scope<String>| {
         is_restricted(scope).then_some(match active {
-            SandboxKind::Landlock => AxisEnforcement::Kernel,
+            SandboxKind::Landlock | SandboxKind::AppContainer => AxisEnforcement::Kernel,
             SandboxKind::None => AxisEnforcement::Interceptor,
         })
     };
@@ -106,7 +106,10 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
         fs_read: fs(&effective.fs_read),
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(AxisEnforcement::Interceptor),
-        net: is_restricted(&effective.net).then_some(AxisEnforcement::Advisory),
+        net: is_restricted(&effective.net).then_some(match active {
+            SandboxKind::AppContainer => AxisEnforcement::Kernel,
+            SandboxKind::Landlock | SandboxKind::None => AxisEnforcement::Advisory,
+        }),
     }
 }
 
@@ -134,6 +137,15 @@ mod tests {
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    #[test]
+    fn appcontainer_marks_fs_kernel_exec_interceptor_net_kernel() {
+        let r = enforcement_report(&fully_restricted(), SandboxKind::AppContainer);
+        assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
+        assert_eq!(r.net, Some(AxisEnforcement::Kernel));
     }
 
     /// The honesty oracle for a Noop host: NO restricted axis is ever `kernel`.

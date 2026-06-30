@@ -21,6 +21,11 @@ linux-landlock = [
     "agent-bridle-tool-shell?/linux-landlock",
     "agent-bridle-tool-web?/linux-landlock",
 ]
+windows-appcontainer = [
+    "agent-bridle-core/windows-appcontainer",
+    "agent-bridle-tool-shell?/windows-appcontainer",
+]
+os-sandbox = ["linux-landlock", "windows-appcontainer"]
 
 [dependencies]
 agent-bridle-core = { workspace = true }

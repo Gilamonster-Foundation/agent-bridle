@@ -23,6 +23,11 @@ shell = ["dep:tokio"]
 # build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Read/exec/net
 # axes (#31) and macOS/Windows backends (#50/#51) are follow-ups.
 linux-landlock = ["agent-bridle-core/linux-landlock"]
+# Windows AppContainer backend marker (agent-bridle#51). Process-launch wiring
+# requires a Windows CreateProcess launcher because AppContainer is a startup
+# attribute, not a current-thread sandbox like Landlock.
+windows-appcontainer = ["agent-bridle-core/windows-appcontainer"]
+os-sandbox = ["linux-landlock", "windows-appcontainer"]
 
 [dependencies]
 agent-bridle-core = { workspace = true }

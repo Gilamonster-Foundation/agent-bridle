@@ -21,6 +21,11 @@ default = []
 # confines the `fs_write` axis; without this feature (or off-Linux) the sandbox
 # is the advisory NoopSandbox reporting SandboxKind::None. ADR 0001 (L3).
 linux-landlock = ["dep:landlock"]
+# Windows AppContainer process sandbox (Windows only). AppContainer is applied
+# at process creation via SECURITY_CAPABILITIES, not by restricting the current
+# thread; see src/sandbox.rs and agent-bridle#51.
+windows-appcontainer = []
+os-sandbox = ["linux-landlock", "windows-appcontainer"]
 # Production Ed25519 `DischargeVerifier` (`Ed25519Verifier`) for the step-up
 # surface. Off by default to keep core lean; enable it for the software /
 # OpenSSH `ed25519-sk`-style passkey verification path (raw Ed25519 assertions
