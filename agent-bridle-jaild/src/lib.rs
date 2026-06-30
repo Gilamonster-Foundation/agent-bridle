@@ -43,6 +43,19 @@ pub struct JailRun {
 #[cfg(target_os = "linux")]
 mod linux;
 
+pub mod protocol;
+pub use protocol::{read_frame, write_frame, JailRequest, JailResponse, MAX_FRAME};
+
+#[cfg(unix)]
+pub mod client;
+#[cfg(unix)]
+pub use client::request_jailed;
+
+#[cfg(target_os = "linux")]
+mod broker;
+#[cfg(target_os = "linux")]
+pub use broker::{handle_connection, handle_request, peer_cred, serve};
+
 /// Run `program` (an absolute path) with `args` inside a Tier-1.5 mount-namespace
 /// jail materialized from `plan`, capturing its output.
 ///
@@ -66,7 +79,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    linux::run_jailed(plan, program, args)
+    linux::run_jailed(plan, program, args, None)
+}
+
+/// Like [`run_jailed`], but **drop to `uid`/`gid` before `exec`** — the jailed
+/// program runs unprivileged (as the requesting client), never as the privileged
+/// jail builder. This is the broker's path (#108 / ADR 0013 D4): the jail confines
+/// *what exists*; the uid drop confines *what authority it runs with*.
+///
+/// **Linux-only** (see [`run_jailed`]).
+#[cfg(target_os = "linux")]
+pub fn run_jailed_as<I, S>(
+    plan: &agent_bridle_core::RootfsPlan,
+    program: &std::path::Path,
+    args: I,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<JailRun>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    linux::run_jailed(plan, program, args, Some((uid, gid)))
 }
 
 /// Whether the current process is effectively root (a quick precondition check for

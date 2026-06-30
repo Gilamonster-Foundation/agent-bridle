@@ -34,7 +34,12 @@ struct BindMount {
 /// `PT_INTERP` bind above, whose `!exists()` guard then skips it here.)
 const MERGED_USR_LINKS: &[&str] = &["bin", "sbin", "lib", "lib32", "lib64", "libx32"];
 
-pub(crate) fn run_jailed<I, S>(plan: &RootfsPlan, program: &Path, args: I) -> io::Result<JailRun>
+pub(crate) fn run_jailed<I, S>(
+    plan: &RootfsPlan,
+    program: &Path,
+    args: I,
+    drop_to: Option<(libc::uid_t, libc::gid_t)>,
+) -> io::Result<JailRun>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -186,6 +191,21 @@ where
             }
             if libc::chdir(c_slash.as_ptr()) != 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // 6. Drop privilege BEFORE exec (after the mounts, which needed root):
+            //    supplementary groups, then gid, then uid (order matters — setuid
+            //    last, or we lose the privilege to setgid). The jailed program then
+            //    runs as the client, never as the broker's root.
+            if let Some((uid, gid)) = drop_to {
+                if libc::setgroups(0, std::ptr::null()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::setgid(gid) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(())
         });
