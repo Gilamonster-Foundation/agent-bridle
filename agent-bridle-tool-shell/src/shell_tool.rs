@@ -150,6 +150,7 @@ fn run_confined(stages: &[Command], cwd: Option<&str>, caveats: &Caveats) -> Too
 pub struct ShellTool {
     spawner: Arc<dyn Spawner>,
     env: Arc<dyn EnvProvider>,
+    lister: Arc<dyn DirLister>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -159,21 +160,23 @@ impl std::fmt::Debug for ShellTool {
 }
 
 impl ShellTool {
-    /// Construct the tool with the real OS spawner and the real environment.
+    /// Construct the tool with the real OS spawner, environment, and dir lister.
     #[must_use]
     pub fn new() -> Self {
         Self {
             spawner: Arc::new(OsSpawner),
             env: Arc::new(RealEnv),
+            lister: Arc::new(RealDirLister),
         }
     }
 
-    /// Construct with an injected spawner and the real environment (tests only).
+    /// Construct with an injected spawner; real environment + dir lister (tests).
     #[cfg(test)]
     fn with_spawner(spawner: Arc<dyn Spawner>) -> Self {
         Self {
             spawner,
             env: Arc::new(RealEnv),
+            lister: Arc::new(RealDirLister),
         }
     }
 
@@ -182,7 +185,27 @@ impl ShellTool {
     /// exercised without touching the real process environment.
     #[cfg(test)]
     fn with_spawner_and_env(spawner: Arc<dyn Spawner>, env: Arc<dyn EnvProvider>) -> Self {
-        Self { spawner, env }
+        Self {
+            spawner,
+            env,
+            lister: Arc::new(RealDirLister),
+        }
+    }
+
+    /// Construct with all three seams injected (tests only): a fake spawner, env,
+    /// and directory lister, so glob expansion + the per-directory `fs_read`
+    /// leash are exercised without a real filesystem (#47).
+    #[cfg(test)]
+    fn with_seams(
+        spawner: Arc<dyn Spawner>,
+        env: Arc<dyn EnvProvider>,
+        lister: Arc<dyn DirLister>,
+    ) -> Self {
+        Self {
+            spawner,
+            env,
+            lister,
+        }
     }
 }
 
@@ -269,22 +292,58 @@ impl Tool for ShellTool {
         // path. A non-allowlisted (or basename-injected) variable denies pre-spawn.
         for item in &mut script {
             for stage in &mut item.pipeline {
-                for arg in &mut stage.argv {
-                    if let Arg::VarGlob(segs) = arg {
-                        match expand_varglob(segs, &*self.env) {
-                            Ok(pattern) => *arg = Arg::Glob(pattern),
-                            Err((target, e)) => {
-                                return Ok(deny(
-                                    sandbox_kind,
-                                    enforcement,
-                                    DenialKind::Exec,
-                                    &target,
-                                    &e,
-                                ))
+                // Expand globs (and glob+var words) to literal matches, leash-
+                // checking EVERY directory the walk lists (#47) — multi-segment
+                // (`*/foo.rs`) and recursive (`**/*.rs`), all before any spawn.
+                // argv[0] is left intact; the program-position check below refuses
+                // a glob/var program (we never exec a pattern).
+                let mut new_argv: Vec<Arg> = Vec::with_capacity(stage.argv.len());
+                for (i, arg) in stage.argv.drain(..).enumerate() {
+                    let pattern: Option<String> = if i == 0 {
+                        None
+                    } else {
+                        match &arg {
+                            Arg::Glob(p) => Some(p.clone()),
+                            Arg::VarGlob(segs) => match expand_varglob(segs, &*self.env) {
+                                Ok(p) => Some(p),
+                                Err((target, e)) => {
+                                    return Ok(deny(
+                                        sandbox_kind,
+                                        enforcement,
+                                        DenialKind::Exec,
+                                        &target,
+                                        &e,
+                                    ))
+                                }
+                            },
+                            _ => None,
+                        }
+                    };
+                    match pattern {
+                        Some(p) => {
+                            let mut leash = |dir: &Path| cx.check_path_read(dir);
+                            match expand_glob_walk(
+                                &p,
+                                parsed.cwd.as_deref(),
+                                &*self.lister,
+                                &mut leash,
+                            ) {
+                                Ok(ms) => new_argv.extend(ms.into_iter().map(Arg::Lit)),
+                                Err(e) => {
+                                    return Ok(deny(
+                                        sandbox_kind,
+                                        enforcement,
+                                        DenialKind::Open,
+                                        &p,
+                                        &e,
+                                    ))
+                                }
                             }
                         }
+                        None => new_argv.push(arg),
                     }
                 }
+                stage.argv = new_argv;
                 for redirect in &mut stage.redirects {
                     let segs = match redirect {
                         Redirect::Stdout { path, .. }
@@ -360,20 +419,6 @@ impl Tool for ShellTool {
                 }
                 for arg in &stage.argv {
                     match arg {
-                        // A glob lists a directory: that fs_read is leash-checked.
-                        Arg::Glob(pattern) => {
-                            let dir =
-                                resolve_glob_dir(parsed.cwd.as_deref(), split_glob(pattern).0);
-                            if let Err(e) = cx.check_path_read(&dir) {
-                                return Ok(deny(
-                                    sandbox_kind,
-                                    enforcement,
-                                    DenialKind::Open,
-                                    &dir.to_string_lossy(),
-                                    &e,
-                                ));
-                            }
-                        }
                         // Every variable referenced must be on the env allowlist
                         // (no secret leak), checked by name before any spawn.
                         Arg::Var(segs) => {
@@ -393,8 +438,10 @@ impl Tool for ShellTool {
                                 }
                             }
                         }
-                        // Lowered to `Arg::Glob` (or denied) in the pass above.
-                        Arg::VarGlob(_) => unreachable!("VarGlob lowered before admission leash"),
+                        // Globs / glob+var words were expanded to literals (with
+                        // the per-directory fs_read leash) in the pass above.
+                        Arg::Glob(_) => unreachable!("glob expanded at admission"),
+                        Arg::VarGlob(_) => unreachable!("VarGlob expanded at admission"),
                         Arg::Lit(_) => {}
                     }
                 }
@@ -734,51 +781,154 @@ fn expand_varglob(segs: &[Seg], env: &dyn EnvProvider) -> Result<String, (String
     Ok(out)
 }
 
-// ── glob expansion ──────────────────────────────────────────────────────────
+// ── glob expansion (multi-segment + recursive `**`) ─────────────────────────
 
-/// Split a glob pattern into (directory prefix incl. trailing `/`, basename
-/// pattern). `*.rs` → `("", "*.rs")`; `src/*.rs` → `("src/", "*.rs")`.
-fn split_glob(pattern: &str) -> (&str, &str) {
-    match pattern.rfind('/') {
-        Some(i) => (&pattern[..=i], &pattern[i + 1..]),
-        None => ("", pattern),
+/// `**` recursion depth cap and total-match cap — bound a pathological walk so a
+/// deep/wide tree can never blow up admission (#47).
+const MAX_GLOB_DEPTH: usize = 64;
+const MAX_GLOB_MATCHES: usize = 4096;
+
+/// One directory entry the glob walker sees: a name and whether it is a directory
+/// (needed to recurse for `**`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Lists a directory's entries — the filesystem seam for the glob walker, so unit
+/// tests drive multi-segment / `**` expansion without a real filesystem (#47).
+pub(crate) trait DirLister: Send + Sync {
+    /// The entries of `dir` (names + is-dir), or empty if it cannot be read.
+    fn list(&self, dir: &Path) -> Vec<GlobEntry>;
+}
+
+/// The real filesystem lister.
+pub(crate) struct RealDirLister;
+impl DirLister for RealDirLister {
+    fn list(&self, dir: &Path) -> Vec<GlobEntry> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| {
+                    let e = e.ok()?;
+                    let name = e.file_name().into_string().ok()?;
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    Some(GlobEntry { name, is_dir })
+                })
+                .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
-/// The directory a glob lists, resolved against the command's `cwd`.
-fn resolve_glob_dir(cwd: Option<&str>, dir_part: &str) -> PathBuf {
-    let base = || cwd.map_or_else(|| PathBuf::from("."), PathBuf::from);
-    if dir_part.is_empty() {
-        base()
-    } else if Path::new(dir_part).is_absolute() {
-        PathBuf::from(dir_part)
+/// Append `name` to the result path `rel`, preserving the pattern's form
+/// (relative vs absolute).
+fn join_rel(rel: &str, name: &str) -> String {
+    if rel.is_empty() {
+        name.to_string()
+    } else if rel == "/" {
+        format!("/{name}")
     } else {
-        base().join(dir_part)
+        format!("{rel}/{name}")
     }
 }
 
-/// Expand a glob pattern against a directory listing (the `list_dir` seam lets
-/// unit tests avoid the real filesystem). Only the last path segment is globbed;
-/// hidden entries are skipped unless the pattern's basename starts with `.`.
-/// No match → the literal pattern (bash `nullglob` off).
-fn expand_glob(
+/// Collect every descendant directory of `(real, rel)` (bounded depth),
+/// leash-checking + listing each — the `**` expansion. Hidden directories are not
+/// descended (bash globstar default).
+fn descend_all(
+    real: &Path,
+    rel: &str,
+    list: &dyn DirLister,
+    leash: &mut dyn FnMut(&Path) -> ToolResult<()>,
+    depth: usize,
+    out: &mut Vec<(PathBuf, String)>,
+) -> ToolResult<()> {
+    if depth == 0 || out.len() >= MAX_GLOB_MATCHES {
+        return Ok(());
+    }
+    leash(real)?;
+    let mut entries = list.list(real);
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in entries {
+        if e.is_dir && !e.name.starts_with('.') {
+            let child_real = real.join(&e.name);
+            let child_rel = join_rel(rel, &e.name);
+            out.push((child_real.clone(), child_rel.clone()));
+            if out.len() >= MAX_GLOB_MATCHES {
+                break;
+            }
+            descend_all(&child_real, &child_rel, list, leash, depth - 1, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Expand a glob pattern (multi-segment and recursive `**`) against the
+/// filesystem via `list`, **leash-checking every directory before listing it**
+/// (`leash`) — so the whole walk stays within `fs_read` scope, *before any stage
+/// spawns* (atomic admission). Per-component matching uses [`fnmatch`]
+/// (`*`/`?`/`[…]` do not cross `/`); `**` matches zero or more directory levels.
+/// Bounded by depth + match count. nullglob-off: no match → the literal pattern.
+/// A `leash` `Err` (an out-of-scope directory) propagates and denies the command.
+fn expand_glob_walk(
     pattern: &str,
     cwd: Option<&str>,
-    list_dir: &dyn Fn(&Path) -> Vec<String>,
-) -> Vec<String> {
-    let (dir_part, base) = split_glob(pattern);
-    let dir = resolve_glob_dir(cwd, dir_part);
-    let base_hidden = base.starts_with('.');
-    let mut matches: Vec<String> = list_dir(&dir)
-        .into_iter()
-        .filter(|name| (base_hidden || !name.starts_with('.')) && fnmatch(base, name))
-        .map(|name| format!("{dir_part}{name}"))
-        .collect();
-    matches.sort();
-    if matches.is_empty() {
-        vec![pattern.to_string()]
+    list: &dyn DirLister,
+    leash: &mut dyn FnMut(&Path) -> ToolResult<()>,
+) -> ToolResult<Vec<String>> {
+    let absolute = pattern.starts_with('/');
+    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+
+    let base_real = if absolute {
+        PathBuf::from("/")
     } else {
-        matches
+        cwd.map_or_else(|| PathBuf::from("."), PathBuf::from)
+    };
+    let base_rel = if absolute {
+        "/".to_string()
+    } else {
+        String::new()
+    };
+    let mut frontier: Vec<(PathBuf, String)> = vec![(base_real, base_rel)];
+
+    for seg in &segments {
+        let mut next: Vec<(PathBuf, String)> = Vec::new();
+        if *seg == "**" {
+            for (real, rel) in &frontier {
+                next.push((real.clone(), rel.clone())); // `**` matches zero levels too
+                descend_all(real, rel, list, leash, MAX_GLOB_DEPTH, &mut next)?;
+            }
+        } else {
+            let seg_hidden = seg.starts_with('.');
+            for (real, rel) in &frontier {
+                leash(real)?;
+                let mut entries = list.list(real);
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                for e in entries {
+                    if (seg_hidden || !e.name.starts_with('.')) && fnmatch(seg, &e.name) {
+                        next.push((real.join(&e.name), join_rel(rel, &e.name)));
+                        if next.len() >= MAX_GLOB_MATCHES {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+
+    let mut matches: Vec<String> = frontier.into_iter().map(|(_, rel)| rel).collect();
+    matches.retain(|m| !m.is_empty()); // drop the "zero-levels" cwd self-match
+    matches.sort();
+    matches.dedup();
+    if matches.is_empty() {
+        Ok(vec![pattern.to_string()])
+    } else {
+        Ok(matches)
     }
 }
 
@@ -864,20 +1014,11 @@ fn kill_all(children: &mut [Child]) {
 /// expanded against the real filesystem, and (allowlisted) variables read from
 /// the environment as a single literal (no re-split / no re-glob of the value).
 /// The allowlist is enforced earlier in [`ShellTool::invoke`].
-fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
-    let list_dir = |dir: &Path| -> Vec<String> {
-        std::fs::read_dir(dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+fn expand_stage_argv(stage: &Command, _cwd: Option<&str>) -> Vec<String> {
     let mut argv = Vec::with_capacity(stage.argv.len());
     for arg in &stage.argv {
         match arg {
             Arg::Lit(s) => argv.push(s.clone()),
-            Arg::Glob(pattern) => argv.extend(expand_glob(pattern, cwd, &list_dir)),
             // Concatenate the segments: literals as-is, variables (already
             // allowlisted in `invoke`) read from the env as a single literal —
             // no re-split / no re-glob of the value.
@@ -891,9 +1032,11 @@ fn expand_stage_argv(stage: &Command, cwd: Option<&str>) -> Vec<String> {
                 }
                 argv.push(word);
             }
-            // A glob+var word is lowered to `Arg::Glob` at admission, before the
-            // (lowered) script reaches any spawner.
-            Arg::VarGlob(_) => unreachable!("VarGlob lowered before spawn"),
+            // Globs (and glob+var words) are expanded to literal matches at
+            // admission (with the per-directory fs_read leash), so the spawner
+            // never sees them.
+            Arg::Glob(_) => unreachable!("glob expanded at admission"),
+            Arg::VarGlob(_) => unreachable!("VarGlob lowered/expanded at admission"),
         }
     }
     argv
@@ -1189,6 +1332,31 @@ mod tests {
         ))
     }
 
+    /// A fake directory lister keyed by path string — drives the glob walker
+    /// without a real filesystem (#47).
+    struct MapLister(HashMap<String, Vec<GlobEntry>>);
+    impl DirLister for MapLister {
+        fn list(&self, dir: &Path) -> Vec<GlobEntry> {
+            self.0
+                .get(&dir.to_string_lossy().into_owned())
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+    fn ent(name: &str, is_dir: bool) -> GlobEntry {
+        GlobEntry {
+            name: name.to_string(),
+            is_dir,
+        }
+    }
+    fn map_lister(dirs: &[(&str, Vec<GlobEntry>)]) -> Arc<dyn DirLister> {
+        Arc::new(MapLister(
+            dirs.iter()
+                .map(|(d, es)| ((*d).to_string(), es.clone()))
+                .collect(),
+        ))
+    }
+
     // ── $VAR in redirect targets (#46, via the env seam) ────────────────────
 
     /// `> $TMPDIR/out` expands the allowlisted var through the seam and the
@@ -1264,13 +1432,16 @@ mod tests {
         assert!(err.is_err(), "var in glob basename must be refused");
     }
 
-    /// `$DIR/*.rs` lowers to a resolved `Arg::Glob` (var → literal dir) that the
-    /// spawner receives; the resolved glob directory was leash-checked.
+    /// `$DIR/*.rs` lowers the var (env seam) AND expands the glob at admission
+    /// (per-directory fs_read leash), so the spawner receives the literal matches.
     #[tokio::test]
-    async fn glob_var_lowers_to_resolved_glob_and_reaches_spawner() {
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+    async fn glob_var_expands_to_resolved_matches_before_spawn() {
         let mock = Arc::new(MockSpawner::default());
-        let tool = ShellTool::with_spawner_and_env(mock.clone(), fake_env(&[("TMPDIR", &tmp)]));
+        let lister = map_lister(&[
+            (".", vec![ent("proj", true)]),
+            ("./proj", vec![ent("a.rs", false), ent("b.rs", false)]),
+        ]);
+        let tool = ShellTool::with_seams(mock.clone(), fake_env(&[("TMPDIR", "proj")]), lister);
         let out = tool
             .invoke(
                 serde_json::json!({"cmd": "ls $TMPDIR/*.rs"}), // fs_read All by default
@@ -1285,7 +1456,11 @@ mod tests {
         );
         assert_eq!(
             calls(&mock)[0][0].argv,
-            vec![Arg::Lit("ls".into()), Arg::Glob(format!("{tmp}/*.rs"))]
+            vec![
+                Arg::Lit("ls".into()),
+                Arg::Lit("proj/a.rs".into()),
+                Arg::Lit("proj/b.rs".into())
+            ]
         );
     }
 
@@ -1376,22 +1551,29 @@ mod tests {
 
     // ── globbing (increment 5) ──────────────────────────────────────────────
 
-    /// A glob arg reaches the spawner as an (unexpanded) `Glob` — expansion is
-    /// the spawner's job; the leash (fs_read on the listed dir) passed in invoke.
+    /// A glob arg is EXPANDED at admission (with the per-directory fs_read leash)
+    /// to its literal matches before the spawner runs (#47).
     #[tokio::test]
-    async fn glob_arg_reaches_spawner_after_leash() {
+    async fn glob_arg_expanded_to_matches_before_spawn() {
         let mock = Arc::new(MockSpawner::default());
-        ShellTool::with_spawner(mock.clone())
+        let lister = map_lister(&[(
+            ".",
+            vec![ent("a.rs", false), ent("b.rs", false), ent("c.txt", false)],
+        )]);
+        ShellTool::with_seams(mock.clone(), fake_env(&[]), lister)
             .invoke(
                 serde_json::json!({"cmd": "ls *.rs"}), // fs_read is All by default
                 &ctx(exec_only(&["ls"])),
             )
             .await
             .expect("invoke");
-        let c = calls(&mock);
         assert_eq!(
-            c[0][0].argv,
-            vec![Arg::Lit("ls".into()), Arg::Glob("*.rs".into())]
+            calls(&mock)[0][0].argv,
+            vec![
+                Arg::Lit("ls".into()),
+                Arg::Lit("a.rs".into()),
+                Arg::Lit("b.rs".into())
+            ]
         );
     }
 
@@ -1606,30 +1788,77 @@ mod tests {
     }
 
     #[test]
-    fn expand_glob_with_a_fake_lister() {
-        let entries = || {
-            vec![
-                "a.rs".to_string(),
-                "b.rs".to_string(),
-                "c.txt".to_string(),
-                ".hidden.rs".to_string(),
-            ]
-        };
-        let lister = |_dir: &Path| entries();
-
+    fn glob_walk_single_segment_and_subpath() {
+        let lister = map_lister(&[
+            (
+                ".",
+                vec![
+                    ent("a.rs", false),
+                    ent("b.rs", false),
+                    ent("c.txt", false),
+                    ent(".hidden.rs", false),
+                    ent("src", true),
+                ],
+            ),
+            ("./src", vec![ent("a.rs", false), ent("b.rs", false)]),
+        ]);
+        let mut allow = |_d: &Path| Ok(());
         // *.rs matches the two .rs files (sorted), hidden excluded.
-        assert_eq!(expand_glob("*.rs", None, &lister), vec!["a.rs", "b.rs"]);
-        // * excludes the dotfile.
         assert_eq!(
-            expand_glob("*", None, &lister),
-            vec!["a.rs", "b.rs", "c.txt"]
+            expand_glob_walk("*.rs", None, &*lister, &mut allow).unwrap(),
+            vec!["a.rs", "b.rs"]
         );
         // No match → the literal pattern (nullglob off).
-        assert_eq!(expand_glob("zzz*", None, &lister), vec!["zzz*"]);
+        assert_eq!(
+            expand_glob_walk("zzz*", None, &*lister, &mut allow).unwrap(),
+            vec!["zzz*"]
+        );
         // Sub-path keeps the directory prefix on each match.
         assert_eq!(
-            expand_glob("src/*.rs", None, &lister),
+            expand_glob_walk("src/*.rs", None, &*lister, &mut allow).unwrap(),
             vec!["src/a.rs", "src/b.rs"]
         );
+    }
+
+    #[test]
+    fn glob_walk_multi_segment_and_recursive() {
+        let lister = map_lister(&[
+            (
+                ".",
+                vec![ent("a", true), ent("b", true), ent("x.rs", false)],
+            ),
+            ("./a", vec![ent("foo.rs", false), ent("sub", true)]),
+            ("./b", vec![ent("bar.rs", false)]),
+            ("./a/sub", vec![ent("deep.rs", false)]),
+        ]);
+        let mut allow = |_d: &Path| Ok(());
+        // Multi-segment: `*/foo.rs` matches only where foo.rs exists.
+        assert_eq!(
+            expand_glob_walk("*/foo.rs", None, &*lister, &mut allow).unwrap(),
+            vec!["a/foo.rs"]
+        );
+        // Recursive `**`: `*.rs` at every level (cwd + all subdirs).
+        assert_eq!(
+            expand_glob_walk("**/*.rs", None, &*lister, &mut allow).unwrap(),
+            vec!["a/foo.rs", "a/sub/deep.rs", "b/bar.rs", "x.rs"]
+        );
+    }
+
+    #[test]
+    fn glob_walk_leashes_every_directory_and_denies_out_of_scope() {
+        let lister = map_lister(&[
+            (".", vec![ent("a", true), ent("x.rs", false)]),
+            ("./a", vec![ent("secret.rs", false)]),
+        ]);
+        // A leash that refuses to read `./a` denies the whole recursive walk
+        // (every directory the walk lists is fs_read-checked before listing).
+        let mut deny_a = |d: &Path| {
+            if d.to_string_lossy().contains("a") {
+                Err(ToolError::denied("out of fs_read scope"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(expand_glob_walk("**/*.rs", None, &*lister, &mut deny_a).is_err());
     }
 }
