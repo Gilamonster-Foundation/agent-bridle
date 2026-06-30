@@ -116,6 +116,18 @@ pub(crate) fn restricts_fs(caveats: &Caveats) -> bool {
         || matches!(caveats.fs_read, crate::Scope::Only(_))
 }
 
+/// `true` if the `exec` axis is actually restricted (`Only(_)`) — the condition
+/// under which an exec-confining backend has an allow-list to enforce. Today only
+/// the macOS Seatbelt backend acts on this: `process-exec*` is a kernel-checked
+/// operation that confines the spawned program's **interior** execs (covering the
+/// loader trampoline that Landlock cannot — ADR 0014), so an `exec:Only` grant
+/// engages Seatbelt even when no fs/net axis is restricted. Landlock's exec axis
+/// stays held (agent-bridle#31/#57), so it does **not** engage on this alone.
+#[must_use]
+pub(crate) fn restricts_exec(caveats: &Caveats) -> bool {
+    matches!(caveats.exec, crate::Scope::Only(_))
+}
+
 /// `true` if the `net` axis is restricted to the **empty** set — i.e. *all*
 /// network egress is denied. This is the one network policy SBPL can soundly
 /// express (`(deny network*)`); a non-empty host allowlist filters by socket,
@@ -133,13 +145,18 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
 /// neither overclaims.
 ///
 /// Capabilities differ per backend, so the engaging condition does too: Landlock
-/// governs the filesystem axes; Seatbelt governs those **and** kernel-denies all
-/// egress when `net` is empty ([`net_fully_denied`]).
+/// governs the filesystem axes; Seatbelt governs those, kernel-denies all egress
+/// when `net` is empty ([`net_fully_denied`]), **and** confines the `exec` axis
+/// via `process-exec*` ([`restricts_exec`]) — a confinement Landlock cannot
+/// supply (ADR 0014). Landlock's exec axis stays held (agent-bridle#31/#57), so a
+/// Landlock host does not engage on `exec` alone.
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
         SandboxKind::Landlock if restricts_fs(caveats) => SandboxKind::Landlock,
-        SandboxKind::Seatbelt if restricts_fs(caveats) || net_fully_denied(caveats) => {
+        SandboxKind::Seatbelt
+            if restricts_fs(caveats) || net_fully_denied(caveats) || restricts_exec(caveats) =>
+        {
             SandboxKind::Seatbelt
         }
         _ => SandboxKind::None,
@@ -599,8 +616,19 @@ mod seatbelt_impl {
     /// (`(deny network*)`) — a confinement Landlock cannot provide, closing the
     /// `find -exec curl` egress path at L3. A non-empty `net` host allowlist is
     /// not expressible in SBPL (it filters by socket, not hostname) and stays
-    /// advisory; `exec` is left ambient (`(allow default)`) — follow-ups
-    /// (agent-bridle#31/#57).
+    /// advisory.
+    ///
+    /// **The `exec` axis** — when restricted, the profile emits
+    /// `(deny process-exec*)` and re-allows exactly the granted programs (resolved
+    /// to absolute paths). Because `process-exec*` is a kernel-checked operation
+    /// applied to the confined process *and everything it spawns*, this confines
+    /// the program's **interior** execs — the L3 gap a path allow-list alone
+    /// cannot reach. Unlike Landlock, no seccomp backstop is needed: the loader
+    /// trampoline (`dyld TARGET`) is itself a governed `process-exec`, and the
+    /// `mmap(PROT_EXEC)` read-as-code path is closed by Apple-Silicon hardware
+    /// W^X + code signing — so "the readable set equals the runnable set" (the
+    /// fact that forces the Linux seccomp filter) does **not** hold here. The axis
+    /// is therefore honestly reported `Kernel` (ADR 0014; agent-bridle#31/#57).
     ///
     /// Read confinement here is **content-level**: file *metadata* (stat,
     /// existence, directory traversal) stays ambient so binaries can load through
@@ -638,10 +666,14 @@ mod seatbelt_impl {
         }
 
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // Nothing on a governed axis (fs, or all-egress-denied net) => nothing
-            // to confine; run unwrapped (coarse honesty falls to `None` upstream,
-            // and the per-axis report omits unrestricted axes).
-            if !super::restricts_fs(effective) && !super::net_fully_denied(effective) {
+            // Nothing on a governed axis (fs, all-egress-denied net, or a
+            // restricted exec allow-list) => nothing to confine; run unwrapped
+            // (coarse honesty falls to `None` upstream, and the per-axis report
+            // omits unrestricted axes).
+            if !super::restricts_fs(effective)
+                && !super::net_fully_denied(effective)
+                && !super::restricts_exec(effective)
+            {
                 return Ok(Vec::new());
             }
             // Fail-closed: if the wrapper is gone we cannot enforce, so refuse
@@ -719,6 +751,27 @@ mod seatbelt_impl {
             p.push_str("(deny network*)\n");
         }
 
+        // exec: deny *all* further execs, then re-allow exactly the granted
+        // programs (resolved to absolute, canonical paths). `process-exec*` is
+        // kernel-checked on the confined process AND everything it spawns, so this
+        // is the `exec` axis at interior grain — no seccomp backstop needed (the
+        // dyld trampoline is itself a governed `process-exec`, and `mmap(PROT_EXEC)`
+        // read-as-code is closed by hardware W^X + code signing; ADR 0014). An
+        // empty/unresolvable grant emits the deny with no re-allow — every exec
+        // (including the wrapped program's own launch) denied: fail-closed, never
+        // ambient. SBPL is last-match-wins, so the trailing allow overrides.
+        if let Scope::Only(_) = &effective.exec {
+            p.push_str("(deny process-exec*)\n");
+            let targets = resolve_exec_targets(&effective.exec);
+            if !targets.is_empty() {
+                p.push_str("(allow process-exec*");
+                for t in &targets {
+                    p.push_str(&format!(" (literal {})", sbpl_string(t)));
+                }
+                p.push_str(")\n");
+            }
+        }
+
         p
     }
 
@@ -734,6 +787,54 @@ mod seatbelt_impl {
         roots.sort();
         roots.dedup();
         roots
+    }
+
+    /// System binary directories searched to resolve a **bare-name** `exec` grant
+    /// (e.g. `["git"]`) to absolute path(s) for the `process-exec*` allow-list.
+    /// SIP-protected, read-only system locations — a trustworthy pin. Bare names
+    /// resolve through this *fixed* list, never the ambient `$PATH` (ADR 0014 /
+    /// ADR 0011 D5), so a binary planted earlier on a caller's `$PATH` cannot
+    /// widen the kernel allow-list. An absolute-path grant is honored verbatim
+    /// (then canonicalized); a basename collision outside these dirs is not.
+    const TRUSTED_EXEC_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+    /// Resolve a restricted `exec` [`Scope`] to the absolute, canonical program
+    /// paths that anchor the SBPL `(allow process-exec* (literal …))` rules. The
+    /// kernel matches `process-exec` against the *resolved* path of the exec
+    /// target, so each grant must become a realpath: an absolute grant is
+    /// canonicalized; a bare name is resolved against [`TRUSTED_EXEC_DIRS`] (each
+    /// existing hit included, mirroring admission's basename semantics in
+    /// [`crate::context`] but pinned to trusted dirs). A relative-path or
+    /// unresolvable grant is dropped — it cannot anchor a rule, so the program
+    /// stays denied (fail-closed). `All` yields nothing (callers pass a restricted
+    /// axis). Results are sorted+deduped so the emitted profile is deterministic.
+    fn resolve_exec_targets(scope: &Scope<String>) -> Vec<String> {
+        let Scope::Only(set) = scope else {
+            return Vec::new();
+        };
+        let canon_file = |path: &Path, out: &mut Vec<String>| {
+            if let Ok(c) = std::fs::canonicalize(path) {
+                if c.is_file() {
+                    out.push(c.to_string_lossy().into_owned());
+                }
+            }
+        };
+        let mut out: Vec<String> = Vec::new();
+        for token in set {
+            if token.starts_with('/') {
+                // Absolute grant: honored verbatim (canonicalized, must exist).
+                canon_file(Path::new(token), &mut out);
+            } else if !token.contains('/') {
+                // Bare name: resolve against the fixed trusted system dirs only.
+                for dir in TRUSTED_EXEC_DIRS {
+                    canon_file(&Path::new(dir).join(token), &mut out);
+                }
+            }
+            // else: a relative path grant cannot anchor a kernel rule safely — drop.
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Resolve `p` to an absolute, symlink-free path suitable for `(subpath …)`
@@ -917,6 +1018,87 @@ mod seatbelt_impl {
                 prof.contains("\\\""),
                 "the crafted quotes must be backslash-escaped: {prof}"
             );
+        }
+
+        #[test]
+        fn restricted_exec_emits_deny_and_allowlist() {
+            let cav = Caveats {
+                exec: Scope::only(["/bin/echo".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny process-exec*)"), "{prof}");
+            assert!(
+                prof.contains("(allow process-exec* (literal \"/bin/echo\")"),
+                "{prof}"
+            );
+        }
+
+        #[test]
+        fn bare_name_exec_resolves_through_trusted_dirs() {
+            // A bare name is pinned to the fixed trusted system dirs, never $PATH.
+            let cav = Caveats {
+                exec: Scope::only(["true".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            // `/usr/bin/true` exists on every macOS host and canonicalizes to
+            // itself, so the literal must name the absolute resolved path.
+            assert!(
+                prof.contains("(literal \"/usr/bin/true\")"),
+                "bare name must resolve to its trusted-dir absolute path: {prof}"
+            );
+        }
+
+        #[test]
+        fn restricted_exec_engages_the_wrapper() {
+            // exec-only (no fs/net restriction) must still engage sandbox-exec.
+            let cav = Caveats {
+                exec: Scope::only(["/bin/echo".to_string()]),
+                ..Caveats::top()
+            };
+            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            assert_eq!(prefix.first().map(String::as_str), Some(SANDBOX_EXEC));
+        }
+
+        #[test]
+        fn empty_exec_scope_denies_all_exec_with_no_allow() {
+            // exec:none — the program may exec nothing. The deny is emitted with no
+            // re-allow, so even the wrapped program's launch is denied: fail-closed,
+            // never silently ambient.
+            let cav = Caveats {
+                exec: Scope::none(),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny process-exec*)"), "{prof}");
+            assert!(
+                !prof.contains("(allow process-exec*"),
+                "an empty exec scope must grant no exec targets: {prof}"
+            );
+        }
+
+        #[test]
+        fn relative_and_unresolvable_exec_grants_are_dropped() {
+            // A relative-path grant cannot anchor a kernel rule; a bare name with no
+            // trusted-dir hit resolves to nothing. Either way: deny with no allow.
+            let cav = Caveats {
+                exec: Scope::only(["./payload".to_string(), "no-such-binary-xyzzy".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny process-exec*)"), "{prof}");
+            assert!(
+                !prof.contains("(allow process-exec*"),
+                "unresolvable/relative grants must not anchor an allow: {prof}"
+            );
+        }
+
+        #[test]
+        fn unrestricted_exec_emits_no_exec_rules() {
+            // exec:All (the default) is ambient on the exec axis — no rules.
+            let prof = seatbelt_profile(&Caveats::top());
+            assert!(!prof.contains("process-exec"), "{prof}");
         }
     }
 }
@@ -1752,6 +1934,131 @@ mod seatbelt_kernel_tests {
             confined.code(),
             Some(7),
             "egress under net:none must be kernel-denied at the socket (curl exit 7)"
+        );
+    }
+
+    /// Like [`run_wrapped`] but captures stdout/stderr, so a proof can assert on
+    /// the *interior* exec behavior (a granted program's child exec statuses) the
+    /// kernel produced — the L3-grain the `exec` axis claims.
+    fn run_wrapped_output(cav: &Caveats, program: &str, args: &[&str]) -> std::process::Output {
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(cav)
+            .expect("a restricted axis must yield a wrapper prefix");
+        assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
+        std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg(program)
+            .args(args)
+            .output()
+            .expect("spawn sandbox-exec")
+    }
+
+    /// The exec allow-list is kernel-enforced at the **interior**: a granted shell
+    /// runs, may exec a *listed* binary, but is kernel-denied an *unlisted* one —
+    /// the L3 gap a path allow-list alone cannot reach (ADR 0014). The discriminator
+    /// is exact: the unlisted `/usr/bin/false` must fail at **exec** (status 127),
+    /// not run-and-return-1 — so this cannot pass vacuously.
+    #[test]
+    fn exec_allowlist_permits_listed_denies_unlisted_child() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only(["/bin/zsh".to_string(), "/usr/bin/true".to_string()]),
+            ..Caveats::top()
+        };
+        let out = run_wrapped_output(
+            &cav,
+            "/bin/zsh",
+            &["-c", "/usr/bin/true; echo T=$?; /usr/bin/false; echo F=$?"],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("T=0"),
+            "a listed binary must exec and run (T=0): {stdout:?}"
+        );
+        assert!(
+            stdout.contains("F=127"),
+            "an unlisted binary must be kernel-denied at EXEC (status 127), not run: {stdout:?}"
+        );
+    }
+
+    /// The `exec:none`-style floor: when the granted set is just the entry shell,
+    /// the shell launches but may exec **nothing** further — every child exec is
+    /// kernel-denied. This is the interior "no further exec" guarantee.
+    #[test]
+    fn granted_shell_cannot_exec_any_unlisted_child() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only(["/bin/zsh".to_string()]),
+            ..Caveats::top()
+        };
+        let out = run_wrapped_output(&cav, "/bin/zsh", &["-c", "/usr/bin/true; echo S=$?"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("S=127"),
+            "a shell granted only itself must be denied every child exec (S=127): {stdout:?}"
+        );
+    }
+
+    /// The ADR 0011 loader trampoline — the bypass that has **no Landlock hook**
+    /// and forces the Linux seccomp backstop — is *closed by the platform* on
+    /// macOS. A granted interpreter (`perl`) cannot reach an unlisted binary by:
+    /// (a) directly `exec`ing it, nor (b) trampolining through `dyld`. Both are
+    /// governed `process-exec`s; `dyld` is not allow-listed, so both are denied.
+    #[test]
+    fn granted_interpreter_cannot_trampoline_to_unlisted_binary() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only(["/usr/bin/perl".to_string()]),
+            ..Caveats::top()
+        };
+        // Each `exec` returns (and perl continues) only when the exec was DENIED.
+        let script = "print \"PERL-RAN\\n\"; \
+                      exec(\"/usr/bin/true\"); print \"DIRECT-DENIED\\n\"; \
+                      exec(\"/usr/lib/dyld\", \"/usr/bin/true\"); print \"TRAMPOLINE-DENIED\\n\";";
+        let out = run_wrapped_output(&cav, "/usr/bin/perl", &["-e", script]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("PERL-RAN"),
+            "the granted interpreter must run: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("DIRECT-DENIED"),
+            "direct exec of an unlisted binary must be denied: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("TRAMPOLINE-DENIED"),
+            "the dyld loader trampoline must be denied (no standing loader entry): {stdout:?}"
+        );
+    }
+
+    /// Positive control / no deny-of-function: an allow-listed **dynamically
+    /// linked** binary still loads its dylibs (via the kernel-trusted dyld path,
+    /// which the exec allow-list does not gate) and runs normally under exec
+    /// confinement — proving the axis confines *spawning*, not legitimate linking.
+    #[test]
+    fn exec_confinement_does_not_break_dynamic_linking() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let curl = "/usr/bin/curl";
+        if !std::path::Path::new(curl).exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only([curl.to_string()]),
+            ..Caveats::top()
+        };
+        let status = run_wrapped(&cav, curl, &["--version"]);
+        assert!(
+            status.success(),
+            "an allow-listed dynamic binary must load + run under exec confinement"
         );
     }
 }

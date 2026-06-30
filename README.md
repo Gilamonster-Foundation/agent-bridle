@@ -301,8 +301,12 @@ end-to-end against a localhost mock server (a disallowed host, a private/loopbac
 address, and a redirect to a disallowed host are all proven *denied*).
 
 Landlock `fs_write`/`fs_read` kernel enforcement is landed (Linux,
-`linux-landlock`). The cross-OS L3 boundary — the `net`/`exec` axes (#35/#57) and
-the macOS/Windows backends (#50/#51), per the three-tier strategy in ADR 0009 —
+`linux-landlock`). On **macOS** (`macos-seatbelt`) the Seatbelt backend
+kernel-confines `fs_write`/`fs_read`, denies all egress for `net: none`, and —
+per ADR 0014 — kernel-confines the **`exec` axis** via `process-exec*` (closing
+the loader trampoline with no seccomp backstop, by hardware W^X + code signing).
+The remaining cross-OS L3 boundary — the Linux `net`/`exec` axes (#35/#57) and
+the Windows backend (#51), per the three-tier strategy in ADR 0009 —
 the optional full-bash `brush` engine (#20), the Python pillars (sidecar + host
 tools dir), the browse tier (headless Chrome — subprocess), `web_search`, and scm
 tools are later phases (see `docs/DESIGN.md` §12).
