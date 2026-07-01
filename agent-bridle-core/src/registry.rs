@@ -8,9 +8,27 @@
 //! `inventory` in P0.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::{Caveats, Gate, Tool, ToolError, ToolResult};
+use crate::{
+    CallRequest, Caveats, DischargeProvider, DischargeVerifier, Gate, StepUpPolicy, Tool,
+    ToolError, ToolResult,
+};
+
+/// Optional step-up enforcement wired into [`Registry::dispatch`] (ADR 0018 R2 /
+/// ADR 0007). When present, dispatch runs the gate's step-up ceremony
+/// (`evaluate → obtain → authorize_with_discharge`) instead of a plain
+/// `authorize`, so a host-designated HIGH-consequence call demands a human
+/// gesture on the **default** path — and even while *unbridled* (the human gate
+/// is orthogonal to the capability axis, ADR 0018 D8). A refused/failed gesture
+/// is a fail-closed denial; nothing is minted or charged. Absent ⇒ today's
+/// behavior (no gestures).
+struct StepUp {
+    policy: StepUpPolicy,
+    provider: Arc<dyn DischargeProvider + Send + Sync>,
+    verifier: Arc<dyn DischargeVerifier + Send + Sync>,
+}
 
 /// A catalog of tools that dispatches through the leash.
 ///
@@ -23,6 +41,15 @@ pub struct Registry {
     /// The causal generation dispatched gates embody. Defaults to 0; set via
     /// [`RegistryBuilder::generation`]. A *counter*, never a clock.
     generation: u64,
+    /// Optional step-up enforcement on the dispatch path (`None` ⇒ today's plain
+    /// authorize). Set via [`RegistryBuilder::step_up`].
+    step_up: Option<StepUp>,
+    /// Monotonic single-use nonce counter for the step-up ceremony. Core is
+    /// rng-less; a per-registry counter is single-use *across* dispatches, which
+    /// is what anti-replay needs here — the gate binds `challenge(action,
+    /// generation, nonce)`, so a fresh nonce makes a captured discharge invalid on
+    /// any later call. (A host wanting unpredictable nonces runs its own ceremony.)
+    step_up_nonce: AtomicU64,
 }
 
 impl Registry {
@@ -76,7 +103,32 @@ impl Registry {
             .ok_or_else(|| ToolError::not_found(name))?;
 
         let gate = self.gate_for(granted);
-        let cx = gate.authorize(tool.as_ref(), granted)?;
+        let cx = match &self.step_up {
+            // Step-up wired in (ADR 0018 R2): run the host-orchestrated ceremony
+            // through the gate — a policy-demanded gesture is obtained + verified
+            // before minting; a refusal is a fail-closed denial (nothing minted or
+            // charged). The gate stays the single mint site. This holds on the
+            // default path and while unbridled (the human gate is orthogonal).
+            Some(su) => {
+                let request = CallRequest::unspecified(name);
+                // Fresh single-use nonce per ceremony (monotonic counter → the
+                // gate's bound challenge differs each call, defeating replay).
+                let mut nonce = [0u8; 32];
+                let n = self.step_up_nonce.fetch_add(1, Ordering::Relaxed);
+                nonce[..8].copy_from_slice(&n.to_le_bytes());
+                let (cx, _attestation) = gate.authorize_step_up(
+                    tool.as_ref(),
+                    granted,
+                    &request,
+                    &su.policy,
+                    su.provider.as_ref(),
+                    su.verifier.as_ref(),
+                    nonce,
+                )?;
+                cx
+            }
+            None => gate.authorize(tool.as_ref(), granted)?,
+        };
         tool.invoke(args, &cx).await
     }
 
@@ -95,6 +147,7 @@ impl Registry {
 pub struct RegistryBuilder {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     generation: u64,
+    step_up: Option<StepUp>,
 }
 
 impl RegistryBuilder {
@@ -113,12 +166,33 @@ impl RegistryBuilder {
         self
     }
 
+    /// Enforce **step-up** on the dispatch path (ADR 0018 R2 / ADR 0007): a
+    /// policy-demanded human gesture is obtained via `provider`, verified by
+    /// `verifier`, and required before the tool runs — on the default path and
+    /// even while unbridled. Omit to keep today's gesture-free dispatch.
+    #[must_use]
+    pub fn step_up(
+        mut self,
+        policy: StepUpPolicy,
+        provider: Arc<dyn DischargeProvider + Send + Sync>,
+        verifier: Arc<dyn DischargeVerifier + Send + Sync>,
+    ) -> Self {
+        self.step_up = Some(StepUp {
+            policy,
+            provider,
+            verifier,
+        });
+        self
+    }
+
     /// Finish building.
     #[must_use]
     pub fn build(self) -> Registry {
         Registry {
             tools: self.tools,
             generation: self.generation,
+            step_up: self.step_up,
+            step_up_nonce: AtomicU64::new(0),
         }
     }
 }
@@ -215,6 +289,63 @@ mod tests {
             gate.authorize(&tool, &granted).unwrap_err(),
             ToolError::Budget
         ));
+    }
+
+    /// A provider whose ceremony always fails (no authenticator / human declined)
+    /// — enough to prove the gesture is *demanded* and a refusal is fail-closed,
+    /// without any crypto. The verifier is never reached (obtain fails first).
+    struct FailingProvider;
+    impl crate::DischargeProvider for FailingProvider {
+        fn obtain(
+            &self,
+            _request: &crate::CallRequest,
+            _required: &crate::AttestRequirement,
+            _generation: u64,
+            _nonce: &[u8; 32],
+        ) -> Result<crate::Discharge, String> {
+            Err("test: no authenticator present".into())
+        }
+    }
+    struct StubVerifier;
+    impl crate::DischargeVerifier for StubVerifier {
+        fn verify(
+            &self,
+            _discharge: &crate::Discharge,
+            _required: &crate::AttestRequirement,
+            _expected: &crate::Challenge,
+        ) -> Result<(), String> {
+            Ok(()) // never called in this test — the provider refuses first
+        }
+    }
+
+    /// R2 (ADR 0018): a step-up policy demanding a gesture is enforced on the
+    /// **default dispatch path** — a refused gesture is a fail-closed denial and
+    /// the tool never runs (nothing minted/charged). Without the seam, dispatch is
+    /// unchanged (covered by `dispatch_runs_in_scope_and_denies_out_of_scope`).
+    #[test]
+    fn step_up_policy_demands_a_gesture_on_the_default_path() {
+        let policy = crate::StepUpPolicy::new(
+            vec![crate::Rule {
+                selector: "probe".to_string(),
+                requirement: crate::AttestRequirement::passkey_recorded(),
+            }],
+            crate::AttestRequirement::NONE,
+        );
+        let r = Registry::builder()
+            .tool(Arc::new(ProbeTool))
+            .step_up(policy, Arc::new(FailingProvider), Arc::new(StubVerifier))
+            .build();
+        let granted = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+        // The policy demands a passkey for `probe`; the provider refuses → denied.
+        let err = block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &granted))
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Denied { .. }),
+            "a demanded-but-refused gesture must fail closed: {err:?}"
+        );
     }
 
     #[test]
