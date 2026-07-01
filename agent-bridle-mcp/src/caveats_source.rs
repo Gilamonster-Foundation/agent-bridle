@@ -73,6 +73,12 @@ pub enum CaveatsSource {
     /// `BRIDLE_MODE=unbridle` was requested **without** the required ack — refused
     /// and failed closed to DENY-ALL (never a silent unbridle, ADR 0018 D3).
     UnbridleRefused { reason: String },
+    /// The **no-step-up ack** (D10) was supplied while the run is **bridled** — an
+    /// illegal combination (there is nothing to deliberately disable if the machine
+    /// leash is on). Refused and failed closed to DENY-ALL rather than silently
+    /// ignored (ADR 0018 D10 / R6). The *absent* case (no ceremony, e.g. CI) is
+    /// always legal and is **not** this.
+    StepUpAckRefused { reason: String },
 }
 
 /// The resolved leash plus where it came from.
@@ -117,7 +123,14 @@ impl GrantedCaveats {
     /// process marker ([`agent_bridle::set_unbridled`]). With the mode set but the
     /// ack missing/wrong, it **fails closed** to DENY-ALL with an
     /// [`CaveatsSource::UnbridleRefused`] provenance — never a silent unbridle.
-    /// Neither key alone does anything. Pure/testable.
+    /// Neither key alone does anything.
+    ///
+    /// The **no-step-up ack** (D10) is a deliberate gesture to remove the *human*
+    /// gate; it is only meaningful while unbridled. Supplying it **while bridled**
+    /// is a contradiction (nothing to disable if the machine leash is on) and is
+    /// **refused** with an explicit [`CaveatsSource::StepUpAckRefused`] — failed
+    /// closed, never silently ignored (ADR 0018 R6). The *absent* case (no
+    /// ceremony) is always legal. Pure/testable.
     #[must_use]
     pub fn apply_unbridle(
         base: Self,
@@ -125,8 +138,27 @@ impl GrantedCaveats {
         ack: Option<&str>,
         no_step_up_ack: Option<&str>,
     ) -> Self {
-        if mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() != Some("unbridle") {
-            return base; // not requested — leave the resolved grant as-is
+        let unbridling = mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() == Some("unbridle");
+        // A no-step-up ack set to any non-empty value is a *present* deliberate
+        // gesture (the exact-token check for Autonomous happens only when unbridled,
+        // below); an unset/blank value is the legal "no ceremony" absence.
+        let no_step_up_present = no_step_up_ack.is_some_and(|s| !s.trim().is_empty());
+        if !unbridling {
+            if no_step_up_present {
+                // Illegal: the human gate can't be "turned off" while the machine
+                // leash is on. Refuse loudly and fail closed (R6).
+                return Self {
+                    caveats: deny_all(),
+                    source: CaveatsSource::StepUpAckRefused {
+                        reason: format!(
+                            "{ENV_NO_STEPUP_ACK} is set but the run is not unbridled \
+                             ({ENV_MODE}≠unbridle); the no-human ack is only valid for an \
+                             unbridled escape hatch"
+                        ),
+                    },
+                };
+            }
+            return base; // not requested, no illegal ack — leave the grant as-is
         }
         if ack == Some(UNBRIDLE_ACK_TOKEN) {
             // The human gate is removed (Autonomous) ONLY with the distinct second
@@ -252,6 +284,12 @@ impl GrantedCaveats {
                 "agent-bridle-mcp: WARNING — {reason}. REFUSING to unbridle; running \
                  DENY-ALL (fail-closed). Set ${ENV_UNBRIDLE_ACK}={UNBRIDLE_ACK_TOKEN} to \
                  unbridle, or unset ${ENV_MODE} to run confined."
+            ),
+            CaveatsSource::StepUpAckRefused { reason } => format!(
+                "agent-bridle-mcp: WARNING — {reason}. REFUSING to run; DENY-ALL \
+                 (fail-closed). The no-human ack only applies to an unbridled run: either \
+                 unbridle (${ENV_MODE}=unbridle + ${ENV_UNBRIDLE_ACK}={UNBRIDLE_ACK_TOKEN}), \
+                 or unset ${ENV_NO_STEPUP_ACK} to run confined with the human gate."
             ),
         }
     }
@@ -463,6 +501,106 @@ valid_for_generation = "all"
             assert_eq!(g.caveats, deny_all(), "refused unbridle fails closed");
             assert!(g.banner().contains("REFUSING"), "banner: {}", g.banner());
         }
+    }
+
+    #[test]
+    fn no_step_up_ack_while_bridled_is_rejected() {
+        // ADR 0018 R6: the D10 no-step-up ack is only meaningful while unbridled.
+        // Set while bridled (mode unset, or a non-unbridle mode) it is a hard,
+        // explicit refusal that fails closed — never a silent ignore. Any non-empty
+        // value trips it (the intent to remove the human gate is the footgun), token
+        // or not.
+        for (mode, ack) in [
+            (None, "i-accept-no-human-in-the-loop"), // exact token, but bridled
+            (Some("bridled"), "i-accept-no-human-in-the-loop"),
+            (None, "yes"), // any non-empty deliberate value
+            (Some("bridled"), "1"),
+        ] {
+            let g = GrantedCaveats::apply_unbridle(
+                base_grant(Caveats::top()),
+                mode,
+                None, // no unbridle ack — the run stays bridled
+                Some(ack),
+            );
+            assert!(
+                matches!(g.source, CaveatsSource::StepUpAckRefused { .. }),
+                "mode={mode:?} no_step_up={ack:?} must be refused, got {:?}",
+                g.source
+            );
+            assert!(!g.is_unbridled());
+            assert!(!g.is_autonomous());
+            assert_eq!(g.caveats, deny_all(), "refused ⇒ fail closed");
+            assert!(g.banner().contains("REFUSING"), "banner: {}", g.banner());
+            assert!(
+                g.banner().contains(ENV_NO_STEPUP_ACK),
+                "banner names the offending var: {}",
+                g.banner()
+            );
+        }
+    }
+
+    #[test]
+    fn step_up_absent_while_bridled_is_legal_no_ceremony() {
+        // The *absent* case (no step-up ceremony, e.g. CI) is always legal — a
+        // bridled run with no no-step-up ack is untouched, NOT refused.
+        let grant = Caveats {
+            exec: Scope::only(["git".to_string()]),
+            ..deny_all()
+        };
+        for absent in [None, Some(""), Some("   ")] {
+            let g = GrantedCaveats::apply_unbridle(
+                base_grant(grant.clone()),
+                None, // bridled
+                None,
+                absent,
+            );
+            assert_eq!(
+                g.source,
+                CaveatsSource::Env,
+                "absent no-step-up ({absent:?}) is legal, grant untouched"
+            );
+            assert_eq!(g.caveats, grant);
+        }
+    }
+
+    #[test]
+    fn the_four_postures_resolve_distinctly() {
+        // ADR 0018 D9 — the full 2×2 lattice, resolved from the ack channel. (The
+        // capability & human-gesture *config* axes are exercised in the loader
+        // crate; here we pin the runtime ack resolution that reaches each cell.)
+        let g = Caveats::top();
+
+        // Guarded — the default: bridled, no acks. Untouched grant.
+        let guarded = GrantedCaveats::apply_unbridle(base_grant(g.clone()), None, None, None);
+        assert!(!guarded.is_unbridled() && !guarded.is_autonomous());
+        assert_eq!(guarded.source, CaveatsSource::Env);
+
+        // Confined-headless — bridled, no ceremony. Same ack shape as Guarded at
+        // this layer (the "no human" distinction is the host's step-up floor, set
+        // via config `gate.step_up`, not an ack); the illegal way to reach "no
+        // human while bridled" (the ack) is refused, proven above.
+        let headless =
+            GrantedCaveats::apply_unbridle(base_grant(g.clone()), Some("bridled"), None, None);
+        assert!(!headless.is_unbridled());
+        assert_eq!(headless.source, CaveatsSource::Env);
+
+        // Supervised-free — unbridled two-key, human gate kept.
+        let sup = GrantedCaveats::apply_unbridle(
+            base_grant(g.clone()),
+            Some("unbridle"),
+            Some(UNBRIDLE_ACK_TOKEN),
+            None,
+        );
+        assert!(sup.is_unbridled() && !sup.is_autonomous());
+
+        // Autonomous — unbridled two-key PLUS the distinct no-step-up ack.
+        let auto = GrantedCaveats::apply_unbridle(
+            base_grant(g),
+            Some("unbridle"),
+            Some(UNBRIDLE_ACK_TOKEN),
+            Some(NO_STEPUP_TOKEN),
+        );
+        assert!(auto.is_unbridled() && auto.is_autonomous());
     }
 
     #[test]
