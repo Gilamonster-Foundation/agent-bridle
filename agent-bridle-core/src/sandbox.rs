@@ -43,6 +43,17 @@ pub enum SandboxKind {
     Seatbelt,
     /// A real AppContainer token is active (Windows). Kernel-enforced.
     AppContainer,
+    /// A Linux **minimal-rootfs mount-namespace jail** is active (ADR 0013 D3/D4,
+    /// agent-bridle#109/#108). The process runs in a `pivot_root` jail that
+    /// physically contains only the granted program files, so `exec` is
+    /// kernel-confined by **identity** — no un-granted binary *exists* to run or to
+    /// `ld.so`-trampoline into (ADR 0011 D7's precondition is now physically true,
+    /// not asserted) — and the filesystem axes are kernel-confined by the
+    /// read-only/read-write bind-mounts. Network is not namespaced at this tier, so
+    /// `net` stays advisory (never overclaimed). Reserved for the minimal-rootfs
+    /// mode: a Landlock-only boundary run stays [`SandboxKind::Landlock`] (its exec
+    /// axis is held — ADR 0011).
+    MinimalRootfs,
     /// No OS-level sandbox — the leash is in-process/advisory only. This is the
     /// honest default on a host with no compiled-and-capable backend.
     #[default]
@@ -1132,6 +1143,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SandboxKind::AppContainer).unwrap(),
             "\"app_container\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::MinimalRootfs).unwrap(),
+            "\"minimal_rootfs\""
         );
     }
 
