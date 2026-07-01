@@ -172,7 +172,7 @@ pub(crate) fn landlock_net_capable() -> bool {
 /// `(remote ip "localhost:*")` filter matches exactly these destinations
 /// (`127.0.0.1` and `::1`) — empirically the *only* remote a non-empty SBPL net
 /// rule can name (an arbitrary IP is rejected: "host must be * or localhost").
-const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+pub(crate) const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 /// `true` if the `net` axis is restricted to a **non-empty** allow-list whose
 /// every host is a [loopback identifier](LOOPBACK_HOSTS) — the one non-deny-all
@@ -424,7 +424,7 @@ pub(crate) mod appcontainer_impl {
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
-mod landlock_impl {
+pub(crate) mod landlock_impl {
     use super::{Sandbox, SandboxKind};
     use crate::{Caveats, Scope, ToolError, ToolResult};
     use landlock::{
@@ -482,7 +482,7 @@ mod landlock_impl {
     /// wholesale (so `/etc/shadow` stays denied) — only the specific resolver /
     /// loader files below. glibc/FHS-tuned; non-existent paths are skipped, so
     /// extra entries are harmless.
-    const BASE_READ_PATHS: &[&str] = &[
+    pub(crate) const BASE_READ_PATHS: &[&str] = &[
         // Library / loader trees: the dynamic linker + shared objects.
         "/lib",
         "/lib64",
@@ -516,7 +516,7 @@ mod landlock_impl {
     /// is confined (`Only`), these are deliberately NOT read-allowed (the granted
     /// binaries are added by resolved path instead), shrinking the trampoline
     /// corpus to exactly the granted programs (ADR 0011 D3).
-    const BIN_READ_PATHS: &[&str] = &[
+    pub(crate) const BIN_READ_PATHS: &[&str] = &[
         "/usr/bin",
         "/bin",
         "/usr/sbin",
@@ -538,7 +538,7 @@ mod landlock_impl {
     /// (`/usr/lib/klibc/bin/sh`, busybox, `git`, `go`), defeating the axis. Allow
     /// only the loader file (plus the resolved granted programs). Non-existent
     /// entries are skipped, so listing several arches is safe.
-    const LOADER_PATHS: &[&str] = &[
+    pub(crate) const LOADER_PATHS: &[&str] = &[
         "/lib64/ld-linux-x86-64.so.2",
         "/lib/ld-linux-x86-64.so.2",
         "/lib/ld-linux.so.2",

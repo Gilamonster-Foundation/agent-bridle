@@ -32,7 +32,7 @@ use crate::{Caveats, Scope};
 /// essentials. The shared libraries are added *specifically* from the per-binary
 /// `ldd` closure, NOT by binding `/usr/lib` wholesale, so only the `.so`s the
 /// granted binaries actually need are present.
-const DATA_PATHS: &[&str] = &[
+pub(crate) const DATA_PATHS: &[&str] = &[
     "/usr/share",
     "/usr/lib/locale",
     "/etc/ld.so.cache",
