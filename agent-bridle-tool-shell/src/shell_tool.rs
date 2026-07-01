@@ -617,10 +617,10 @@ impl Tool for ShellTool {
         // the principal's strength floor. Decided against `sandbox_kind` — the kind
         // that ACTUALLY governs the spawn (`effective_sandbox_kind`, what
         // `OsSpawner` routes through), NOT the raw probe: a backend the run path
-        // does not route through (AppContainer today — its shell launcher is #51)
-        // collapses to `None` here, so an fs-restricted run on it fails closed
-        // instead of executing unconfined via `run_pipeline` (the adversarial-review
-        // fix — the check and the routing must agree). The filesystem axes always
+        // does not route through collapses to `None` here, so an fs-restricted
+        // run on it fails closed instead of executing unconfined via
+        // `run_pipeline` (the adversarial-review fix — the check and the routing
+        // must agree). The filesystem axes always
         // fail closed when restricted-but-unenforceable (closing the run-unconfined
         // gap the shell shared with ConfinedCommand); exec/net fail closed only for
         // a strong principal (the default floor is permissive).

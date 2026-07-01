@@ -1,0 +1,26 @@
+[package]
+name = "agent-bridle-aclaunch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Windows AppContainer process launcher for agent-bridle (agent-bridle#51, ADR 0009)."
+# Only meaningful on Windows; on other platforms the binary compiles but exits
+# immediately with an unsupported message. Kept in the workspace so the full
+# `cargo check --workspace --all-features` matrix passes on any host.
+
+[[bin]]
+name = "agent-bridle-aclaunch"
+path = "src/main.rs"
+
+# Windows-only deps: the Win32 API surface for AppContainer + CreateProcessW.
+# Guarded by target triple so cross-compile (Linux host, Windows target) still
+# pulls the right set of features without cargo resolving windows-sys on Linux.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Isolation",
+    "Win32_System_Threading",
+] }
