@@ -217,8 +217,7 @@ pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
         SandboxKind::Landlock
-            if restricts_fs(caveats)
-                || (net_fully_denied(caveats) && landlock_net_capable()) =>
+            if restricts_fs(caveats) || (net_fully_denied(caveats) && landlock_net_capable()) =>
         {
             SandboxKind::Landlock
         }
