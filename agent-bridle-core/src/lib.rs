@@ -74,7 +74,7 @@ pub use step_up::{
     DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,
 };
 pub use tool::Tool;
-pub use unbridle::{is_unbridled, set_unbridled};
+pub use unbridle::{human_gate, is_unbridled, set_human_gate, set_unbridled, HumanGate};
 
 #[cfg(test)]
 mod tests {

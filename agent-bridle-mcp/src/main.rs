@@ -41,6 +41,14 @@ async fn main() -> anyhow::Result<()> {
     // discloses `unbridled`. Never reached without the acked `Unbridled` source.
     if granted.is_unbridled() {
         agent_bridle::set_unbridled();
+        // The human-gate posture (ADR 0018 D10/D11): Autonomous (no human gate)
+        // only when the distinct second ack was supplied; otherwise Supervised-free
+        // keeps the passkey gate. Disclosed on every envelope (R5).
+        agent_bridle::set_human_gate(if granted.is_autonomous() {
+            agent_bridle::HumanGate::None
+        } else {
+            agent_bridle::HumanGate::Passkey
+        });
     }
 
     // Build the registry for this binary's compiled feature set (shell on by
