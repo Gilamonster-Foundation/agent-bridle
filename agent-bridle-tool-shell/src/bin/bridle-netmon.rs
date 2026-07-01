@@ -41,7 +41,12 @@ fn main() -> io::Result<()> {
 fn run_file(path: &str) -> io::Result<()> {
     let mut agg = Agg::default();
     let mut pos: u64 = 0;
-    let mut leftover = String::new();
+    // Byte buffer (not String): a polled window can end mid-multibyte-char (an IDN
+    // host) or on a mid-write boundary, so `read_to_string` would return
+    // `InvalidData` and `?` would kill the live monitor (#138). We keep raw bytes,
+    // split on `\n`, and lossy-decode complete lines — a split char is preserved in
+    // `leftover` until the rest of the line arrives.
+    let mut leftover: Vec<u8> = Vec::new();
     loop {
         if let Ok(mut f) = std::fs::File::open(path) {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -53,10 +58,10 @@ fn run_file(path: &str) -> io::Result<()> {
             }
             if len > pos {
                 f.seek(SeekFrom::Start(pos))?;
-                let mut buf = String::new();
-                f.take(len - pos).read_to_string(&mut buf)?;
+                let mut buf: Vec<u8> = Vec::new();
+                f.take(len - pos).read_to_end(&mut buf)?;
                 pos = len;
-                leftover.push_str(&buf);
+                leftover.extend_from_slice(&buf);
                 drain_lines(&mut leftover, &mut agg);
             }
         }
@@ -70,8 +75,12 @@ fn run_file(path: &str) -> io::Result<()> {
 fn run_stdin() -> io::Result<()> {
     let stdin = io::stdin();
     let mut agg = Agg::default();
-    for line in stdin.lock().lines() {
-        if let Ok(ev) = serde_json::from_str::<NetAuditEvent>(line?.trim()) {
+    // Split on raw bytes + lossy-decode (not `.lines()`, which returns `Err` on
+    // invalid UTF-8 and would kill the monitor on an IDN host / partial char, #138).
+    for chunk in stdin.lock().split(b'\n') {
+        let bytes = chunk?;
+        let line = String::from_utf8_lossy(&bytes);
+        if let Ok(ev) = serde_json::from_str::<NetAuditEvent>(line.trim()) {
             agg.ingest(ev);
         }
         draw(&agg)?;
@@ -81,9 +90,13 @@ fn run_stdin() -> io::Result<()> {
 
 /// Split complete lines out of `buf` (keeping any trailing partial line) and fold
 /// each parseable event into `agg`.
-fn drain_lines(buf: &mut String, agg: &mut Agg) {
-    while let Some(i) = buf.find('\n') {
-        let line: String = buf.drain(..=i).collect();
+fn drain_lines(buf: &mut Vec<u8>, agg: &mut Agg) {
+    while let Some(i) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=i).collect();
+        // Lossy: never fail on invalid/partial UTF-8 (a split multibyte char at a
+        // window boundary stays in `buf` until its line completes, so a *complete*
+        // line here is well-formed; the lossy decode is belt-and-suspenders).
+        let line = String::from_utf8_lossy(&line);
         if let Ok(ev) = serde_json::from_str::<NetAuditEvent>(line.trim()) {
             agg.ingest(ev);
         }
@@ -278,17 +291,37 @@ mod tests {
 
     #[test]
     fn drain_lines_keeps_a_partial_trailing_line() {
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut a = Agg::default();
         let full = serde_json::to_string(&ev("h", NetDecision::Allowed, 1, 2, 5)).unwrap();
-        buf.push_str(&full);
-        buf.push('\n');
-        buf.push_str("{\"partial\":"); // incomplete line, must be retained
+        buf.extend_from_slice(full.as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(b"{\"partial\":"); // incomplete line, must be retained
         drain_lines(&mut buf, &mut a);
         assert_eq!(a.total, 1, "the complete line was ingested");
         assert_eq!(
-            buf, "{\"partial\":",
+            buf, b"{\"partial\":",
             "the partial line is kept for next read"
+        );
+    }
+
+    /// #138 (HIGH): a window ending mid-multibyte-char must not crash the tailer.
+    /// A complete IDN-host line is ingested; the split byte is retained (byte-based
+    /// buffering), never a UTF-8 decode failure.
+    #[test]
+    fn drain_lines_tolerates_split_multibyte_char() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut a = Agg::default();
+        let full = serde_json::to_string(&ev("café.test", NetDecision::Allowed, 1, 2, 5)).unwrap();
+        buf.extend_from_slice(full.as_bytes());
+        buf.push(b'\n');
+        buf.push(0xC3); // first byte of a 2-byte UTF-8 char, split at the window edge
+        drain_lines(&mut buf, &mut a); // must NOT panic / error on the partial byte
+        assert_eq!(a.total, 1, "the complete IDN-host line was ingested");
+        assert_eq!(
+            buf,
+            vec![0xC3],
+            "the split byte is retained for the next read"
         );
     }
 
