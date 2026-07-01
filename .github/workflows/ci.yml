@@ -157,8 +157,19 @@ jobs:
 
       # The launcher's own unit tests: MSVC CommandLineToArgvW quoting (arg-injection
       # surface) and the flag parser. Windows-only crate — only this job builds it.
-      - name: Test the agent-bridle-aclaunch launcher
-        run: cargo test -p agent-bridle-aclaunch
+      - name: Test the agent-bridle-aclaunch launcher (unit)
+        run: cargo test -p agent-bridle-aclaunch --bins
+
+      # REAL AppContainer kernel-enforcement proofs (#51 / #123): spawn confined
+      # children through the built launcher and assert the KERNEL blocks out-of-scope
+      # fs writes/reads and (via --no-child-process) child-process creation.
+      # BRIDLE_REQUIRE_APPCONTAINER turns "cannot create an AppContainer here" from a
+      # silent skip into a hard FAIL, so CI cannot go green without exercising the
+      # real boundary — the Windows analog of BRIDLE_REQUIRE_LANDLOCK/SEATBELT (#74).
+      - name: AppContainer kernel-enforcement proofs (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1
 
       # The ADR 0018 R9 per-OS honesty leg on the REAL AppContainer backend: an
       # unbridled run reports `sandbox_kind = none` with no axis claiming `kernel`,
