@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::report::AxisEnforcement;
+use crate::HumanGate;
 
 fn to_vec(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
@@ -89,13 +90,26 @@ pub enum BridleMode {
     Unbridle,
 }
 
-/// Gate defaults (`gate.rs` constants).
+/// Gate defaults (`gate.rs` constants) — and the **human-gesture axis** of the
+/// ADR 0018 mode lattice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatePolicy {
     /// The fence-strength floor stamped when none is set (`DEFAULT_STRENGTH_FLOOR`).
     pub default_strength_floor: AxisEnforcement,
     /// Cap on the discharge freshness-window scan (`MAX_FRESHNESS_WINDOW`).
     pub max_freshness_window: u64,
+    /// The **step-up floor** — the human-gate posture the host enforces for a
+    /// HIGH-consequence act (ADR 0018 D9/D11, R6). This is the human-gesture axis
+    /// of the mode lattice, the config sibling of the capability axis
+    /// [`BridleConfig::mode`]. Defaults to [`HumanGate::Passkey`] (the human leash
+    /// is on unless deliberately lowered). `none` is the *legal* "no ceremony"
+    /// case (e.g. CI) — distinct from the illegal *acked-off* combination the
+    /// loader refuses (the D10 no-step-up ack **while bridled**; that ack rides a
+    /// separate env-only channel, never a config file — ADR 0018 D3). The
+    /// Autonomous posture (`none` while unbridled) is reached at runtime via that
+    /// second ack, never by a config file lowering this floor.
+    #[serde(default)]
+    pub step_up: HumanGate,
 }
 
 impl Default for GatePolicy {
@@ -103,6 +117,7 @@ impl Default for GatePolicy {
         Self {
             default_strength_floor: AxisEnforcement::Advisory,
             max_freshness_window: 4096,
+            step_up: HumanGate::Passkey,
         }
     }
 }
@@ -529,6 +544,29 @@ mod tests {
         let g = GatePolicy::default();
         assert_eq!(g.default_strength_floor, AxisEnforcement::Advisory);
         assert_eq!(g.max_freshness_window, 4096);
+        // The human-gesture axis floor (ADR 0018 R6) defaults ON: the human leash
+        // is Passkey unless deliberately lowered — Autonomous is never by omission.
+        assert_eq!(g.step_up, HumanGate::Passkey);
+    }
+
+    #[test]
+    fn gate_step_up_floor_round_trips_each_posture() {
+        // Each human-gesture posture survives serialize→deserialize as snake_case,
+        // so the config file / env / API can express any of them.
+        for (gate, tok) in [
+            (HumanGate::None, "none"),
+            (HumanGate::Prompt, "prompt"),
+            (HumanGate::Passkey, "passkey"),
+        ] {
+            let g = GatePolicy {
+                step_up: gate,
+                ..GatePolicy::default()
+            };
+            let json = serde_json::to_value(&g).unwrap();
+            assert_eq!(json["step_up"], tok, "serializes snake_case");
+            let back: GatePolicy = serde_json::from_value(json).unwrap();
+            assert_eq!(back.step_up, gate);
+        }
     }
 
     #[test]

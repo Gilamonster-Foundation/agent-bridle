@@ -341,6 +341,61 @@ mod tests {
     }
 
     #[test]
+    fn both_mode_axes_settable_across_file_env_api_with_precedence() {
+        // ADR 0018 R6: the two axes of the mode lattice are ordinary config fields,
+        // so both flow through the documented defaults→file→env→API precedence.
+        //   capability axis  = `mode`            (env `BRIDLE_MODE`)
+        //   human-gesture ax = `gate.step_up`    (env `BRIDLE_GATE_STEP_UP`)
+        use agent_bridle_core::{BridleMode, HumanGate};
+
+        // Defaults: Guarded (bridled) + human leash on (passkey).
+        let (d, _) = resolve(None, &env(&[]), None).unwrap();
+        assert_eq!(d.mode, BridleMode::Bridled);
+        assert_eq!(d.gate.step_up, HumanGate::Passkey);
+
+        // File sets both; env overrides the human-gesture floor; API overrides mode.
+        let file = r#"
+            [bridle]
+            mode = "bridled"
+            [bridle.gate]
+            step_up = "passkey"
+        "#;
+        let (cfg, prov) = resolve(
+            Some(file),
+            &env(&[("BRIDLE_GATE_STEP_UP", "prompt")]), // env beats file on this axis
+            Some(json_at(&["mode"], Value::String("unbridle".into()))), // api beats all on mode
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.mode,
+            BridleMode::Unbridle,
+            "api wins the capability axis"
+        );
+        assert_eq!(
+            cfg.gate.step_up,
+            HumanGate::Prompt,
+            "env wins the human-gesture axis over the file"
+        );
+        // A sibling gate field the layers never touched keeps its default.
+        assert_eq!(
+            cfg.gate.max_freshness_window,
+            BridleConfig::default().gate.max_freshness_window
+        );
+        assert!(prov.file && prov.env && prov.api);
+    }
+
+    #[test]
+    fn step_up_floor_none_is_the_legal_no_ceremony_case() {
+        // `gate.step_up = none` is the *legal* "no step-up ceremony" posture (e.g.
+        // CI) — settable via config. (The illegal thing the loader rejects is the
+        // no-step-up *ack* while bridled, which rides a separate env-only channel in
+        // the caveats source, not this config surface — ADR 0018 D3/R6.)
+        use agent_bridle_core::HumanGate;
+        let (cfg, _) = resolve(None, &env(&[("BRIDLE_GATE_STEP_UP", "none")]), None).unwrap();
+        assert_eq!(cfg.gate.step_up, HumanGate::None);
+    }
+
+    #[test]
     fn list_valued_env_extends_via_comma() {
         // sandbox.base_read_paths is a PathList: setting `.extra` via a comma list.
         let (cfg, _) = resolve(
