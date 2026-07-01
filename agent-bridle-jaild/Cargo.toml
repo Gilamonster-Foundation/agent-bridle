@@ -9,6 +9,10 @@ description = "Privileged Tier-1.5 mount-namespace jail for agent-bridle program
 
 [dependencies]
 agent-bridle-core = { workspace = true }
+# The wire protocol (JailRequest/JailResponse) carries the authority `Caveats`,
+# which is serde-serializable; framed JSON over a Unix socket.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Linux-only: the namespace/mount/pivot_root syscalls. `libc` is already in the
 # lockfile (transitive via the Landlock backend), so this adds no new dependency.
