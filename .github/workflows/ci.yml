@@ -155,6 +155,11 @@ jobs:
       - name: Test the AppContainer backend (core proofs)
         run: cargo test -p agent-bridle-core --features windows-appcontainer
 
+      # The launcher's own unit tests: MSVC CommandLineToArgvW quoting (arg-injection
+      # surface) and the flag parser. Windows-only crate — only this job builds it.
+      - name: Test the agent-bridle-aclaunch launcher
+        run: cargo test -p agent-bridle-aclaunch
+
       # The ADR 0018 R9 per-OS honesty leg on the REAL AppContainer backend: an
       # unbridled run reports `sandbox_kind = none` with no axis claiming `kernel`,
       # even though a bridled AppContainer would kernel-confine every axis here.
