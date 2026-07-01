@@ -26,7 +26,8 @@
 //! [`Sandbox::command_prefix`] (Seatbelt); a spawn site honors both, so the
 //! mechanism is uniform at the call site.
 
-use crate::{Caveats, ToolResult};
+use crate::{Caveats, SandboxPolicy, ToolResult};
+use std::sync::Arc;
 
 /// Which OS-level sandbox actually backs an authorization.
 ///
@@ -290,9 +291,10 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
 /// honest [`SandboxKind::None`] where it does not, rather than silently
 /// overclaiming. Enabling a backend's feature off its target OS compiles nothing
 /// and selects nothing (the arm is `cfg`-gated away).
-pub fn best_available_sandbox() -> Box<dyn Sandbox> {
+pub fn best_available_sandbox(policy: &Arc<SandboxPolicy>) -> Box<dyn Sandbox> {
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
     {
+        let _ = policy; // AppContainer configures per-process via the launcher.
         Box::new(appcontainer_impl::AppContainerSandbox::new())
     }
 
@@ -301,15 +303,16 @@ pub fn best_available_sandbox() -> Box<dyn Sandbox> {
         #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
         {
             if landlock_impl::landlock_is_supported() {
-                return Box::new(landlock_impl::LandlockSandbox::new());
+                return Box::new(landlock_impl::LandlockSandbox::with_policy(policy.clone()));
             }
         }
         #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
         {
             if seatbelt_impl::seatbelt_is_supported() {
-                return Box::new(seatbelt_impl::SeatbeltSandbox::new());
+                return Box::new(seatbelt_impl::SeatbeltSandbox::with_policy(policy.clone()));
             }
         }
+        let _ = policy; // NoopSandbox is unconfigurable (advisory).
         Box::new(NoopSandbox)
     }
 }
@@ -426,22 +429,26 @@ pub(crate) mod appcontainer_impl {
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub(crate) mod landlock_impl {
     use super::{Sandbox, SandboxKind};
-    use crate::{Caveats, Scope, ToolError, ToolResult};
+    use crate::{Caveats, SandboxPolicy, Scope, ToolError, ToolResult};
     use landlock::{
         path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
         RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
     };
+    use std::sync::Arc;
 
-    /// ABI floor we request. Every filesystem *write*-side right exists by V3
-    /// (WriteFile/Make*/Remove* at V1, Refer at V2, Truncate at V3). We request
-    /// V3 and run BestEffort, so newer kernels keep working and older ones
-    /// degrade gracefully (dropping Refer/Truncate) instead of failing to build
-    /// the ruleset.
-    const ABI_FLOOR: ABI = ABI::V3;
-
-    /// ABI floor required for TCP network rules (`AccessNet::BindTcp` /
-    /// `ConnectTcp`). Available from Linux kernel 6.7 (Landlock ABI V4).
-    const NET_ABI_FLOOR: ABI = ABI::V4;
+    /// Map a configured ABI floor (`SandboxPolicy::landlock_abi_floor`) to the
+    /// landlock `ABI` enum. `apply` runs `BestEffort`, so a floor above the
+    /// running kernel still degrades gracefully; unknown/too-high values clamp to
+    /// the highest ABI this build knows (V4 — TCP net rules). The default floors
+    /// (fs 3 / net 4) reproduce the previous `ABI::V3` / `ABI::V4` constants.
+    fn abi_from_u32(v: u32) -> ABI {
+        match v {
+            0 | 1 => ABI::V1,
+            2 => ABI::V2,
+            3 => ABI::V3,
+            _ => ABI::V4,
+        }
+    }
 
     /// `true` if this kernel can enforce a Landlock ruleset.
     ///
@@ -458,110 +465,49 @@ pub(crate) mod landlock_impl {
 
     /// `true` if this kernel supports Landlock TCP network rules (ABI V4,
     /// kernel ≥ 6.7). Probed non-destructively — creates but never
-    /// `restrict_self`s a throwaway ruleset.
+    /// `restrict_self`s a throwaway ruleset. This is the *capability* threshold
+    /// (TCP rules first appear at V4), distinct from the configurable request
+    /// floor in [`abi_from_u32`].
     pub fn landlock_net_is_supported() -> bool {
         Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
-            .handle_access(AccessNet::from_all(NET_ABI_FLOOR))
+            .handle_access(AccessNet::from_all(ABI::V4))
             .and_then(|r| r.create())
             .is_ok()
     }
 
-    /// Read base allow-list: the loader/library trees + the system DATA and
-    /// runtime files a permitted, dynamically-linked program needs to start and
-    /// resolve names — but **NOT** the executable directories (`/usr/bin`, `/bin`,
-    /// `/sbin`). Keeping the bin dirs out of the read set shrinks the
-    /// loader-trampoline corpus (ADR 0011 D3): `/usr/bin/curl` is then unreadable
-    /// and so cannot be `mmap`-exec'd via `ld.so`. The granted program's OWN
-    /// binary is added back in `apply` ([`BIN_READ_PATHS`] when `exec` is ambient,
-    /// or the resolved granted paths when `exec` is confined).
-    ///
-    /// This *shrinks* the corpus, it does not *close* the trampoline — `/usr/lib`
-    /// (the `.so` tree) still hides some interpreters, so `exec` stays
-    /// `interceptor`, never `kernel` (ADR 0011 D7). `/etc` is never granted
-    /// wholesale (so `/etc/shadow` stays denied) — only the specific resolver /
-    /// loader files below. glibc/FHS-tuned; non-existent paths are skipped, so
-    /// extra entries are harmless.
-    pub(crate) const BASE_READ_PATHS: &[&str] = &[
-        // Library / loader trees: the dynamic linker + shared objects.
-        "/lib",
-        "/lib64",
-        "/lib32",
-        "/libx32",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/libexec",
-        // System DATA a program reads at runtime (none of these are bin dirs):
-        // locale, timezone, terminfo, gconv, CA-cert bundles, package data, …
-        "/usr/share",
-        "/etc/ld.so.cache",
-        "/etc/ld.so.preload",
-        "/etc/alternatives",
-        "/etc/nsswitch.conf",
-        "/etc/localtime",
-        "/etc/resolv.conf",
-        "/etc/ssl",
-        "/etc/ca-certificates",
-        "/proc/self",
-        "/dev/null",
-        "/dev/zero",
-        "/dev/full",
-        "/dev/urandom",
-        "/dev/random",
-    ];
-
-    /// Executable directories a program's OWN binary loads from. Read-allowed only
-    /// when `exec` is **ambient** (`All`) — then the program is arbitrary and its
-    /// path unknown, so the bin dirs must be readable for it to load. When `exec`
-    /// is confined (`Only`), these are deliberately NOT read-allowed (the granted
-    /// binaries are added by resolved path instead), shrinking the trampoline
-    /// corpus to exactly the granted programs (ADR 0011 D3).
-    pub(crate) const BIN_READ_PATHS: &[&str] = &[
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-        "/usr/local/bin",
-        "/usr/local/sbin",
-        "/opt",
-    ];
-
-    /// Execute base allow-list: the dynamic linker(s) only — specific **files**,
-    /// never directories. The kernel `execve`s the program and `open_exec`s its
-    /// `PT_INTERP` (the loader), so both need `Execute`; shared libraries are
-    /// `open(O_RDONLY)`+`mmap`'d (governed by the read axis, not `Execute`), so the
-    /// `.so` directories do **not** need execute.
-    ///
-    /// Security-critical narrowing: a *directory* grant here would be recursive
-    /// (`path_beneath`), and `/lib`→`/usr/lib` is a merged-usr symlink, so allowing
-    /// any lib directory would make every executable beneath `/usr/lib` runnable
-    /// (`/usr/lib/klibc/bin/sh`, busybox, `git`, `go`), defeating the axis. Allow
-    /// only the loader file (plus the resolved granted programs). Non-existent
-    /// entries are skipped, so listing several arches is safe.
-    pub(crate) const LOADER_PATHS: &[&str] = &[
-        "/lib64/ld-linux-x86-64.so.2",
-        "/lib/ld-linux-x86-64.so.2",
-        "/lib/ld-linux.so.2",
-        "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-        "/lib64/ld64.so.2",
-        "/lib/ld-linux-aarch64.so.1",
-        "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
-        "/lib/ld-linux-armhf.so.3",
-        "/lib/ld-musl-x86-64.so.1",
-        "/lib/ld-musl-aarch64.so.1",
-    ];
+    // The Landlock read/exec allow-lists now live in `SandboxPolicy`
+    // (config.rs) and are read from `self.policy` in `apply`. Their security
+    // rationale is unchanged (ADR 0011 D3/D7):
+    //
+    // - `base_read_paths`: the loader/library trees + system DATA a permitted,
+    //   dynamically-linked program needs to start — but NOT the executable dirs
+    //   (`/usr/bin`, `/bin`, `/sbin`). Keeping bin dirs out of the read set
+    //   shrinks the loader-trampoline corpus: `/usr/bin/curl` is unreadable and
+    //   so cannot be `mmap`-exec'd via `ld.so`. This shrinks, but does not close,
+    //   the trampoline (`/usr/lib` still hides interpreters), so `exec` stays
+    //   `interceptor`, never `kernel`. `/etc` is never granted wholesale.
+    // - `bin_read_paths`: executable dirs, read-allowed ONLY when `exec` is
+    //   ambient (`All`); when `exec` is confined the granted binaries are added
+    //   by resolved path instead, narrowing the corpus to exactly them.
+    // - `loader_paths`: the dynamic linker(s) only — specific FILES, never
+    //   directories (a `path_beneath` dir grant would expose every ELF beneath
+    //   `/usr/lib` via the merged-usr symlink, defeating the exec axis).
+    //
+    // The `PathList` shrink-guard (config) means an operator can *widen* these
+    // (disclosed) but can only *remove* an entry with an explicit `replace=true`.
 
     /// A real, kernel-enforced Landlock sandbox (Linux).
     ///
     /// **The `fs_write`, `fs_read`, and `exec` axes.** Writes are always governed
     /// (from `fs_write`); reads are governed only when `fs_read` is *restricted*
-    /// (`Only(_)`), in which case the granted read roots plus [`BASE_READ_PATHS`]
-    /// are read-allowed and everything else is denied — so a permitted external
-    /// program cannot read user data outside `fs_read` (closing `grep -f
-    /// /etc/shadow`-style reads) yet can still load its libraries.
+    /// (`Only(_)`), in which case the granted read roots plus the configured
+    /// `base_read_paths` are read-allowed and everything else is denied — so a
+    /// permitted external program cannot read user data outside `fs_read` (closing
+    /// `grep -f /etc/shadow`-style reads) yet can still load its libraries.
     ///
     /// `Execute` is governed only when `exec` is restricted: the *resolved*
-    /// granted program files plus [`LOADER_PATHS`] (the dynamic linker only — never
+    /// granted program files plus the configured `loader_paths` (the dynamic linker only — never
     /// library directories, which `path_beneath` would make recursively executable
     /// and expose `/usr/lib`'s interpreters) are execute-allowed and all else
     /// denied. This kernel-denies a **direct** `execve` of a different, un-granted
@@ -584,13 +530,21 @@ pub(crate) mod landlock_impl {
     /// `fork`/`execve`. Callers must therefore call [`Sandbox::apply`] on the
     /// very thread that will spawn the confined work, immediately before the
     /// spawn.
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct LandlockSandbox;
+    #[derive(Debug, Default, Clone)]
+    pub struct LandlockSandbox {
+        /// The read/exec allow-lists + ABI floors this backend enforces (I5-B).
+        policy: Arc<SandboxPolicy>,
+    }
 
     impl LandlockSandbox {
-        /// Construct the sandbox. (Stateless; capability comes from the kernel.)
+        /// Construct with the built-in defaults (today's allow-lists).
         pub fn new() -> Self {
-            Self
+            Self::default()
+        }
+
+        /// Construct configured with an operator-supplied [`SandboxPolicy`].
+        pub fn with_policy(policy: Arc<SandboxPolicy>) -> Self {
+            Self { policy }
         }
     }
 
@@ -600,7 +554,7 @@ pub(crate) mod landlock_impl {
         }
 
         fn apply(&self, effective: &Caveats) -> ToolResult<()> {
-            let write = AccessFs::from_write(ABI_FLOOR);
+            let write = AccessFs::from_write(abi_from_u32(self.policy.landlock_abi_floor));
             // Pure read rights — `from_read` also bundles `Execute`, which we
             // govern separately (only when `exec` is restricted), never via the
             // read axis.
@@ -637,7 +591,9 @@ pub(crate) mod landlock_impl {
             // NetPort rules → deny-by-default for all TCP bind + connect.
             let ruleset = if confine_net {
                 ruleset
-                    .handle_access(AccessNet::from_all(NET_ABI_FLOOR))
+                    .handle_access(AccessNet::from_all(abi_from_u32(
+                        self.policy.landlock_net_abi_floor,
+                    )))
                     .map_err(landlock_denied)?
             } else {
                 ruleset
@@ -652,7 +608,7 @@ pub(crate) mod landlock_impl {
                 // Granted read roots + the loader/library/data base list, so a
                 // permitted binary loads while out-of-scope reads stay denied.
                 let mut read_roots = scope_roots(&effective.fs_read);
-                read_roots.extend(BASE_READ_PATHS.iter().map(|p| (*p).to_string()));
+                read_roots.extend(self.policy.base_read_paths.resolve());
                 // The program's own binary must be readable to load. When `exec`
                 // is confined, read-allow ONLY the resolved granted programs — so
                 // the bin dirs stay OUT of the trampoline corpus (`/usr/bin/curl`
@@ -662,7 +618,7 @@ pub(crate) mod landlock_impl {
                 if confine_exec {
                     read_roots.extend(resolve_exec_paths(&effective.exec));
                 } else {
-                    read_roots.extend(BIN_READ_PATHS.iter().map(|p| (*p).to_string()));
+                    read_roots.extend(self.policy.bin_read_paths.resolve());
                 }
                 read_roots.retain(|p| std::path::Path::new(p).exists());
                 ruleset
@@ -679,7 +635,7 @@ pub(crate) mod landlock_impl {
                 // (its own execve + the loader + .so reads), but cannot DIRECTLY
                 // execve a different, un-granted program.
                 let mut exec_roots = resolve_exec_paths(&effective.exec);
-                exec_roots.extend(LOADER_PATHS.iter().map(|p| (*p).to_string()));
+                exec_roots.extend(self.policy.loader_paths.resolve());
                 exec_roots.retain(|p| std::path::Path::new(p).exists());
                 ruleset
                     .add_rules(path_beneath_rules(&exec_roots, AccessFs::Execute))
@@ -780,8 +736,9 @@ pub(crate) mod landlock_impl {
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 mod seatbelt_impl {
     use super::{Sandbox, SandboxKind};
-    use crate::{Caveats, Scope, ToolError, ToolResult};
+    use crate::{Caveats, SandboxPolicy, Scope, ToolError, ToolResult};
     use std::path::Path;
+    use std::sync::Arc;
 
     /// The macOS sandbox wrapper. We invoke it by **absolute path** (never via
     /// `PATH`) so the boundary cannot be shadowed by a `sandbox-exec` planted
@@ -801,17 +758,8 @@ mod seatbelt_impl {
     /// data outside scope stays unreadable. Non-existent entries are dropped
     /// during canonicalization, so extra entries are harmless across macOS
     /// layouts (verified on Apple Silicon: `grep`/`cat`/`cp` load read-confined).
-    const BASE_READ_PATHS: &[&str] = &[
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/System",
-        "/Library",
-        "/opt",
-        "/private/etc",
-        "/private/var/db/dyld",
-        "/dev",
-    ];
+    /// The list now lives in `SandboxPolicy::base_read_paths` (config.rs), whose
+    /// default is macOS-specific on this platform (I5-B, #144).
 
     /// `true` if this host can enforce a Seatbelt profile — i.e. the
     /// `sandbox-exec` wrapper is present. The wrapper itself is the boundary, so
@@ -850,7 +798,7 @@ mod seatbelt_impl {
     ///
     /// Read confinement here is **content-level**: file *metadata* (stat,
     /// existence, directory traversal) stays ambient so binaries can load through
-    /// symlink ancestors, and the system read base ([`BASE_READ_PATHS`], incl.
+    /// symlink ancestors, and the system read base (the configured `base_read_paths`, incl.
     /// `/private/etc`) is broadly readable — looser than Landlock's file-level
     /// `/etc` allow-list, but the protected resource (out-of-scope file
     /// *contents*, the exfil threat) is denied identically. macOS keeps user
@@ -860,14 +808,23 @@ mod seatbelt_impl {
     /// carried by the wrapper process and inherited by the child, so
     /// [`Sandbox::apply`] is a no-op and the boundary lives entirely in
     /// [`Sandbox::command_prefix`].
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct SeatbeltSandbox;
+    #[derive(Debug, Default, Clone)]
+    pub struct SeatbeltSandbox {
+        /// The read base this backend's SBPL profile allows (I5-B).
+        policy: Arc<SandboxPolicy>,
+    }
 
     impl SeatbeltSandbox {
-        /// Construct the sandbox. (Stateless; capability comes from the OS.)
+        /// Construct with the built-in defaults (today's read base).
         #[must_use]
         pub fn new() -> Self {
-            Self
+            Self::default()
+        }
+
+        /// Construct configured with an operator-supplied [`SandboxPolicy`].
+        #[must_use]
+        pub fn with_policy(policy: Arc<SandboxPolicy>) -> Self {
+            Self { policy }
         }
     }
 
@@ -905,7 +862,7 @@ mod seatbelt_impl {
             Ok(vec![
                 SANDBOX_EXEC.to_string(),
                 "-p".to_string(),
-                seatbelt_profile(effective),
+                seatbelt_profile_with(effective, &self.policy.base_read_paths.resolve()),
             ])
         }
     }
@@ -923,6 +880,18 @@ mod seatbelt_impl {
     /// so the trailing allow-roots override the deny.
     #[must_use]
     pub fn seatbelt_profile(effective: &Caveats) -> String {
+        // Convenience over the built-in read base (used by unit tests). The
+        // production path is `command_prefix` → `seatbelt_profile_with` with the
+        // configured `SandboxPolicy::base_read_paths` (I5-B, #144).
+        seatbelt_profile_with(
+            effective,
+            &SandboxPolicy::default().base_read_paths.resolve(),
+        )
+    }
+
+    /// SBPL profile builder, parameterized on the read base (`base_read`).
+    #[must_use]
+    fn seatbelt_profile_with(effective: &Caveats, base_read: &[String]) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n");
 
         // fs_write: deny writes, then re-allow the granted roots.
@@ -950,7 +919,7 @@ mod seatbelt_impl {
             p.push_str("(deny file-read*)\n");
             p.push_str("(allow file-read-metadata)\n");
             p.push_str("(allow file-read* (literal \"/\")");
-            for base in BASE_READ_PATHS {
+            for base in base_read {
                 if let Some(c) = canonical_path(base) {
                     p.push_str(&format!(" (subpath {})", sbpl_string(&c)));
                 }
@@ -1572,7 +1541,7 @@ mod tests {
     fn best_available_sandbox_is_a_sandbox() {
         // Always returns *some* sandbox; on a non-landlock build/kernel it is the
         // advisory Noop. Just exercise the trait object.
-        let sb = best_available_sandbox();
+        let sb = best_available_sandbox(&Arc::new(SandboxPolicy::default()));
         if sb.kind() == SandboxKind::AppContainer {
             assert!(
                 sb.apply(&Caveats::top()).is_err(),
@@ -1586,7 +1555,10 @@ mod tests {
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
     #[test]
     fn windows_appcontainer_feature_selects_appcontainer_backend() {
-        assert_eq!(best_available_sandbox().kind(), SandboxKind::AppContainer);
+        assert_eq!(
+            best_available_sandbox(&Arc::new(SandboxPolicy::default())).kind(),
+            SandboxKind::AppContainer
+        );
     }
 }
 
@@ -1705,6 +1677,62 @@ mod landlock_kernel_tests {
 
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    /// #144 (I5-B): the Landlock read base is config-driven. Widening
+    /// `base_read_paths` lets a confined thread read a path that is otherwise
+    /// outside `fs_read` scope — proving `apply` reads `self.policy`, not the old
+    /// module const. The control (default policy) denies the same read.
+    #[test]
+    fn landlock_config_widens_base_read() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let allowed = unique_dir("cfg-allowed");
+        let extra = unique_dir("cfg-extra");
+        fs::write(extra.join("data.txt"), b"configured").unwrap();
+
+        let cav = Caveats {
+            fs_read: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+
+        // Control: with the DEFAULT policy the out-of-scope `extra` dir is denied.
+        let (extra_c, cav_c) = (extra.clone(), cav.clone());
+        let denied = std::thread::spawn(move || {
+            LandlockSandbox::new().apply(&cav_c).expect("apply");
+            fs::read(extra_c.join("data.txt"))
+        })
+        .join()
+        .unwrap();
+        assert!(
+            denied.is_err(),
+            "default base read must NOT include the out-of-scope extra dir"
+        );
+
+        // Widened policy: add `extra` to base_read_paths → the same read succeeds.
+        let mut base = SandboxPolicy::default().base_read_paths;
+        base.extra.push(extra.to_string_lossy().into_owned());
+        let policy = Arc::new(SandboxPolicy {
+            base_read_paths: base,
+            ..SandboxPolicy::default()
+        });
+        let extra_w = extra.clone();
+        let allowed_read = std::thread::spawn(move || {
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply");
+            fs::read(extra_w.join("data.txt"))
+        })
+        .join()
+        .unwrap();
+        assert!(
+            allowed_read.is_ok(),
+            "config-widened base_read_paths must allow the extra dir: {allowed_read:?}"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&extra);
     }
 
     #[test]

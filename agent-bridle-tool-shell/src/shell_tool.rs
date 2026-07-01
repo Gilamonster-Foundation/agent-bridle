@@ -41,8 +41,8 @@ use std::time::Duration;
 use agent_bridle_core::{
     best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
     loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial, DenialKind,
-    EnforcementReport, LimitsPolicy, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError,
-    ToolResult,
+    EnforcementReport, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope,
+    ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -75,6 +75,19 @@ pub(crate) struct Captured {
 /// no real process/fs in unit tests). A `Spawner` only ever receives a pipeline
 /// that already passed the `exec` **and** `fs` (redirect + glob-dir) leash —
 /// admission happens in [`ShellTool::invoke`] *before* the spawner runs.
+/// Per-invocation spawn *mechanism* config, threaded from `ShellTool`'s fields to
+/// the spawner. It rides an explicit parameter, **never** `ToolContext` (which
+/// carries only authority — authority≠mechanism, ADR 0017 D2). Bundles the tuning
+/// knobs so the `Spawner` seam takes one config, not a growing list of scalars.
+pub(crate) struct SpawnCfg {
+    /// Captured stdout/stderr cap ([`LimitsPolicy::max_output_bytes`]).
+    pub max_output: usize,
+    /// Egress audit sink path ([`LimitsPolicy::audit_sink`]; `None` = off).
+    pub audit_sink: Option<String>,
+    /// Sandbox read/exec allow-lists + ABI floors ([`SandboxPolicy`]).
+    pub sandbox: Arc<SandboxPolicy>,
+}
+
 pub(crate) trait Spawner: Send + Sync {
     /// Run one leash-approved pipeline to completion, capturing its output. The
     /// effective `caveats` are passed so the real spawner can apply the L3 OS
@@ -83,18 +96,14 @@ pub(crate) trait Spawner: Send + Sync {
     /// spawner sets these vars on each spawned child (additive over the inherited
     /// ambient env). `env` is structured host input, never model-authored command
     /// text, so it grants no new authority — the exec/fs leash is unaffected.
-    /// `max_output` bounds the captured stdout/stderr (the configured output cap,
-    /// [`LimitsPolicy::max_output_bytes`]). `audit_sink` is the configured egress
-    /// audit path ([`LimitsPolicy::audit_sink`]; `None` = off) — used only on the
-    /// egress-proxy path.
+    /// `cfg` carries the mechanism tuning (output cap, audit sink, sandbox policy).
     fn run(
         &self,
         stages: &[Command],
         cwd: Option<&str>,
         caveats: &Caveats,
         env: &BTreeMap<String, String>,
-        max_output: usize,
-        audit_sink: Option<&str>,
+        cfg: &SpawnCfg,
     ) -> ToolResult<Captured>;
 }
 
@@ -109,31 +118,22 @@ impl Spawner for OsSpawner {
         cwd: Option<&str>,
         caveats: &Caveats,
         env: &BTreeMap<String, String>,
-        max_output: usize,
-        audit_sink: Option<&str>,
+        cfg: &SpawnCfg,
     ) -> ToolResult<Captured> {
         // A general remote-host `net` allow-list that cannot be named in SBPL is
         // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
         // to loopback and route it through the proxy. Self-gating — `Some` only
         // where the fence is actually emittable (macOS + seatbelt).
-        if let Some((allow_hosts, fenced)) = egress_proxy_plan(caveats) {
-            return run_with_egress_proxy(
-                stages,
-                cwd,
-                &fenced,
-                env,
-                allow_hosts,
-                max_output,
-                audit_sink,
-            );
+        if let Some((allow_hosts, fenced)) = egress_proxy_plan(caveats, &cfg.sandbox) {
+            return run_with_egress_proxy(stages, cwd, &fenced, env, allow_hosts, cfg);
         }
         // When an OS sandbox (Landlock/Seatbelt) will actually confine this run,
         // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
         // 0006 D4). Otherwise run directly — no need to spend a thread.
-        if intended_sandbox_kind(caveats) == SandboxKind::None {
-            run_pipeline(stages, cwd, &[], env, max_output)
+        if intended_sandbox_kind(caveats, &cfg.sandbox) == SandboxKind::None {
+            run_pipeline(stages, cwd, &[], env, cfg.max_output)
         } else {
-            run_confined(stages, cwd, caveats, env, max_output)
+            run_confined(stages, cwd, caveats, env, cfg)
         }
     }
 }
@@ -146,10 +146,13 @@ impl Spawner for OsSpawner {
 /// ([`intended_sandbox_kind`] ≠ `None`; today only macOS Seatbelt). This one
 /// helper feeds BOTH the spawn routing ([`OsSpawner::run`]) and the reported
 /// `sandbox_kind` ([`ShellTool::invoke`]), so check and routing cannot disagree.
-fn egress_proxy_plan(caveats: &Caveats) -> Option<(Vec<String>, Caveats)> {
+fn egress_proxy_plan(
+    caveats: &Caveats,
+    sandbox: &Arc<SandboxPolicy>,
+) -> Option<(Vec<String>, Caveats)> {
     let allow_hosts = net_egress_proxy_hosts(caveats)?;
     let fenced = loopback_fenced_caveats(caveats);
-    if intended_sandbox_kind(&fenced) == SandboxKind::None {
+    if intended_sandbox_kind(&fenced, sandbox) == SandboxKind::None {
         return None; // no loopback fence available → not enforceable; fall through
     }
     Some((allow_hosts, fenced))
@@ -169,18 +172,17 @@ fn run_with_egress_proxy(
     fenced: &Caveats,
     env: &BTreeMap<String, String>,
     allow_hosts: Vec<String>,
-    max_output: usize,
-    audit_sink: Option<&str>,
+    cfg: &SpawnCfg,
 ) -> ToolResult<Captured> {
     // (1) Fence prefix first (pure, cheap) — fail-closed if the wrapper is gone.
-    let prefix = best_available_sandbox().command_prefix(fenced)?;
+    let prefix = best_available_sandbox(&cfg.sandbox).command_prefix(fenced)?;
     // (2) Start the proxy — fail-closed if it cannot bind loopback (never spawn
     //     an unfenced child that would then egress freely). Audit is opt-in via the
     //     configured audit sink (observability only; off = zero overhead).
     let proxy = net_proxy::start(
         allow_hosts,
         Arc::new(net_proxy::StdResolver),
-        net_audit_sink(audit_sink),
+        net_audit_sink(cfg.audit_sink.as_deref()),
     )
     .map_err(ToolError::Exec)?;
     // (3) Point the child at the proxy via the env seam (a clone — never mutate
@@ -193,10 +195,12 @@ fn run_with_egress_proxy(
     let stages = stages.to_vec();
     let cwd = cwd.map(str::to_string);
     let fenced = fenced.clone();
+    let max_output = cfg.max_output;
+    let sandbox = cfg.sandbox.clone();
     let captured = std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
-            best_available_sandbox().apply(&fenced)?;
+            best_available_sandbox(&sandbox).apply(&fenced)?;
             run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output)
         })
         .map_err(ToolError::Exec)?
@@ -234,8 +238,8 @@ fn net_audit_sink(configured: Option<&str>) -> Arc<dyn net_proxy::AuditSink> {
 /// available backend's kind when a filesystem axis is restricted (so it confines
 /// something), else `None` — the fs-only ruleset governs nothing, so never
 /// overclaim. The same rule backs the subprocess primitive in core.
-fn intended_sandbox_kind(caveats: &Caveats) -> SandboxKind {
-    effective_sandbox_kind(best_available_sandbox().kind(), caveats)
+fn intended_sandbox_kind(caveats: &Caveats, sandbox: &Arc<SandboxPolicy>) -> SandboxKind {
+    effective_sandbox_kind(best_available_sandbox(sandbox).kind(), caveats)
 }
 
 /// Run the pipeline on a dedicated thread that first applies the OS sandbox.
@@ -253,18 +257,20 @@ fn run_confined(
     cwd: Option<&str>,
     caveats: &Caveats,
     env: &BTreeMap<String, String>,
-    max_output: usize,
+    cfg: &SpawnCfg,
 ) -> ToolResult<Captured> {
     // Computed before the spawn so a fail-closed wrapper error aborts the run.
-    let prefix = best_available_sandbox().command_prefix(caveats)?;
+    let prefix = best_available_sandbox(&cfg.sandbox).command_prefix(caveats)?;
     let stages = stages.to_vec();
     let cwd = cwd.map(str::to_string);
     let caveats = caveats.clone();
     let env = env.clone();
+    let max_output = cfg.max_output;
+    let sandbox = cfg.sandbox.clone();
     std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
-            best_available_sandbox().apply(&caveats)?;
+            best_available_sandbox(&sandbox).apply(&caveats)?;
             run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output)
         })
         .map_err(ToolError::Exec)?
@@ -284,6 +290,9 @@ pub struct ShellTool {
     env: Arc<dyn EnvProvider>,
     lister: Arc<dyn DirLister>,
     limits: LimitsPolicy,
+    /// Sandbox mechanism policy (read/exec allow-lists, ABI floors) the L3 backend
+    /// enforces (I5-B, #144). Rides the tool, not the `ToolContext`.
+    sandbox: Arc<SandboxPolicy>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -309,7 +318,16 @@ impl ShellTool {
             env: Arc::new(RealEnv),
             lister: Arc::new(RealDirLister),
             limits,
+            sandbox: Arc::new(SandboxPolicy::default()),
         }
+    }
+
+    /// Set the sandbox mechanism policy (read/exec allow-lists, ABI floors) the L3
+    /// backend enforces (I5-B, #144). The default is today's built-in allow-lists.
+    #[must_use]
+    pub fn with_sandbox_policy(mut self, sandbox: SandboxPolicy) -> Self {
+        self.sandbox = Arc::new(sandbox);
+        self
     }
 
     /// Construct with an injected spawner; real environment + dir lister (tests).
@@ -320,6 +338,7 @@ impl ShellTool {
             env: Arc::new(RealEnv),
             lister: Arc::new(RealDirLister),
             limits: LimitsPolicy::default(),
+            sandbox: Arc::new(SandboxPolicy::default()),
         }
     }
 
@@ -333,6 +352,7 @@ impl ShellTool {
             env,
             lister: Arc::new(RealDirLister),
             limits: LimitsPolicy::default(),
+            sandbox: Arc::new(SandboxPolicy::default()),
         }
     }
 
@@ -350,6 +370,7 @@ impl ShellTool {
             env,
             lister,
             limits: LimitsPolicy::default(),
+            sandbox: Arc::new(SandboxPolicy::default()),
         }
     }
 }
@@ -438,9 +459,9 @@ impl Tool for ShellTool {
         // disagree). The per-axis `net` stays Advisory below (the report is
         // computed from the ORIGINAL grant, whose remote host SBPL cannot confine)
         // — the proxy over-delivers above that floor, it does not raise the claim.
-        let sandbox_kind = match egress_proxy_plan(cx.caveats()) {
-            Some((_, fenced)) => intended_sandbox_kind(&fenced),
-            None => intended_sandbox_kind(cx.caveats()),
+        let sandbox_kind = match egress_proxy_plan(cx.caveats(), &self.sandbox) {
+            Some((_, fenced)) => intended_sandbox_kind(&fenced, &self.sandbox),
+            None => intended_sandbox_kind(cx.caveats(), &self.sandbox),
         };
         // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
         // returns carries the per-axis report alongside the coarse sandbox_kind.
@@ -676,22 +697,17 @@ impl Tool for ShellTool {
         let spawner = Arc::clone(&self.spawner);
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
-        let max_output = self.limits.max_output_bytes;
-        let audit_sink = self.limits.audit_sink.clone();
+        let cfg = SpawnCfg {
+            max_output: self.limits.max_output_bytes,
+            audit_sink: self.limits.audit_sink.clone(),
+            sandbox: Arc::clone(&self.sandbox),
+        };
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
         let env = parsed.env;
         let caveats = cx.caveats().clone();
         let run = tokio::task::spawn_blocking(move || {
-            run_script(
-                &*spawner,
-                &script,
-                cwd.as_deref(),
-                &caveats,
-                &env,
-                max_output,
-                audit_sink.as_deref(),
-            )
+            run_script(&*spawner, &script, cwd.as_deref(), &caveats, &env, &cfg)
         });
         match tokio::time::timeout(timeout, run).await {
             Ok(joined) => {
@@ -724,8 +740,7 @@ fn run_script(
     cwd: Option<&str>,
     caveats: &Caveats,
     env: &BTreeMap<String, String>,
-    max_output: usize,
-    audit_sink: Option<&str>,
+    cfg: &SpawnCfg,
 ) -> ToolResult<Captured> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -740,8 +755,7 @@ fn run_script(
             Sep::Or => status != 0,
         };
         if run_it {
-            let captured =
-                spawner.run(&item.pipeline, cwd, caveats, env, max_output, audit_sink)?;
+            let captured = spawner.run(&item.pipeline, cwd, caveats, env, cfg)?;
             stdout.push_str(&captured.stdout);
             stderr.push_str(&captured.stderr);
             stdout_truncated |= captured.stdout_truncated;
@@ -751,13 +765,13 @@ fn run_script(
     }
 
     // The concatenation across pipelines may itself exceed the cap; flag that.
-    let stdout_truncated = stdout_truncated || stdout.len() > max_output;
-    let stderr_truncated = stderr_truncated || stderr.len() > max_output;
+    let stdout_truncated = stdout_truncated || stdout.len() > cfg.max_output;
+    let stderr_truncated = stderr_truncated || stderr.len() > cfg.max_output;
 
     Ok(Captured {
         exit_code: status,
-        stdout: cap_string(stdout, max_output),
-        stderr: cap_string(stderr, max_output),
+        stdout: cap_string(stdout, cfg.max_output),
+        stderr: cap_string(stderr, cfg.max_output),
         stdout_truncated,
         stderr_truncated,
     })
@@ -1555,8 +1569,7 @@ mod tests {
             _cwd: Option<&str>,
             _caveats: &Caveats,
             env: &BTreeMap<String, String>,
-            _max_output: usize,
-            _audit_sink: Option<&str>,
+            _cfg: &SpawnCfg,
         ) -> ToolResult<Captured> {
             self.calls.lock().unwrap().push(stages.to_vec());
             self.envs.lock().unwrap().push(env.clone());
@@ -1625,8 +1638,11 @@ mod tests {
         let granted = exec_only(&["echo"]);
         // Does the backend that will actually govern this run kernel-confine `exec`?
         // Seatbelt does (`process-exec*`, ADR 0014); Landlock/Noop do not (#31/#57).
-        let exec_is_kernel_confined = enforcement_report(&granted, intended_sandbox_kind(&granted))
-            .exec
+        let exec_is_kernel_confined = enforcement_report(
+            &granted,
+            intended_sandbox_kind(&granted, &Arc::new(SandboxPolicy::default())),
+        )
+        .exec
             == Some(agent_bridle_core::AxisEnforcement::Kernel);
 
         let mock = Arc::new(MockSpawner::default());
