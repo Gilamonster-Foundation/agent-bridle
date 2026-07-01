@@ -416,7 +416,9 @@ mod tests {
     #[test]
     #[ignore = "requires root + qemu; run via scripts/jail-dev.sh"]
     fn microvm_runs_granted_program_from_minimal_rootfs() {
-        use agent_bridle_core::{build_rootfs_plan, Caveats, RootfsPolicy, Scope};
+        use agent_bridle_core::{
+            build_rootfs_plan, Caveats, NormalizationPolicy, RootfsPolicy, Scope,
+        };
 
         if !crate::is_root() || !microvm_is_supported() {
             return;
@@ -438,7 +440,12 @@ mod tests {
             fs_read: Scope::only([hello.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav, &RootfsPolicy::default()).expect("plan");
+        let plan = build_rootfs_plan(
+            &cav,
+            &RootfsPolicy::default(),
+            &NormalizationPolicy::default(),
+        )
+        .expect("plan");
         let cat = plan
             .entries
             .iter()

@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{Caveats, RootfsPolicy, Scope};
+use crate::{Caveats, NormalizationPolicy, RootfsPolicy, Scope};
 
 // The curated runtime data paths a permitted program reads (locale, timezone, CA
 // bundles, resolver/loader config, `/dev` + `/proc/self` essentials) are supplied
@@ -139,28 +139,33 @@ fn add_runtime_closure_fallback(
     programs: &BTreeSet<String>,
     files: &mut BTreeSet<PathBuf>,
     ro_dirs: &mut BTreeSet<PathBuf>,
+    nss_fallback: bool,
+    python_fallback: bool,
 ) {
     // glibc `dlopen`s `libnss_*.so.N` at runtime (getpwnam, gethostbyname, …).
     // They live in libc's directory but are never in the static closure. Add them
     // from the same dir(s) as the resolved libc (canonicalized ⇒ the real `.so.N`,
     // the soname glibc actually opens; the `.so` dev symlinks are not needed).
-    let libc_dirs: BTreeSet<PathBuf> = files
-        .iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("libc.so"))
-        })
-        .filter_map(|p| p.parent().map(Path::to_path_buf))
-        .collect();
-    for dir in &libc_dirs {
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("libnss_") && name.contains(".so") {
-                    if let Ok(c) = entry.path().canonicalize() {
-                        files.insert(c);
+    // Toggle: disabling only makes the rootfs *more* minimal (I7, #146).
+    if nss_fallback {
+        let libc_dirs: BTreeSet<PathBuf> = files
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("libc.so"))
+            })
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect();
+        for dir in &libc_dirs {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("libnss_") && name.contains(".so") {
+                        if let Ok(c) = entry.path().canonicalize() {
+                            files.insert(c);
+                        }
                     }
                 }
             }
@@ -172,13 +177,14 @@ fn add_runtime_closure_fallback(
     // interpreter will not even start without it. When a `python*` is granted, add
     // the versioned stdlib dirs (data + `.so`; a bind-mount includes `lib-dynload`
     // and preserves internal symlinks). No `/usr/bin` is added.
-    let wants_python = programs.iter().any(|p| {
-        Path::new(p)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(p)
-            .starts_with("python")
-    });
+    let wants_python = python_fallback
+        && programs.iter().any(|p| {
+            Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(p)
+                .starts_with("python")
+        });
     if wants_python {
         for base in ["/usr/lib", "/usr/local/lib", "/usr/lib64"] {
             if let Ok(rd) = std::fs::read_dir(base) {
@@ -200,7 +206,11 @@ fn add_runtime_closure_fallback(
 /// boundary). The plan contains: the resolved granted program files + each one's
 /// `ldd` shared-library closure (incl. the loader) + the configured data paths +
 /// the granted `fs_read` (ro) / `fs_write` (rw) roots — and nothing else.
-pub fn build_rootfs_plan(effective: &Caveats, rootfs: &RootfsPolicy) -> Result<RootfsPlan, String> {
+pub fn build_rootfs_plan(
+    effective: &Caveats,
+    rootfs: &RootfsPolicy,
+    norm: &NormalizationPolicy,
+) -> Result<RootfsPlan, String> {
     let programs = match &effective.exec {
         Scope::All => {
             return Err("minimal rootfs requires a confined exec scope (exec: Only)".to_string())
@@ -217,8 +227,13 @@ pub fn build_rootfs_plan(effective: &Caveats, rootfs: &RootfsPolicy) -> Result<R
     for prog in programs {
         let bin = resolve_program(prog, search_fallback)
             .ok_or_else(|| format!("granted program not found: {prog}"))?;
-        for so in ldd_closure(&bin) {
-            files.insert(so);
+        // Toggle: the static `ldd` closure. Disabling only removes `.so`s from the
+        // plan (more minimal) — a granted dynamic program then fails to load, so
+        // this is a capability/degradation knob, never a confinement relaxation.
+        if norm.ldd_closure {
+            for so in ldd_closure(&bin) {
+                files.insert(so);
+            }
         }
         files.insert(bin);
     }
@@ -227,7 +242,13 @@ pub fn build_rootfs_plan(effective: &Caveats, rootfs: &RootfsPolicy) -> Result<R
     // are undecidable to enumerate statically, so widen the closure with known
     // dynamic **library/data** paths — never un-granted executables, so the D1
     // identity invariant still holds.
-    add_runtime_closure_fallback(programs, &mut files, &mut ro_dirs);
+    add_runtime_closure_fallback(
+        programs,
+        &mut files,
+        &mut ro_dirs,
+        norm.nss_closure_fallback,
+        norm.python_closure_fallback,
+    );
 
     for d in rootfs.data_paths.resolve() {
         let p = PathBuf::from(&d);
@@ -404,7 +425,12 @@ mod tests {
     #[test]
     fn ambient_exec_is_rejected() {
         // exec: All ⇒ no minimal rootfs (any program could run).
-        let err = build_rootfs_plan(&Caveats::top(), &crate::RootfsPolicy::default()).unwrap_err();
+        let err = build_rootfs_plan(
+            &Caveats::top(),
+            &crate::RootfsPolicy::default(),
+            &crate::NormalizationPolicy::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("confined exec scope"), "{err}");
     }
 
@@ -419,7 +445,12 @@ mod tests {
             fs_write: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
+        let plan = build_rootfs_plan(
+            &cav,
+            &crate::RootfsPolicy::default(),
+            &crate::NormalizationPolicy::default(),
+        )
+        .expect("plan");
 
         // The granted binary and at least one library (its closure) are planned.
         let has_cat = plan
@@ -502,7 +533,12 @@ mod tests {
             |p: &RootfsPlan| p.entries.iter().any(|e| e.src == Path::new("/usr/share"));
 
         // Default policy: /usr/share (a DATA_PATHS dir) is planned.
-        let default_plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
+        let default_plan = build_rootfs_plan(
+            &cav,
+            &crate::RootfsPolicy::default(),
+            &crate::NormalizationPolicy::default(),
+        )
+        .expect("plan");
         assert!(
             has_usr_share(&default_plan),
             "default plan must include the built-in /usr/share data dir"
@@ -517,10 +553,49 @@ mod tests {
             },
             ..crate::RootfsPolicy::default()
         };
-        let stripped_plan = build_rootfs_plan(&cav, &stripped).expect("plan");
+        let stripped_plan =
+            build_rootfs_plan(&cav, &stripped, &crate::NormalizationPolicy::default())
+                .expect("plan");
         assert!(
             !has_usr_share(&stripped_plan),
             "a replace'd empty data_paths must drop /usr/share from the plan"
+        );
+    }
+
+    /// #146 (I7): the `ldd` static-closure normalization is a toggle — disabling
+    /// it drops the `.so` closure from the plan (a capability/degradation knob,
+    /// never a confinement relaxation: fewer files present is strictly tighter).
+    /// Would fail on the old always-on path.
+    #[test]
+    fn rootfs_ldd_closure_is_toggleable() {
+        let cav = Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            ..Caveats::top()
+        };
+        let has_lib = |p: &RootfsPlan| {
+            p.entries
+                .iter()
+                .any(|e| e.src.to_string_lossy().contains("/libc.so"))
+        };
+
+        // Default (on): cat's libc closure is planned.
+        let on = build_rootfs_plan(
+            &cav,
+            &crate::RootfsPolicy::default(),
+            &crate::NormalizationPolicy::default(),
+        )
+        .expect("plan");
+        assert!(has_lib(&on), "default plan must include cat's libc closure");
+
+        // Off: the `.so` closure is gone (the toggle drives it).
+        let off = crate::NormalizationPolicy {
+            ldd_closure: false,
+            ..crate::NormalizationPolicy::default()
+        };
+        let plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default(), &off).expect("plan");
+        assert!(
+            !has_lib(&plan),
+            "disabling ldd_closure must drop the .so closure from the plan"
         );
     }
 
@@ -535,13 +610,28 @@ mod tests {
             ..Caveats::top()
         };
         let k_cat = RootfsCache::key(
-            &build_rootfs_plan(&mk("cat"), &crate::RootfsPolicy::default()).unwrap(),
+            &build_rootfs_plan(
+                &mk("cat"),
+                &crate::RootfsPolicy::default(),
+                &crate::NormalizationPolicy::default(),
+            )
+            .unwrap(),
         );
         let k_cat2 = RootfsCache::key(
-            &build_rootfs_plan(&mk("cat"), &crate::RootfsPolicy::default()).unwrap(),
+            &build_rootfs_plan(
+                &mk("cat"),
+                &crate::RootfsPolicy::default(),
+                &crate::NormalizationPolicy::default(),
+            )
+            .unwrap(),
         );
         let k_grep = RootfsCache::key(
-            &build_rootfs_plan(&mk("grep"), &crate::RootfsPolicy::default()).unwrap(),
+            &build_rootfs_plan(
+                &mk("grep"),
+                &crate::RootfsPolicy::default(),
+                &crate::NormalizationPolicy::default(),
+            )
+            .unwrap(),
         );
         assert_eq!(k_cat, k_cat2, "same grant ⇒ stable key");
         assert_ne!(k_cat, k_grep, "different exec scope ⇒ different key");
@@ -560,7 +650,12 @@ mod tests {
             fs_write: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
+        let plan = build_rootfs_plan(
+            &cav,
+            &crate::RootfsPolicy::default(),
+            &crate::NormalizationPolicy::default(),
+        )
+        .expect("plan");
         let cache_root = unique_dir("cache");
         let cache = RootfsCache::new(&cache_root);
 
@@ -595,7 +690,11 @@ mod tests {
             fs_read: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = match build_rootfs_plan(&cav, &crate::RootfsPolicy::default()) {
+        let plan = match build_rootfs_plan(
+            &cav,
+            &crate::RootfsPolicy::default(),
+            &crate::NormalizationPolicy::default(),
+        ) {
             Ok(p) => p,
             Err(_) => return, // python3 not installed ⇒ nothing to prove
         };
@@ -637,7 +736,12 @@ mod tests {
             fs_read: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
+        let plan = build_rootfs_plan(
+            &cav,
+            &crate::RootfsPolicy::default(),
+            &crate::NormalizationPolicy::default(),
+        )
+        .expect("plan");
         let nss_in_plan = |p: &RootfsPlan| {
             p.entries.iter().any(|e| {
                 e.src
