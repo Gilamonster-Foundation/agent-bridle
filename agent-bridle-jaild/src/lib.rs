@@ -117,3 +117,73 @@ pub fn is_root() -> bool {
         false
     }
 }
+
+/// Classify a jailed run's stderr as a **missing shared library** deny-of-function
+/// (ADR 0013 D7 / agent-bridle#113): the runtime closure was incomplete — a
+/// `dlopen`/loader `.so` the program needed was absent from the minimal rootfs.
+///
+/// Returns the offending library name so a caller can surface a clear diagnostic
+/// ("widen the closure / grant the toolchain") instead of a misleading *denied* or
+/// a silent failure. `None` ⇒ the failure was not a shared-library load error.
+///
+/// A missing `.so` is a deny-of-*function*, never a safety hole — the D1 identity
+/// invariant is unaffected (nothing extra becomes runnable); the program simply
+/// fails to load, and this makes that legible.
+#[must_use]
+pub fn missing_shared_library(stderr: &[u8]) -> Option<String> {
+    const SIG: &str = "cannot open shared object file";
+    let text = String::from_utf8_lossy(stderr);
+    if !text.contains(SIG) {
+        return None;
+    }
+    for line in text.lines() {
+        if let Some(idx) = line.find(SIG) {
+            // The library is the last whitespace-separated token before the
+            // "<lib>: cannot open shared object file" signature (glibc loader and
+            // Python `ImportError` both use this phrasing).
+            let prefix = line[..idx].trim_end().trim_end_matches(':');
+            if let Some(tok) = prefix.split_whitespace().last() {
+                let lib = tok.trim_end_matches(':');
+                if lib.contains(".so") {
+                    return Some(lib.to_string());
+                }
+            }
+        }
+    }
+    Some("(unknown shared library)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_shared_library;
+
+    #[test]
+    fn canary_detects_glibc_loader_missing_library() {
+        let stderr = b"/usr/bin/foo: error while loading shared libraries: libbar.so.6: \
+                       cannot open shared object file: No such file or directory\n";
+        assert_eq!(
+            missing_shared_library(stderr).as_deref(),
+            Some("libbar.so.6")
+        );
+    }
+
+    #[test]
+    fn canary_detects_python_import_missing_extension() {
+        let stderr =
+            b"ImportError: libcrypto.so.3: cannot open shared object file: No such file or directory\n";
+        assert_eq!(
+            missing_shared_library(stderr).as_deref(),
+            Some("libcrypto.so.3")
+        );
+    }
+
+    #[test]
+    fn canary_ignores_ordinary_errors() {
+        assert_eq!(missing_shared_library(b"ValueError: bad input\n"), None);
+        assert_eq!(missing_shared_library(b""), None);
+        assert_eq!(
+            missing_shared_library(b"cat: /x: Permission denied\n"),
+            None
+        );
+    }
+}

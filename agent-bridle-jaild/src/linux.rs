@@ -388,4 +388,67 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&work);
     }
+
+    /// #113 / ADR 0013 D7, root-only: a granted `python3` starts and `dlopen`s a
+    /// stdlib C-extension inside the jail — its stdlib + `lib-dynload` are present
+    /// via the runtime-closure fallback (#113) — while an un-granted executable
+    /// stays physically absent (D1 holds even with the wider closure). Skips if
+    /// python3 is not installed.
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN; run via scripts/jail-dev.sh"]
+    fn python_runs_and_dlopens_extension_in_jail() {
+        assert!(is_root(), "run as root via scripts/jail-dev.sh");
+        let work = unique_work("py");
+        let cav = Caveats {
+            exec: Scope::only(["python3".to_string()]),
+            fs_read: Scope::only([work.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([work.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let plan = match build_rootfs_plan(&cav) {
+            Ok(p) => p,
+            Err(_) => return, // python3 absent on this host ⇒ skip
+        };
+        let py = plan
+            .entries
+            .iter()
+            .find(|e| {
+                !e.is_dir
+                    && e.src
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("python3"))
+                        .unwrap_or(false)
+            })
+            .map(|e| e.src.clone())
+            .expect("granted python3 must be in the plan");
+
+        // `array` is a lib-dynload C-extension ⇒ forces a runtime `dlopen` of a
+        // stdlib `.so` that is NOT in the static closure (present via the fallback).
+        let run = run_jailed(
+            &plan,
+            &py,
+            [OsStr::new("-c"), OsStr::new("import array; print('ok')")],
+        )
+        .expect("python should run in the jail");
+        assert!(
+            run.status.success(),
+            "python failed in jail (missing lib: {:?}) — stderr={}",
+            crate::missing_shared_library(&run.stderr),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(run.stdout, b"ok\n");
+
+        // D1 still holds with the wider closure: an un-granted program is absent.
+        assert!(
+            run_jailed(
+                &plan,
+                Path::new("/bin/sh"),
+                [OsStr::new("-c"), OsStr::new("echo x")]
+            )
+            .is_err(),
+            "un-granted /bin/sh must remain absent even with the D7 fallback"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
 }

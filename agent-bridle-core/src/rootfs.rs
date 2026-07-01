@@ -112,8 +112,17 @@ fn ldd_closure(bin: &Path) -> Vec<PathBuf> {
         if let Some(rhs) = line.split(" => ").nth(1) {
             let path = rhs.split(" (").next().unwrap_or("").trim();
             if path.starts_with('/') {
-                if let Ok(c) = PathBuf::from(path).canonicalize() {
-                    libs.insert(c);
+                // Keep the SONAME path ldd reports (e.g. `libz.so.1`), NOT its
+                // canonical target (`libz.so.1.3`): the dynamic loader opens the
+                // soname, so the jail must expose the `.so` at that exact path or
+                // the granted program fails to load (agent-bridle#113 — a
+                // deny-of-function the runtime canary surfaced). A bind-mount of the
+                // soname (a symlink on most distros) exposes the real file's content
+                // at that name; `libc.so.6` worked before only because it is a real
+                // file, not a symlink.
+                let pb = PathBuf::from(path);
+                if pb.exists() {
+                    libs.insert(pb);
                 }
             }
         } else if line.starts_with('/') {
@@ -147,6 +156,72 @@ pub struct RootfsPlan {
     pub entries: Vec<RootfsEntry>,
 }
 
+/// Widen the static closure for known runtime-dynamic loaders (ADR 0013 D7 /
+/// agent-bridle#113). `dlopen` / `ctypes` loads and glibc NSS modules are not in
+/// the `ldd` closure, so a granted toolchain can fail to load a `.so` it needs at
+/// runtime (a **deny-of-function**, not a safety hole). This adds their typical
+/// **library/data** paths — `.so` files and stdlib data dirs, **never** `/usr/bin`
+/// executables — so the D1 identity invariant (no un-granted *program* is
+/// reachable) still holds: the fallback widens libraries, not the executable set.
+fn add_runtime_closure_fallback(
+    programs: &BTreeSet<String>,
+    files: &mut BTreeSet<PathBuf>,
+    ro_dirs: &mut BTreeSet<PathBuf>,
+) {
+    // glibc `dlopen`s `libnss_*.so.N` at runtime (getpwnam, gethostbyname, …).
+    // They live in libc's directory but are never in the static closure. Add them
+    // from the same dir(s) as the resolved libc (canonicalized ⇒ the real `.so.N`,
+    // the soname glibc actually opens; the `.so` dev symlinks are not needed).
+    let libc_dirs: BTreeSet<PathBuf> = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libc.so"))
+        })
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
+    for dir in &libc_dirs {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("libnss_") && name.contains(".so") {
+                    if let Ok(c) = entry.path().canonicalize() {
+                        files.insert(c);
+                    }
+                }
+            }
+        }
+    }
+
+    // Python `dlopen`s C-extensions from its stdlib (`lib-dynload/*.so`) and reads
+    // the pure-python stdlib — none of it in the static closure, and the
+    // interpreter will not even start without it. When a `python*` is granted, add
+    // the versioned stdlib dirs (data + `.so`; a bind-mount includes `lib-dynload`
+    // and preserves internal symlinks). No `/usr/bin` is added.
+    let wants_python = programs.iter().any(|p| {
+        Path::new(p)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(p)
+            .starts_with("python")
+    });
+    if wants_python {
+        for base in ["/usr/lib", "/usr/local/lib", "/usr/lib64"] {
+            if let Ok(rd) = std::fs::read_dir(base) {
+                for entry in rd.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with("python3")
+                        && entry.path().is_dir()
+                    {
+                        ro_dirs.insert(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Build the minimal-rootfs plan for `effective` (ADR 0013 D2). Requires `exec` to
 /// be **confined** (`Only`) — a minimal rootfs is meaningless when any program may
 /// run, so an ambient `exec` is rejected (the caller falls back to the Tier-1
@@ -174,6 +249,12 @@ pub fn build_rootfs_plan(effective: &Caveats) -> Result<RootfsPlan, String> {
         }
         files.insert(bin);
     }
+
+    // D7 runtime-closure fallback (agent-bridle#113): `dlopen`/`ctypes`/NSS loads
+    // are undecidable to enumerate statically, so widen the closure with known
+    // dynamic **library/data** paths — never un-granted executables, so the D1
+    // identity invariant still holds.
+    add_runtime_closure_fallback(programs, &mut files, &mut ro_dirs);
 
     for d in DATA_PATHS {
         let p = PathBuf::from(d);
@@ -485,5 +566,95 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&work);
         let _ = std::fs::remove_dir_all(&cache_root);
+    }
+
+    /// #113 / ADR 0013 D7: granting `python3` widens the closure with the python
+    /// stdlib dir(s) (so startup imports and `dlopen`ed C-extensions resolve) — but
+    /// adds **no un-granted executable** (`/usr/bin/*`), preserving the D1 identity
+    /// invariant. Skips if python3 is not installed on the host.
+    #[test]
+    fn python_fallback_adds_stdlib_without_executables() {
+        let work = unique_dir("py");
+        let cav = Caveats {
+            exec: Scope::only(["python3".to_string()]),
+            fs_read: Scope::only([work.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let plan = match build_rootfs_plan(&cav) {
+            Ok(p) => p,
+            Err(_) => return, // python3 not installed ⇒ nothing to prove
+        };
+        let has_py_stdlib = plan
+            .entries
+            .iter()
+            .any(|e| e.is_dir && !e.writable && e.src.to_string_lossy().contains("/python3"));
+        assert!(
+            has_py_stdlib,
+            "python stdlib dir must be in the plan: {:?}",
+            plan.entries
+        );
+        // D1: the only executable file the fallback may leave in a bin dir is the
+        // granted python itself — never another `/usr/bin` program.
+        for e in &plan.entries {
+            if e.is_dir {
+                continue;
+            }
+            let s = e.src.to_string_lossy();
+            if s.starts_with("/usr/bin") || s.starts_with("/bin") || s.contains("/sbin/") {
+                let base = e.src.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                assert!(
+                    base.starts_with("python"),
+                    "fallback must not add an un-granted executable: {s}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// #113 / ADR 0013 D7: the NSS modules glibc `dlopen`s at runtime (never in the
+    /// static `ldd` closure) are added for a dynamically-linked grant. Asserts only
+    /// when the host actually ships them (all mainstream glibc distros do).
+    #[test]
+    fn nss_modules_added_to_closure() {
+        let work = unique_dir("nss");
+        let cav = Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            fs_read: Scope::only([work.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let plan = build_rootfs_plan(&cav).expect("plan");
+        let nss_in_plan = |p: &RootfsPlan| {
+            p.entries.iter().any(|e| {
+                e.src
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("libnss_"))
+            })
+        };
+        // Derive libc's directory from the plan; if the host ships NSS modules
+        // there, the fallback must have added them.
+        if let Some(libc) = plan.entries.iter().find(|e| {
+            e.src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libc.so"))
+        }) {
+            if let Some(dir) = libc.src.parent() {
+                let host_has_nss = dir
+                    .read_dir()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("libnss_"));
+                if host_has_nss {
+                    assert!(
+                        nss_in_plan(&plan),
+                        "NSS modules must be added to the closure: {:?}",
+                        plan.entries
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
