@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agent_bridle_core::{materialize_copy, RootfsPlan};
+use agent_bridle_core::{materialize_copy, RootfsPlan, VmPolicy};
 
 const STDOUT_BEGIN: &str = "-----BRIDLE-VM-STDOUT-BEGIN-----";
 const RC_PREFIX: &str = "-----BRIDLE-VM-RC=";
@@ -43,23 +43,34 @@ pub struct VmOutcome {
 /// readable host kernel image. (KVM is used when available but not required — qemu
 /// falls back to TCG.) Used for honest backend selection / fail-closed.
 #[must_use]
-pub fn microvm_is_supported() -> bool {
-    which_qemu().is_some() && find_kernel().is_some()
+pub fn microvm_is_supported(vm: &VmPolicy) -> bool {
+    which_qemu(&vm.qemu_path).is_some() && find_kernel(&vm.kernel_search).is_some()
 }
 
-fn which_qemu() -> Option<PathBuf> {
-    let p = PathBuf::from("/usr/bin/qemu-system-x86_64");
-    p.exists().then_some(p)
+/// The first existing qemu binary among the configured `candidates`
+/// (`VmPolicy::qemu_path`).
+fn which_qemu(candidates: &[String]) -> Option<PathBuf> {
+    candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-/// The host kernel to boot as the guest kernel: `/boot/vmlinuz` (the current
-/// symlink) or the newest `/boot/vmlinuz-*`. Readable only as root on Ubuntu.
-fn find_kernel() -> Option<PathBuf> {
-    let current = PathBuf::from("/boot/vmlinuz");
-    if current.exists() {
-        return Some(current);
+/// The host kernel to boot as the guest kernel: the first existing configured
+/// `candidates` entry (`VmPolicy::kernel_search`, default `/boot/vmlinuz`), else
+/// the newest `<dir>/vmlinuz-*` beside the first candidate. Readable only as root
+/// on Ubuntu.
+fn find_kernel(candidates: &[String]) -> Option<PathBuf> {
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Some(p);
+        }
     }
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir("/boot")
+    // Fallback: newest `vmlinuz-*` in the directory of the first candidate.
+    let dir = candidates
+        .first()
+        .map(PathBuf::from)
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("/boot"));
+    let mut versioned: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -69,8 +80,8 @@ fn find_kernel() -> Option<PathBuf> {
                 .is_some_and(|n| n.starts_with("vmlinuz-"))
         })
         .collect();
-    candidates.sort();
-    candidates.pop()
+    versioned.sort();
+    versioned.pop()
 }
 
 /// Run `program` (+`args`) inside a micro-VM built from `plan`, using `jail_init`
@@ -80,17 +91,19 @@ pub fn run_microvm<I, S>(
     program: &Path,
     args: I,
     jail_init: &Path,
+    vm: &VmPolicy,
 ) -> io::Result<VmOutcome>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let qemu = which_qemu()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "qemu-system-x86_64 not found"))?;
-    let kernel = find_kernel().ok_or_else(|| {
+    let qemu = which_qemu(&vm.qemu_path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no configured qemu binary found")
+    })?;
+    let kernel = find_kernel(&vm.kernel_search).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "no readable /boot/vmlinuz (run as root?)",
+            "no readable guest kernel in the configured search paths (run as root?)",
         )
     })?;
 
@@ -98,10 +111,14 @@ where
     let argv: Vec<Vec<u8>> = std::iter::once(program.as_os_str().as_bytes().to_vec())
         .chain(args.into_iter().map(|a| a.as_ref().as_bytes().to_vec()))
         .collect();
-    let cpio = build_initramfs(plan, &argv, jail_init, &staging)?;
+    let cpio = build_initramfs(plan, &argv, jail_init, &vm.merged_usr_links, &staging)?;
 
-    // Try KVM, fall back to TCG (`kvm:tcg`); no network device ⇒ the guest has no
+    // Configurable accel / memory / cmdline (VmPolicy). Default accel `kvm:tcg`
+    // tries KVM then falls back to TCG (the `:`-fallback is only valid on
+    // `-machine accel=`, not `-accel`); no network device ⇒ the guest has no
     // egress at all; `-no-reboot` + the init's power-off makes qemu exit.
+    let machine = format!("accel={}", vm.accel);
+    let memory = vm.memory_mb.to_string();
     let out = Command::new(&qemu)
         .args([
             "-no-reboot",
@@ -111,18 +128,16 @@ where
             "none",
             "-serial",
             "stdio",
-            // KVM when available, else TCG software emulation (the `:`-fallback is
-            // only valid on `-machine accel=`, not `-accel`).
             "-machine",
-            "accel=kvm:tcg",
+            &machine,
             "-m",
-            "512",
+            &memory,
         ])
         .arg("-kernel")
         .arg(&kernel)
         .arg("-initrd")
         .arg(&cpio)
-        .args(["-append", "console=ttyS0 panic=1 loglevel=4"])
+        .args(["-append", &vm.kernel_cmdline])
         .output();
 
     let _ = std::fs::remove_dir_all(&staging);
@@ -148,6 +163,7 @@ fn build_initramfs(
     plan: &RootfsPlan,
     argv: &[Vec<u8>],
     jail_init: &Path,
+    merged_usr_links: &[String],
     staging: &Path,
 ) -> io::Result<PathBuf> {
     let root = staging.join("root");
@@ -164,7 +180,7 @@ fn build_initramfs(
 
     // 3. Reproduce the host's top-level merged-usr symlinks so library references
     //    (`/lib/<triple>/…`, `/lib64/ld-…`) resolve inside the guest.
-    for link in ["bin", "sbin", "lib", "lib32", "lib64", "libx32"] {
+    for link in merged_usr_links {
         if let Ok(dest) = std::fs::read_link(PathBuf::from("/").join(link)) {
             let in_root = root.join(link);
             if !in_root.exists() {
@@ -407,6 +423,30 @@ mod tests {
         assert_eq!(code, Some(127));
     }
 
+    /// #147 (I8): the micro-VM support probe reads the configured qemu/kernel
+    /// search paths (`VmPolicy`), not hard-coded ones. Non-privileged (no VM boot).
+    #[test]
+    fn microvm_is_supported_reads_config_paths() {
+        // A bogus qemu path ⇒ unsupported, regardless of any host `/usr/bin/qemu`.
+        let bogus = VmPolicy {
+            qemu_path: vec!["/nonexistent/qemu".to_string()],
+            ..VmPolicy::default()
+        };
+        assert!(!microvm_is_supported(&bogus));
+
+        // Two real existing files stand in for qemu + kernel ⇒ supported, proving
+        // both configured lists drive the probe (would fail on the old const path).
+        let real = VmPolicy {
+            qemu_path: vec!["/nonexistent".to_string(), "/bin/sh".to_string()],
+            kernel_search: vec!["/bin/sh".to_string()],
+            ..VmPolicy::default()
+        };
+        assert!(
+            microvm_is_supported(&real),
+            "configured existing qemu + kernel paths must be honored"
+        );
+    }
+
     /// ADR 0013 D3 (#111), root + qemu only: the granted toolchain runs inside a
     /// real micro-VM booted from the minimal rootfs, and its output comes back over
     /// the serial console. `fs_read` grants the input *file* (so it is copied into
@@ -420,7 +460,8 @@ mod tests {
             build_rootfs_plan, Caveats, NormalizationPolicy, RootfsPolicy, Scope,
         };
 
-        if !crate::is_root() || !microvm_is_supported() {
+        let vm = VmPolicy::default();
+        if !crate::is_root() || !microvm_is_supported(&vm) {
             return;
         }
         let Some(jail_init) = std::env::var_os("BRIDLE_JAIL_INIT").map(PathBuf::from) else {
@@ -453,7 +494,8 @@ mod tests {
             .map(|e| e.src.clone())
             .expect("granted cat in plan");
 
-        let out = run_microvm(&plan, &cat, [hello.as_os_str()], &jail_init).expect("micro-VM run");
+        let out =
+            run_microvm(&plan, &cat, [hello.as_os_str()], &jail_init, &vm).expect("micro-VM run");
         assert_eq!(
             out.code,
             Some(0),
