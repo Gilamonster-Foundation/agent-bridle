@@ -266,11 +266,10 @@ pub fn loopback_fenced_caveats(caveats: &Caveats) -> Caveats {
 /// **and** confines the `exec` axis via `process-exec*` ([`restricts_exec`]) — a
 /// confinement Landlock cannot supply (ADR 0014). Landlock's exec axis stays held
 /// (agent-bridle#31/#57), so a Landlock host does not engage on `exec` alone.
-/// AppContainer (Windows) engages only when `net` is fully denied — the only axis
-/// the launcher currently kernel-confines (deny-by-default capability model, ADR 0006
-/// / #51). Filesystem ACL narrowing is deferred (#136); until it lands, a restricted
-/// fs axis does NOT engage AppContainer (the spawn fails closed via
-/// `confinement_unenforceable` instead of overclaiming kernel enforcement).
+/// AppContainer (Windows, #51 / #123 / #133) engages when: `net` is fully denied
+/// (deny-all capability model), `net` is loopback-only (egress-proxy fence, ADR 0016),
+/// `exec` is fully denied (`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, ADR 0013 D7),
+/// or `fs` is restricted (per-path DACL grants, ADR 0009).
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
@@ -288,7 +287,10 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
             SandboxKind::Seatbelt
         }
         SandboxKind::AppContainer
-            if net_fully_denied(caveats) || exec_fully_denied(caveats) || restricts_fs(caveats) =>
+            if net_fully_denied(caveats)
+                || net_loopback_only(caveats)
+                || exec_fully_denied(caveats)
+                || restricts_fs(caveats) =>
         {
             SandboxKind::AppContainer
         }
@@ -342,7 +344,9 @@ pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 pub(crate) mod appcontainer_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{exec_fully_denied, net_fully_denied, restricts_fs, Sandbox, SandboxKind};
+    use super::{
+        exec_fully_denied, net_fully_denied, net_loopback_only, restricts_fs, Sandbox, SandboxKind,
+    };
     use crate::{Caveats, Scope, ToolError, ToolResult};
 
     /// Monotonic counter for unique container names (PID + counter → no clock).
@@ -411,9 +415,11 @@ pub(crate) mod appcontainer_impl {
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
             // The launcher engages when:
             //  - net is fully denied (deny-by-default network policy)
+            //  - net is loopback-only (egress proxy path, #133)
             //  - exec is fully denied (kernel child-process-creation block)
             //  - fs is restricted (ACL grants let the container reach its workspace)
             if !net_fully_denied(effective)
+                && !net_loopback_only(effective)
                 && !exec_fully_denied(effective)
                 && !restricts_fs(effective)
             {
@@ -439,6 +445,14 @@ pub(crate) mod appcontainer_impl {
             // the AppContainer's deny-by-default network policy.
             if matches!(effective.net, Scope::All) {
                 prefix.push("--net-allow".to_string());
+            }
+
+            // Loopback-only fence (#133, ADR 0016): AppContainers block loopback
+            // by default. For the egress-proxy pattern the child must reach the
+            // parent's loopback proxy, so grant the loopback exemption via the
+            // NetworkIsolationSetAppContainerConfig API.
+            if net_loopback_only(effective) {
+                prefix.push("--loopback-exemption".to_string());
             }
 
             // Kernel-block child process creation when exec is fully denied.
@@ -1672,6 +1686,56 @@ mod tests {
             effective_sandbox_kind(SandboxKind::Landlock, &net_denied),
             expected_landlock_net,
             "Landlock engages for net:none only when V4 TCP-deny support is present"
+        );
+    }
+
+    /// AppContainer engages for a loopback-only net scope (#133, ADR 0016).
+    /// This enables the egress-proxy pattern: `loopback_fenced_caveats` produces
+    /// a net=loopback grant, and with AppContainer that fence is kernel-expressed
+    /// (off-box egress is denied; loopback exemption lets the child reach the proxy).
+    #[test]
+    fn appcontainer_engages_for_loopback_only_net() {
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            let loopback_only = Caveats {
+                net: Scope::only([host.to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                effective_sandbox_kind(SandboxKind::AppContainer, &loopback_only),
+                SandboxKind::AppContainer,
+                "AppContainer must engage for loopback host {host}"
+            );
+        }
+        // A general remote host is NOT loopback-only → falls through to None
+        // (net advisory; handled by egress-proxy when the sandbox is AppContainer).
+        let remote = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &remote),
+            SandboxKind::None,
+            "general remote host must not directly engage AppContainer"
+        );
+    }
+
+    /// `loopback_fenced_caveats` + AppContainer engages the backend, enabling
+    /// `egress_proxy_plan` to route through the loopback proxy on Windows (#133).
+    #[test]
+    fn loopback_fenced_caveats_engages_appcontainer() {
+        let remote = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+        let fenced = loopback_fenced_caveats(&remote);
+        assert!(
+            net_loopback_only(&fenced),
+            "loopback_fenced_caveats must produce a loopback-only net scope"
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &fenced),
+            SandboxKind::AppContainer,
+            "loopback-fenced caveats must engage AppContainer"
         );
     }
 
