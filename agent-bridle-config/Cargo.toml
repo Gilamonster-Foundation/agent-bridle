@@ -1,0 +1,17 @@
+[package]
+name = "agent-bridle-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Layered configuration loader (defaults → file → env → API) for agent-bridle (agent-bridle#142, ADR 0017)."
+
+[dependencies]
+# The config TYPES live in core (serde-only); this crate is the file/env LOADER
+# (the only place `toml` lives, keeping core lean — ADR 0008/0017).
+agent-bridle-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+toml = "0.8"
