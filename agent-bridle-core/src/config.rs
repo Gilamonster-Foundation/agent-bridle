@@ -568,19 +568,102 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_base_read_default_is_platform_correct() {
-        // The single `base_read_paths` field defaults to the active backend's
-        // read base: Landlock's on Linux, Seatbelt's on macOS (I5-B, #144).
-        let base = SandboxPolicy::default().base_read_paths.resolve();
+    fn sandbox_path_and_abi_defaults_are_byte_for_byte() {
+        // Byte-for-byte anti-drift for the kernel-confinement allow-lists this
+        // config now owns (#144, I5-B). The old `sandbox.rs` consts were deleted,
+        // so `SandboxPolicy::default()` is the single source of truth — pin its
+        // exact contents (mirroring the retained `LOOPBACK_HOSTS` / gate guards)
+        // so any silent edit to these security-relevant lists is caught, honoring
+        // the PR's "defaults == today, byte-for-byte" claim.
+        let d = SandboxPolicy::default();
+
+        // `base_read_paths` is platform-conditional: Landlock's read base on
+        // Linux, Seatbelt's on macOS.
         #[cfg(target_os = "macos")]
-        assert!(
-            base.iter().any(|p| p == "/System") && base.iter().any(|p| p == "/private/etc"),
-            "macOS base read must include the dyld/system base: {base:?}"
-        );
+        let want_base = to_vec(&[
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/System",
+            "/Library",
+            "/opt",
+            "/private/etc",
+            "/private/var/db/dyld",
+            "/dev",
+        ]);
         #[cfg(not(target_os = "macos"))]
-        assert!(
-            base.iter().any(|p| p == "/usr/lib") && base.iter().any(|p| p == "/lib"),
-            "Linux base read must include the loader/library trees: {base:?}"
+        let want_base = to_vec(&[
+            "/lib",
+            "/lib64",
+            "/lib32",
+            "/libx32",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/libexec",
+            "/usr/share",
+            "/etc/ld.so.cache",
+            "/etc/ld.so.preload",
+            "/etc/alternatives",
+            "/etc/nsswitch.conf",
+            "/etc/localtime",
+            "/etc/resolv.conf",
+            "/etc/ssl",
+            "/etc/ca-certificates",
+            "/proc/self",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/full",
+            "/dev/urandom",
+            "/dev/random",
+        ]);
+        assert_eq!(d.base_read_paths.resolve(), want_base, "base_read drift");
+
+        // `bin_read_paths` + `loader_paths` are platform-independent.
+        assert_eq!(
+            d.bin_read_paths.resolve(),
+            to_vec(&[
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+                "/usr/local/bin",
+                "/usr/local/sbin",
+                "/opt",
+            ]),
+            "bin_read drift"
         );
+        assert_eq!(
+            d.loader_paths.resolve(),
+            to_vec(&[
+                "/lib64/ld-linux-x86-64.so.2",
+                "/lib/ld-linux-x86-64.so.2",
+                "/lib/ld-linux.so.2",
+                "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                "/lib64/ld64.so.2",
+                "/lib/ld-linux-aarch64.so.1",
+                "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+                "/lib/ld-linux-armhf.so.3",
+                "/lib/ld-musl-x86-64.so.1",
+                "/lib/ld-musl-aarch64.so.1",
+            ]),
+            "loader drift"
+        );
+
+        // ABI floors reproduce the old `ABI::V3` / `ABI::V4` constants.
+        assert_eq!(d.landlock_abi_floor, 3, "fs ABI floor drift");
+        assert_eq!(d.landlock_net_abi_floor, 4, "net ABI floor drift");
+
+        // Landlock invariant (ADR 0011 D3): the read base must NOT contain the
+        // executable dirs — keeping `/usr/bin` etc. out of the read set shrinks
+        // the ld.so-trampoline corpus. A widening that re-admits a bin dir would
+        // silently re-open it, so guard against it here. (macOS Seatbelt read
+        // confinement is content-level and intentionally admits `/bin` etc.)
+        #[cfg(not(target_os = "macos"))]
+        for bin in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            assert!(
+                !d.base_read_paths.resolve().iter().any(|p| p == bin),
+                "Linux base read must exclude the executable dir {bin} (trampoline corpus)"
+            );
+        }
     }
 }
