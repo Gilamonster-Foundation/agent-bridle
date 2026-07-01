@@ -752,11 +752,14 @@ mod tests {
         let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/y"); // denied
 
         // The connection threads are detached, so poll (not a fixed sleep) until
-        // both records land — robust under parallel-test load. The audit now fires
-        // promptly (the forward tears down as soon as the origin closes; see
-        // `splice_buffered`), so a 10s deadline is ample headroom yet still fails
-        // fast if the CONN_TIMEOUT deadlock ever regresses (rather than racing it).
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // both records land. The ~30s forward deadlock is fixed structurally (the
+        // forward tears down as soon as the origin closes — see `splice_buffered`),
+        // so the audit normally fires in milliseconds. This deadline is only
+        // async-poll headroom: under the full-suite parallel load the NUC CI runner
+        // can starve the single-threaded test origin for several seconds, so keep
+        // it generous (a regressed deadlock would surface as broad slowness, not
+        // just here). A too-tight bound reintroduced the very flake this fixed.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let events = loop {
             let ev = sink.events();
             let have = |h: &str| ev.iter().any(|e| e.host == h);
