@@ -40,3 +40,10 @@ mod shell_tool;
 
 #[cfg(feature = "shell")]
 pub use shell_tool::ShellTool;
+
+/// Network egress audit surface (#124, ADR 0016): the loopback proxy records
+/// every proxy-visible connection as a [`NetAuditEvent`] through an [`AuditSink`]
+/// (default off; enable via the `BRIDLE_NET_AUDIT` setting). The `bridle-netmon`
+/// binary renders the JSON-lines stream as a live monitor.
+#[cfg(feature = "shell")]
+pub use net_proxy::{AuditSink, JsonlSink, NetAuditEvent, NetDecision, NetKind, NullSink};

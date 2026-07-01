@@ -25,15 +25,109 @@ use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 /// Longest request line / header block the proxy will buffer before giving up
 /// (a request line is short; this only bounds a hostile client). 8 KiB.
 const MAX_HEAD: usize = 8 * 1024;
 /// Per-connection socket timeout, so a stuck peer cannot pin a proxy thread.
 const CONN_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ── Audit (#124, ADR 0016): the proxy is the child's sole egress chokepoint, so
+// every proxy-visible connection is recorded through an operator-supplied sink.
+// This is observability only — it never changes an enforcement decision. ────────
+
+/// The kind of egress a child requested through the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetKind {
+    /// `CONNECT host:port` — an opaque (HTTPS) tunnel.
+    Connect,
+    /// `http://…` plaintext forward.
+    Http,
+}
+
+/// The proxy's allow-list decision for one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetDecision {
+    /// Host on the allow-list — connection made.
+    Allowed,
+    /// Host **not** on the allow-list — refused with 403 (the exfil-attempt signal).
+    Denied,
+    /// Allow-listed but the origin could not be reached (DNS/connect failure).
+    Error,
+}
+
+/// One audited egress connection through the proxy — a complete record of the
+/// child's proxy-visible network activity (#124, ADR 0016). Serialised as one
+/// JSON line by [`JsonlSink`]; the `bridle-netmon` binary renders a live view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetAuditEvent {
+    /// Unix-epoch milliseconds when the connection was decided.
+    pub ts_ms: u64,
+    /// The requested host (CONNECT authority or `http://` URI host).
+    pub host: String,
+    /// The requested port.
+    pub port: u16,
+    /// Tunnel (`connect`) or plaintext forward (`http`).
+    pub kind: NetKind,
+    /// Allow-list outcome.
+    pub decision: NetDecision,
+    /// Bytes the child sent (client → origin); `0` for a denied/errored conn.
+    pub bytes_up: u64,
+    /// Bytes the origin returned (origin → child).
+    pub bytes_down: u64,
+    /// Connection lifetime in milliseconds.
+    pub dur_ms: u64,
+}
+
+/// A destination for [`NetAuditEvent`]s — the operator's audit trail. `record` is
+/// called from a per-connection thread, so implementations must be thread-safe
+/// and must never block the connection for long.
+pub trait AuditSink: Send + Sync {
+    /// Record one completed connection.
+    fn record(&self, event: &NetAuditEvent);
+}
+
+/// The default sink — discard everything (audit off, zero overhead).
+pub struct NullSink;
+
+impl AuditSink for NullSink {
+    fn record(&self, _event: &NetAuditEvent) {}
+}
+
+/// Append each event as one JSON line to a `Write` (a file, stderr, a pipe).
+pub struct JsonlSink<W: Write + Send>(Mutex<W>);
+
+impl<W: Write + Send> JsonlSink<W> {
+    /// Wrap a writer as a JSON-lines audit sink.
+    pub fn new(w: W) -> Self {
+        Self(Mutex::new(w))
+    }
+}
+
+impl<W: Write + Send> AuditSink for JsonlSink<W> {
+    fn record(&self, event: &NetAuditEvent) {
+        if let (Ok(mut w), Ok(mut line)) = (self.0.lock(), serde_json::to_string(event)) {
+            line.push('\n');
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Unix-epoch milliseconds now (saturating to 0 before the epoch — never panics).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Resolves a proxied hostname to the address the proxy dials. A seam so a test
 /// can map an allow-listed name to a loopback origin (hermetic, no real DNS).
@@ -186,7 +280,8 @@ impl Drop for ProxyHandle {
 }
 
 /// Start a loopback forward proxy that admits only `allow_hosts`, resolving via
-/// `resolver`. Binds `127.0.0.1:0` (an ephemeral port — concurrent runs never
+/// `resolver` and auditing every connection through `sink` ([`NullSink`] for no
+/// audit). Binds `127.0.0.1:0` (an ephemeral port — concurrent runs never
 /// collide) and serves until the returned [`ProxyHandle`] is dropped.
 ///
 /// Fail-closed: an error binding the listener is returned so the caller refuses
@@ -194,6 +289,7 @@ impl Drop for ProxyHandle {
 pub fn start(
     allow_hosts: impl IntoIterator<Item = String>,
     resolver: Arc<dyn Resolver>,
+    sink: Arc<dyn AuditSink>,
 ) -> io::Result<ProxyHandle> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
@@ -212,11 +308,12 @@ pub fn start(
                     let Ok(client) = stream else { continue };
                     let policy = policy.clone();
                     let resolver = Arc::clone(&resolver);
+                    let sink = Arc::clone(&sink);
                     // One detached thread per connection; it ends at EOF.
                     let _ = thread::Builder::new()
                         .name("agent-bridle-egress-conn".to_string())
                         .spawn(move || {
-                            let _ = handle_conn(client, &policy, resolver.as_ref());
+                            let _ = handle_conn(client, &policy, resolver.as_ref(), sink.as_ref());
                         });
                 }
             })?
@@ -231,42 +328,72 @@ pub fn start(
 
 /// Serve one client connection: parse its request line, enforce the allow-list,
 /// and either tunnel (`CONNECT`) or forward (`http://`) to the resolved origin.
-fn handle_conn(client: TcpStream, policy: &HostPolicy, resolver: &dyn Resolver) -> io::Result<()> {
+/// Every connection with a parsed host is recorded through `sink`.
+fn handle_conn(
+    client: TcpStream,
+    policy: &HostPolicy,
+    resolver: &dyn Resolver,
+    sink: &dyn AuditSink,
+) -> io::Result<()> {
     client.set_read_timeout(Some(CONN_TIMEOUT))?;
     client.set_write_timeout(Some(CONN_TIMEOUT))?;
     let mut reader = BufReader::new(client.try_clone()?);
+    let t0 = Instant::now();
 
     let line = read_line_bounded(&mut reader)?;
     let Some(target) = parse_request_line(&line) else {
+        // No host to attribute — a malformed request is not an egress event.
         return respond(&client, 400, "Bad Request");
     };
 
+    let (host, port, kind) = match &target {
+        Target::Connect { host, port } => (host.clone(), *port, NetKind::Connect),
+        Target::Http { host, port, .. } => (host.clone(), *port, NetKind::Http),
+    };
+    // Emit the audit record once, whatever the outcome.
+    let audit = |decision: NetDecision, up: u64, down: u64| {
+        sink.record(&NetAuditEvent {
+            ts_ms: now_ms(),
+            host: host.clone(),
+            port,
+            kind,
+            decision,
+            bytes_up: up,
+            bytes_down: down,
+            dur_ms: t0.elapsed().as_millis() as u64,
+        });
+    };
+
+    if !policy.allows(&host) {
+        audit(NetDecision::Denied, 0, 0); // the exfil-attempt signal
+        return respond(&client, 403, "Forbidden");
+    }
+
     match target {
         Target::Connect { host, port } => {
-            if !policy.allows(&host) {
-                return respond(&client, 403, "Forbidden");
-            }
             // CONNECT: drain the remaining request headers (up to the blank line)
             // before the tunnel begins — the client waits for our 200 first.
             drain_headers(&mut reader)?;
             let origin = match resolver.resolve(&host, port).and_then(dial) {
                 Ok(o) => o,
-                Err(_) => return respond(&client, 502, "Bad Gateway"),
+                Err(_) => {
+                    audit(NetDecision::Error, 0, 0);
+                    return respond(&client, 502, "Bad Gateway");
+                }
             };
             // A CONNECT success is a *bare* status line — no body, no
             // `Content-Length` — after which the socket is an opaque tunnel. (Do
             // NOT use `respond`, which appends a body that would corrupt it.)
             (&client).write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-            tunnel(client, origin)
+            let (up, down) = tunnel(client, origin)?;
+            audit(NetDecision::Allowed, up, down);
+            Ok(())
         }
         Target::Http {
             host,
             port,
             origin_line,
         } => {
-            if !policy.allows(&host) {
-                return respond(&client, 403, "Forbidden");
-            }
             // Read the client's request headers and **drop any client-supplied
             // Host** — an attacker could send `Host: disallowed.com` to domain-front
             // off a shared/CDN origin at the allow-listed IP. Substitute the proxy's
@@ -275,7 +402,10 @@ fn handle_conn(client: TcpStream, policy: &HostPolicy, resolver: &dyn Resolver) 
             let headers = read_headers(&mut reader)?;
             let mut origin = match resolver.resolve(&host, port).and_then(dial) {
                 Ok(o) => o,
-                Err(_) => return respond(&client, 502, "Bad Gateway"),
+                Err(_) => {
+                    audit(NetDecision::Error, 0, 0);
+                    return respond(&client, 502, "Bad Gateway");
+                }
             };
             let host_hdr = if port == 80 {
                 format!("Host: {host}\r\n")
@@ -290,7 +420,9 @@ fn handle_conn(client: TcpStream, policy: &HostPolicy, resolver: &dyn Resolver) 
                 }
             }
             origin.write_all(b"\r\n")?; // end of the (rewritten) header block
-            splice_buffered(reader, client, origin) // forward the body
+            let (up, down) = splice_buffered(reader, client, origin)?; // forward the body
+            audit(NetDecision::Allowed, up, down);
+            Ok(())
         }
     }
 }
@@ -352,40 +484,44 @@ fn respond(client: &TcpStream, code: u16, reason: &str) -> io::Result<()> {
 }
 
 /// Bidirectional raw byte tunnel between `client` and `origin` (the `CONNECT`
-/// case): two copy threads, each shutting its write half at EOF.
-fn tunnel(client: TcpStream, origin: TcpStream) -> io::Result<()> {
+/// case): two copy threads, each shutting its write half at EOF. Returns
+/// `(bytes_up, bytes_down)` — child→origin and origin→child — for the audit.
+fn tunnel(client: TcpStream, origin: TcpStream) -> io::Result<(u64, u64)> {
     let mut c_read = client.try_clone()?;
     let mut o_write = origin.try_clone()?;
     let up = thread::spawn(move || {
-        let _ = io::copy(&mut c_read, &mut o_write);
+        let n = io::copy(&mut c_read, &mut o_write).unwrap_or(0);
         let _ = o_write.shutdown(Shutdown::Write);
+        n
     });
     let mut o_read = origin;
     let mut c_write = client;
-    let _ = io::copy(&mut o_read, &mut c_write);
+    let down = io::copy(&mut o_read, &mut c_write).unwrap_or(0);
     let _ = c_write.shutdown(Shutdown::Write);
-    let _ = up.join();
-    Ok(())
+    let up = up.join().unwrap_or(0);
+    Ok((up, down))
 }
 
 /// Like [`tunnel`] but the client side is a `BufReader` that may already hold
 /// buffered bytes (the `http://` forward case, after the request line was read).
+/// Returns `(bytes_up, bytes_down)` for the audit.
 fn splice_buffered(
     mut client_reader: BufReader<TcpStream>,
     client: TcpStream,
     origin: TcpStream,
-) -> io::Result<()> {
+) -> io::Result<(u64, u64)> {
     let mut o_write = origin.try_clone()?;
     let up = thread::spawn(move || {
-        let _ = io::copy(&mut client_reader, &mut o_write);
+        let n = io::copy(&mut client_reader, &mut o_write).unwrap_or(0);
         let _ = o_write.shutdown(Shutdown::Write);
+        n
     });
     let mut o_read = origin;
     let mut c_write = client;
-    let _ = io::copy(&mut o_read, &mut c_write);
+    let down = io::copy(&mut o_read, &mut c_write).unwrap_or(0);
     let _ = c_write.shutdown(Shutdown::Write);
-    let _ = up.join();
-    Ok(())
+    let up = up.join().unwrap_or(0);
+    Ok((up, down))
 }
 
 #[cfg(test)]
@@ -462,6 +598,28 @@ mod tests {
         }
     }
 
+    /// Start the proxy with no audit sink (most tests don't inspect the audit).
+    fn start_null(
+        hosts: impl IntoIterator<Item = String>,
+        resolver: Arc<dyn Resolver>,
+    ) -> io::Result<ProxyHandle> {
+        start(hosts, resolver, Arc::new(NullSink))
+    }
+
+    /// An audit sink that collects every event into a shared vec, for assertions.
+    #[derive(Clone, Default)]
+    struct CapturingSink(Arc<Mutex<Vec<NetAuditEvent>>>);
+    impl AuditSink for CapturingSink {
+        fn record(&self, event: &NetAuditEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+    impl CapturingSink {
+        fn events(&self) -> Vec<NetAuditEvent> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
     /// A one-shot HTTP origin on loopback that replies 200 with a marker body.
     fn spawn_origin() -> SocketAddr {
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -500,7 +658,7 @@ mod tests {
     #[test]
     fn allowed_http_host_is_forwarded_to_origin() {
         let origin = spawn_origin();
-        let proxy = start(
+        let proxy = start_null(
             ["allowed.test".to_string()],
             Arc::new(FixedResolver(origin)),
         )
@@ -516,13 +674,110 @@ mod tests {
     #[test]
     fn disallowed_http_host_is_refused_403_without_reaching_origin() {
         // No origin needed — a denied host must never be dialled.
-        let proxy = start(
+        let proxy = start_null(
             ["allowed.test".to_string()],
             Arc::new(FixedResolver("127.0.0.1:1".parse().unwrap())),
         )
         .unwrap();
         let (status, _) = http_get_via_proxy(proxy.addr(), "http://evil.test/x");
         assert!(status.contains("403"), "denied host must get 403: {status}");
+    }
+
+    #[test]
+    fn audit_records_allowed_with_bytes_and_denied_attempts() {
+        let origin = spawn_origin();
+        let sink = CapturingSink::default();
+        let proxy = start(
+            ["allowed.test".to_string()],
+            Arc::new(FixedResolver(origin)),
+            Arc::new(sink.clone()),
+        )
+        .unwrap();
+        let _ = http_get_via_proxy(proxy.addr(), "http://allowed.test/x");
+        let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/y"); // denied
+        thread::sleep(Duration::from_millis(150)); // detached conn threads record
+
+        let events = sink.events();
+        let allowed = events
+            .iter()
+            .find(|e| e.host == "allowed.test")
+            .expect("an allowed event");
+        assert_eq!(allowed.decision, NetDecision::Allowed);
+        assert_eq!(allowed.kind, NetKind::Http);
+        assert_eq!(allowed.port, 80);
+        assert!(
+            allowed.bytes_down > 0,
+            "an allowed connection records response bytes: {allowed:?}"
+        );
+
+        let denied = events
+            .iter()
+            .find(|e| e.host == "evil.test")
+            .expect("a denied event (the exfil-attempt signal)");
+        assert_eq!(denied.decision, NetDecision::Denied);
+        assert_eq!(denied.bytes_up, 0);
+        assert_eq!(denied.bytes_down, 0);
+    }
+
+    #[test]
+    fn jsonl_sink_appends_one_newline_terminated_json_line_per_event() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = SharedBuf::default();
+        let sink = JsonlSink::new(buf.clone());
+        let mk = |host: &str| NetAuditEvent {
+            ts_ms: 1,
+            host: host.into(),
+            port: 80,
+            kind: NetKind::Http,
+            decision: NetDecision::Allowed,
+            bytes_up: 1,
+            bytes_down: 2,
+            dur_ms: 3,
+        };
+        sink.record(&mk("a"));
+        sink.record(&mk("b"));
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one JSON line per event: {text:?}");
+        assert_eq!(
+            serde_json::from_str::<NetAuditEvent>(lines[0])
+                .unwrap()
+                .host,
+            "a"
+        );
+        assert_eq!(
+            serde_json::from_str::<NetAuditEvent>(lines[1])
+                .unwrap()
+                .host,
+            "b"
+        );
+    }
+
+    #[test]
+    fn audit_event_json_round_trips() {
+        let e = NetAuditEvent {
+            ts_ms: 1,
+            host: "h".into(),
+            port: 443,
+            kind: NetKind::Connect,
+            decision: NetDecision::Allowed,
+            bytes_up: 10,
+            bytes_down: 20,
+            dur_ms: 5,
+        };
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(line.contains("\"decision\":\"allowed\"") && line.contains("\"kind\":\"connect\""));
+        assert_eq!(serde_json::from_str::<NetAuditEvent>(&line).unwrap(), e);
     }
 
     /// A one-shot raw-TCP echo origin (no HTTP), to prove the `CONNECT` tunnel
@@ -545,7 +800,8 @@ mod tests {
     #[test]
     fn connect_allowed_host_tunnels_opaque_bytes() {
         let echo = spawn_echo();
-        let proxy = start(["allowed.test".to_string()], Arc::new(FixedResolver(echo))).unwrap();
+        let proxy =
+            start_null(["allowed.test".to_string()], Arc::new(FixedResolver(echo))).unwrap();
         let mut c = TcpStream::connect(proxy.addr()).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         write!(
@@ -581,7 +837,7 @@ mod tests {
 
     #[test]
     fn connect_disallowed_host_is_refused_403() {
-        let proxy = start(
+        let proxy = start_null(
             ["allowed.test".to_string()],
             Arc::new(FixedResolver("127.0.0.1:1".parse().unwrap())),
         )
@@ -631,7 +887,7 @@ mod tests {
     #[test]
     fn http_host_header_is_normalized_to_the_validated_authority() {
         let origin = spawn_host_echo();
-        let proxy = start(
+        let proxy = start_null(
             ["allowed.test".to_string()],
             Arc::new(FixedResolver(origin)),
         )
@@ -661,7 +917,7 @@ mod tests {
 
     #[test]
     fn proxy_env_points_at_the_bound_loopback_addr() {
-        let proxy = start(["x".to_string()], Arc::new(StdResolver)).unwrap();
+        let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let env = proxy.proxy_env();
         let url = format!("http://127.0.0.1:{}", proxy.addr().port());
         assert!(env.iter().any(|(k, v)| k == "https_proxy" && *v == url));
@@ -693,7 +949,7 @@ mod tests {
         }
 
         let origin = spawn_origin();
-        let proxy = start(
+        let proxy = start_null(
             ["allowed.test".to_string()],
             Arc::new(FixedResolver(origin)),
         )
@@ -759,7 +1015,7 @@ mod tests {
 
     #[test]
     fn dropping_the_handle_stops_the_listener() {
-        let proxy = start(["x".to_string()], Arc::new(StdResolver)).unwrap();
+        let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let addr = proxy.addr();
         drop(proxy);
         // After shutdown the port is no longer served: a connect either refuses

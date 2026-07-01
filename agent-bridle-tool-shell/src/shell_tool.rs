@@ -162,9 +162,14 @@ fn run_with_egress_proxy(
     // (1) Fence prefix first (pure, cheap) — fail-closed if the wrapper is gone.
     let prefix = best_available_sandbox().command_prefix(fenced)?;
     // (2) Start the proxy — fail-closed if it cannot bind loopback (never spawn
-    //     an unfenced child that would then egress freely).
-    let proxy =
-        net_proxy::start(allow_hosts, Arc::new(net_proxy::StdResolver)).map_err(ToolError::Exec)?;
+    //     an unfenced child that would then egress freely). Audit is opt-in via the
+    //     `BRIDLE_NET_AUDIT` setting (observability only; off = zero overhead).
+    let proxy = net_proxy::start(
+        allow_hosts,
+        Arc::new(net_proxy::StdResolver),
+        net_audit_sink(),
+    )
+    .map_err(ToolError::Exec)?;
     // (3) Point the child at the proxy via the env seam (a clone — never mutate
     //     the caller's map).
     let mut env = env.clone();
@@ -188,6 +193,24 @@ fn run_with_egress_proxy(
         })?;
     drop(proxy); // hold the proxy until the child is reaped, then tear it down
     captured
+}
+
+/// Build the egress audit sink from the `BRIDLE_NET_AUDIT` operator setting
+/// (#124, ADR 0016). Unset/empty → **no audit** (the default; zero overhead). A
+/// path → append each proxied connection as one JSON line (host, port, decision,
+/// bytes, duration) for `bridle-netmon` to render live. Audit is **observability
+/// only** — it never changes an enforcement decision — so a path that cannot be
+/// opened falls back to the null sink rather than failing the run.
+fn net_audit_sink() -> Arc<dyn net_proxy::AuditSink> {
+    match std::env::var("BRIDLE_NET_AUDIT") {
+        Ok(path) if !path.is_empty() => std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map(|f| Arc::new(net_proxy::JsonlSink::new(f)) as Arc<dyn net_proxy::AuditSink>)
+            .unwrap_or_else(|_| Arc::new(net_proxy::NullSink)),
+        _ => Arc::new(net_proxy::NullSink),
+    }
 }
 
 /// The L3 `SandboxKind` that will actually be enforced for these caveats in this
