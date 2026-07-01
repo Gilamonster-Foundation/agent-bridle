@@ -436,18 +436,54 @@ pub(crate) mod landlock_impl {
     };
     use std::sync::Arc;
 
-    /// Map a configured ABI floor (`SandboxPolicy::landlock_abi_floor`) to the
-    /// landlock `ABI` enum. `apply` runs `BestEffort`, so a floor above the
-    /// running kernel still degrades gracefully; unknown/too-high values clamp to
-    /// the highest ABI this build knows (V4 — TCP net rules). The default floors
-    /// (fs 3 / net 4) reproduce the previous `ABI::V3` / `ABI::V4` constants.
+    /// Map a configured ABI floor to the landlock `ABI` enum. `apply` runs
+    /// `BestEffort`, so a floor above the running kernel still degrades
+    /// gracefully; unknown/too-high values clamp to the highest ABI this crate
+    /// (landlock 0.4.5) models — V7 — so raising a floor to reach a newer axis
+    /// (e.g. `IoctlDev` at V5) is honored, not silently dropped to V4. The
+    /// default floors (fs 3 / net 4) reproduce the previous `ABI::V3` / `ABI::V4`
+    /// constants.
+    ///
+    /// The *lower* bound is deliberately NOT enforced here: it is axis-specific
+    /// and applied at the call site via [`fs_abi_floor`] / [`net_abi_floor`],
+    /// because fs and net have different safe minimums below which the honesty
+    /// report would overclaim.
     fn abi_from_u32(v: u32) -> ABI {
         match v {
             0 | 1 => ABI::V1,
             2 => ABI::V2,
             3 => ABI::V3,
-            _ => ABI::V4,
+            4 => ABI::V4,
+            5 => ABI::V5,
+            6 => ABI::V6,
+            _ => ABI::V7,
         }
+    }
+
+    /// The fs-axis ABI floor actually installed — never below V3 (the default).
+    ///
+    /// Security-critical clamp: a configured `landlock_abi_floor` below 3 would
+    /// drop `Refer` (V2) / `Truncate` (V3) from the governed write set, letting a
+    /// confined child `truncate`/`rename` files OUTSIDE its `fs_write` scope while
+    /// [`crate::enforcement_report`] still reports `fs_write = Kernel` — a silent
+    /// weakening *and* an overclaim. Lowering a floor has no legitimate use
+    /// (`BestEffort` already degrades on genuinely older kernels), so we clamp up
+    /// to the claimed baseline rather than honor a weakening. Raising above the
+    /// default stays allowed (explicit opt-in hardening).
+    fn fs_abi_floor(policy: &SandboxPolicy) -> ABI {
+        abi_from_u32(policy.landlock_abi_floor.max(3))
+    }
+
+    /// The net-axis ABI floor actually installed — never below V4 (the default).
+    ///
+    /// TCP net rights first exist at V4, so a configured `landlock_net_abi_floor`
+    /// below 4 makes `AccessNet::from_all` EMPTY; under `BestEffort`,
+    /// `handle_access` of an empty set governs nothing, silently dropping a
+    /// requested deny-all-egress even on a capable (≥ 6.7) kernel while the report
+    /// claims `net = Kernel`. Clamp up to V4 for the same reason as
+    /// [`fs_abi_floor`].
+    fn net_abi_floor(policy: &SandboxPolicy) -> ABI {
+        abi_from_u32(policy.landlock_net_abi_floor.max(4))
     }
 
     /// `true` if this kernel can enforce a Landlock ruleset.
@@ -554,7 +590,7 @@ pub(crate) mod landlock_impl {
         }
 
         fn apply(&self, effective: &Caveats) -> ToolResult<()> {
-            let write = AccessFs::from_write(abi_from_u32(self.policy.landlock_abi_floor));
+            let write = AccessFs::from_write(fs_abi_floor(&self.policy));
             // Pure read rights — `from_read` also bundles `Execute`, which we
             // govern separately (only when `exec` is restricted), never via the
             // read axis.
@@ -591,9 +627,7 @@ pub(crate) mod landlock_impl {
             // NetPort rules → deny-by-default for all TCP bind + connect.
             let ruleset = if confine_net {
                 ruleset
-                    .handle_access(AccessNet::from_all(abi_from_u32(
-                        self.policy.landlock_net_abi_floor,
-                    )))
+                    .handle_access(AccessNet::from_all(net_abi_floor(&self.policy)))
                     .map_err(landlock_denied)?
             } else {
                 ruleset
