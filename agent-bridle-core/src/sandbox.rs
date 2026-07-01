@@ -1123,6 +1123,56 @@ mod seatbelt_impl {
                 .is_empty());
         }
 
+        /// #144 (I5-B) regression guard: the Seatbelt backend must read its base
+        /// allow-list from `self.policy` on the PRODUCTION path (`command_prefix`
+        /// → `seatbelt_profile_with`), not a hardcoded const. A widened
+        /// `base_read_paths` must appear in the generated SBPL profile; the
+        /// default policy must not admit it. Mirrors the Landlock proof
+        /// `landlock_config_widens_base_read`, so a revert of the const path is
+        /// caught on macOS too (previously only Landlock had this coverage).
+        #[test]
+        fn command_prefix_widens_the_read_base_from_policy() {
+            if !seatbelt_is_supported() {
+                eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+                return;
+            }
+            let extra = std::env::temp_dir().join("abridle-seatbelt-cfg-widen");
+            std::fs::create_dir_all(&extra).unwrap();
+            let extra_str = extra.to_string_lossy().into_owned();
+            // The profile carries the canonicalized path (e.g. /tmp → /private/tmp).
+            let want = canonical_path(&extra_str).expect("temp dir canonicalizes");
+
+            // fs_read must be restricted for the read base to be emitted at all.
+            let cav = Caveats {
+                fs_read: Scope::only(["/usr".to_string()]),
+                ..Caveats::top()
+            };
+
+            // Control: the default read base does NOT admit the extra dir.
+            let default_prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            assert!(
+                !default_prefix.iter().any(|a| a.contains(&want)),
+                "default read base must not include the extra dir: {default_prefix:?}"
+            );
+
+            // Widened policy: add `extra` to base_read_paths → it appears.
+            let mut base = SandboxPolicy::default().base_read_paths;
+            base.extra.push(extra_str);
+            let policy = Arc::new(SandboxPolicy {
+                base_read_paths: base,
+                ..SandboxPolicy::default()
+            });
+            let widened_prefix = SeatbeltSandbox::with_policy(policy)
+                .command_prefix(&cav)
+                .unwrap();
+            assert!(
+                widened_prefix.iter().any(|a| a.contains(&want)),
+                "config-widened base_read_paths must reach the SBPL profile: {widened_prefix:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&extra);
+        }
+
         #[test]
         fn empty_net_denies_all_egress_and_engages_the_wrapper() {
             // net:none with fs unrestricted still confines (network), so the
