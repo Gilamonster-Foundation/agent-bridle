@@ -74,8 +74,8 @@ mod windows {
     /// are emitted verbatim.
     fn build_cmdline(program: &str, args: &[String]) -> Vec<u16> {
         fn quote(s: &str) -> String {
-            let needs_quoting = s.is_empty()
-                || s.chars().any(|c| matches!(c, '"' | ' ' | '\t'));
+            let needs_quoting =
+                s.is_empty() || s.chars().any(|c| matches!(c, '"' | ' ' | '\t'));
             if !needs_quoting {
                 return s.to_string();
             }
