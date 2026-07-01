@@ -123,6 +123,9 @@ fn fs_write_kernel_allows_granted_denies_ungranted() {
 
     // One confined child attempts BOTH writes (`copy NUL <path>` creates an empty
     // file with no `>` redirection to quote). Only the granted one may land.
+    // DIAGNOSTIC: also dump the container's own groups/integrity and the ACL it sees
+    // DURING the run (aclaunch restores the DACL after exit, so a post-run icacls
+    // cannot show the temporary AppContainer ACE).
     let out = launch(&[
         "--name",
         &tag("fsw"),
@@ -130,6 +133,18 @@ fn fs_write_kernel_allows_granted_denies_ungranted() {
         &granted.to_string_lossy(),
         "cmd.exe",
         "/c",
+        "whoami",
+        "/groups",
+        "&",
+        "echo",
+        "--ACL--",
+        "&",
+        "icacls",
+        &granted.to_string_lossy(),
+        "&",
+        "echo",
+        "--COPY--",
+        "&",
         "copy",
         "NUL",
         &g_file.to_string_lossy(),
