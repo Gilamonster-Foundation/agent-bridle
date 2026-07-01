@@ -172,8 +172,14 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             // to run or to `ld.so`-trampoline into (ADR 0013 D5, ADR 0011 D7's
             // precondition made physically true). Landlock's exec axis is held
             // (agent-bridle#31/#57) and a Noop host has no OS allow-list, so both
-            // stay interceptor; AppContainer's exec story is not wired this
-            // increment, so it stays interceptor too (never overclaimed).
+            // stay interceptor. AppContainer: when exec is *fully denied* (empty
+            // allow-list), `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` prevents
+            // any child-process creation at the kernel level, closing the exec axis
+            // by OS enforcement (#123). A non-empty allow-list cannot be kernel-
+            // expressed (no WDAC policy), so it stays interceptor.
+            SandboxKind::AppContainer if crate::sandbox::exec_fully_denied(effective) => {
+                AxisEnforcement::Kernel
+            }
             SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
                 AxisEnforcement::Kernel
             }
@@ -410,6 +416,35 @@ mod tests {
         assert_eq!(r.fs_read, None);
         assert_eq!(r.fs_write, None);
         assert_eq!(r.exec, None);
+    }
+
+    /// exec → Kernel for AppContainer only when the scope is empty (deny-all):
+    /// `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` blocks any child-process
+    /// creation at the kernel level (#123, ADR 0013 D7).
+    #[test]
+    fn appcontainer_marks_exec_kernel_for_deny_all() {
+        let exec_deny_all = Caveats {
+            exec: Scope::none(),
+            ..Caveats::top()
+        };
+        let r = enforcement_report(&exec_deny_all, SandboxKind::AppContainer);
+        assert_eq!(r.exec, Some(AxisEnforcement::Kernel));
+        // fs/net are unrestricted (top) — not in the report.
+        assert_eq!(r.fs_read, None);
+        assert_eq!(r.fs_write, None);
+        assert_eq!(r.net, None);
+    }
+
+    /// exec with a non-empty allow-list stays Interceptor: only the deny-all
+    /// case can be kernel-enforced (no WDAC policy in the AppContainer launcher).
+    #[test]
+    fn appcontainer_exec_allowlist_stays_interceptor() {
+        let exec_allowlist = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+        let r = enforcement_report(&exec_allowlist, SandboxKind::AppContainer);
+        assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
     }
 
     /// Seatbelt's net honesty is scope-shaped (ADR 0015): kernel for the two

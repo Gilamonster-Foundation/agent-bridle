@@ -457,6 +457,33 @@ mod tests {
         );
     }
 
+    /// exec_fully_denied engages the AppContainer backend: governing == AppContainer,
+    /// and the enforcement report marks exec → Kernel (#123).
+    #[test]
+    fn exec_deny_all_under_appcontainer_is_kernel() {
+        let exec_denied = Caveats {
+            exec: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+        let governing = effective_sandbox_kind(SandboxKind::AppContainer, &exec_denied);
+        assert_eq!(
+            governing,
+            SandboxKind::AppContainer,
+            "exec deny-all must engage AppContainer"
+        );
+        // With an AppContainer backend and exec fully denied, the axis is kernel-enforced.
+        assert!(
+            !confinement_unenforceable(governing, &exec_denied, AxisEnforcement::Advisory),
+            "exec deny-all under AppContainer is enforceable (kernel-level block)"
+        );
+        let report = enforcement_report(&exec_denied, governing);
+        assert_eq!(
+            report.exec,
+            Some(AxisEnforcement::Kernel),
+            "exec deny-all must be Kernel under AppContainer"
+        );
+    }
+
     /// Builds with **no** available OS sandbox: a restrictive `fs_write` must be
     /// refused rather than spawned unconfined. Gated off where a backend can
     /// actually enforce (Linux+Landlock, macOS+Seatbelt, Windows+AppContainer) —
