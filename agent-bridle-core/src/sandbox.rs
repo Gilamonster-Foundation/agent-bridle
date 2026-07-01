@@ -157,6 +157,17 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
 }
 
+/// `true` if this kernel supports Landlock TCP network rules (ABI V4, kernel ≥ 6.7).
+/// Always `false` on non-Linux or builds without `linux-landlock`.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+pub(crate) fn landlock_net_capable() -> bool {
+    landlock_impl::landlock_net_is_supported()
+}
+#[cfg(not(all(target_os = "linux", feature = "linux-landlock")))]
+pub(crate) fn landlock_net_capable() -> bool {
+    false
+}
+
 /// The host tokens that name the machine's own **loopback interface**. SBPL's
 /// `(remote ip "localhost:*")` filter matches exactly these destinations
 /// (`127.0.0.1` and `::1`) — empirically the *only* remote a non-empty SBPL net
@@ -205,7 +216,12 @@ pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
-        SandboxKind::Landlock if restricts_fs(caveats) => SandboxKind::Landlock,
+        SandboxKind::Landlock
+            if restricts_fs(caveats)
+                || (net_fully_denied(caveats) && landlock_net_capable()) =>
+        {
+            SandboxKind::Landlock
+        }
         SandboxKind::Seatbelt
             if restricts_fs(caveats)
                 || net_fully_denied(caveats)
@@ -253,7 +269,7 @@ pub fn best_available_sandbox() -> Box<dyn Sandbox> {
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
-pub use landlock_impl::{landlock_is_supported, LandlockSandbox};
+pub use landlock_impl::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
 
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
@@ -299,8 +315,8 @@ mod landlock_impl {
     use super::{Sandbox, SandboxKind};
     use crate::{Caveats, Scope, ToolError, ToolResult};
     use landlock::{
-        path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, ABI,
+        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
+        RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
     };
 
     /// ABI floor we request. Every filesystem *write*-side right exists by V3
@@ -309,6 +325,10 @@ mod landlock_impl {
     /// degrade gracefully (dropping Refer/Truncate) instead of failing to build
     /// the ruleset.
     const ABI_FLOOR: ABI = ABI::V3;
+
+    /// ABI floor required for TCP network rules (`AccessNet::BindTcp` /
+    /// `ConnectTcp`). Available from Linux kernel 6.7 (Landlock ABI V4).
+    const NET_ABI_FLOOR: ABI = ABI::V4;
 
     /// `true` if this kernel can enforce a Landlock ruleset.
     ///
@@ -319,6 +339,17 @@ mod landlock_impl {
         Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(AccessFs::from_all(ABI::V1))
+            .and_then(|r| r.create())
+            .is_ok()
+    }
+
+    /// `true` if this kernel supports Landlock TCP network rules (ABI V4,
+    /// kernel ≥ 6.7). Probed non-destructively — creates but never
+    /// `restrict_self`s a throwaway ruleset.
+    pub fn landlock_net_is_supported() -> bool {
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessNet::from_all(NET_ABI_FLOOR))
             .and_then(|r| r.create())
             .is_ok()
     }
@@ -467,6 +498,11 @@ mod landlock_impl {
             // for, so that axis stays ambient and needs no base allow-list.
             let confine_read = matches!(effective.fs_read, Scope::Only(_));
             let confine_exec = matches!(effective.exec, Scope::Only(_));
+            // `net: Scope::Only([])` (empty) = deny ALL TCP bind + connect.
+            // Non-empty host allow-lists are not expressible in Landlock (port-
+            // based, not hostname-based) and stay advisory — only the empty-set
+            // case maps cleanly to a deny-all TCP rule.
+            let confine_net = super::net_fully_denied(effective);
             let mut handled = write;
             if confine_read {
                 handled |= read;
@@ -476,10 +512,24 @@ mod landlock_impl {
             }
 
             let write_roots = scope_roots(&effective.fs_write);
+            // Build the ruleset: fs axes first (V3 floor), then optionally the
+            // net axis (V4+). BestEffort means handle_access silently skips
+            // access types the kernel doesn't know — so on pre-6.7 kernels the
+            // TCP handle is a no-op and only fs rules apply.
             let ruleset = Ruleset::default()
                 .set_compatibility(CompatLevel::BestEffort)
                 .handle_access(handled)
-                .map_err(landlock_denied)?
+                .map_err(landlock_denied)?;
+            // When net is fully denied: declare AccessNet without adding any
+            // NetPort rules → deny-by-default for all TCP bind + connect.
+            let ruleset = if confine_net {
+                ruleset
+                    .handle_access(AccessNet::from_all(NET_ABI_FLOOR))
+                    .map_err(landlock_denied)?
+            } else {
+                ruleset
+            };
+            let ruleset = ruleset
                 .create()
                 .map_err(landlock_denied)?
                 .add_rules(path_beneath_rules(&write_roots, write))
@@ -1296,8 +1346,8 @@ mod tests {
             SandboxKind::Seatbelt
         );
         // An empty net scope (all egress denied), even with fs unrestricted,
-        // engages Seatbelt (it kernel-denies network) but NOT Landlock (which
-        // cannot gate net) — capabilities differ, so honesty differs.
+        // engages Seatbelt. Landlock engages only on V4+ kernels (≥ 6.7) where
+        // TCP deny-all is expressible; on older kernels it falls back to None.
         let net_denied = Caveats {
             net: Scope::none(),
             ..Caveats::top()
@@ -1307,10 +1357,15 @@ mod tests {
             SandboxKind::Seatbelt,
             "Seatbelt kernel-denies egress, so net:none engages it"
         );
+        let expected_landlock_net = if landlock_net_capable() {
+            SandboxKind::Landlock
+        } else {
+            SandboxKind::None
+        };
         assert_eq!(
             effective_sandbox_kind(SandboxKind::Landlock, &net_denied),
-            SandboxKind::None,
-            "Landlock cannot gate net, so net:none must NOT report Landlock"
+            expected_landlock_net,
+            "Landlock engages for net:none only when V4 TCP-deny support is present"
         );
     }
 
