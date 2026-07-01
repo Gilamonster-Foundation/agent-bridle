@@ -45,6 +45,11 @@ impl DischargeVerifier for StubVerifier {
 /// None), every envelope discloses `unbridled`, and — crucially — the L2 OCAP gate
 /// **still denies** an out-of-scope program (authority is kept; only the mechanism
 /// is dropped, ADR 0018 D1).
+///
+/// Unix-only: it spawns the `echo` **binary** to prove the native run. Windows has
+/// no standalone `echo` (it is a `cmd` builtin), so the AppContainer host proves the
+/// same honesty via the denial path in [`unbridled_never_overclaims_kernel_appcontainer`].
+#[cfg(unix)]
 #[tokio::test]
 async fn unbridled_runs_native_discloses_and_still_gates_the_grant() {
     set_unbridled(); // this binary is dedicated to the unbridled posture
@@ -103,8 +108,12 @@ async fn unbridled_runs_native_discloses_and_still_gates_the_grant() {
 /// axis ever claiming `kernel`**. This is the crucial property: even on macOS, where
 /// Seatbelt would otherwise kernel-confine `fs`/`exec`, unbridle must **not**
 /// overclaim. Because both the Linux and the macOS CI jobs run `cargo test
-/// --workspace --all-features`, this one test is the cross-OS matrix assertion (the
-/// Windows/AppContainer leg lands with that host's backend).
+/// --workspace --all-features`, this one test is the Unix cross-OS matrix assertion.
+///
+/// Unix-only: it spawns the `echo` binary. The **Windows/AppContainer leg** is
+/// [`unbridled_never_overclaims_kernel_appcontainer`] below — same honesty guard,
+/// run on the real AppContainer backend via the denial path (no Unix `echo`).
+#[cfg(unix)]
 #[tokio::test]
 async fn unbridled_never_overclaims_kernel_on_any_os() {
     set_unbridled(); // dedicated, isolated marker for this binary
@@ -187,4 +196,71 @@ async fn unbridled_still_owes_step_up_supervised_free() {
         matches!(err, ToolError::Denied { .. }),
         "unbridled must still owe the step-up gesture (Supervised-free): {err:?}"
     );
+}
+
+/// R9 **Windows/AppContainer leg** (ADR 0018 D2 — the delegated per-OS honesty
+/// proof). The Unix legs run on the Linux/macOS CI jobs; this one runs only on a
+/// Windows host with the AppContainer backend, where the overclaim risk is the
+/// *largest*: a **bridled** AppContainer kernel-confines exec deny-all (#123), net
+/// deny-all/loopback (#133), and a restricted fs axis (#51) — four axes that could
+/// each report `kernel`. Unbridle drops the mechanism, so the honest report must be
+/// `sandbox_kind = none` with **no axis claiming `kernel`**, even though the
+/// AppContainer backend is genuinely available on this host.
+///
+/// Uses the **denial path** (exec deny-all ⇒ any program is out of scope ⇒ refused
+/// before any spawn), so it needs no Windows `echo`; the refused envelope still
+/// carries the coarse kind + per-axis report + disclosure — which is what honesty
+/// parity is about (ADR 0018 R9; the macOS test's own rationale).
+#[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+#[tokio::test]
+async fn unbridled_never_overclaims_kernel_appcontainer() {
+    use agent_bridle_core::{best_available_sandbox, SandboxKind, SandboxPolicy};
+
+    set_unbridled(); // dedicated, isolated marker for this binary
+
+    // Precondition: the AppContainer backend really IS available here, so the guard
+    // is meaningful — a bridled run on this host would kernel-confine the axes below.
+    assert_eq!(
+        best_available_sandbox(&Arc::new(SandboxPolicy::default())).kind(),
+        SandboxKind::AppContainer,
+        "this leg must run on the real AppContainer backend"
+    );
+
+    // A grant a BRIDLED AppContainer would kernel-confine on every axis: exec
+    // deny-all → Kernel (#123), net deny-all → Kernel (#133), fs restricted → Kernel
+    // (#51). exec deny-all also means any program is out of scope, so the call is
+    // refused before any spawn.
+    let granted = Caveats {
+        fs_read: Scope::only(["C:/etc".to_string()]),
+        fs_write: Scope::only(["C:/tmp/x".to_string()]),
+        exec: Scope::only([] as [String; 0]),
+        net: Scope::only([] as [String; 0]),
+        ..Caveats::top()
+    };
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "whatever.exe", "args": []}),
+            &ctx(granted),
+        )
+        .await
+        .expect("invoke");
+
+    assert_eq!(
+        out["denied"], true,
+        "exec deny-all ⇒ refused before any spawn: {out}"
+    );
+    assert_eq!(
+        out["sandbox_kind"], "none",
+        "unbridle ⇒ no OS sandbox even though AppContainer is available: {out}"
+    );
+    // The overclaim guard: not one axis may report kernel when unbridled, even
+    // though a bridled AppContainer would kernel-confine each of these.
+    let e = &out["enforcement"];
+    for axis in ["fs_read", "fs_write", "exec", "net"] {
+        assert_ne!(
+            e[axis], "kernel",
+            "unbridle must never claim kernel on {axis} — AppContainer would, bridled: {out}"
+        );
+    }
+    assert_eq!(out["disclosure"]["unbridled"], true, "{out}");
 }

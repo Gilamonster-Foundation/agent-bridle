@@ -7,7 +7,10 @@
 # The `check` job (ubuntu) is the primary matrix. The `check-macos` job
 # (macos-latest, free for public repos) is the ONLY place the macOS-only
 # `SeatbeltSandbox` is compiled and its kernel-enforcement proofs run (ADR 0006 /
-# agent-bridle#50) — it cannot be built or tested from the Linux box.
+# agent-bridle#50) — it cannot be built or tested from the Linux box. Likewise the
+# `check-windows` job (windows-latest) is the ONLY place the Windows-only
+# `AppContainerSandbox` + the `agent-bridle-aclaunch` launcher are compiled and the
+# AppContainer unbridle honesty leg runs (ADR 0009 / agent-bridle#51; ADR 0018 R9).
 
 name: CI
 
@@ -123,3 +126,39 @@ jobs:
         env:
           BRIDLE_REQUIRE_SEATBELT: "1"
         run: cargo test --workspace --exclude agent-bridle-py --all-features
+
+  check-windows:
+    name: Windows — AppContainer L3 backend (clippy + unbridle honesty leg)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `--all-features` turns on `windows-appcontainer` (and the inert Linux/macOS
+      # backends). This is the ONLY job that compiles the Windows-only
+      # `appcontainer_impl` module and the `agent-bridle-aclaunch` launcher —
+      # `cfg(target_os = "windows")` code neither the Linux nor the macOS job builds.
+      # `agent-bridle-py` is excluded (its PyO3 wheel link is handled separately).
+      - name: Clippy (compiles the Windows-only AppContainerSandbox + launcher)
+        run: cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
+
+      # The AppContainer backend's pure honesty proofs (report / sandbox / spawn):
+      # exec-deny-all → Kernel (#123), net deny-all/loopback → Kernel (#133), fs
+      # ACL narrowing (#51), and the `best_available_sandbox` → AppContainer select.
+      - name: Test the AppContainer backend (core proofs)
+        run: cargo test -p agent-bridle-core --features windows-appcontainer
+
+      # The ADR 0018 R9 per-OS honesty leg on the REAL AppContainer backend: an
+      # unbridled run reports `sandbox_kind = none` with no axis claiming `kernel`,
+      # even though a bridled AppContainer would kernel-confine every axis here.
+      # Scoped to the `unbridle` test binary — the shell/web integration suites
+      # assume a Unix host (POSIX paths, the `echo` binary) and run on the other jobs.
+      - name: Unbridle honesty leg on AppContainer (ADR 0018 R9)
+        run: cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test unbridle
