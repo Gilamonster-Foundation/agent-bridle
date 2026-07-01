@@ -41,7 +41,8 @@ use std::time::Duration;
 use agent_bridle_core::{
     best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
     loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial, DenialKind,
-    EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    EnforcementReport, LimitsPolicy, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError,
+    ToolResult,
 };
 use async_trait::async_trait;
 
@@ -50,10 +51,6 @@ use crate::parse::{
     classify, seg_literal, Arg, Command, Redirect, Refusal, Script, ScriptItem, Seg, Sep, StderrTo,
 };
 
-/// Maximum permitted (and default-clamped) wall-clock timeout.
-const MAX_TIMEOUT_SECS: u64 = 300;
-/// Default timeout when the caller does not specify one.
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Cap on captured stdout/stderr returned in the envelope (bytes), so a chatty
 /// command cannot return unbounded output. Streaming caps are a follow-up; the
 /// timeout bounds runaway producers in the meantime.
@@ -267,6 +264,7 @@ pub struct ShellTool {
     spawner: Arc<dyn Spawner>,
     env: Arc<dyn EnvProvider>,
     lister: Arc<dyn DirLister>,
+    limits: LimitsPolicy,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -276,13 +274,22 @@ impl std::fmt::Debug for ShellTool {
 }
 
 impl ShellTool {
-    /// Construct the tool with the real OS spawner, environment, and dir lister.
+    /// Construct the tool with the real OS spawner, environment, and dir lister,
+    /// and the default [`LimitsPolicy`].
     #[must_use]
     pub fn new() -> Self {
+        Self::with_config(LimitsPolicy::default())
+    }
+
+    /// Construct with the real seams and a caller-supplied [`LimitsPolicy`] — the
+    /// configurability seam (agent-bridle#143): tune timeouts / output / glob caps.
+    #[must_use]
+    pub fn with_config(limits: LimitsPolicy) -> Self {
         Self {
             spawner: Arc::new(OsSpawner),
             env: Arc::new(RealEnv),
             lister: Arc::new(RealDirLister),
+            limits,
         }
     }
 
@@ -293,6 +300,7 @@ impl ShellTool {
             spawner,
             env: Arc::new(RealEnv),
             lister: Arc::new(RealDirLister),
+            limits: LimitsPolicy::default(),
         }
     }
 
@@ -305,6 +313,7 @@ impl ShellTool {
             spawner,
             env,
             lister: Arc::new(RealDirLister),
+            limits: LimitsPolicy::default(),
         }
     }
 
@@ -321,6 +330,7 @@ impl ShellTool {
             spawner,
             env,
             lister,
+            limits: LimitsPolicy::default(),
         }
     }
 }
@@ -383,7 +393,7 @@ impl Tool for ShellTool {
                 "timeout_secs": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_TIMEOUT_SECS,
+                    "maximum": self.limits.max_timeout_secs,
                     "description": "Wall-clock timeout bound (not a coordination primitive)."
                 }
             },
@@ -396,7 +406,7 @@ impl Tool for ShellTool {
         args: serde_json::Value,
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
-        let parsed = ShellArgs::parse(&args)?;
+        let parsed = ShellArgs::parse(&args, &self.limits)?;
         // Honest reporting (ADR 0005 D1 / I9 / ADR 0006 D3): report the L3 kind
         // that will actually be enforced for these caveats on this kernel —
         // Landlock when `fs_write` is restricted on a capable Linux build, else
@@ -765,7 +775,7 @@ struct ShellArgs {
 }
 
 impl ShellArgs {
-    fn parse(v: &serde_json::Value) -> ToolResult<Self> {
+    fn parse(v: &serde_json::Value, limits: &LimitsPolicy) -> ToolResult<Self> {
         let obj = v
             .as_object()
             .ok_or_else(|| ToolError::denied("shell args must be a JSON object"))?;
@@ -800,8 +810,8 @@ impl ShellArgs {
         let timeout_secs = obj
             .get("timeout_secs")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .clamp(1, MAX_TIMEOUT_SECS);
+            .unwrap_or(limits.default_timeout_secs)
+            .clamp(1, limits.max_timeout_secs);
 
         match (&program, &cmd) {
             (Some(_), Some(_)) => {
@@ -1698,18 +1708,48 @@ mod tests {
     #[test]
     fn parse_env_field_present_and_absent() {
         // Present → populated (string values only).
-        let parsed = ShellArgs::parse(&serde_json::json!({
-            "program": "echo",
-            "env": { "FOO": "bar", "BAZ": "qux" },
-        }))
+        let parsed = ShellArgs::parse(
+            &serde_json::json!({
+                "program": "echo",
+                "env": { "FOO": "bar", "BAZ": "qux" },
+            }),
+            &agent_bridle_core::LimitsPolicy::default(),
+        )
         .expect("parse");
         assert_eq!(parsed.env.get("FOO").map(String::as_str), Some("bar"));
         assert_eq!(parsed.env.get("BAZ").map(String::as_str), Some("qux"));
         assert_eq!(parsed.env.len(), 2);
 
         // Absent → empty map (existing dispatches are unaffected).
-        let parsed = ShellArgs::parse(&serde_json::json!({ "program": "echo" })).expect("parse");
+        let parsed = ShellArgs::parse(
+            &serde_json::json!({ "program": "echo" }),
+            &agent_bridle_core::LimitsPolicy::default(),
+        )
+        .expect("parse");
         assert!(parsed.env.is_empty(), "absent env defaults to empty");
+    }
+
+    /// #143: the timeout is bounded/defaulted by the configured `LimitsPolicy`,
+    /// not the old hard-coded 300/60. A tuned policy clamps and defaults to its
+    /// own values.
+    #[test]
+    fn parse_timeout_uses_configured_limits() {
+        let limits = agent_bridle_core::LimitsPolicy {
+            max_timeout_secs: 5,
+            default_timeout_secs: 3,
+            ..agent_bridle_core::LimitsPolicy::default()
+        };
+        // A request over the configured max is clamped to it.
+        let over = ShellArgs::parse(
+            &serde_json::json!({ "program": "echo", "timeout_secs": 9999 }),
+            &limits,
+        )
+        .expect("parse");
+        assert_eq!(over.timeout, std::time::Duration::from_secs(5));
+        // No timeout specified → the configured default.
+        let dflt =
+            ShellArgs::parse(&serde_json::json!({ "program": "echo" }), &limits).expect("parse");
+        assert_eq!(dflt.timeout, std::time::Duration::from_secs(3));
     }
 
     /// A fake environment for the `$VAR` tests — exercises the allowlist +
