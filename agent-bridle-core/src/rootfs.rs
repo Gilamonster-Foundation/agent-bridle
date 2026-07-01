@@ -26,30 +26,12 @@ use std::process::Command;
 
 use crate::{Caveats, RootfsPolicy, Scope};
 
-/// Curated DATA paths a permitted program reads at runtime — **never
-/// executables** (so they do not reopen the loader trampoline): locale, timezone,
-/// CA bundles, the resolver/loader config, and the `/dev` + `/proc/self`
-/// essentials. The shared libraries are added *specifically* from the per-binary
-/// `ldd` closure, NOT by binding `/usr/lib` wholesale, so only the `.so`s the
-/// granted binaries actually need are present.
-pub(crate) const DATA_PATHS: &[&str] = &[
-    "/usr/share",
-    "/usr/lib/locale",
-    "/etc/ld.so.cache",
-    "/etc/ld.so.preload",
-    "/etc/alternatives",
-    "/etc/nsswitch.conf",
-    "/etc/localtime",
-    "/etc/resolv.conf",
-    "/etc/ssl",
-    "/etc/ca-certificates",
-    "/proc/self",
-    "/dev/null",
-    "/dev/zero",
-    "/dev/full",
-    "/dev/urandom",
-    "/dev/random",
-];
+// The curated runtime data paths a permitted program reads (locale, timezone, CA
+// bundles, resolver/loader config, `/dev` + `/proc/self` essentials) are supplied
+// by `RootfsPolicy::data_paths` (config.rs) — never executables (so they do not
+// reopen the loader trampoline). The shared libraries are added *specifically*
+// from the per-binary `ldd` closure, NOT by binding `/usr/lib` wholesale, so only
+// the `.so`s the granted binaries actually need are present.
 
 /// The directories a bare program name is resolved against (mirrors the loader's
 /// search, `$PATH` then the configured `fallback`). Only used to find the granted
@@ -216,7 +198,7 @@ fn add_runtime_closure_fallback(
 /// be **confined** (`Only`) — a minimal rootfs is meaningless when any program may
 /// run, so an ambient `exec` is rejected (the caller falls back to the Tier-1
 /// boundary). The plan contains: the resolved granted program files + each one's
-/// `ldd` shared-library closure (incl. the loader) + the curated [`DATA_PATHS`] +
+/// `ldd` shared-library closure (incl. the loader) + the configured data paths +
 /// the granted `fs_read` (ro) / `fs_write` (rw) roots — and nothing else.
 pub fn build_rootfs_plan(effective: &Caveats, rootfs: &RootfsPolicy) -> Result<RootfsPlan, String> {
     let programs = match &effective.exec {

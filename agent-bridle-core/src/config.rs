@@ -209,9 +209,29 @@ pub struct RootfsPolicy {
 impl Default for RootfsPolicy {
     fn default() -> Self {
         Self {
-            // Single source of truth: the rootfs builder reads this policy, and
-            // the policy default IS the const — so the two cannot drift (I5, #144).
-            data_paths: PathList::from_defaults(crate::rootfs::DATA_PATHS),
+            // The curated runtime data paths (formerly `rootfs::DATA_PATHS`).
+            // This policy is the single source of truth — the rootfs builder
+            // reads it directly (I5, #144). Kept here (not in `rootfs.rs`) so the
+            // default is platform-independent: `rootfs` is a Linux-only module,
+            // but `BridleConfig` must construct on every host.
+            data_paths: PathList::from_defaults(&[
+                "/usr/share",
+                "/usr/lib/locale",
+                "/etc/ld.so.cache",
+                "/etc/ld.so.preload",
+                "/etc/alternatives",
+                "/etc/nsswitch.conf",
+                "/etc/localtime",
+                "/etc/resolv.conf",
+                "/etc/ssl",
+                "/etc/ca-certificates",
+                "/proc/self",
+                "/dev/null",
+                "/dev/zero",
+                "/dev/full",
+                "/dev/urandom",
+                "/dev/random",
+            ]),
             search_dirs: to_vec(&[
                 "/usr/local/bin",
                 "/usr/bin",
