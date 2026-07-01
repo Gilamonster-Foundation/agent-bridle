@@ -437,23 +437,28 @@ mod tests {
     /// as the governing kind — effective_sandbox_kind returns None — so the spawn
     /// fails closed via confinement_unenforceable (fs→Interceptor < Kernel).
     /// This is the same fail-closed behavior as SandboxKind::None.
+    /// fs restrictions now engage the AppContainer backend (ACL narrowing, #51).
+    /// AppContainer DOES engage for fs-only caveats — `--fs-read`/`--fs-write` flags
+    /// grant the AppContainer SID access to the workspace paths.
     #[test]
-    fn fs_restricted_under_appcontainer_is_unenforceable_until_acl_wiring() {
+    fn fs_restricted_under_appcontainer_engages_the_launcher() {
         let fs = Caveats {
             fs_write: Scope::only(["/tmp/x".to_string()]),
             ..Caveats::top()
         };
-        // AppContainer does not engage for fs-only (launcher doesn't enforce it).
         let governing = effective_sandbox_kind(SandboxKind::AppContainer, &fs);
         assert_eq!(
             governing,
-            SandboxKind::None,
-            "fs-only must not engage AppContainer"
+            SandboxKind::AppContainer,
+            "fs-only must engage AppContainer (ACL narrowing wired, #51)"
         );
-        // Without a kernel-confining backend, fs→Interceptor → unenforceable.
+        // fs_write is Kernel: DACL grants + AppContainer default deny-user-dirs (#51).
+        let report = enforcement_report(&fs, governing);
+        assert_eq!(report.fs_write, Some(AxisEnforcement::Kernel));
+        // With AppContainer engaged and fs Kernel, confinement is enforceable.
         assert!(
-            confinement_unenforceable(governing, &fs, AxisEnforcement::Advisory),
-            "restricted fs with no kernel backend must fail closed"
+            !confinement_unenforceable(governing, &fs, AxisEnforcement::Advisory),
+            "fs-restricted AppContainer is enforceable (launcher wired)"
         );
     }
 
