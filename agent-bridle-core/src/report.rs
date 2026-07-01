@@ -154,11 +154,14 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             | SandboxKind::Seatbelt
             | SandboxKind::MinimalRootfs
             | SandboxKind::MicroVm => AxisEnforcement::Kernel,
-            // AppContainer: FS ACL narrowing is deferred (#136). Until per-path
-            // ACEs are wired in the launcher the fs axis is NOT kernel-enforced —
-            // only the in-process leash (tool-call boundary) checks it. Reporting
-            // Kernel here would be an honesty overclaim (ADR 0006 / #136).
-            SandboxKind::AppContainer | SandboxKind::None => AxisEnforcement::Interceptor,
+            // AppContainer (#51): per-path ACEs are now wired in the launcher via
+            // Win32 ACL APIs. The container's default deny-all-user-directories
+            // combined with explicit DACL grants makes both read and write Kernel
+            // for user-space paths. System paths remain accessible via
+            // ALL_APPLICATION_PACKAGES (a known limitation documented in ADR 0009),
+            // but write access to system paths is still kernel-denied by NTFS.
+            SandboxKind::AppContainer => AxisEnforcement::Kernel,
+            SandboxKind::None => AxisEnforcement::Interceptor,
         })
     };
     EnforcementReport {
@@ -386,18 +389,18 @@ mod tests {
         assert_eq!(fence_strength(&r), Some(AxisEnforcement::Kernel));
     }
 
-    /// AppContainer honesty (#136): fs is NOT kernel-enforced (ACL narrowing is
-    /// deferred) → Interceptor. net is Kernel only for deny-all (empty scope) — a
-    /// general remote-host allowlist cannot be kernel-expressed without the egress
-    /// proxy (#133), so it stays Advisory. exec stays Interceptor (ACE wiring for
-    /// exec is #123, not yet landed).
+    /// AppContainer (#51): fs ACL narrowing is wired in the launcher. Both fs axes
+    /// are now Kernel (per-path DACL grants + container default deny-user-dirs).
+    /// exec stays Interceptor for non-deny-all (only deny-all → Kernel via #123).
+    /// net stays Advisory for a general remote-host allowlist (no egress proxy yet,
+    /// #133).
     #[test]
-    fn appcontainer_marks_fs_interceptor_exec_interceptor_net_advisory_for_allowlist() {
+    fn appcontainer_marks_fs_kernel_exec_interceptor_net_advisory_for_allowlist() {
         // `fully_restricted()` uses net: Only(["example.com"]) — a non-empty
         // allowlist the launcher cannot kernel-express → Advisory.
         let r = enforcement_report(&fully_restricted(), SandboxKind::AppContainer);
-        assert_eq!(r.fs_read, Some(AxisEnforcement::Interceptor));
-        assert_eq!(r.fs_write, Some(AxisEnforcement::Interceptor));
+        assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
     }

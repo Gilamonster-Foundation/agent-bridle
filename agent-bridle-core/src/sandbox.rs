@@ -287,7 +287,9 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
         {
             SandboxKind::Seatbelt
         }
-        SandboxKind::AppContainer if net_fully_denied(caveats) || exec_fully_denied(caveats) => {
+        SandboxKind::AppContainer
+            if net_fully_denied(caveats) || exec_fully_denied(caveats) || restricts_fs(caveats) =>
+        {
             SandboxKind::AppContainer
         }
         _ => SandboxKind::None,
@@ -340,7 +342,7 @@ pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 pub(crate) mod appcontainer_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{exec_fully_denied, net_fully_denied, Sandbox, SandboxKind};
+    use super::{exec_fully_denied, net_fully_denied, restricts_fs, Sandbox, SandboxKind};
     use crate::{Caveats, Scope, ToolError, ToolResult};
 
     /// Monotonic counter for unique container names (PID + counter → no clock).
@@ -407,11 +409,14 @@ pub(crate) mod appcontainer_impl {
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // The launcher engages when net is fully denied (deny-by-default
-            // network policy via AppContainer) or exec is fully denied (kernel
-            // child-process-creation block via PROCESS_CREATION_CHILD_PROCESS_RESTRICTED).
-            // Filesystem ACL narrowing is deferred (#51/#136).
-            if !net_fully_denied(effective) && !exec_fully_denied(effective) {
+            // The launcher engages when:
+            //  - net is fully denied (deny-by-default network policy)
+            //  - exec is fully denied (kernel child-process-creation block)
+            //  - fs is restricted (ACL grants let the container reach its workspace)
+            if !net_fully_denied(effective)
+                && !exec_fully_denied(effective)
+                && !restricts_fs(effective)
+            {
                 return Ok(Vec::new());
             }
 
@@ -442,6 +447,32 @@ pub(crate) mod appcontainer_impl {
             // it makes, closing the exec axis by OS enforcement (#123).
             if exec_fully_denied(effective) {
                 prefix.push("--no-child-process".to_string());
+            }
+
+            // FS ACL narrowing (#51): grant the AppContainer SID access to the
+            // allowed paths so the container can read/write its workspace.
+            // AppContainers are denied user directories by default; without this
+            // grant the child cannot access its working directory.
+            if let Scope::Only(paths) = &effective.fs_write {
+                for p in paths {
+                    prefix.push("--fs-write".to_string());
+                    prefix.push(p.clone());
+                }
+            }
+            // Read-only paths that are not already covered by fs_write.
+            let write_set: std::collections::HashSet<&str> =
+                if let Scope::Only(paths) = &effective.fs_write {
+                    paths.iter().map(String::as_str).collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            if let Scope::Only(paths) = &effective.fs_read {
+                for p in paths {
+                    if !write_set.contains(p.as_str()) {
+                        prefix.push("--fs-read".to_string());
+                        prefix.push(p.clone());
+                    }
+                }
             }
 
             Ok(prefix)
