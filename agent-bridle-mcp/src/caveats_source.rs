@@ -25,6 +25,14 @@ use agent_bridle::{Caveats, CountBound, Scope};
 /// Environment variable carrying an inline JSON grant.
 const ENV_CAVEATS: &str = "AGENT_BRIDLE_CAVEATS";
 
+/// The bridle **mode** intent (ADR 0018): `unbridle` requests the escape hatch.
+const ENV_MODE: &str = "BRIDLE_MODE";
+/// The unbridle **acknowledgement** — the second key (ADR 0018 D3).
+const ENV_UNBRIDLE_ACK: &str = "AGENT_BRIDLE_UNBRIDLE";
+/// The exact ack token: long and self-describing so it can't be set by muscle
+/// memory or pasted without reading it (ADR 0018 D3).
+const UNBRIDLE_ACK_TOKEN: &str = "i-understand-this-is-dangerous";
+
 /// The fail-closed bottom: no authority on any axis. The dual of `Caveats::top()`
 /// — used as the default when no grant is configured (§9.3). `agent-mesh-protocol`
 /// ships `top()` but no lattice bottom yet; constructed here until it does.
@@ -49,6 +57,13 @@ pub enum CaveatsSource {
     ConfigFile(PathBuf),
     /// No grant configured — defaulted to DENY-ALL (fail-closed, §9.3).
     FailClosedDefault,
+    /// **Unbridled** (ADR 0018): the two-key escape hatch engaged. The configured
+    /// grant is kept (never widened); the L3 confinement mechanism is off. `ack` is
+    /// the acknowledgement token the operator supplied, recorded for the audit trail.
+    Unbridled { ack: String },
+    /// `BRIDLE_MODE=unbridle` was requested **without** the required ack — refused
+    /// and failed closed to DENY-ALL (never a silent unbridle, ADR 0018 D3).
+    UnbridleRefused { reason: String },
 }
 
 /// The resolved leash plus where it came from.
@@ -71,7 +86,52 @@ impl GrantedCaveats {
     pub fn load() -> anyhow::Result<Self> {
         let env = std::env::var(ENV_CAVEATS).ok();
         let home = home_dir();
-        Self::resolve(env.as_deref(), home.as_deref())
+        let base = Self::resolve(env.as_deref(), home.as_deref())?;
+        let mode = std::env::var(ENV_MODE).ok();
+        let ack = std::env::var(ENV_UNBRIDLE_ACK).ok();
+        Ok(Self::apply_unbridle(base, mode.as_deref(), ack.as_deref()))
+    }
+
+    /// Apply the ADR 0018 unbridle escape hatch on top of a resolved grant.
+    ///
+    /// Unbridle needs **both** keys: `BRIDLE_MODE=unbridle` **and**
+    /// `AGENT_BRIDLE_UNBRIDLE=i-understand-this-is-dangerous`. With both, the
+    /// configured grant is **kept unchanged** (never widened to `top()` — authority
+    /// is untouched; only the mechanism is dropped, ADR 0018 D1) and the source is
+    /// stamped [`CaveatsSource::Unbridled`]; the caller must then flip the core
+    /// process marker ([`agent_bridle::set_unbridled`]). With the mode set but the
+    /// ack missing/wrong, it **fails closed** to DENY-ALL with an
+    /// [`CaveatsSource::UnbridleRefused`] provenance — never a silent unbridle.
+    /// Neither key alone does anything. Pure/testable.
+    #[must_use]
+    pub fn apply_unbridle(base: Self, mode: Option<&str>, ack: Option<&str>) -> Self {
+        if mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() != Some("unbridle") {
+            return base; // not requested — leave the resolved grant as-is
+        }
+        if ack == Some(UNBRIDLE_ACK_TOKEN) {
+            Self {
+                caveats: base.caveats, // KEEP the configured grant (not top())
+                source: CaveatsSource::Unbridled {
+                    ack: UNBRIDLE_ACK_TOKEN.to_string(),
+                },
+            }
+        } else {
+            Self {
+                caveats: deny_all(),
+                source: CaveatsSource::UnbridleRefused {
+                    reason: format!(
+                        "{ENV_MODE}=unbridle requires {ENV_UNBRIDLE_ACK}={UNBRIDLE_ACK_TOKEN}"
+                    ),
+                },
+            }
+        }
+    }
+
+    /// Whether this resolution engaged the unbridle escape hatch — the caller flips
+    /// the core process marker only when this is `true`.
+    #[must_use]
+    pub fn is_unbridled(&self) -> bool {
+        matches!(self.source, CaveatsSource::Unbridled { .. })
     }
 
     /// Pure resolution given the (optional) env value and (optional) home dir.
@@ -129,6 +189,21 @@ impl GrantedCaveats {
                  ~/.agent-bridle/config.toml [caveats]) — running DENY-ALL \
                  (fail-closed); every tool is refused. Set ${ENV_CAVEATS} or \
                  [caveats] to grant authority."
+            ),
+            CaveatsSource::Unbridled { .. } => format!(
+                "\n\
+                 ============================ !!! UNBRIDLED !!! ============================\n\
+                 agent-bridle-mcp: the confinement MECHANISM is OFF (ADR 0018) — tools run\n\
+                 NATIVELY, with no OS sandbox. Your configured OCAP grant still gates each\n\
+                 call (advisory) and the human step-up gate still applies; every result\n\
+                 discloses `unbridled`. Acked via ${ENV_UNBRIDLE_ACK}. Unset ${ENV_MODE}\n\
+                 to run confined again.\n\
+                 =========================================================================="
+            ),
+            CaveatsSource::UnbridleRefused { reason } => format!(
+                "agent-bridle-mcp: WARNING — {reason}. REFUSING to unbridle; running \
+                 DENY-ALL (fail-closed). Set ${ENV_UNBRIDLE_ACK}={UNBRIDLE_ACK_TOKEN} to \
+                 unbridle, or unset ${ENV_MODE} to run confined."
             ),
         }
     }
@@ -242,6 +317,79 @@ valid_for_generation = "all"
         assert_eq!(g.caveats.max_calls, CountBound::AtMost(0));
         assert!(g.banner().contains("DENY-ALL"), "banner: {}", g.banner());
         assert!(g.banner().contains("fail-closed"), "banner: {}", g.banner());
+    }
+
+    // ── ADR 0018 unbridle (I12) ──────────────────────────────────────────────
+
+    fn base_grant(caveats: Caveats) -> GrantedCaveats {
+        GrantedCaveats {
+            caveats,
+            source: CaveatsSource::Env,
+        }
+    }
+
+    #[test]
+    fn unbridle_two_key_keeps_the_configured_grant() {
+        let grant = Caveats {
+            exec: Scope::only(["git".to_string()]),
+            ..deny_all()
+        };
+        let g = GrantedCaveats::apply_unbridle(
+            base_grant(grant.clone()),
+            Some("unbridle"),
+            Some("i-understand-this-is-dangerous"),
+        );
+        assert!(g.is_unbridled());
+        assert!(matches!(g.source, CaveatsSource::Unbridled { .. }));
+        // The configured grant is KEPT — unbridle never widens authority to top().
+        assert_eq!(g.caveats, grant);
+        assert_ne!(g.caveats, Caveats::top());
+        assert!(g.banner().contains("UNBRIDLED"), "banner: {}", g.banner());
+    }
+
+    #[test]
+    fn unbridle_without_matching_ack_fails_closed() {
+        // Mode set, ack missing/empty/bare/stale ⇒ hard refusal to DENY-ALL.
+        for ack in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("i-understand"),
+        ] {
+            let g =
+                GrantedCaveats::apply_unbridle(base_grant(Caveats::top()), Some("unbridle"), ack);
+            assert!(
+                matches!(g.source, CaveatsSource::UnbridleRefused { .. }),
+                "ack={ack:?} must be refused"
+            );
+            assert!(!g.is_unbridled());
+            assert_eq!(g.caveats, deny_all(), "refused unbridle fails closed");
+            assert!(g.banner().contains("REFUSING"), "banner: {}", g.banner());
+        }
+    }
+
+    #[test]
+    fn neither_key_alone_unbridles() {
+        let grant = Caveats {
+            exec: Scope::only(["git".to_string()]),
+            ..deny_all()
+        };
+        // The ack without the mode does nothing (two-key).
+        let g1 = GrantedCaveats::apply_unbridle(
+            base_grant(grant.clone()),
+            None,
+            Some("i-understand-this-is-dangerous"),
+        );
+        assert_eq!(g1.source, CaveatsSource::Env);
+        assert!(!g1.is_unbridled());
+        // A non-unbridle mode leaves the resolved grant untouched.
+        let g2 = GrantedCaveats::apply_unbridle(
+            base_grant(grant),
+            Some("bridled"),
+            Some("i-understand-this-is-dangerous"),
+        );
+        assert_eq!(g2.source, CaveatsSource::Env);
     }
 
     #[test]

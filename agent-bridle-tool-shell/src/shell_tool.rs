@@ -40,9 +40,9 @@ use std::time::Duration;
 
 use agent_bridle_core::{
     best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
-    loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial, DenialKind,
-    EnforcementReport, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope,
-    ToolError, ToolResult,
+    is_unbridled, loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial, DenialKind,
+    Disclosure, EnforcementReport, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext,
+    ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -86,6 +86,10 @@ pub(crate) struct SpawnCfg {
     pub audit_sink: Option<String>,
     /// Sandbox read/exec allow-lists + ABI floors ([`SandboxPolicy`]).
     pub sandbox: Arc<SandboxPolicy>,
+    /// Process is **unbridled** (ADR 0018): drop the L3 OS sandbox and run the
+    /// pipeline natively. The L2 grant checks in `invoke` still gate (advisory);
+    /// only the kernel mechanism is skipped. Read once from the process marker.
+    pub unbridled: bool,
 }
 
 pub(crate) trait Spawner: Send + Sync {
@@ -120,6 +124,12 @@ impl Spawner for OsSpawner {
         env: &BTreeMap<String, String>,
         cfg: &SpawnCfg,
     ) -> ToolResult<Captured> {
+        // Unbridled (ADR 0018): the operator explicitly dropped the L3 mechanism —
+        // run natively, no OS sandbox and no egress proxy. The L2 grant checks in
+        // `invoke` already gated this run (advisory); confinement is off by consent.
+        if cfg.unbridled {
+            return run_pipeline(stages, cwd, &[], env, cfg.max_output);
+        }
         // A general remote-host `net` allow-list that cannot be named in SBPL is
         // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
         // to loopback and route it through the proxy. Self-gating — `Some` only
@@ -447,6 +457,12 @@ impl Tool for ShellTool {
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
         let parsed = ShellArgs::parse(&args, &self.limits)?;
+        // Unbridled (ADR 0018): the operator dropped the L3 mechanism. Report
+        // `None` (no OS sandbox) — the per-axis report then honestly shows each
+        // restricted axis at `advisory` (the L2 interceptor, which still gates the
+        // configured grant below), never `kernel`. Authority is unchanged; only the
+        // mechanism is off. Every envelope discloses `unbridled` (D5).
+        let unbridled = is_unbridled();
         // Honest reporting (ADR 0005 D1 / I9 / ADR 0006 D3): report the L3 kind
         // that will actually be enforced for these caveats on this kernel —
         // Landlock when `fs_write` is restricted on a capable Linux build, else
@@ -459,9 +475,13 @@ impl Tool for ShellTool {
         // disagree). The per-axis `net` stays Advisory below (the report is
         // computed from the ORIGINAL grant, whose remote host SBPL cannot confine)
         // — the proxy over-delivers above that floor, it does not raise the claim.
-        let sandbox_kind = match egress_proxy_plan(cx.caveats(), &self.sandbox) {
-            Some((_, fenced)) => intended_sandbox_kind(&fenced, &self.sandbox),
-            None => intended_sandbox_kind(cx.caveats(), &self.sandbox),
+        let sandbox_kind = if unbridled {
+            SandboxKind::None
+        } else {
+            match egress_proxy_plan(cx.caveats(), &self.sandbox) {
+                Some((_, fenced)) => intended_sandbox_kind(&fenced, &self.sandbox),
+                None => intended_sandbox_kind(cx.caveats(), &self.sandbox),
+            }
         };
         // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
         // returns carries the per-axis report alongside the coarse sandbox_kind.
@@ -678,7 +698,12 @@ impl Tool for ShellTool {
         // fail closed when restricted-but-unenforceable (closing the run-unconfined
         // gap the shell shared with ConfinedCommand); exec/net fail closed only for
         // a strong principal (the default floor is permissive).
-        if confinement_unenforceable(sandbox_kind, cx.caveats(), cx.strength_floor()) {
+        // Unbridled skips this fail-closed guard by consent: dropping the L3
+        // mechanism is *exactly* what the operator acknowledged (ADR 0018 D1). The
+        // L2 grant checks above still ran (advisory), and every axis reports
+        // advisory + `disclosure.unbridled` — honest, not silent.
+        if !unbridled && confinement_unenforceable(sandbox_kind, cx.caveats(), cx.strength_floor())
+        {
             return Ok(deny(
                 sandbox_kind,
                 enforcement,
@@ -701,6 +726,12 @@ impl Tool for ShellTool {
             max_output: self.limits.max_output_bytes,
             audit_sink: self.limits.audit_sink.clone(),
             sandbox: Arc::clone(&self.sandbox),
+            unbridled,
+        };
+        // Disclosed on every envelope this run returns (ADR 0018 D5 / I11).
+        let disclosure = Disclosure {
+            unbridled,
+            ..Disclosure::default()
         };
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
@@ -715,6 +746,7 @@ impl Tool for ShellTool {
                     .map_err(|e| ToolError::Other(anyhow::anyhow!("shell task panicked: {e}")))??;
                 Ok(ToolEnvelope::new(sandbox_kind)
                     .with_enforcement(enforcement)
+                    .with_disclosure(disclosure)
                     .with_exit_code(captured.exit_code)
                     .with_truncation(captured.stdout_truncated, captured.stderr_truncated)
                     .with_stdout(captured.stdout)
@@ -724,6 +756,7 @@ impl Tool for ShellTool {
             }
             Err(_elapsed) => Ok(ToolEnvelope::new(sandbox_kind)
                 .with_enforcement(enforcement)
+                .with_disclosure(disclosure)
                 .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
                 .with_timed_out(true)
                 .into_json()),
@@ -787,12 +820,23 @@ fn deny(
 ) -> serde_json::Value {
     ToolEnvelope::new(sandbox_kind)
         .with_enforcement(enforcement)
+        .with_disclosure(unbridle_disclosure())
         .with_denials(vec![Denial {
             kind,
             target: target.to_string(),
             reason: err.to_string(),
         }])
         .into_json()
+}
+
+/// The disclosure block stamped on **every** envelope (ADR 0018 D5): reads the
+/// process-level unbridle marker so a denied/refused result is as honest about
+/// the posture as a successful one.
+fn unbridle_disclosure() -> Disclosure {
+    Disclosure {
+        unbridled: is_unbridled(),
+        ..Disclosure::default()
+    }
 }
 
 /// Build a structured `denied` envelope for a parser [`Refusal`].
@@ -803,6 +847,7 @@ fn refused_envelope(
 ) -> serde_json::Value {
     ToolEnvelope::new(sandbox_kind)
         .with_enforcement(enforcement)
+        .with_disclosure(unbridle_disclosure())
         .with_denials(vec![Denial {
             kind: DenialKind::Exec,
             target: refusal.construct(),
