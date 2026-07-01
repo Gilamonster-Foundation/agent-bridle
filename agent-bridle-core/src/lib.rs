@@ -39,6 +39,7 @@ mod sandbox;
 mod spawn;
 mod step_up;
 mod tool;
+mod unbridle;
 
 pub use config::{
     BackendToggles, BridleConfig, BridleMode, GatePolicy, HostMatch, LimitsPolicy, NetDefault,
@@ -73,6 +74,7 @@ pub use step_up::{
     DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,
 };
 pub use tool::Tool;
+pub use unbridle::{is_unbridled, set_unbridled};
 
 #[cfg(test)]
 mod tests {

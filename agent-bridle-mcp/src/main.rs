@@ -35,6 +35,14 @@ async fn main() -> anyhow::Result<()> {
     let granted = GrantedCaveats::load()?;
     eprintln!("{}", granted.banner());
 
+    // Unbridle (ADR 0018): the loader verified the two-key ack, so flip the core
+    // process marker BEFORE any tool runs. This drops the L3 mechanism (native
+    // execution) while the configured grant + step-up still gate; every result
+    // discloses `unbridled`. Never reached without the acked `Unbridled` source.
+    if granted.is_unbridled() {
+        agent_bridle::set_unbridled();
+    }
+
     // Build the registry for this binary's compiled feature set (shell on by
     // default) and serve it over stdio, confined to the granted leash.
     let server = McpServer::new(registry(), granted.caveats);
