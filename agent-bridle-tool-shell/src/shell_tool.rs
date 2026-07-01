@@ -23,7 +23,7 @@
 //! performs each redirect's open and each glob's directory listing itself, those
 //! filesystem touches are leash-checked (`fs_write`/`fs_read`) *before any stage
 //! spawns*; a `$VAR` is expanded only if its name is on a small secret-free
-//! allowlist ([`VAR_ALLOWLIST`]), checked before any spawn — a real enforcement
+//! allowlist (the configured `var_allowlist`), checked before any spawn — a real enforcement
 //! point, unlike a spawned program's own opens (L3's job). `2>&1` uses a shared
 //! `std::io::pipe()` writer cloned into both stdout and stderr. Process spawning
 //! is behind a [`Spawner`] seam (mocked in unit tests; real path in
@@ -51,21 +51,19 @@ use crate::parse::{
     classify, seg_literal, Arg, Command, Redirect, Refusal, Script, ScriptItem, Seg, Sep, StderrTo,
 };
 
-/// Cap on captured stdout/stderr returned in the envelope (bytes), so a chatty
-/// command cannot return unbounded output. Streaming caps are a follow-up; the
-/// timeout bounds runaway producers in the meantime.
-const MAX_OUTPUT_BYTES: usize = 1 << 20; // 1 MiB
-
 /// What a finished pipeline produced (the last stage's exit code; concatenated
-/// output). The unit of the [`Spawner`] seam.
+/// output). The unit of the [`Spawner`] seam. The captured output is bounded by
+/// the configured cap ([`LimitsPolicy::max_output_bytes`]) so a chatty command
+/// cannot return unbounded output. Streaming caps are a follow-up; the timeout
+/// bounds runaway producers in the meantime.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Captured {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// Whether stdout was clipped at [`MAX_OUTPUT_BYTES`] (more was produced).
+    /// Whether stdout was clipped at the configured output cap (more was produced).
     pub stdout_truncated: bool,
-    /// Whether stderr was clipped at [`MAX_OUTPUT_BYTES`] (more was produced).
+    /// Whether stderr was clipped at the configured output cap (more was produced).
     pub stderr_truncated: bool,
 }
 
@@ -85,12 +83,15 @@ pub(crate) trait Spawner: Send + Sync {
     /// spawner sets these vars on each spawned child (additive over the inherited
     /// ambient env). `env` is structured host input, never model-authored command
     /// text, so it grants no new authority — the exec/fs leash is unaffected.
+    /// `max_output` bounds the captured stdout/stderr (the configured output cap,
+    /// [`LimitsPolicy::max_output_bytes`]).
     fn run(
         &self,
         stages: &[Command],
         cwd: Option<&str>,
         caveats: &Caveats,
         env: &BTreeMap<String, String>,
+        max_output: usize,
     ) -> ToolResult<Captured>;
 }
 
@@ -105,21 +106,22 @@ impl Spawner for OsSpawner {
         cwd: Option<&str>,
         caveats: &Caveats,
         env: &BTreeMap<String, String>,
+        max_output: usize,
     ) -> ToolResult<Captured> {
         // A general remote-host `net` allow-list that cannot be named in SBPL is
         // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
         // to loopback and route it through the proxy. Self-gating — `Some` only
         // where the fence is actually emittable (macOS + seatbelt).
         if let Some((allow_hosts, fenced)) = egress_proxy_plan(caveats) {
-            return run_with_egress_proxy(stages, cwd, &fenced, env, allow_hosts);
+            return run_with_egress_proxy(stages, cwd, &fenced, env, allow_hosts, max_output);
         }
         // When an OS sandbox (Landlock/Seatbelt) will actually confine this run,
         // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
         // 0006 D4). Otherwise run directly — no need to spend a thread.
         if intended_sandbox_kind(caveats) == SandboxKind::None {
-            run_pipeline(stages, cwd, &[], env)
+            run_pipeline(stages, cwd, &[], env, max_output)
         } else {
-            run_confined(stages, cwd, caveats, env)
+            run_confined(stages, cwd, caveats, env, max_output)
         }
     }
 }
@@ -155,6 +157,7 @@ fn run_with_egress_proxy(
     fenced: &Caveats,
     env: &BTreeMap<String, String>,
     allow_hosts: Vec<String>,
+    max_output: usize,
 ) -> ToolResult<Captured> {
     // (1) Fence prefix first (pure, cheap) — fail-closed if the wrapper is gone.
     let prefix = best_available_sandbox().command_prefix(fenced)?;
@@ -181,7 +184,7 @@ fn run_with_egress_proxy(
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox().apply(&fenced)?;
-            run_pipeline(&stages, cwd.as_deref(), &prefix, &env)
+            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output)
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -235,6 +238,7 @@ fn run_confined(
     cwd: Option<&str>,
     caveats: &Caveats,
     env: &BTreeMap<String, String>,
+    max_output: usize,
 ) -> ToolResult<Captured> {
     // Computed before the spawn so a fail-closed wrapper error aborts the run.
     let prefix = best_available_sandbox().command_prefix(caveats)?;
@@ -246,7 +250,7 @@ fn run_confined(
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox().apply(&caveats)?;
-            run_pipeline(&stages, cwd.as_deref(), &prefix, &env)
+            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output)
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -452,18 +456,20 @@ impl Tool for ShellTool {
                     } else {
                         match &arg {
                             Arg::Glob(p) => Some(p.clone()),
-                            Arg::VarGlob(segs) => match expand_varglob(segs, &*self.env) {
-                                Ok(p) => Some(p),
-                                Err((target, e)) => {
-                                    return Ok(deny(
-                                        sandbox_kind,
-                                        enforcement,
-                                        DenialKind::Exec,
-                                        &target,
-                                        &e,
-                                    ))
+                            Arg::VarGlob(segs) => {
+                                match expand_varglob(segs, &*self.env, &self.limits.var_allowlist) {
+                                    Ok(p) => Some(p),
+                                    Err((target, e)) => {
+                                        return Ok(deny(
+                                            sandbox_kind,
+                                            enforcement,
+                                            DenialKind::Exec,
+                                            &target,
+                                            &e,
+                                        ))
+                                    }
                                 }
-                            },
+                            }
                             _ => None,
                         }
                     };
@@ -475,6 +481,8 @@ impl Tool for ShellTool {
                                 parsed.cwd.as_deref(),
                                 &*self.lister,
                                 &mut leash,
+                                self.limits.max_glob_depth,
+                                self.limits.max_glob_matches,
                             ) {
                                 Ok(ms) => new_argv.extend(ms.into_iter().map(Arg::Lit)),
                                 Err(e) => {
@@ -499,7 +507,7 @@ impl Tool for ShellTool {
                         | Redirect::Stdin { path } => path,
                         Redirect::StderrToStdout => continue,
                     };
-                    match expand_redirect_target(segs, &*self.env) {
+                    match expand_redirect_target(segs, &*self.env, &self.limits.var_allowlist) {
                         Ok(resolved) => *segs = vec![Seg::Lit(resolved)],
                         Err((target, e)) => {
                             return Ok(deny(
@@ -572,7 +580,7 @@ impl Tool for ShellTool {
                         Arg::Var(segs) => {
                             for seg in segs {
                                 if let Seg::Var(name) = seg {
-                                    if !is_allowed_var(name) {
+                                    if !is_allowed_var(name, &self.limits.var_allowlist) {
                                         return Ok(deny(
                                             sandbox_kind,
                                             enforcement,
@@ -653,12 +661,20 @@ impl Tool for ShellTool {
         let spawner = Arc::clone(&self.spawner);
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
+        let max_output = self.limits.max_output_bytes;
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
         let env = parsed.env;
         let caveats = cx.caveats().clone();
         let run = tokio::task::spawn_blocking(move || {
-            run_script(&*spawner, &script, cwd.as_deref(), &caveats, &env)
+            run_script(
+                &*spawner,
+                &script,
+                cwd.as_deref(),
+                &caveats,
+                &env,
+                max_output,
+            )
         });
         match tokio::time::timeout(timeout, run).await {
             Ok(joined) => {
@@ -691,6 +707,7 @@ fn run_script(
     cwd: Option<&str>,
     caveats: &Caveats,
     env: &BTreeMap<String, String>,
+    max_output: usize,
 ) -> ToolResult<Captured> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -705,7 +722,7 @@ fn run_script(
             Sep::Or => status != 0,
         };
         if run_it {
-            let captured = spawner.run(&item.pipeline, cwd, caveats, env)?;
+            let captured = spawner.run(&item.pipeline, cwd, caveats, env, max_output)?;
             stdout.push_str(&captured.stdout);
             stderr.push_str(&captured.stderr);
             stdout_truncated |= captured.stdout_truncated;
@@ -715,13 +732,13 @@ fn run_script(
     }
 
     // The concatenation across pipelines may itself exceed the cap; flag that.
-    let stdout_truncated = stdout_truncated || stdout.len() > MAX_OUTPUT_BYTES;
-    let stderr_truncated = stderr_truncated || stderr.len() > MAX_OUTPUT_BYTES;
+    let stdout_truncated = stdout_truncated || stdout.len() > max_output;
+    let stderr_truncated = stderr_truncated || stderr.len() > max_output;
 
     Ok(Captured {
         exit_code: status,
-        stdout: cap_string(stdout),
-        stderr: cap_string(stderr),
+        stdout: cap_string(stdout, max_output),
+        stderr: cap_string(stderr, max_output),
         stdout_truncated,
         stderr_truncated,
     })
@@ -865,20 +882,16 @@ impl ShellArgs {
 /// allowlist-only). Deliberately small and secret-free: no `PATH`, no tokens.
 /// A `$VAR` outside this set is denied — so a confined run can never splice a
 /// secret (e.g. `$AWS_SECRET_KEY`) into an argument, even when `exec` is tight.
-const VAR_ALLOWLIST: &[&str] = &[
-    "HOME", "PWD", "OLDPWD", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "SHELL", "HOSTNAME",
-    "TERM",
-];
-
-/// Whether `name` may be expanded from the environment.
-fn is_allowed_var(name: &str) -> bool {
-    VAR_ALLOWLIST.contains(&name)
+/// Whether `name` may be expanded from the environment, against the configured
+/// allowlist ([`LimitsPolicy::var_allowlist`]).
+fn is_allowed_var(name: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|v| v == name)
 }
 
 /// The environment seam (#46): the engine reads `$VAR` values through this, so the
 /// allowlist + expansion + the resolved-path `fs` leash stay unit-testable
 /// without touching the real process environment (a fake map in tests). Only
-/// allowlisted names ([`VAR_ALLOWLIST`]) are ever read.
+/// allowlisted names (the configured `var_allowlist`) are ever read.
 pub(crate) trait EnvProvider: Send + Sync {
     /// The value of `name`, or `None` if unset.
     fn get(&self, name: &str) -> Option<String>;
@@ -899,13 +912,14 @@ impl EnvProvider for RealEnv {
 fn expand_redirect_target(
     segs: &[Seg],
     env: &dyn EnvProvider,
+    allowlist: &[String],
 ) -> Result<String, (String, ToolError)> {
     let mut out = String::new();
     for seg in segs {
         match seg {
             Seg::Lit(s) => out.push_str(s),
             Seg::Var(name) => {
-                if !is_allowed_var(name) {
+                if !is_allowed_var(name, allowlist) {
                     return Err((
                         format!("${name}"),
                         ToolError::denied(format!(
@@ -929,7 +943,11 @@ fn expand_redirect_target(
 /// single-segment globber then treats the (var-derived) directory as a literal
 /// path and globs only the source-literal basename. A variable in the basename is
 /// refused. `Err((target, reason))` names a non-allowlisted var or the refusal.
-fn expand_varglob(segs: &[Seg], env: &dyn EnvProvider) -> Result<String, (String, ToolError)> {
+fn expand_varglob(
+    segs: &[Seg],
+    env: &dyn EnvProvider,
+    allowlist: &[String],
+) -> Result<String, (String, ToolError)> {
     let mut out = String::new();
     let mut last_var_byte: Option<usize> = None; // byte index of the last var-origin char
     let mut last_slash_byte: Option<usize> = None; // byte index of the last '/'
@@ -944,7 +962,7 @@ fn expand_varglob(segs: &[Seg], env: &dyn EnvProvider) -> Result<String, (String
                 }
             }
             Seg::Var(name) => {
-                if !is_allowed_var(name) {
+                if !is_allowed_var(name, allowlist) {
                     return Err((
                         format!("${name}"),
                         ToolError::denied(format!(
@@ -978,11 +996,6 @@ fn expand_varglob(segs: &[Seg], env: &dyn EnvProvider) -> Result<String, (String
 }
 
 // ── glob expansion (multi-segment + recursive `**`) ─────────────────────────
-
-/// `**` recursion depth cap and total-match cap — bound a pathological walk so a
-/// deep/wide tree can never blow up admission (#47).
-const MAX_GLOB_DEPTH: usize = 64;
-const MAX_GLOB_MATCHES: usize = 4096;
 
 /// One directory entry the glob walker sees: a name and whether it is a directory
 /// (needed to recurse for `**`).
@@ -1038,9 +1051,10 @@ fn descend_all(
     list: &dyn DirLister,
     leash: &mut dyn FnMut(&Path) -> ToolResult<()>,
     depth: usize,
+    max_matches: usize,
     out: &mut Vec<(PathBuf, String)>,
 ) -> ToolResult<()> {
-    if depth == 0 || out.len() >= MAX_GLOB_MATCHES {
+    if depth == 0 || out.len() >= max_matches {
         return Ok(());
     }
     leash(real)?;
@@ -1051,10 +1065,18 @@ fn descend_all(
             let child_real = real.join(&e.name);
             let child_rel = join_rel(rel, &e.name);
             out.push((child_real.clone(), child_rel.clone()));
-            if out.len() >= MAX_GLOB_MATCHES {
+            if out.len() >= max_matches {
                 break;
             }
-            descend_all(&child_real, &child_rel, list, leash, depth - 1, out)?;
+            descend_all(
+                &child_real,
+                &child_rel,
+                list,
+                leash,
+                depth - 1,
+                max_matches,
+                out,
+            )?;
         }
     }
     Ok(())
@@ -1072,6 +1094,8 @@ fn expand_glob_walk(
     cwd: Option<&str>,
     list: &dyn DirLister,
     leash: &mut dyn FnMut(&Path) -> ToolResult<()>,
+    max_depth: usize,
+    max_matches: usize,
 ) -> ToolResult<Vec<String>> {
     let absolute = pattern.starts_with('/');
     let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
@@ -1093,7 +1117,7 @@ fn expand_glob_walk(
         if *seg == "**" {
             for (real, rel) in &frontier {
                 next.push((real.clone(), rel.clone())); // `**` matches zero levels too
-                descend_all(real, rel, list, leash, MAX_GLOB_DEPTH, &mut next)?;
+                descend_all(real, rel, list, leash, max_depth, max_matches, &mut next)?;
             }
         } else {
             let seg_hidden = seg.starts_with('.');
@@ -1104,7 +1128,7 @@ fn expand_glob_walk(
                 for e in entries {
                     if (seg_hidden || !e.name.starts_with('.')) && fnmatch(seg, &e.name) {
                         next.push((real.join(&e.name), join_rel(rel, &e.name)));
-                        if next.len() >= MAX_GLOB_MATCHES {
+                        if next.len() >= max_matches {
                             break;
                         }
                     }
@@ -1265,6 +1289,7 @@ fn run_pipeline(
     cwd: Option<&str>,
     wrap: &[String],
     env: &BTreeMap<String, String>,
+    max_output: usize,
 ) -> ToolResult<Captured> {
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
@@ -1369,7 +1394,7 @@ fn run_pipeline(
 
         if matches!(stage.stderr_disposition(), StderrTo::Capture) {
             let err = child.stderr.take().expect("stderr is piped");
-            stderr_threads.push(std::thread::spawn(move || read_capped(err)));
+            stderr_threads.push(std::thread::spawn(move || read_capped(err, max_output)));
         }
         children.push(child);
     }
@@ -1378,7 +1403,7 @@ fn run_pipeline(
     // the child(ren) exit. Read stdout (bounded by the cap) concurrently with
     // waiting; a child producing past the cap is cut off via EPIPE.
     let stdout_thread =
-        stdout_capture.map(|reader| std::thread::spawn(move || read_capped(reader)));
+        stdout_capture.map(|reader| std::thread::spawn(move || read_capped(reader, max_output)));
 
     // Wait all stages; the pipeline's exit code is the last stage's.
     let mut exit_code = -1;
@@ -1400,12 +1425,12 @@ fn run_pipeline(
     }
     // Concatenated stderr across stages may itself exceed the cap; `capped_utf8`
     // clips it and we flag that too.
-    let stderr_truncated = stderr_truncated || stderr.len() > MAX_OUTPUT_BYTES;
+    let stderr_truncated = stderr_truncated || stderr.len() > max_output;
 
     Ok(Captured {
         exit_code,
-        stdout: capped_utf8(&stdout),
-        stderr: capped_utf8(&stderr),
+        stdout: capped_utf8(&stdout, max_output),
+        stderr: capped_utf8(&stderr, max_output),
         stdout_truncated,
         stderr_truncated,
     })
@@ -1426,7 +1451,7 @@ fn ok_or_kill<T>(result: std::io::Result<T>, children: &mut [Child]) -> ToolResu
     })
 }
 
-/// Read **at most** [`MAX_OUTPUT_BYTES`] from `reader` into memory, then probe one
+/// Read **at most** `max_output` bytes from `reader` into memory, then probe one
 /// more byte to decide whether the source had more. Returns the captured bytes
 /// (≤ cap) and whether it was truncated.
 ///
@@ -1436,32 +1461,30 @@ fn ok_or_kill<T>(result: std::io::Result<T>, children: &mut [Child]) -> ToolResu
 /// remainder is **not** drained: dropping `reader` closes the pipe read end, so a
 /// still-writing child gets `EPIPE`/`SIGPIPE` on its next write (the `| head`
 /// model) rather than blocking us — and we never read past `cap + 1` bytes.
-fn read_capped(mut reader: impl Read) -> (Vec<u8>, bool) {
+fn read_capped(mut reader: impl Read, max_output: usize) -> (Vec<u8>, bool) {
     let mut buf = Vec::new();
     // `take` bounds total bytes read into `buf` to the cap.
-    let _ = (&mut reader)
-        .take(MAX_OUTPUT_BYTES as u64)
-        .read_to_end(&mut buf);
+    let _ = (&mut reader).take(max_output as u64).read_to_end(&mut buf);
     // One probe read: any byte beyond the cap means the source was truncated.
     let mut probe = [0u8; 1];
     let truncated = matches!(reader.read(&mut probe), Ok(n) if n > 0);
     (buf, truncated)
 }
 
-/// Lossy-decode captured output (already bounded to ≤ [`MAX_OUTPUT_BYTES`] by
+/// Lossy-decode captured output (already bounded to ≤ `max_output` by
 /// [`read_capped`]). The `min` is a defensive belt-and-suspenders. Truncation at
 /// a byte boundary is safe: [`String::from_utf8_lossy`] replaces any partial
 /// trailing sequence rather than panicking.
-fn capped_utf8(bytes: &[u8]) -> String {
-    let slice = &bytes[..bytes.len().min(MAX_OUTPUT_BYTES)];
+fn capped_utf8(bytes: &[u8], max_output: usize) -> String {
+    let slice = &bytes[..bytes.len().min(max_output)];
     String::from_utf8_lossy(slice).into_owned()
 }
 
-/// Cap an already-decoded string to [`MAX_OUTPUT_BYTES`] at a char boundary
+/// Cap an already-decoded string to `max_output` at a char boundary
 /// (used for the concatenated output of a multi-pipeline script).
-fn cap_string(mut s: String) -> String {
-    if s.len() > MAX_OUTPUT_BYTES {
-        let mut end = MAX_OUTPUT_BYTES;
+fn cap_string(mut s: String, max_output: usize) -> String {
+    if s.len() > max_output {
+        let mut end = max_output;
         while !s.is_char_boundary(end) {
             end -= 1;
         }
@@ -1513,6 +1536,7 @@ mod tests {
             _cwd: Option<&str>,
             _caveats: &Caveats,
             env: &BTreeMap<String, String>,
+            _max_output: usize,
         ) -> ToolResult<Captured> {
             self.calls.lock().unwrap().push(stages.to_vec());
             self.envs.lock().unwrap().push(env.clone());
@@ -1859,13 +1883,22 @@ mod tests {
     fn expand_varglob_keeps_value_metachars_literal_and_refuses_basename_var() {
         // TMPDIR is allowlisted; give it a value containing a glob metachar.
         let env = FakeEnv(HashMap::from([("TMPDIR".to_string(), "/a*b".to_string())]));
+        let allow = agent_bridle_core::LimitsPolicy::default().var_allowlist;
         // `$TMPDIR/*.rs` → "/a*b/*.rs": the var's `*` is in the dir prefix
         // (literal); only the source `*.rs` basename globs.
-        let pattern =
-            expand_varglob(&[Seg::Var("TMPDIR".into()), Seg::Lit("/*.rs".into())], &env).unwrap();
+        let pattern = expand_varglob(
+            &[Seg::Var("TMPDIR".into()), Seg::Lit("/*.rs".into())],
+            &env,
+            &allow,
+        )
+        .unwrap();
         assert_eq!(pattern, "/a*b/*.rs");
         // A variable in the glob basename is refused (would re-inject metachars).
-        let err = expand_varglob(&[Seg::Var("TMPDIR".into()), Seg::Lit("*.rs".into())], &env);
+        let err = expand_varglob(
+            &[Seg::Var("TMPDIR".into()), Seg::Lit("*.rs".into())],
+            &env,
+            &allow,
+        );
         assert!(err.is_err(), "var in glob basename must be refused");
     }
 
@@ -2190,6 +2223,8 @@ mod tests {
     /// an endless producer.
     #[test]
     fn read_capped_bounds_buffering_and_flags_truncation() {
+        // The default output cap (LimitsPolicy::max_output_bytes == 1 MiB).
+        const CAP: usize = 1 << 20;
         // An endless 'x' source that asserts it is never asked for more than the
         // cap plus a small probe/pipe slack.
         struct Endless {
@@ -2199,27 +2234,23 @@ mod tests {
             fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
                 self.served = self.served.saturating_add(b.len());
                 assert!(
-                    self.served <= MAX_OUTPUT_BYTES + 64 * 1024,
-                    "read_capped over-read {} bytes (cap {MAX_OUTPUT_BYTES})",
+                    self.served <= CAP + 64 * 1024,
+                    "read_capped over-read {} bytes (cap {CAP})",
                     self.served
                 );
                 b.fill(b'x');
                 Ok(b.len())
             }
         }
-        let (buf, truncated) = read_capped(Endless { served: 0 });
-        assert_eq!(
-            buf.len(),
-            MAX_OUTPUT_BYTES,
-            "peak buffering bounded by the cap"
-        );
+        let (buf, truncated) = read_capped(Endless { served: 0 }, CAP);
+        assert_eq!(buf.len(), CAP, "peak buffering bounded by the cap");
         assert!(
             truncated,
             "a source longer than the cap is flagged truncated"
         );
 
         // A short source is captured whole and NOT flagged.
-        let (buf2, trunc2) = read_capped(&b"hello"[..]);
+        let (buf2, trunc2) = read_capped(&b"hello"[..], CAP);
         assert_eq!(buf2, b"hello");
         assert!(!trunc2, "a sub-cap source is not truncated");
     }
@@ -2242,17 +2273,17 @@ mod tests {
         let mut allow = |_d: &Path| Ok(());
         // *.rs matches the two .rs files (sorted), hidden excluded.
         assert_eq!(
-            expand_glob_walk("*.rs", None, &*lister, &mut allow).unwrap(),
+            expand_glob_walk("*.rs", None, &*lister, &mut allow, 64, 4096).unwrap(),
             vec!["a.rs", "b.rs"]
         );
         // No match → the literal pattern (nullglob off).
         assert_eq!(
-            expand_glob_walk("zzz*", None, &*lister, &mut allow).unwrap(),
+            expand_glob_walk("zzz*", None, &*lister, &mut allow, 64, 4096).unwrap(),
             vec!["zzz*"]
         );
         // Sub-path keeps the directory prefix on each match.
         assert_eq!(
-            expand_glob_walk("src/*.rs", None, &*lister, &mut allow).unwrap(),
+            expand_glob_walk("src/*.rs", None, &*lister, &mut allow, 64, 4096).unwrap(),
             vec!["src/a.rs", "src/b.rs"]
         );
     }
@@ -2271,12 +2302,12 @@ mod tests {
         let mut allow = |_d: &Path| Ok(());
         // Multi-segment: `*/foo.rs` matches only where foo.rs exists.
         assert_eq!(
-            expand_glob_walk("*/foo.rs", None, &*lister, &mut allow).unwrap(),
+            expand_glob_walk("*/foo.rs", None, &*lister, &mut allow, 64, 4096).unwrap(),
             vec!["a/foo.rs"]
         );
         // Recursive `**`: `*.rs` at every level (cwd + all subdirs).
         assert_eq!(
-            expand_glob_walk("**/*.rs", None, &*lister, &mut allow).unwrap(),
+            expand_glob_walk("**/*.rs", None, &*lister, &mut allow, 64, 4096).unwrap(),
             vec!["a/foo.rs", "a/sub/deep.rs", "b/bar.rs", "x.rs"]
         );
     }
@@ -2296,6 +2327,61 @@ mod tests {
                 Ok(())
             }
         };
-        assert!(expand_glob_walk("**/*.rs", None, &*lister, &mut deny_a).is_err());
+        assert!(expand_glob_walk("**/*.rs", None, &*lister, &mut deny_a, 64, 4096).is_err());
+    }
+
+    /// #143: the total-match cap is config-driven, not a hard-coded const — a
+    /// `max_matches` of 2 truncates a 4-match single-segment glob.
+    #[test]
+    fn glob_walk_respects_configured_match_cap() {
+        let lister = map_lister(&[(
+            ".",
+            vec![
+                ent("a.rs", false),
+                ent("b.rs", false),
+                ent("c.rs", false),
+                ent("d.rs", false),
+            ],
+        )]);
+        let mut allow = |_d: &Path| Ok(());
+        let got = expand_glob_walk("*.rs", None, &*lister, &mut allow, 64, 2).unwrap();
+        assert_eq!(got.len(), 2, "match cap of 2 must bound the result set");
+    }
+
+    /// #143: the `**` recursion-depth cap is config-driven — a `max_depth` of 1
+    /// descends a single level and never reaches the deeper `sub` directory.
+    #[test]
+    fn glob_walk_respects_configured_depth_cap() {
+        let lister = map_lister(&[
+            (".", vec![ent("a", true), ent("x.rs", false)]),
+            ("./a", vec![ent("foo.rs", false), ent("sub", true)]),
+            ("./a/sub", vec![ent("deep.rs", false)]),
+        ]);
+        let mut allow = |_d: &Path| Ok(());
+        // depth 1: cwd + one level of dirs; `a/sub/deep.rs` is out of reach.
+        let got = expand_glob_walk("**/*.rs", None, &*lister, &mut allow, 1, 4096).unwrap();
+        assert!(
+            !got.iter().any(|m| m.contains("deep.rs")),
+            "depth cap of 1 must not reach a/sub/deep.rs; got {got:?}"
+        );
+    }
+
+    /// #143: the variable allowlist is config-driven — a name absent from the
+    /// default set is expandable when configured, and a default name is denied
+    /// when configured out. Proves `is_allowed_var` reads the passed allowlist.
+    #[test]
+    fn var_allowlist_is_config_driven() {
+        // A custom var (not in the default set) is allowed when configured.
+        let allow_custom = vec!["MY_CUSTOM_VAR".to_string()];
+        let env = FakeEnv(HashMap::from([(
+            "MY_CUSTOM_VAR".to_string(),
+            "/data".to_string(),
+        )]));
+        let out = expand_redirect_target(&[Seg::Var("MY_CUSTOM_VAR".into())], &env, &allow_custom)
+            .unwrap();
+        assert_eq!(out, "/data");
+        // A default-allowlisted name (HOME) is denied when configured out.
+        assert!(!is_allowed_var("HOME", &["PWD".to_string()]));
+        assert!(is_allowed_var("PWD", &["PWD".to_string()]));
     }
 }
