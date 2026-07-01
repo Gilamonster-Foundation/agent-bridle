@@ -2,9 +2,10 @@
 # agent-bridle pre-push hook — the local equivalent of CI gates.
 #
 # PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml and the `check` /
-# `publish-check` / `py-test` recipes in justfile. When editing the
+# `check-windows` / `publish-check` / `py-test` recipes in justfile. When editing the
 # lint/format/test/publish/python steps here, verify it still matches the CI
-# workflow and the justfile (HOOK PARITY rule).
+# workflow and the justfile (HOOK PARITY rule). `check-windows` only does real work
+# on a Windows host (the AppContainer backend is Windows-only) and skips elsewhere.
 #
 # Do NOT bypass with --no-verify. If this fails, fix the issue.
 
@@ -12,6 +13,9 @@ set -euo pipefail
 
 echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, full matrix)"
 just check
+
+echo "[pre-push] running 'just check-windows' (AppContainer backend + kernel proofs; skips off Windows)"
+just check-windows
 
 echo "[pre-push] running coverage gate (skips gracefully if cargo-llvm-cov absent)"
 just cov-ci

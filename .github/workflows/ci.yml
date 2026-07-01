@@ -177,6 +177,9 @@ jobs:
       - name: AppContainer net-axis kernel proofs (require the boundary)
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
+          # This runner is elevated, so require the loopback-exemption proof too
+          # (a non-elevated dev box skips it via `just check-windows`).
+          BRIDLE_REQUIRE_ELEVATED: "1"
         run: cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1
 
       # The ADR 0018 R9 per-OS honesty leg on the REAL AppContainer backend: an

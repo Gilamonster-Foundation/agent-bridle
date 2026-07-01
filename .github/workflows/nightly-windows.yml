@@ -1,0 +1,55 @@
+name: nightly-windows
+
+# Scheduled Windows AppContainer verification. The push/PR `CI` workflow already runs
+# the `check-windows` job on every change; this nightly run catches intermittent
+# AppContainer / kernel-proof flakiness and regressions on days with no pushes, and
+# re-exercises the real kernel boundary on a fresh runner image. The `nightly-windows`
+# repo label tracks issues that need this host to verify.
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  windows-appcontainer:
+    name: nightly — Windows AppContainer backend + kernel proofs
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (Windows-only AppContainerSandbox + launcher)
+        run: cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
+
+      - name: Test the AppContainer backend (core proofs)
+        run: cargo test -p agent-bridle-core --features windows-appcontainer
+
+      - name: Test the agent-bridle-aclaunch launcher (unit)
+        run: cargo test -p agent-bridle-aclaunch --bins
+
+      # Real kernel-enforcement proofs — hard-required (BRIDLE_REQUIRE_APPCONTAINER),
+      # one cargo invocation per step so each exit code is checked independently.
+      - name: AppContainer fs/exec kernel proofs (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1
+
+      - name: AppContainer net-axis kernel proofs (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+          BRIDLE_REQUIRE_ELEVATED: "1" # runner is elevated → require the loopback proof
+        run: cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1

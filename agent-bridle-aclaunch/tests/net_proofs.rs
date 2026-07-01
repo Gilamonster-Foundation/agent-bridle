@@ -146,13 +146,17 @@ fn net_loopback_exemption_permits_loopback() {
     if skip_proof_unless_appcontainer() {
         return;
     }
-    let required = std::env::var("BRIDLE_REQUIRE_APPCONTAINER")
+    // Elevation is a *separate* requirement from "AppContainer must work": a normal
+    // dev host (non-elevated) can run every other proof but not this one. So the
+    // hard-require is its own flag, BRIDLE_REQUIRE_ELEVATED, which the (elevated) CI
+    // runner sets — `just check-windows` on a non-elevated box skips this gracefully.
+    let require_elevated = std::env::var("BRIDLE_REQUIRE_ELEVATED")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
     if !elevated() {
-        if required {
+        if require_elevated {
             panic!(
-                "BRIDLE_REQUIRE_APPCONTAINER is set but this token is not elevated — the \
+                "BRIDLE_REQUIRE_ELEVATED is set but this token is not elevated — the \
                  loopback-exemption proof needs admin (NetworkIsolationSetAppContainerConfig)"
             );
         }

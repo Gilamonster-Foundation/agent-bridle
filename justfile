@@ -29,6 +29,28 @@ check:
     cargo test --workspace --all-features
     cargo test --workspace --no-default-features
 
+# Windows AppContainer L3 backend checks — the local mirror of the `check-windows`
+# job in .github/workflows/ci.yml (and nightly-windows.yml). The `appcontainer_impl`
+# module and the `agent-bridle-aclaunch` launcher only compile on Windows, so this
+# skips gracefully on a non-Windows host (like py-test/cov-ci). BRIDLE_REQUIRE_APPCONTAINER
+# makes the fs/exec/net kernel proofs hard-FAIL if a container cannot be created,
+# matching the CI job (#74 parity).
+#
+# HOOK PARITY: run by .githooks/pre-push and mirrored by the `check-windows` CI job.
+check-windows:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*|Windows_NT) ;;
+        *) echo "not a Windows host — skipping check-windows (AppContainer backend is Windows-only)"; exit 0 ;;
+    esac
+    set -e
+    cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
+    cargo test -p agent-bridle-core --features windows-appcontainer
+    cargo test -p agent-bridle-aclaunch --bins
+    BRIDLE_REQUIRE_APPCONTAINER=1 cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1
+    BRIDLE_REQUIRE_APPCONTAINER=1 cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1
+
 # Coverage gate. Uses cargo-llvm-cov if installed; skips gracefully otherwise
 # so the recipe never blocks a machine that lacks the tool. Also skips when
 # there are no tests yet (e.g. a fresh scaffold) — llvm-cov reports "no
