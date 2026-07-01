@@ -1,4 +1,4 @@
-# ADR 0018 — First-class "unbridle": an honest, acknowledged, loud confinement-off mode
+# ADR 0018 — First-class "unbridle": an honest, acknowledged, loud escape hatch that drops the confinement *mechanism* while keeping the OCAP authority + human gate
 
 - Status: **Proposed** (2026-07-01) — for review; do not implement until ratified
 - Date: 2026-07-01
@@ -14,43 +14,70 @@
   (authority≠mechanism, enforcement≠disclosure; D8 in particular). Cross-refs the
   fail-open work (#158) and the caveats source
   (`agent-bridle-mcp/src/caveats_source.rs`).
-- **Reviewer refinements (2026-07-01).** Review of the D1–D7 draft surfaced that
-  unbridle and the **step-up / human-gesture axis** (ADR 0007) are orthogonal, and
-  that the draft collapses them into a single "free" state. This revision adds
-  **D8–D11** (the two-axis model, the mode lattice, the second ack for removing the
-  human, and disclosure of the human-gate posture), resolves the two open questions
-  in D3/D5, and appends a **ratification roadmap** (the issue series that walks the
-  platform to make the vision real). The canonical ack token is updated to
-  `i-understand-this-is-dangerous` (D3).
+- **Why it exists (the real purpose).** Unbridle is a pragmatic **escape hatch**.
+  We cannot assume the bridled tool set + confinement mechanism will ever be able
+  to accomplish *every* task an operator needs — some jobs require reaching for the
+  host's real shell/tools in ways the confined tier does not (yet) support. Rather
+  than block the operator or pretend coverage is complete, unbridle lets a human
+  **explicitly** drop the *confinement mechanism* so the agent can use the native
+  shell/tools — while the **OCAP authority gate and the human step-up gate stay in
+  force**. It is "get unstuck," not "turn off security."
+- **Reviewer refinements (2026-07-01).** Two rounds. Round 1 surfaced that unbridle
+  and the **step-up / human-gesture axis** (ADR 0007) are orthogonal (→ D8–D11: the
+  two-axis model, the mode lattice, the autonomous ack, human-gate disclosure) and
+  resolved the D3/D5 open questions; the ack token is `i-understand-this-is-dangerous`
+  (D3). Round 2 (this revision) corrects the **capability pole**: unbridle **keeps
+  the operator's configured `Caveats` grant** and drops only the *mechanism*
+  (`sandbox_kind`, `strength_floor`) — it does **not** resolve to `Caveats::top()`.
+  That is what preserves "permission gating stays on" (D1/D2), and it is the
+  authority≠mechanism split (ADR 0017 D1) applied literally.
 
 ## Question
 
-How do we provide a **complete confinement-off switch** that (a) never weakens the
-honesty guarantees (no envelope may claim confinement it does not have), (b) is
-**impossible to reach by accident or omission**, (c) is **loud** and auditable,
-and (d) adds **no second authority channel** and no second `ToolContext::mint`
+How do we provide an **escape hatch that drops the confinement *mechanism*** — so
+the agent can use the host's native shell/tools when the confined tier can't do the
+job — while (a) **keeping permission gating on** (the OCAP authority grant + the
+human step-up gate still govern what the agent may do), (b) never weakening the
+honesty guarantees (no envelope may claim confinement it does not have), (c) being
+**impossible to reach by accident or omission**, (d) being **loud** and auditable,
+and (e) adding **no second authority channel** and no second `ToolContext::mint`
 path?
 
 ## Decision
 
-### D1 — Unbridle is a resolution-layer *mode*, not a new code path
+### D1 — Unbridle drops the *mechanism*, keeps the *authority* (a resolution-layer mode)
 
-`BridleMode::Unbridle` resolves — **in the loader**, before any tool runs — to a
-principal of `granted = Caveats::top()`, `strength_floor = Advisory`, and
-`sandbox_kind = None`. There is **no** `bypass_checks`, no `UnsafeToolContext`, no
-second mint site. The existing `Gate::authorize` chokepoint runs unchanged; with
-`granted = top()`, `effective = granted.meet(required)` simply yields exactly what
-each tool asks for. Unbridle changes **zero** lines in `gate.rs` / `context.rs` /
-`report.rs`.
+`BridleMode::Unbridle` resolves — **in the loader**, before any tool runs — to
+`strength_floor = Advisory` and `sandbox_kind = None` (**no** Landlock / Seatbelt /
+AppContainer / jail / micro-VM), so the agent runs the host's **native** shell and
+tools, unconfined by the kernel. It **keeps the operator's configured `granted`
+`Caveats` unchanged** — it does **not** resolve to `Caveats::top()`. There is **no**
+`bypass_checks`, no `UnsafeToolContext`, no second mint site; `Gate::authorize`
+runs exactly as always (`effective = granted.meet(required)`).
+
+Because `granted` is preserved, the **in-process (L2) OCAP gate still gates**: an
+`exec`/`open`/`net` outside the configured grant is still **denied** — now at
+*advisory / interceptor* grade (there is no kernel backstop), not silently. Only
+the *mechanism* (the L3 OS sandbox) is dropped; the *authority* channel is
+untouched (ADR 0017 D1). This is the "get-unstuck escape hatch that still gates"
+the operator asked for; the step-up/human axis (D8) is likewise untouched.
+
+*Deliberately out of scope:* a "drop the authority too" mode (`granted = top()`,
+no permission gating at all) is **not** what `--unbridle` does. If ever wanted it
+would be a further, even-louder escalation with its own ack — analogous to the
+autonomous no-step-up ack (D10) — not folded into this mode.
 
 ### D2 — Honest by construction (it cannot lie)
 
-Because `top()` restricts nothing, `enforcement_report` is empty and
-`sandbox_kind = None` — the run is *structurally incapable* of claiming
-confinement. The honesty lattice (ADR 0004/0012) needs no special-case: there is
-nothing to overclaim. This is why unbridle is safe to add without touching the
-enforcement core — it lives entirely at the authority-resolution layer (ADR 0017
-D1: authority ≠ mechanism).
+With `sandbox_kind = None`, `enforcement_report` reports each *restricted* axis at
+its **achieved** grade — `advisory`/`interceptor` (the L2 leash), **never**
+`kernel` (nothing is kernel-enforced). It is not "empty": a confined `fs_read` grant
+still shows `fs_read = advisory`, honestly telling the operator the data axis is
+gated but not kernel-backed. The honesty lattice (ADR 0004/0012) needs no
+special-case — with no OS backend, no axis can derive `kernel`, so the mode is
+structurally incapable of overclaiming. This is why unbridle touches **zero** lines
+of the enforcement core: it changes only the *mechanism* inputs (`sandbox_kind`,
+`strength_floor`), never the report's derivation.
 
 ### D3 — Never by omission: a two-key, acknowledged opt-in (fail-closed absence)
 
@@ -91,8 +118,8 @@ gains an `Unbridled` arm (D5).
   so downstream consumers and logs always see it — never quiet.
 
 > **Resolved (2026-07-01, review).** A process-level marker, set once by the loader
-> at startup from the acked mode (**not** inferred from `top()`+`None` — a normal
-> permissive `Caveats::top()` grant is *not* "unbridled"), read when a tool builds
+> at startup from the acked mode (**not** inferred from `sandbox_kind == None` — a
+> legitimately-unconfined or permissively-granted run is *not* "unbridled"), read when a tool builds
 > its `ToolEnvelope`. It is a **process mechanism, not per-invocation authority**, so
 > it does not ride `ToolContext` (authority≠mechanism, ADR 0017 D1 stays intact). The
 > same marker carries the **human-gate posture** so the envelope can distinguish the
@@ -116,15 +143,16 @@ tokens, distinct disclosure fields).
 
 ### D8 — Unbridle is *one* axis; step-up (the human gesture) is the orthogonal second
 
-Unbridle collapses only the **capability/sandbox axis** (`granted`,
-`strength_floor`, `sandbox_kind` → `top()`/`Advisory`/`None`). It does **not** touch
+Unbridle collapses only the **confinement-mechanism axis** (`strength_floor`,
+`sandbox_kind` → `Advisory`/`None`; `granted` is kept, D1). It does **not** touch
 the **step-up axis** (ADR 0007): the `StepUpPolicy` + `DischargeProvider` gesture
 ceremony the *host* orchestrates. Step-up is **caveat-independent by construction** —
 `step_up.rs`: *"Caveats decides whether the authority exists, this decides what
-gesture admits its use."* An unbridled principal (`granted = top()`) can therefore
-**still** owe a `Passkey`/FIDO gesture for a host-designated HIGH-consequence act,
-because `Gate::evaluate` derives `NeedsDischarge` from the `StepUpPolicy`, not from
-the caveats (ADR 0007 D1/D2).
+gesture admits its use."* An unbridled principal can therefore **still** owe a
+`Passkey`/FIDO gesture for a host-designated HIGH-consequence act, because
+`Gate::evaluate` derives `NeedsDischarge` from the `StepUpPolicy`, not from the
+caveats (ADR 0007 D1/D2) — and with the kernel sandbox gone, that human gesture is
+the *primary* guardrail on a dangerous act.
 
 The consequence Shawn's review asked for: **unbridle removes the *machine* leash; it
 does not remove the *human* leash unless the human is removed too (D10).** "Free to
@@ -146,7 +174,7 @@ The capability axis (D1) and the human-gesture axis (D8) compose into four postu
 | capability axis ↓ / human axis → | **step-up in force** (host runs the gesture ceremony) | **no step-up in force** |
 | --- | --- | --- |
 | **bridled** (`effective ⊑ policy`, `sandbox_kind ≠ None`) | **Guarded** — default: machine leash **and** human leash | **Confined-headless** — sandbox holds; no gestures (CI) |
-| **unbridled** (`top()`, `None`) | **Supervised-free** — no machine leash, but FIDO still gates HIGH-consequence acts | **Autonomous** (`--yolo`) — no machine leash, no human gate |
+| **unbridled** (mechanism off: `sandbox_kind = None`, configured grant kept → advisory) | **Supervised-free** — no *kernel* leash, but the OCAP grant still gates (advisory) **and** FIDO still gates HIGH-consequence acts | **Autonomous** (`--yolo`) — no kernel leash, no human gate (OCAP grant still advisory-gates) |
 
 **"No step-up in force" is reached two different ways — this distinction is
 load-bearing.** *Step-up **absent*** — no gesture ceremony is wired at all (the
@@ -177,12 +205,15 @@ mechanism-degradation escape for one integration (the brush `CommandInterceptor`
 hook being absent), off-grid per D7. Folding it into the mode grid is precisely the
 conflation this ADR forbids.
 
-On the `--ocap-disabled` spelling raised in review: under D1, unbridle already makes
-capability enforcement a **no-op** (`top()` has nothing to attenuate), so a separate
-"disable OCAP" toggle would subtract nothing on the capability axis. The only thing
-left to turn off is **step-up** — which is D10. We therefore name the human-gesture
-axis directly and **do not** introduce an `--ocap-disabled` flag (it would be a
-redundant, confusing alias for "unbridled").
+On the `--ocap-disabled` spelling raised in review: under the corrected D1, unbridle
+does **not** disable OCAP — it keeps the configured grant and gates it at *advisory*
+grade (only the kernel *mechanism* is dropped). A true "disable OCAP" (resolve to
+`top()`, no permission gating at all) is a *different, stronger* thing — the
+deliberately out-of-scope authority-off escalation noted in D1. We do **not** offer
+it as part of `--unbridle`: the escape hatch keeps the authority gate on by design.
+The remaining knob on the human axis is **step-up**, turned off only via D10. So the
+flag surface is: `--unbridle` (mechanism off, authority + step-up kept) and the D10
+autonomous ack (also drop the human) — no `--ocap-disabled`.
 
 ### D10 — Removing the human too costs a *second* key (the autonomous ack)
 
@@ -209,32 +240,41 @@ run is unbridled.
 
 ## Consequences
 
-- **Positive:** a clean, honest, auditable off-switch with *zero* blast radius on
-  the security core (no gate/context/report changes); composes with the existing
-  provenance, banner, and I11 disclosure; satisfies the operator's "completely
-  unbridle" requirement without a second authority path.
-- **Negative / residual risk:** an unbridled process has **no** confinement — the
-  two-key opt-in, the shouting banner, and the per-envelope disclosure are the
-  mitigations against silent misuse. The ack token is a **footgun-guard, not a
-  security boundary** (an operator who can set env on their own machine can
-  unbridle by definition; the goal is to make it impossible to do *by accident*,
-  and impossible to do *quietly*).
-- **Honesty invariant upheld:** because unbridle yields `top()` + `None`, no
-  envelope can claim confinement — the mode cannot produce a dishonest report.
+- **Positive:** a clean, honest, auditable **escape hatch** with *zero* blast radius
+  on the security core (no gate/context/report changes); the agent can use the host's
+  native shell/tools to accomplish what the confined tier can't, while the OCAP grant
+  (advisory) **and** the human step-up gate still govern it; composes with the
+  existing provenance, banner, and I11 disclosure — no second authority path.
+- **Negative / residual risk:** an unbridled process has **no kernel confinement** —
+  the L2 OCAP gate is advisory (a determined native process could ignore an
+  in-process leash), so the real backstops become the human step-up gate (D8) and
+  the audit/disclosure trail. The two-key opt-in, the shouting banner, and the
+  per-envelope disclosure are the mitigations against silent misuse. The ack token
+  is a **footgun-guard, not a security boundary** (an operator who can set env on
+  their own machine can unbridle by definition; the goal is to make it impossible to
+  do *by accident* and impossible to do *quietly*).
+- **Honesty invariant upheld:** with `sandbox_kind = None` no axis can derive
+  `kernel`, so the mode cannot overclaim; the report honestly shows each restricted
+  axis at *advisory* grade (not "empty").
 
 ## Implementation sketch (I12 / #151, after ratification)
 
-1. Loader: on `BridleMode::Unbridle`, read `AGENT_BRIDLE_UNBRIDLE`; if it equals
-   the ack token, resolve `GrantedCaveats { caveats: Caveats::top(), source:
-   CaveatsSource::Unbridled { ack } }`; otherwise hard-fail closed with a message.
+1. Loader: on `BridleMode::Unbridle`, read `AGENT_BRIDLE_UNBRIDLE`; if it equals the
+   ack token, **keep the already-resolved `granted` `Caveats`** and stamp
+   `CaveatsSource::Unbridled { ack }`, then drop the mechanism (`strength_floor =
+   Advisory`, force `sandbox_kind = None` at the spawn/report seam — no OS backend
+   selected); otherwise hard-fail closed with a message. Note: `granted` is **not**
+   replaced with `Caveats::top()`.
 2. `GrantedCaveats::banner()`: add the shouting `Unbridled` arm; call it at startup.
 3. A process-level `Unbridled` marker (set by the loader) that tool envelope
    construction reads to stamp `disclosure.unbridled = true` (D5, resolved; extended
    by D11 to also stamp `disclosure.human_gate`).
-4. Tests: `top()`+`None` ⇒ empty report / no confinement claim; ack required
-   (missing ack fails closed; bare `=1` rejected); provenance is `Unbridled`, never
-   `FailClosedDefault`; `disclosure.unbridled` on every envelope; the gate remains
-   the only mint path.
+4. Tests: with `sandbox_kind = None`, a *restricted* axis reports `advisory` (never
+   `kernel`, never empty); the configured grant **still denies** an out-of-scope
+   `exec`/`open` (advisory) — unbridle did not widen authority; ack required (missing
+   ack fails closed; bare `=1` / the old `=i-understand` rejected); provenance is
+   `Unbridled`, never `FailClosedDefault`; `disclosure.unbridled` on every envelope;
+   the gate remains the only mint path.
 
 Note: the sketch covers D1–D6 (I12 / #151, roadmap **R1**). D8–D11 add work beyond
 #151 — most importantly threading step-up into the default dispatch path (**R2**) so
@@ -270,9 +310,9 @@ issues:
       and a process-level marker that stamps disclosure.unbridled on every envelope.
     acceptance:
       - "mode=unbridle without a matching ack (missing / empty / =1 / old =i-understand) fails closed loudly"
-      - "resolved principal is top() + Advisory + None; enforcement_report is empty"
+      - "resolved principal KEEPS the configured granted Caveats (NOT top()) + Advisory + None; a restricted axis reports advisory (never kernel, never empty), and an out-of-scope exec/open is still denied (advisory)"
       - "provenance is CaveatsSource::Unbridled{ack}, never FailClosedDefault or Env"
-      - "disclosure.unbridled=true on every envelope, driven by the acked mode (not inferred from top()+None)"
+      - "disclosure.unbridled=true on every envelope, driven by the acked mode (not inferred from sandbox_kind==None)"
       - "Gate::authorize remains the only mint site; gate.rs / context.rs / report.rs unchanged"
 
   - id: R2
@@ -301,8 +341,8 @@ issues:
     labels: [security, step-up, unbridle, test]
     summary: >
       Ensure unbridle resolution (R1) does not clear or bypass the host's StepUpPolicy,
-      and pin it with regression tests: an unbridled principal (top()) with a Passkey
-      selector still yields NeedsDischarge.
+      and pin it with regression tests: an unbridled principal (configured grant kept)
+      with a Passkey selector still yields NeedsDischarge.
     acceptance:
       - "unbridled + Passkey selector ⇒ NeedsDischarge (Supervised-free posture holds)"
       - "test asserts caveat-independence: top() caveats do not lower the presence floor"
@@ -396,13 +436,14 @@ issues:
     decisions: [D2]
     labels: [security, honesty, ci]
     summary: >
-      Assert that an unbridled run reports sandbox_kind=None and an empty enforcement
-      report identically on every OS backend, and that the capability matrix (ADR 0004
-      D1 / #30) records no confinement claim under unbridle on each host.
+      Assert that an unbridled run reports sandbox_kind=None with every restricted axis
+      at advisory grade (never kernel) identically on every OS backend, and that the
+      capability matrix (ADR 0004 D1 / #30) records no *kernel* claim under unbridle on
+      each host while the configured grant still advisory-gates.
     acceptance:
-      - "unbridle yields None + empty report on Linux, macOS, and Windows"
-      - "CI matrix asserts the reported posture matches the host's true (nil) confinement under unbridle"
-      - "no backend overclaims when unbridled"
+      - "unbridle yields sandbox_kind=None with restricted axes at advisory (never kernel) on Linux, macOS, and Windows"
+      - "CI matrix asserts the reported posture matches the host's true (advisory-only) confinement under unbridle"
+      - "no backend overclaims (reports kernel) when unbridled"
 
   - id: R10
     title: "Ratify ADR 0018 (Accepted) + operator/doc updates for the four postures"
