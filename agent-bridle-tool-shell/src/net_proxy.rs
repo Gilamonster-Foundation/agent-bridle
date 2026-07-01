@@ -643,6 +643,19 @@ mod tests {
         }
     }
 
+    /// Serialize the networky proxy tests. Each spins up its own origin + proxy
+    /// accept-loops; running them concurrently under the full-suite `just check`
+    /// contends enough that one connection's **close-time** audit can be starved
+    /// (flaky in the pre-push hook, though each passes instantly in isolation —
+    /// loadavg stays low, so it is interleaving, not CPU). A single shared lock
+    /// runs them one-at-a-time. Poison is ignored so a panicking test does not
+    /// cascade-fail the rest. (The underlying audit-under-contention robustness is
+    /// tracked separately in #138.)
+    fn net_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A one-shot HTTP origin on loopback that replies 200 with a marker body.
     fn spawn_origin() -> SocketAddr {
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -680,6 +693,7 @@ mod tests {
 
     #[test]
     fn allowed_http_host_is_forwarded_to_origin() {
+        let _serial = net_test_lock();
         let origin = spawn_origin();
         let proxy = start_null(
             ["allowed.test".to_string()],
@@ -696,6 +710,7 @@ mod tests {
 
     #[test]
     fn disallowed_http_host_is_refused_403_without_reaching_origin() {
+        let _serial = net_test_lock();
         // No origin needed — a denied host must never be dialled.
         let proxy = start_null(
             ["allowed.test".to_string()],
@@ -708,6 +723,7 @@ mod tests {
 
     #[test]
     fn audit_records_allowed_with_bytes_and_denied_attempts() {
+        let _serial = net_test_lock();
         let origin = spawn_origin();
         let sink = CapturingSink::default();
         let proxy = start(
@@ -834,6 +850,7 @@ mod tests {
 
     #[test]
     fn connect_allowed_host_tunnels_opaque_bytes() {
+        let _serial = net_test_lock();
         let echo = spawn_echo();
         let proxy =
             start_null(["allowed.test".to_string()], Arc::new(FixedResolver(echo))).unwrap();
@@ -872,6 +889,7 @@ mod tests {
 
     #[test]
     fn connect_disallowed_host_is_refused_403() {
+        let _serial = net_test_lock();
         let proxy = start_null(
             ["allowed.test".to_string()],
             Arc::new(FixedResolver("127.0.0.1:1".parse().unwrap())),
@@ -921,6 +939,7 @@ mod tests {
 
     #[test]
     fn http_host_header_is_normalized_to_the_validated_authority() {
+        let _serial = net_test_lock();
         let origin = spawn_host_echo();
         let proxy = start_null(
             ["allowed.test".to_string()],
@@ -952,6 +971,7 @@ mod tests {
 
     #[test]
     fn proxy_env_points_at_the_bound_loopback_addr() {
+        let _serial = net_test_lock();
         let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let env = proxy.proxy_env();
         let url = format!("http://127.0.0.1:{}", proxy.addr().port());
@@ -1050,6 +1070,7 @@ mod tests {
 
     #[test]
     fn dropping_the_handle_stops_the_listener() {
+        let _serial = net_test_lock();
         let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let addr = proxy.addr();
         drop(proxy);
