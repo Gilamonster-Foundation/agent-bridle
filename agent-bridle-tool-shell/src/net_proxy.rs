@@ -1024,7 +1024,8 @@ mod tests {
     #[test]
     fn fenced_child_reaches_allowed_via_proxy_denied_refused_direct_kernel_blocked() {
         use agent_bridle_core::{
-            best_available_sandbox, loopback_fenced_caveats, seatbelt_is_supported, Caveats, Scope,
+            best_available_sandbox, loopback_fenced_caveats, seatbelt_is_supported, Caveats,
+            SandboxPolicy, Scope,
         };
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
@@ -1049,7 +1050,7 @@ mod tests {
             net: Scope::only(["allowed.test".to_string()]),
             ..Caveats::top()
         };
-        let prefix = best_available_sandbox()
+        let prefix = best_available_sandbox(&Arc::new(SandboxPolicy::default()))
             .command_prefix(&loopback_fenced_caveats(&granted))
             .expect("seatbelt wrapper");
 

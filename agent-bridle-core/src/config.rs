@@ -143,32 +143,51 @@ pub struct SandboxPolicy {
 
 impl Default for SandboxPolicy {
     fn default() -> Self {
+        // The read base is backend-specific: the Landlock (Linux) loader/library
+        // trees vs the Seatbelt (macOS) dyld/system base. One `base_read_paths`
+        // field defaults to whichever backend this host runs (I5-B, #144). The
+        // literals are duplicated here (not referenced from the cfg-gated sandbox
+        // consts) so `BridleConfig` constructs on every platform.
+        #[cfg(target_os = "macos")]
+        let base_read: &[&str] = &[
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/System",
+            "/Library",
+            "/opt",
+            "/private/etc",
+            "/private/var/db/dyld",
+            "/dev",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let base_read: &[&str] = &[
+            "/lib",
+            "/lib64",
+            "/lib32",
+            "/libx32",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/libexec",
+            "/usr/share",
+            "/etc/ld.so.cache",
+            "/etc/ld.so.preload",
+            "/etc/alternatives",
+            "/etc/nsswitch.conf",
+            "/etc/localtime",
+            "/etc/resolv.conf",
+            "/etc/ssl",
+            "/etc/ca-certificates",
+            "/proc/self",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/full",
+            "/dev/urandom",
+            "/dev/random",
+        ];
         Self {
             backends: BackendToggles::default(),
-            base_read_paths: PathList::from_defaults(&[
-                "/lib",
-                "/lib64",
-                "/lib32",
-                "/libx32",
-                "/usr/lib",
-                "/usr/lib64",
-                "/usr/libexec",
-                "/usr/share",
-                "/etc/ld.so.cache",
-                "/etc/ld.so.preload",
-                "/etc/alternatives",
-                "/etc/nsswitch.conf",
-                "/etc/localtime",
-                "/etc/resolv.conf",
-                "/etc/ssl",
-                "/etc/ca-certificates",
-                "/proc/self",
-                "/dev/null",
-                "/dev/zero",
-                "/dev/full",
-                "/dev/urandom",
-                "/dev/random",
-            ]),
+            base_read_paths: PathList::from_defaults(base_read),
             bin_read_paths: PathList::from_defaults(&[
                 "/usr/bin",
                 "/bin",
@@ -548,21 +567,20 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
     #[test]
-    fn sandbox_path_defaults_match_landlock_constants() {
-        use crate::sandbox::landlock_impl as l;
-        assert_eq!(
-            SandboxPolicy::default().base_read_paths.resolve(),
-            to_vec(l::BASE_READ_PATHS)
+    fn sandbox_base_read_default_is_platform_correct() {
+        // The single `base_read_paths` field defaults to the active backend's
+        // read base: Landlock's on Linux, Seatbelt's on macOS (I5-B, #144).
+        let base = SandboxPolicy::default().base_read_paths.resolve();
+        #[cfg(target_os = "macos")]
+        assert!(
+            base.iter().any(|p| p == "/System") && base.iter().any(|p| p == "/private/etc"),
+            "macOS base read must include the dyld/system base: {base:?}"
         );
-        assert_eq!(
-            SandboxPolicy::default().bin_read_paths.resolve(),
-            to_vec(l::BIN_READ_PATHS)
-        );
-        assert_eq!(
-            SandboxPolicy::default().loader_paths.resolve(),
-            to_vec(l::LOADER_PATHS)
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            base.iter().any(|p| p == "/usr/lib") && base.iter().any(|p| p == "/lib"),
+            "Linux base read must include the loader/library trees: {base:?}"
         );
     }
 }

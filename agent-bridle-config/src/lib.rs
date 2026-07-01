@@ -355,8 +355,14 @@ mod tests {
         let resolved = cfg.sandbox.base_read_paths.resolve();
         assert!(resolved.contains(&"/opt/a".to_string()));
         assert!(resolved.contains(&"/opt/b".to_string()));
+        // The platform-specific base is preserved (extend, not replace). The
+        // default base differs by active backend (Landlock vs Seatbelt; I5-B #144).
+        #[cfg(target_os = "macos")]
+        let base_entry = "/System";
+        #[cfg(not(target_os = "macos"))]
+        let base_entry = "/lib";
         assert!(
-            resolved.contains(&"/lib".to_string()),
+            resolved.contains(&base_entry.to_string()),
             "base preserved (extend)"
         );
     }

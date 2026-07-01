@@ -31,9 +31,11 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use std::sync::Arc;
+
 use crate::{
     best_available_sandbox, effective_sandbox_kind, enforcement_report, fence_strength,
-    AxisEnforcement, Caveats, SandboxKind, ToolContext, ToolError, ToolResult,
+    AxisEnforcement, Caveats, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
 };
 // Used only by the test modules below (each `use super::*`); kept here so all
 // three (`tests`, `landlock_child_tests`, `seatbelt_child_tests`) see it without
@@ -69,6 +71,10 @@ pub struct ConfinedCommand {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    /// The sandbox mechanism config (read/exec allow-lists). Rides the builder —
+    /// NOT the `ToolContext`, which carries only authority (I5-B, #144, ADR 0017
+    /// D2). Defaults to today's built-in allow-lists.
+    sandbox_policy: Arc<SandboxPolicy>,
 }
 
 impl ConfinedCommand {
@@ -82,7 +88,16 @@ impl ConfinedCommand {
             stdin: None,
             stdout: None,
             stderr: None,
+            sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
+    }
+
+    /// Set the sandbox mechanism policy (read/exec allow-lists, ABI floors) the
+    /// OS backend will enforce. The default is today's built-in allow-lists.
+    #[must_use]
+    pub fn sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
+        self.sandbox_policy = policy;
+        self
     }
 
     /// Append a single argument.
@@ -152,7 +167,7 @@ impl ConfinedCommand {
         cx.check_exec(&self.program)?;
 
         let effective = cx.caveats().clone();
-        let sandbox = best_available_sandbox();
+        let sandbox = best_available_sandbox(&self.sandbox_policy);
         let kind = sandbox.kind();
         // The kind that actually GOVERNS this spawn: the backend's kind only when
         // it will actually confine something (fs or net restricted), else `None`.
@@ -194,6 +209,8 @@ impl ConfinedCommand {
             stdin,
             stdout,
             stderr,
+            // Already consumed above into `sandbox` via `best_available_sandbox`.
+            sandbox_policy: _,
         } = self;
 
         let spawned = std::thread::spawn(move || -> ToolResult<Child> {
@@ -595,6 +612,68 @@ mod landlock_child_tests {
 
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    /// #144 (I5-B): `ConfinedCommand::sandbox_policy` is honored — a child spawned
+    /// with a widened `base_read_paths` can read a file outside `fs_read` scope
+    /// that the default policy denies. Proves the builder threads the policy into
+    /// `best_available_sandbox` (mechanism rides the builder, not `ToolContext`).
+    #[test]
+    fn confined_command_honors_sandbox_policy_base_read() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let cat = ["/usr/bin/cat", "/bin/cat"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        let Some(cat) = cat else {
+            eprintln!("skipping: no cat(1) found");
+            return;
+        };
+
+        let allowed = unique_dir("cfg-allowed");
+        let extra = unique_dir("cfg-extra");
+        fs::write(extra.join("data.txt"), b"configured").unwrap();
+        let cx = ctx(Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            fs_read: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+
+        // Control: default policy → the child cannot read the out-of-scope file.
+        let mut denied = ConfinedCommand::new(cat)
+            .arg(extra.join("data.txt"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn(&cx)
+            .expect("spawn");
+        assert!(
+            !denied.child.wait().expect("wait").success(),
+            "default base read must deny the child reading the out-of-scope file"
+        );
+
+        // Widened policy: add `extra` to base_read_paths → the child reads it.
+        let mut base = SandboxPolicy::default().base_read_paths;
+        base.extra.push(extra.to_string_lossy().into_owned());
+        let policy = Arc::new(SandboxPolicy {
+            base_read_paths: base,
+            ..SandboxPolicy::default()
+        });
+        let mut ok = ConfinedCommand::new(cat)
+            .arg(extra.join("data.txt"))
+            .sandbox_policy(policy)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn(&cx)
+            .expect("spawn");
+        assert!(
+            ok.child.wait().expect("wait").success(),
+            "a config-widened base_read_paths must let the child read the extra file"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&extra);
     }
 }
 
