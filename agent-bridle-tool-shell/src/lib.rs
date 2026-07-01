@@ -32,6 +32,8 @@
 #![warn(missing_docs)]
 
 #[cfg(feature = "shell")]
+mod net_proxy;
+#[cfg(feature = "shell")]
 mod parse;
 #[cfg(feature = "shell")]
 mod shell_tool;

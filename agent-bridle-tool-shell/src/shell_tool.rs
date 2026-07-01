@@ -40,11 +40,12 @@ use std::time::Duration;
 
 use agent_bridle_core::{
     best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
-    Caveats, Denial, DenialKind, EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope,
-    ToolError, ToolResult,
+    loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial, DenialKind,
+    EnforcementReport, SandboxKind, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
+use crate::net_proxy;
 use crate::parse::{
     classify, seg_literal, Arg, Command, Redirect, Refusal, Script, ScriptItem, Seg, Sep, StderrTo,
 };
@@ -108,6 +109,13 @@ impl Spawner for OsSpawner {
         caveats: &Caveats,
         env: &BTreeMap<String, String>,
     ) -> ToolResult<Captured> {
+        // A general remote-host `net` allow-list that cannot be named in SBPL is
+        // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
+        // to loopback and route it through the proxy. Self-gating — `Some` only
+        // where the fence is actually emittable (macOS + seatbelt).
+        if let Some((allow_hosts, fenced)) = egress_proxy_plan(caveats) {
+            return run_with_egress_proxy(stages, cwd, &fenced, env, allow_hosts);
+        }
         // When an OS sandbox (Landlock/Seatbelt) will actually confine this run,
         // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
         // 0006 D4). Otherwise run directly — no need to spend a thread.
@@ -117,6 +125,69 @@ impl Spawner for OsSpawner {
             run_confined(stages, cwd, caveats, env)
         }
     }
+}
+
+/// The egress-proxy plan for `caveats`, or `None` to fall through to the ordinary
+/// confinement paths (#124, ADR 0016). `Some((allow_hosts, fenced))` **iff** the
+/// grant is a general remote-host `net` allow-list ([`net_egress_proxy_hosts`])
+/// *and* the loopback fence it needs is actually emittable on this host — i.e.
+/// [`loopback_fenced_caveats`] engages a real backend
+/// ([`intended_sandbox_kind`] ≠ `None`; today only macOS Seatbelt). This one
+/// helper feeds BOTH the spawn routing ([`OsSpawner::run`]) and the reported
+/// `sandbox_kind` ([`ShellTool::invoke`]), so check and routing cannot disagree.
+fn egress_proxy_plan(caveats: &Caveats) -> Option<(Vec<String>, Caveats)> {
+    let allow_hosts = net_egress_proxy_hosts(caveats)?;
+    let fenced = loopback_fenced_caveats(caveats);
+    if intended_sandbox_kind(&fenced) == SandboxKind::None {
+        return None; // no loopback fence available → not enforceable; fall through
+    }
+    Some((allow_hosts, fenced))
+}
+
+/// Run the pipeline under the loopback egress proxy (#124, ADR 0016). Mirrors
+/// [`run_confined`] but, before spawning: (1) starts a loopback forward proxy
+/// bound to the `allow_hosts` — **fail-closed** if it cannot bind; (2) computes
+/// the fence prefix from the loopback-`fenced` caveats — fail-closed if the
+/// wrapper is missing; (3) injects `*_PROXY` into a clone of the env-seam map so
+/// the child routes its HTTP/HTTPS out through the proxy. The [`ProxyHandle`] is
+/// held until the confined child has been reaped, then dropped (tearing the
+/// listener down) — so the proxy's lifetime brackets the child's.
+fn run_with_egress_proxy(
+    stages: &[Command],
+    cwd: Option<&str>,
+    fenced: &Caveats,
+    env: &BTreeMap<String, String>,
+    allow_hosts: Vec<String>,
+) -> ToolResult<Captured> {
+    // (1) Fence prefix first (pure, cheap) — fail-closed if the wrapper is gone.
+    let prefix = best_available_sandbox().command_prefix(fenced)?;
+    // (2) Start the proxy — fail-closed if it cannot bind loopback (never spawn
+    //     an unfenced child that would then egress freely).
+    let proxy =
+        net_proxy::start(allow_hosts, Arc::new(net_proxy::StdResolver)).map_err(ToolError::Exec)?;
+    // (3) Point the child at the proxy via the env seam (a clone — never mutate
+    //     the caller's map).
+    let mut env = env.clone();
+    for (k, v) in proxy.proxy_env() {
+        env.insert(k, v);
+    }
+
+    let stages = stages.to_vec();
+    let cwd = cwd.map(str::to_string);
+    let fenced = fenced.clone();
+    let captured = std::thread::Builder::new()
+        .name("agent-bridle-confined".to_string())
+        .spawn(move || {
+            best_available_sandbox().apply(&fenced)?;
+            run_pipeline(&stages, cwd.as_deref(), &prefix, &env)
+        })
+        .map_err(ToolError::Exec)?
+        .join()
+        .map_err(|_| {
+            ToolError::Exec(std::io::Error::other("confined execution thread panicked"))
+        })?;
+    drop(proxy); // hold the proxy until the child is reaped, then tear it down
+    captured
 }
 
 /// The L3 `SandboxKind` that will actually be enforced for these caveats in this
@@ -307,7 +378,18 @@ impl Tool for ShellTool {
         // that will actually be enforced for these caveats on this kernel —
         // Landlock when `fs_write` is restricted on a capable Linux build, else
         // None (advisory). `OsSpawner` applies exactly this, fail-closed.
-        let sandbox_kind = intended_sandbox_kind(cx.caveats());
+        //
+        // On the egress-proxy path (#124, ADR 0016) the run is governed by the
+        // loopback-`fenced` caveats — a real Seatbelt kernel boundary — so the
+        // coarse kind is reported from those, derived from the SAME
+        // `egress_proxy_plan` helper `OsSpawner::run` routes on (they cannot
+        // disagree). The per-axis `net` stays Advisory below (the report is
+        // computed from the ORIGINAL grant, whose remote host SBPL cannot confine)
+        // — the proxy over-delivers above that floor, it does not raise the claim.
+        let sandbox_kind = match egress_proxy_plan(cx.caveats()) {
+            Some((_, fenced)) => intended_sandbox_kind(&fenced),
+            None => intended_sandbox_kind(cx.caveats()),
+        };
         // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
         // returns carries the per-axis report alongside the coarse sandbox_kind.
         let enforcement = enforcement_report(cx.caveats(), sandbox_kind);

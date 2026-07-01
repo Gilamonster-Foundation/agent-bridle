@@ -189,6 +189,47 @@ pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
         if !s.is_empty() && s.iter().all(|h| LOOPBACK_HOSTS.contains(&h.as_str())))
 }
 
+/// The granted host set of a **general remote-host** `net` allow-list — the case
+/// SBPL cannot express and [`net_loopback_only`] therefore leaves advisory
+/// (ADR 0015 D3). `Some(hosts)` iff `net` is `Only(set)`, non-empty, with **at
+/// least one non-loopback host**; `None` for `All`, the empty set (deny-all), and
+/// a loopback-only allow-list — those three keep their existing owners
+/// ([`net_fully_denied`] / [`net_loopback_only`]).
+///
+/// This is the trigger for the macOS **egress-proxy** mechanism (#124, ADR 0016):
+/// a caller confines a spawned child's egress to the loopback interface
+/// ([`loopback_fenced_caveats`], reusing the ADR 0015 kernel fence) and runs a
+/// loopback forward proxy that enforces this host set. Pure; no IO. The returned
+/// set is the **full** grant (loopback members included — the proxy admits them
+/// too), matching `ToolContext::check_net`'s exact-name membership.
+#[must_use]
+pub fn net_egress_proxy_hosts(caveats: &Caveats) -> Option<Vec<String>> {
+    match &caveats.net {
+        crate::Scope::Only(s)
+            if !s.is_empty() && s.iter().any(|h| !LOOPBACK_HOSTS.contains(&h.as_str())) =>
+        {
+            Some(s.iter().cloned().collect())
+        }
+        _ => None,
+    }
+}
+
+/// The confinement caveats for a spawned child paired with a loopback **egress
+/// proxy** (#124, ADR 0016): identical to `caveats` except the `net` axis is
+/// replaced by the loopback set, so its [`seatbelt_profile`] emits the ADR 0015
+/// kernel fence — `(deny network*)` + `(allow network* (remote ip
+/// "localhost:*"))` — while the `fs`/`exec` rules are preserved verbatim. The
+/// child can then reach *nothing* off-box directly; its only path off the
+/// loopback interface is the proxy it is pointed at via `*_PROXY` env. Pure; no
+/// IO. Only meaningful for a grant where [`net_egress_proxy_hosts`] is `Some`.
+#[must_use]
+pub fn loopback_fenced_caveats(caveats: &Caveats) -> Caveats {
+    Caveats {
+        net: crate::Scope::Only(LOOPBACK_HOSTS.iter().map(|h| (*h).to_string()).collect()),
+        ..caveats.clone()
+    }
+}
+
 /// The [`SandboxKind`] honestly in force for `caveats` given the strongest
 /// `available` backend: the backend's own kind when it will actually confine
 /// *something*, else [`SandboxKind::None`]. The single honesty rule shared by the
@@ -1035,6 +1076,31 @@ mod seatbelt_impl {
         }
 
         #[test]
+        fn loopback_fenced_caveats_emit_the_egress_proxy_fence() {
+            // The egress-proxy mechanism (#124, ADR 0016) fences a remote-host
+            // grant to loopback via `loopback_fenced_caveats`: the resulting
+            // profile must carry the ADR 0015 loopback fence AND preserve fs/exec.
+            let granted = Caveats {
+                net: Scope::only(["example.com".to_string()]),
+                fs_write: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            // The remote grant alone emits NO net rule (advisory) …
+            assert!(!seatbelt_profile(&granted).contains("network"));
+            // … but its loopback-fenced form emits the kernel egress fence.
+            let prof = seatbelt_profile(&super::super::loopback_fenced_caveats(&granted));
+            assert!(prof.contains("(deny network*)"), "{prof}");
+            assert!(
+                prof.contains("(allow network* (remote ip \"localhost:*\"))"),
+                "fence must re-allow loopback: {prof}"
+            );
+            assert!(
+                prof.contains("(deny file-write*)"),
+                "fs_write rule must survive the fence: {prof}"
+            );
+        }
+
+        #[test]
         fn restricted_write_yields_sandbox_exec_wrapper() {
             let cav = Caveats {
                 fs_write: Scope::only(["/tmp".to_string()]),
@@ -1220,6 +1286,67 @@ mod tests {
         let s = NoopSandbox;
         assert_eq!(s.kind(), SandboxKind::None);
         assert!(s.apply(&Caveats::top()).is_ok());
+    }
+
+    #[test]
+    fn net_egress_proxy_hosts_triggers_only_on_a_general_remote_allowlist() {
+        let with_net = |net| {
+            net_egress_proxy_hosts(&Caveats {
+                net,
+                ..Caveats::top()
+            })
+        };
+        // No trigger: unrestricted, deny-all, or loopback-only — owned elsewhere.
+        assert_eq!(with_net(Scope::All), None);
+        assert_eq!(with_net(Scope::none()), None); // empty = deny-all (net_fully_denied)
+        for lo in ["localhost", "127.0.0.1", "::1"] {
+            assert_eq!(
+                with_net(Scope::only([lo.to_string()])),
+                None,
+                "{lo} is loopback-only"
+            );
+        }
+        // Trigger: a remote host, alone or mixed with loopback (full set returned).
+        assert_eq!(
+            with_net(Scope::only(["example.com".to_string()])),
+            Some(vec!["example.com".to_string()])
+        );
+        let mixed = with_net(Scope::only([
+            "example.com".to_string(),
+            "localhost".to_string(),
+        ]))
+        .expect("mixed set triggers");
+        assert_eq!(
+            mixed.len(),
+            2,
+            "the FULL grant is returned, loopback included: {mixed:?}"
+        );
+        assert!(
+            mixed.contains(&"example.com".to_string()) && mixed.contains(&"localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn loopback_fenced_caveats_swaps_net_to_loopback_preserving_other_axes() {
+        let granted = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            fs_write: Scope::only(["/tmp/x".to_string()]),
+            exec: Scope::only(["git".to_string()]),
+            ..Caveats::top()
+        };
+        let fenced = loopback_fenced_caveats(&granted);
+        // net is now loopback-only, so it engages the ADR 0015 kernel fence …
+        assert!(
+            net_loopback_only(&fenced),
+            "fenced net must be loopback-only"
+        );
+        assert!(
+            net_egress_proxy_hosts(&fenced).is_none(),
+            "fenced caveats no longer trigger the proxy"
+        );
+        // … while fs/exec are preserved verbatim (the fence keeps their rules).
+        assert_eq!(fenced.fs_write, granted.fs_write);
+        assert_eq!(fenced.exec, granted.exec);
     }
 
     #[test]
