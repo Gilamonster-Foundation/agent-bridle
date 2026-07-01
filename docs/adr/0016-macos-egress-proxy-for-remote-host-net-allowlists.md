@@ -97,6 +97,27 @@ kernel-fenced to loopback and therefore **blocked off-box** — fail-closed, the
 direction; common agent tooling (curl/wget/git/python-requests/node) honours
 `*_PROXY`.
 
+### D5 — Audit surface: the proxy is an observable chokepoint
+
+Because the proxy is the child's **sole** egress path, it is a complete vantage
+point for the child's proxy-visible network activity. It records one
+`NetAuditEvent` per connection — `{ts_ms, host, port, kind (connect/http),
+decision (allowed/denied/error), bytes_up, bytes_down, dur_ms}` — through a
+pluggable `AuditSink`. Audit is **observability only**: it never changes an
+enforcement decision, and it is **off by default** (`NullSink`, zero overhead).
+
+The operator opts in with the `BRIDLE_NET_AUDIT` **setting** (an env var, matching
+the `BRIDLE_REQUIRE_*` precedent): a path enables a `JsonlSink` that appends one
+JSON line per connection. The `bridle-netmon` binary (std-only, no TUI framework)
+tails that file and renders a live per-host table — connections, allowed /
+**denied** / errored, bytes up/down, last-seen — like `iptraf`/`nmap`. A denied
+host (an allow-list refusal — the exfil-attempt signal for proxy-aware traffic) is
+flagged in **text** (`! DENIED`), never colour alone (accessibility). **Scope:**
+the audit sees what the proxy sees — proxied HTTP/HTTPS, allowed *and* denied.
+Raw-socket direct egress is kernel-blocked *before* the proxy (D4), so those
+attempts are not visible here; capturing them needs kernel tracing (Endpoint
+Security / dtrace), a follow-up.
+
 ## Bypass vectors and their disposition
 
 | Vector | Disposition |
@@ -142,14 +163,18 @@ direction; common agent tooling (curl/wget/git/python-requests/node) honours
 
 ## Follow-ups
 
-- **Envelope disclosure**: an informational, non-lattice `net_proxy` field
-  (`{engaged, allow_hosts, addr}`) on the result envelope so operators can *see* the
-  over-delivery — kept OUT of `EnforcementReport` to preserve the honesty lattice.
+- **Audit / observability (partly done, D5)**: the `NetAuditEvent` stream +
+  `BRIDLE_NET_AUDIT` sink + `bridle-netmon` live monitor ship here. Remaining:
+  capture **kernel-blocked direct-egress attempts** (raw sockets the fence denies
+  before the proxy) via the Endpoint Security framework / dtrace — macOS-specific,
+  entitlement-heavy; and an informational, non-lattice `net_proxy` field
+  (`{engaged, allow_hosts}`) on the result envelope, kept OUT of
+  `EnforcementReport` to preserve the honesty lattice.
 - **`ConfinedCommand::spawn` integration** (core subprocess primitive) for
   MCP-server-style long-lived children — needs the handle tied to `ConfinedChild`'s
   drop rather than a bracketed call; the shell path is the immediate #124 win.
 - **TLS SNI cross-check** (CONNECT host vs ClientHello SNI); SOCKS5 / websockets;
-  per-host port policy; connection caps + metrics.
+  per-host port policy; connection caps.
 - **Linux equivalent** — blocked on a Linux kernel net-egress fence (the loopback
   primitive ADR 0015 gives on macOS does not yet exist on Linux); ADR 0015
   Follow-ups / #35.
