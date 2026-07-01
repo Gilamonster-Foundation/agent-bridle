@@ -520,7 +520,15 @@ fn tunnel(client: TcpStream, origin: TcpStream) -> io::Result<(u64, u64)> {
     let mut o_read = origin;
     let mut c_write = client;
     let down = copy_counted(&mut o_read, &mut c_write);
-    let _ = c_write.shutdown(Shutdown::Write);
+    // The origin side has closed, so tear the whole connection down: shut down
+    // BOTH client halves, not just write. `Write` alone leaves the `up` thread
+    // blocked reading the client's (half-open) upload direction until CONN_TIMEOUT
+    // — a plain client that sends its request then only reads the response never
+    // closes its write half until it sees our EOF, and we never see its EOF: a
+    // ~30s deadlock on every forward/tunnel (surfaced by the flaky `audit_records_*`
+    // test, since the audit fires only once `up` joins). `Both` gives `up`'s read
+    // on the shared socket an immediate EOF.
+    let _ = c_write.shutdown(Shutdown::Both);
     let up = up.join().unwrap_or(0);
     Ok((up, down))
 }
@@ -542,7 +550,15 @@ fn splice_buffered(
     let mut o_read = origin;
     let mut c_write = client;
     let down = copy_counted(&mut o_read, &mut c_write);
-    let _ = c_write.shutdown(Shutdown::Write);
+    // The origin side has closed, so tear the whole connection down: shut down
+    // BOTH client halves, not just write. `Write` alone leaves the `up` thread
+    // blocked reading the client's (half-open) upload direction until CONN_TIMEOUT
+    // — a plain client that sends its request then only reads the response never
+    // closes its write half until it sees our EOF, and we never see its EOF: a
+    // ~30s deadlock on every forward/tunnel (surfaced by the flaky `audit_records_*`
+    // test, since the audit fires only once `up` joins). `Both` gives `up`'s read
+    // on the shared socket an immediate EOF.
+    let _ = c_write.shutdown(Shutdown::Both);
     let up = up.join().unwrap_or(0);
     Ok((up, down))
 }
@@ -736,11 +752,11 @@ mod tests {
         let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/y"); // denied
 
         // The connection threads are detached, so poll (not a fixed sleep) until
-        // both records land — robust under parallel-test load.
-        // Generous headroom: under the pre-push hook's parallel full-suite load the
-        // proxy→origin round-trip + detached audit thread can exceed a tight bound;
-        // match the production CONN_TIMEOUT so a busy host never spuriously fails.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // both records land — robust under parallel-test load. The audit now fires
+        // promptly (the forward tears down as soon as the origin closes; see
+        // `splice_buffered`), so a 10s deadline is ample headroom yet still fails
+        // fast if the CONN_TIMEOUT deadlock ever regresses (rather than racing it).
+        let deadline = Instant::now() + Duration::from_secs(10);
         let events = loop {
             let ev = sink.events();
             let have = |h: &str| ev.iter().any(|e| e.host == h);
