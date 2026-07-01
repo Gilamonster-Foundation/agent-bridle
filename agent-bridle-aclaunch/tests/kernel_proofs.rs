@@ -40,10 +40,22 @@ fn tag(kind: &str) -> String {
 
 /// A fresh, empty temp dir owned by this (test) user — so the launcher, running as
 /// the same user, has `WRITE_DAC` to grant the AppContainer SID an ACE on it.
+///
+/// The dir's **mandatory integrity label is lowered to Low** (with object/container
+/// inheritance). An AppContainer child runs below Medium integrity; without this,
+/// Mandatory Integrity Control's *no-write-up* rule blocks writes independently of
+/// the DACL — which would confound the proof, especially on an **elevated** CI host
+/// where temp dirs are created at a higher label (there fs_read passes but fs_write
+/// fails for the wrong reason). With every test dir at Low, the only variable that
+/// decides read/write is the `--fs-read`/`--fs-write` DACL grant we are proving.
 fn fresh_dir(kind: &str) -> PathBuf {
     let mut d = std::env::temp_dir();
     d.push(format!("ab-proof-{}", tag(kind)));
     std::fs::create_dir_all(&d).expect("create temp dir");
+    let _ = Command::new("icacls")
+        .arg(&d)
+        .args(["/setintegritylevel", "(OI)(CI)Low"])
+        .output();
     d
 }
 
