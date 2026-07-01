@@ -155,9 +155,8 @@ impl ConfinedCommand {
         let sandbox = best_available_sandbox();
         let kind = sandbox.kind();
         // The kind that actually GOVERNS this spawn: the backend's kind only when
-        // an fs axis is restricted (so it confines something), else `None`. A
-        // backend the spawn path does not route through collapses to `None` here
-        // (e.g. AppContainer, whose launcher is unbuilt — #51). The fail-closed
+        // it will actually confine something (fs or net restricted), else `None`.
+        // The fail-closed
         // check is decided against THIS, not the raw probe, so the check and the
         // routing cannot disagree (the adversarial-review fix: a raw
         // `enforcement_report` claim of fs→Kernel for a backend that is not
@@ -198,13 +197,22 @@ impl ConfinedCommand {
         } = self;
 
         let spawned = std::thread::spawn(move || -> ToolResult<Child> {
-            // L3 on this very thread, before the spawn. `apply` is fail-closed:
-            // if the kernel did not actually enforce, it returns Err and we never
-            // spawn.
-            sandbox.apply(&effective)?;
+            // Thread-confining backends (Landlock): apply the sandbox on this
+            // throwaway thread before the spawn so the child inherits the
+            // Landlock domain. `apply` is fail-closed: if the kernel did not
+            // actually enforce, it returns Err and we never spawn.
+            //
+            // Wrapper-based backends (Seatbelt, AppContainer): confinement is
+            // achieved by the `command_prefix` wrapper — no per-thread state is
+            // involved, and calling `apply` would be wrong (AppContainer fails
+            // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
+            // non-empty.
+            if prefix.is_empty() {
+                sandbox.apply(&effective)?;
+            }
 
             // Wrap the child in the backend's command prefix when it confines via
-            // a wrapper (Seatbelt); otherwise spawn the program directly.
+            // a wrapper (Seatbelt, AppContainer); otherwise spawn the program directly.
             let (spawn_program, spawn_args) = wrap_argv(&prefix, &program, &args);
             let mut cmd = Command::new(&spawn_program);
             cmd.args(&spawn_args);
@@ -409,28 +417,29 @@ mod tests {
 
     /// Regression (adversarial review of ADR 0012 D4): the fail-closed check must
     /// be decided against the kind the spawn path ACTUALLY applies
-    /// (`effective_sandbox_kind`), never the raw probe. A backend whose
-    /// `enforcement_report` claims fs→Kernel but which the run path does not route
-    /// through — AppContainer today, whose shell launcher is unbuilt (#51) — must
-    /// fail closed on a restricted-fs run, not execute it unconfined.
+    /// (`effective_sandbox_kind`), never the raw probe. Now that the AppContainer
+    /// launcher is built (#51), AppContainer is the governing kind for a restricted
+    /// fs scope — and since `enforcement_report` reports fs→Kernel for AppContainer,
+    /// the spawn is ENFORCEABLE (not fail-closed). The `SandboxKind::None` case
+    /// (no sandbox available) still fails closed.
     #[test]
     fn fs_floor_uses_the_governing_kind_not_the_raw_probe_for_appcontainer() {
         let fs = Caveats {
             fs_write: Scope::only(["/tmp/x".to_string()]),
             ..Caveats::top()
         };
-        // The spawn path collapses AppContainer → None (not yet routed).
+        // With the launcher built, AppContainer is the governing kind (not None).
         let governing = effective_sandbox_kind(SandboxKind::AppContainer, &fs);
-        assert_eq!(governing, SandboxKind::None);
-        // Fed the GOVERNING kind (what spawn.rs/shell now pass), the fs floor trips
-        // → fail closed. Fed the RAW probe (the bug), it would WRONGLY pass.
-        assert!(confinement_unenforceable(
+        assert_eq!(governing, SandboxKind::AppContainer);
+        // AppContainer reports fs→Kernel; the spawn is enforceable.
+        assert!(!confinement_unenforceable(
             governing,
             &fs,
             AxisEnforcement::Advisory
         ));
-        assert!(!confinement_unenforceable(
-            SandboxKind::AppContainer,
+        // Without a sandbox (None), the same restricted fs IS unenforceable.
+        assert!(confinement_unenforceable(
+            SandboxKind::None,
             &fs,
             AxisEnforcement::Advisory
         ));

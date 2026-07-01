@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "agent-bridle-core",
+    "agent-bridle-aclaunch",
     "agent-bridle-jaild",
     "agent-bridle-tool-shell",
     "agent-bridle-tool-web",

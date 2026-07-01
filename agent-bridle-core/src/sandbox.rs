@@ -168,7 +168,9 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
 /// when `net` is empty ([`net_fully_denied`]), **and** confines the `exec` axis
 /// via `process-exec*` ([`restricts_exec`]) — a confinement Landlock cannot
 /// supply (ADR 0014). Landlock's exec axis stays held (agent-bridle#31/#57), so a
-/// Landlock host does not engage on `exec` alone.
+/// Landlock host does not engage on `exec` alone. AppContainer (Windows) engages
+/// on any restricted fs axis or a fully-denied `net` — matching the honesty
+/// condition for what the launcher actually confines (ADR 0006 / #51).
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
@@ -177,6 +179,9 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
             if restricts_fs(caveats) || net_fully_denied(caveats) || restricts_exec(caveats) =>
         {
             SandboxKind::Seatbelt
+        }
+        SandboxKind::AppContainer if restricts_fs(caveats) || net_fully_denied(caveats) => {
+            SandboxKind::AppContainer
         }
         _ => SandboxKind::None,
     }
@@ -224,25 +229,52 @@ pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 
 #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
 pub(crate) mod appcontainer_impl {
-    use super::{Sandbox, SandboxKind};
-    use crate::{Caveats, ToolError, ToolResult};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{net_fully_denied, restricts_fs, Sandbox, SandboxKind};
+    use crate::{Caveats, Scope, ToolError, ToolResult};
+
+    /// Monotonic counter for unique container names (PID + counter → no clock).
+    static SPAWN_N: AtomicU64 = AtomicU64::new(0);
 
     /// A Windows AppContainer process sandbox.
     ///
-    /// AppContainer is attached when creating a new process with
-    /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`; unlike Landlock, it cannot
-    /// be installed on the current thread and inherited by a later spawn via a
-    /// Rust `std::process::Command`. The process-spawn path must therefore use a
-    /// Windows-specific launcher. Calling [`Sandbox::apply`] directly fails
-    /// closed rather than pretending the current thread was confined.
+    /// AppContainer is attached when creating a new process via
+    /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`; it cannot be installed on
+    /// the current thread and inherited across a later spawn the way Landlock
+    /// can. The spawn path must therefore use the `agent-bridle-aclaunch`
+    /// wrapper binary returned by [`command_prefix`] rather than the thread
+    /// `apply` path (ADR 0006 / agent-bridle#51).
+    ///
+    /// Calling [`Sandbox::apply`] directly fails closed: it is never correct to
+    /// call `apply` expecting AppContainer confinement on the current thread.
     #[derive(Debug, Default, Clone, Copy)]
     pub struct AppContainerSandbox;
 
     impl AppContainerSandbox {
-        /// Construct the sandbox. (Stateless; capability comes from Windows.)
+        /// Construct the sandbox. (Stateless; confinement is per-process.)
         pub fn new() -> Self {
             Self
         }
+    }
+
+    /// Return the path of `agent-bridle-aclaunch.exe`, searching first next to
+    /// the current executable and then via `PATH`.
+    fn find_launcher() -> Option<String> {
+        const LAUNCHER: &str = "agent-bridle-aclaunch.exe";
+
+        // Same directory as the current exe — the normal install layout.
+        if let Ok(mut p) = std::env::current_exe() {
+            p.set_file_name(LAUNCHER);
+            if p.exists() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+        // Fall back to PATH.
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(LAUNCHER))
+            .find(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
     }
 
     impl Sandbox for AppContainerSandbox {
@@ -250,10 +282,50 @@ pub(crate) mod appcontainer_impl {
             SandboxKind::AppContainer
         }
 
+        /// Fail closed: AppContainer is applied at process creation via the
+        /// `agent-bridle-aclaunch` launcher prefix, not via this thread.
         fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
             Err(ToolError::denied(
-                "AppContainer must be applied at Windows process creation",
+                "AppContainer must be applied at Windows process creation via the \
+                 agent-bridle-aclaunch launcher; call command_prefix instead",
             ))
+        }
+
+        /// Build the `["agent-bridle-aclaunch.exe", ...]` prefix that wraps the
+        /// child inside a fresh AppContainer profile.
+        ///
+        /// Returns an empty prefix when nothing on a governed axis is restricted
+        /// (so the spawn runs unwrapped — the backend engages only when it
+        /// actually confines something). Fails closed if the launcher binary is
+        /// not found.
+        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            // Nothing to confine — no wrapper needed.
+            if !restricts_fs(effective) && !net_fully_denied(effective) {
+                return Ok(Vec::new());
+            }
+
+            // Fail-closed: without the launcher we cannot enforce.
+            let launcher = find_launcher().ok_or_else(|| {
+                ToolError::denied(
+                    "windows-appcontainer: agent-bridle-aclaunch.exe not found next to the \
+                     current executable or on PATH; cannot confine",
+                )
+            })?;
+
+            // Unique container name: PID + monotonic counter (no wall clock).
+            let n = SPAWN_N.fetch_add(1, Ordering::Relaxed);
+            let container_name = format!("ab{}{}", std::process::id(), n);
+
+            let mut prefix = vec![launcher, "--name".to_string(), container_name];
+
+            // Grant network capabilities only when net is fully unrestricted
+            // (Scope::All). Any non-All net scope denies egress by default via
+            // the AppContainer's deny-by-default network policy.
+            if matches!(effective.net, Scope::All) {
+                prefix.push("--net-allow".to_string());
+            }
+
+            Ok(prefix)
         }
     }
 }
