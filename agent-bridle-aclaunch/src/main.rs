@@ -62,6 +62,12 @@ mod windows {
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
     };
 
+    // PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY = ProcThreadAttributeValue(14, FALSE, TRUE, FALSE)
+    // = (14 & 0xFFFF) | PROC_THREAD_ATTRIBUTE_INPUT (0x00020000) = 0x0002000E
+    const PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY: usize = 0x0002000E;
+    // PROCESS_CREATION_CHILD_PROCESS_RESTRICTED: the process may not create child processes.
+    const PROCESS_CREATION_CHILD_PROCESS_RESTRICTED: u32 = 1;
+
     /// Null-terminate an `OsStr` as a `Vec<u16>`.
     fn to_wide(s: &OsStr) -> Vec<u16> {
         s.encode_wide().chain(std::iter::once(0)).collect()
@@ -154,6 +160,7 @@ mod windows {
         // Parse optional launcher flags and find the exe + child args.
         let mut container_name: Option<String> = None;
         let mut net_allow = false;
+        let mut no_child_process = false;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -164,19 +171,26 @@ mod windows {
                 "--net-allow" => {
                     net_allow = true;
                 }
+                "--no-child-process" => {
+                    no_child_process = true;
+                }
                 _ => break,
             }
             i += 1;
         }
         if i >= args.len() {
-            eprintln!("usage: agent-bridle-aclaunch [--name <n>] [--net-allow] <exe> [args...]");
+            eprintln!(
+                "usage: agent-bridle-aclaunch [--name <n>] [--net-allow] \
+                 [--no-child-process] <exe> [args...]"
+            );
             std::process::exit(2);
         }
         let exe = &args[i];
         let child_args = &args[i + 1..];
 
         let name = container_name.unwrap_or_else(|| format!("ab{}", std::process::id()));
-        let exit_code = unsafe { spawn_in_container(&name, net_allow, exe, child_args) };
+        let exit_code =
+            unsafe { spawn_in_container(&name, net_allow, no_child_process, exe, child_args) };
         std::process::exit(exit_code as i32);
     }
 
@@ -185,6 +199,7 @@ mod windows {
     unsafe fn spawn_in_container(
         name: &str,
         net_allow: bool,
+        no_child_process: bool,
         exe: &str,
         child_args: &[String],
     ) -> u32 {
@@ -242,14 +257,16 @@ mod windows {
             Reserved: 0,
         };
 
-        // 4. Attribute list: one slot for PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES.
+        // 4. Attribute list.  Slots: always one for SECURITY_CAPABILITIES;
+        //    one more when --no-child-process applies.
+        let slot_count: u32 = if no_child_process { 2 } else { 1 };
         let mut attr_size: usize = 0;
         // First call: get the required buffer size (returns FALSE, that is expected).
-        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), slot_count, 0, &mut attr_size);
         let mut attr_buf: Vec<u8> = vec![0u8; attr_size];
         let attr_list = attr_buf.as_mut_ptr().cast();
 
-        let ok = InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size);
+        let ok = InitializeProcThreadAttributeList(attr_list, slot_count, 0, &mut attr_size);
         if ok == 0 {
             eprintln!(
                 "agent-bridle-aclaunch: InitializeProcThreadAttributeList failed: {:?}",
@@ -270,12 +287,39 @@ mod windows {
         );
         if ok == 0 {
             eprintln!(
-                "agent-bridle-aclaunch: UpdateProcThreadAttribute failed: {:?}",
+                "agent-bridle-aclaunch: UpdateProcThreadAttribute(SECURITY_CAPABILITIES) \
+                 failed: {:?}",
                 std::io::Error::last_os_error()
             );
             DeleteProcThreadAttributeList(attr_list);
             do_cleanup(name, ac_sid);
             std::process::exit(1);
+        }
+
+        // When exec is fully denied, apply the kernel child-process-creation block.
+        // PROCESS_CREATION_CHILD_PROCESS_RESTRICTED causes the kernel to refuse any
+        // CreateProcess call the sandboxed process makes (#123, ADR 0013 D7).
+        if no_child_process {
+            let policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+            let ok = UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+                (&policy as *const u32).cast(),
+                std::mem::size_of::<u32>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if ok == 0 {
+                eprintln!(
+                    "agent-bridle-aclaunch: UpdateProcThreadAttribute(CHILD_PROCESS_POLICY) \
+                     failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                DeleteProcThreadAttributeList(attr_list);
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            }
         }
 
         // 5. Spawn the child inside the AppContainer.  `bInheritHandles = TRUE`

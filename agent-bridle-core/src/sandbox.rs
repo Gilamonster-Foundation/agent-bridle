@@ -158,6 +158,17 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
 }
 
+/// `true` when the `exec` axis is a deny-all empty allow-list (`Scope::Only([])`).
+///
+/// An empty allow-list means *no program may be spawned* — any `exec` call is
+/// refused. On Windows AppContainer this maps to the
+/// `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` kernel mitigation, so the
+/// sandboxed process cannot create child processes at the kernel level.
+#[must_use]
+pub(crate) fn exec_fully_denied(caveats: &Caveats) -> bool {
+    matches!(&caveats.exec, crate::Scope::Only(s) if s.is_empty())
+}
+
 /// `true` if this kernel supports Landlock TCP network rules (ABI V4, kernel ≥ 6.7).
 /// Always `false` on non-Linux or builds without `linux-landlock`.
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
@@ -276,7 +287,9 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
         {
             SandboxKind::Seatbelt
         }
-        SandboxKind::AppContainer if net_fully_denied(caveats) => SandboxKind::AppContainer,
+        SandboxKind::AppContainer if net_fully_denied(caveats) || exec_fully_denied(caveats) => {
+            SandboxKind::AppContainer
+        }
         _ => SandboxKind::None,
     }
 }
@@ -327,7 +340,7 @@ pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 pub(crate) mod appcontainer_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{net_fully_denied, restricts_fs, Sandbox, SandboxKind};
+    use super::{exec_fully_denied, net_fully_denied, Sandbox, SandboxKind};
     use crate::{Caveats, Scope, ToolError, ToolResult};
 
     /// Monotonic counter for unique container names (PID + counter → no clock).
@@ -394,10 +407,11 @@ pub(crate) mod appcontainer_impl {
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // Nothing the launcher currently confines — no wrapper needed.
-            // Filesystem ACL narrowing is deferred (#136); only `net_fully_denied`
-            // triggers the AppContainer wrapper (deny-by-default network policy).
-            if !net_fully_denied(effective) {
+            // The launcher engages when net is fully denied (deny-by-default
+            // network policy via AppContainer) or exec is fully denied (kernel
+            // child-process-creation block via PROCESS_CREATION_CHILD_PROCESS_RESTRICTED).
+            // Filesystem ACL narrowing is deferred (#51/#136).
+            if !net_fully_denied(effective) && !exec_fully_denied(effective) {
                 return Ok(Vec::new());
             }
 
@@ -420,6 +434,14 @@ pub(crate) mod appcontainer_impl {
             // the AppContainer's deny-by-default network policy.
             if matches!(effective.net, Scope::All) {
                 prefix.push("--net-allow".to_string());
+            }
+
+            // Kernel-block child process creation when exec is fully denied.
+            // The `--no-child-process` flag sets PROCESS_CREATION_CHILD_PROCESS_RESTRICTED
+            // on the spawned process — the kernel refuses any CreateProcess call
+            // it makes, closing the exec axis by OS enforcement (#123).
+            if exec_fully_denied(effective) {
+                prefix.push("--no-child-process".to_string());
             }
 
             Ok(prefix)
@@ -1626,15 +1648,10 @@ mod tests {
     fn best_available_sandbox_is_a_sandbox() {
         // Always returns *some* sandbox; on a non-landlock build/kernel it is the
         // advisory Noop. Just exercise the trait object.
+        // AppContainer's `apply` is a deliberate no-op (confinement is applied at
+        // process creation via `command_prefix`, not to the current thread).
         let sb = best_available_sandbox(&Arc::new(SandboxPolicy::default()));
-        if sb.kind() == SandboxKind::AppContainer {
-            assert!(
-                sb.apply(&Caveats::top()).is_err(),
-                "AppContainer cannot be applied to the current thread"
-            );
-        } else {
-            assert!(sb.apply(&Caveats::top()).is_ok());
-        }
+        assert!(sb.apply(&Caveats::top()).is_ok());
     }
 
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
