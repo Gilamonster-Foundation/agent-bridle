@@ -97,6 +97,57 @@ async fn unbridled_runs_native_discloses_and_still_gates_the_grant() {
     );
 }
 
+/// R9 (ADR 0018 D2 — **per-OS honesty parity**): an unbridled run drops the L3
+/// mechanism on *every* backend, so the honesty report is identical across OSes —
+/// `sandbox_kind` None and every restricted axis at advisory/interceptor, with **no
+/// axis ever claiming `kernel`**. This is the crucial property: even on macOS, where
+/// Seatbelt would otherwise kernel-confine `fs`/`exec`, unbridle must **not**
+/// overclaim. Because both the Linux and the macOS CI jobs run `cargo test
+/// --workspace --all-features`, this one test is the cross-OS matrix assertion (the
+/// Windows/AppContainer leg lands with that host's backend).
+#[tokio::test]
+async fn unbridled_never_overclaims_kernel_on_any_os() {
+    set_unbridled(); // dedicated, isolated marker for this binary
+
+    // Restrict every OS-confinement axis so all four appear in the report.
+    let granted = Caveats {
+        fs_read: Scope::only(["/etc".to_string()]),
+        fs_write: Scope::only(["/tmp/x".to_string()]),
+        exec: Scope::only(["echo".to_string()]),
+        net: Scope::only(["example.com".to_string()]),
+        ..Caveats::top()
+    };
+    // Whether the advisory L2 gate permits or denies this specific call, the
+    // envelope carries the coarse kind + the per-axis report + the disclosure —
+    // which is what honesty parity is about (not command success).
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "echo", "args": ["hi"]}),
+            &ctx(granted),
+        )
+        .await
+        .expect("invoke");
+
+    assert_eq!(
+        out["sandbox_kind"], "none",
+        "unbridle ⇒ no OS sandbox: {out}"
+    );
+    let e = &out["enforcement"];
+    // The honest Noop grades — identical on Linux and macOS under unbridle.
+    assert_eq!(e["fs_read"], "interceptor", "{out}");
+    assert_eq!(e["fs_write"], "interceptor", "{out}");
+    assert_eq!(e["exec"], "interceptor", "{out}");
+    assert_eq!(e["net"], "advisory", "{out}");
+    // The overclaim guard: not one axis may report kernel when unbridled.
+    for axis in ["fs_read", "fs_write", "exec", "net"] {
+        assert_ne!(
+            e[axis], "kernel",
+            "unbridle must never claim kernel on {axis} (any OS): {out}"
+        );
+    }
+    assert_eq!(out["disclosure"]["unbridled"], true, "{out}");
+}
+
 /// R3 (ADR 0018 D8/D9 — *Supervised-free*): unbridle drops the machine leash but
 /// **not** the human one. Dispatching the real `ShellTool` through a step-up
 /// Registry while the process is unbridled STILL owes the demanded gesture — a
