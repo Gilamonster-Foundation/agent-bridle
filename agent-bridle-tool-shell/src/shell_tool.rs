@@ -1834,10 +1834,10 @@ mod tests {
     struct MapLister(HashMap<String, Vec<GlobEntry>>);
     impl DirLister for MapLister {
         fn list(&self, dir: &Path) -> Vec<GlobEntry> {
-            self.0
-                .get(&dir.to_string_lossy().into_owned())
-                .cloned()
-                .unwrap_or_default()
+            // Normalize to forward slashes so test maps written with `/` work on
+            // Windows where PathBuf::join produces `\`-separated paths.
+            let key = dir.to_string_lossy().replace('\\', "/");
+            self.0.get(&key).cloned().unwrap_or_default()
         }
     }
     fn ent(name: &str, is_dir: bool) -> GlobEntry {
