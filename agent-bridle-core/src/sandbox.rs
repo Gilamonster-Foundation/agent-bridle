@@ -747,19 +747,18 @@ mod seatbelt_impl {
     /// (`unsafe_code = "forbid"`).
     const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-    /// Read-side base allow-list (subpaths): the system/loader paths a
-    /// dynamically-linked Mach-O binary must read to *start and run* — the
-    /// dynamic linker and dyld shared cache (under `/System`, incl. the Cryptex
-    /// volume), system dylibs/frameworks, the binaries themselves, the
-    /// name-service and locale config (`/private/etc`, the real target of
-    /// `/etc`), the dyld closure db, and the `/dev` essentials. Added whenever
-    /// `fs_read` is confined, alongside the literal root entry (see
-    /// [`seatbelt_profile`]), so a *permitted* program still loads while user
-    /// data outside scope stays unreadable. Non-existent entries are dropped
-    /// during canonicalization, so extra entries are harmless across macOS
-    /// layouts (verified on Apple Silicon: `grep`/`cat`/`cp` load read-confined).
-    /// The list now lives in `SandboxPolicy::base_read_paths` (config.rs), whose
-    /// default is macOS-specific on this platform (I5-B, #144).
+    // Read-side base allow-list (subpaths): the system/loader paths a
+    // dynamically-linked Mach-O binary must read to *start and run* — the dynamic
+    // linker and dyld shared cache (under `/System`, incl. the Cryptex volume),
+    // system dylibs/frameworks, the binaries themselves, the name-service and
+    // locale config (`/private/etc`, the real target of `/etc`), the dyld closure
+    // db, and the `/dev` essentials. Added whenever `fs_read` is confined,
+    // alongside the literal root entry, so a *permitted* program still loads while
+    // user data outside scope stays unreadable. Non-existent entries are dropped
+    // during canonicalization, so extra entries are harmless across macOS layouts
+    // (verified on Apple Silicon: `grep`/`cat`/`cp` load read-confined). The list
+    // now lives in `SandboxPolicy::base_read_paths` (config.rs), whose default is
+    // macOS-specific on this platform (I5-B, #144).
 
     /// `true` if this host can enforce a Seatbelt profile — i.e. the
     /// `sandbox-exec` wrapper is present. The wrapper itself is the boundary, so
@@ -878,11 +877,12 @@ mod seatbelt_impl {
     /// so `/tmp` → `/private/tmp` matches). An empty `fs_write` scope emits the
     /// deny with no re-allow — every write denied. SBPL evaluates last-match-wins,
     /// so the trailing allow-roots override the deny.
+    // Convenience over the built-in read base — **tests only** (production uses
+    // `command_prefix` → `seatbelt_profile_with` with the configured
+    // `SandboxPolicy::base_read_paths`, I5-B #144).
+    #[cfg(test)]
     #[must_use]
     pub fn seatbelt_profile(effective: &Caveats) -> String {
-        // Convenience over the built-in read base (used by unit tests). The
-        // production path is `command_prefix` → `seatbelt_profile_with` with the
-        // configured `SandboxPolicy::base_read_paths` (I5-B, #144).
         seatbelt_profile_with(
             effective,
             &SandboxPolicy::default().base_read_paths.resolve(),
