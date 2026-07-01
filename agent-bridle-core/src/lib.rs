@@ -48,7 +48,8 @@ pub use report::{enforcement_report, fence_strength, AxisEnforcement, Enforcemen
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
 pub use sandbox::{
-    best_available_sandbox, effective_sandbox_kind, NoopSandbox, Sandbox, SandboxKind,
+    best_available_sandbox, effective_sandbox_kind, loopback_fenced_caveats,
+    net_egress_proxy_hosts, NoopSandbox, Sandbox, SandboxKind,
 };
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
