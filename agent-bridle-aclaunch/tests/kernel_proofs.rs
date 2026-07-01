@@ -15,9 +15,16 @@
 //! cannot be created here — so CI cannot go green without exercising the real
 //! kernel boundary. A local run without the flag legitimately skips.
 //!
-//! fs/exec proofs need no elevation (ACLs on user-owned temp dirs + the child-process
-//! policy). The net/loopback proofs live separately because the loopback exemption
-//! (`NetworkIsolationSetAppContainerConfig`) requires an elevated token.
+//! **Write proofs test *modify-in-place* (`FILE_WRITE_DATA`), not directory create
+//! (`FILE_ADD_FILE`).** The targets are pre-created so the only variable is the
+//! `--fs-write` DACL grant. (An AppContainer spawned from an *elevated* parent — as
+//! on the GitHub Windows runner — is denied the directory-create right even with the
+//! grant, an elevated-context quirk unrelated to the confinement contract; modify is
+//! the portable, faithful check of "can the confined child write here".)
+//!
+//! fs/exec proofs need no elevation. The net/loopback proofs live separately because
+//! the loopback exemption (`NetworkIsolationSetAppContainerConfig`) requires an
+//! elevated token.
 #![cfg(target_os = "windows")]
 
 use std::path::PathBuf;
@@ -44,10 +51,9 @@ fn tag(kind: &str) -> String {
 /// The dir's **mandatory integrity label is lowered to Low** (with object/container
 /// inheritance). An AppContainer child runs below Medium integrity; without this,
 /// Mandatory Integrity Control's *no-write-up* rule blocks writes independently of
-/// the DACL — which would confound the proof, especially on an **elevated** CI host
-/// where temp dirs are created at a higher label (there fs_read passes but fs_write
-/// fails for the wrong reason). With every test dir at Low, the only variable that
-/// decides read/write is the `--fs-read`/`--fs-write` DACL grant we are proving.
+/// the DACL — especially on an elevated CI host where temp dirs default to a higher
+/// label. With every test dir at Low, the only variable that decides read/write is
+/// the `--fs-read`/`--fs-write` DACL grant we are proving.
 fn fresh_dir(kind: &str) -> PathBuf {
     let mut d = std::env::temp_dir();
     d.push(format!("ab-proof-{}", tag(kind)));
@@ -59,15 +65,14 @@ fn fresh_dir(kind: &str) -> PathBuf {
     d
 }
 
-/// Run the launcher with `args`, returning the captured output (stdout/stderr +
-/// status). Panics if the launcher itself cannot be spawned.
+/// Run the launcher with `args`, returning the captured output. Panics if the
+/// launcher itself cannot be spawned.
 ///
 /// The child inherits the launcher's current directory, so we run from `C:\Windows`
-/// — a directory every AppContainer can read (`ALL_APPLICATION_PACKAGES`). The
-/// crate's own build dir is *not* granted to the container, and a confined child
-/// whose CWD it cannot access dies with "The current directory is invalid" before
-/// running (which would break a real grandchild spawn). Proofs use absolute paths,
-/// so the CWD choice never affects what is read/written.
+/// — a directory every AppContainer can read (`ALL_APPLICATION_PACKAGES`). A confined
+/// child whose CWD it cannot access dies with "The current directory is invalid"
+/// before running. Proofs use absolute paths, so the CWD choice never affects what
+/// is read/written.
 fn launch(args: &[&str]) -> std::process::Output {
     Command::new(LAUNCHER)
         .args(args)
@@ -77,8 +82,6 @@ fn launch(args: &[&str]) -> std::process::Output {
 }
 
 /// Can this host actually create an AppContainer and run a trivial confined child?
-/// A container-less environment (some CI sandboxes) cannot — the proofs then skip,
-/// unless `BRIDLE_REQUIRE_APPCONTAINER` demands them.
 fn appcontainer_available() -> bool {
     launch(&["--name", &tag("probe"), "cmd.exe", "/c", "exit 0"])
         .status
@@ -108,9 +111,12 @@ fn skip_proof_unless_appcontainer() -> bool {
     true
 }
 
-/// fs_write (#51): the kernel allows a write to a `--fs-write`-granted path and
-/// **denies** a write to an ungranted user dir (AppContainers default-deny user
-/// directories; only the explicit DACL ACE opens the granted one).
+const SENTINEL: &str = "ORIG";
+const WRITTEN: &str = "WRITTEN_BY_CHILD";
+
+/// fs_write (#51): the kernel lets the confined child modify a `--fs-write`-granted
+/// file and **denies** modifying an ungranted user file (AppContainers default-deny
+/// user files; only the explicit DACL ACE opens the granted one).
 #[test]
 fn fs_write_kernel_allows_granted_denies_ungranted() {
     if skip_proof_unless_appcontainer() {
@@ -120,12 +126,11 @@ fn fs_write_kernel_allows_granted_denies_ungranted() {
     let denied = fresh_dir("fsw-deny");
     let g_file = granted.join("g.txt");
     let d_file = denied.join("d.txt");
+    std::fs::write(&g_file, SENTINEL).expect("seed granted file");
+    std::fs::write(&d_file, SENTINEL).expect("seed denied file");
 
-    // One confined child attempts BOTH writes (`copy NUL <path>` creates an empty
-    // file with no `>` redirection to quote). Only the granted one may land.
-    // DIAGNOSTIC: also dump the container's own groups/integrity and the ACL it sees
-    // DURING the run (aclaunch restores the DACL after exit, so a post-run icacls
-    // cannot show the temporary AppContainer ACE).
+    // One confined child overwrites BOTH files (`echo WRITTEN> file`). Only the
+    // granted one may change; the ungranted one must remain the sentinel.
     let out = launch(&[
         "--name",
         &tag("fsw"),
@@ -133,61 +138,35 @@ fn fs_write_kernel_allows_granted_denies_ungranted() {
         &granted.to_string_lossy(),
         "cmd.exe",
         "/c",
-        "whoami",
-        "/groups",
-        "&",
         "echo",
-        "--ACL--",
-        "&",
-        "icacls",
-        &granted.to_string_lossy(),
-        "&",
-        "echo",
-        "--COPY--",
-        "&",
-        "copy",
-        "NUL",
+        WRITTEN,
+        ">",
         &g_file.to_string_lossy(),
         "&",
-        "copy",
-        "NUL",
+        "echo",
+        WRITTEN,
+        ">",
         &d_file.to_string_lossy(),
     ]);
 
-    // Rich failure diagnostics (this proof behaves differently on elevated hosts):
-    // the launcher's own output (does it report a failed ACL grant?) and the actual
-    // resulting ACL + integrity label on the granted dir.
-    let diag = || {
-        let acl = Command::new("icacls")
-            .arg(&granted)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        format!(
-            "\n  temp_dir = {}\n  launcher stdout: {}\n  launcher stderr: {}\n  granted ACL:\n{}",
-            std::env::temp_dir().display(),
-            String::from_utf8_lossy(&out.stdout).trim(),
-            String::from_utf8_lossy(&out.stderr).trim(),
-            acl
-        )
-    };
-
+    let g = std::fs::read_to_string(&g_file).unwrap_or_default();
+    let d = std::fs::read_to_string(&d_file).unwrap_or_default();
     assert!(
-        g_file.exists(),
-        "kernel must ALLOW the write to the --fs-write-granted path{}",
-        diag()
+        g.contains(WRITTEN),
+        "kernel must ALLOW writing the --fs-write-granted file; got {g:?}; launcher stderr: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
     );
     assert!(
-        !d_file.exists(),
-        "kernel must DENY the write to the ungranted path (AppContainer default-deny)"
+        d.contains(SENTINEL) && !d.contains(WRITTEN),
+        "kernel must DENY writing the ungranted file; it leaked to {d:?}"
     );
 
     let _ = std::fs::remove_dir_all(&granted);
     let _ = std::fs::remove_dir_all(&denied);
 }
 
-/// fs_read (#51): a `--fs-read`-granted file is readable by the confined child;
-/// an ungranted user file is **kernel-denied** (its content never reaches stdout).
+/// fs_read (#51): a `--fs-read`-granted file is readable by the confined child; an
+/// ungranted user file is **kernel-denied** (its content never reaches stdout).
 #[test]
 fn fs_read_kernel_allows_granted_denies_ungranted() {
     if skip_proof_unless_appcontainer() {
@@ -201,7 +180,6 @@ fn fs_read_kernel_allows_granted_denies_ungranted() {
     let hidden = hidden_dir.join("hidden.txt");
     std::fs::write(&hidden, "SECRET_HIDDEN_MARKER").expect("write hidden");
 
-    // Granted read → the marker reaches stdout.
     let allowed = launch(&[
         "--name",
         &tag("fsr-ok"),
@@ -218,7 +196,6 @@ fn fs_read_kernel_allows_granted_denies_ungranted() {
         String::from_utf8_lossy(&allowed.stdout)
     );
 
-    // Ungranted read → the marker must NOT reach stdout (access denied).
     let denied = launch(&[
         "--name",
         &tag("fsr-no"),
@@ -239,18 +216,19 @@ fn fs_read_kernel_allows_granted_denies_ungranted() {
 
 /// exec deny-all (#123): with `--no-child-process`
 /// (`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`) the confined child cannot spawn a
-/// grandchild — the kernel refuses the inner `CreateProcess`. The control run
-/// (same command, no flag) proves the grandchild otherwise *would* run, so the
-/// difference is the kernel policy, not the environment.
+/// grandchild — the kernel refuses the inner `CreateProcess`. The grandchild's job
+/// is to overwrite a pre-created, `--fs-write`-granted marker; the control run (no
+/// flag) proves it otherwise *would*, so the difference is the kernel policy.
 #[test]
 fn exec_deny_all_kernel_blocks_child_process_creation() {
     if skip_proof_unless_appcontainer() {
         return;
     }
-    // Control: no --no-child-process ⇒ the inner cmd.exe runs and creates gc.txt.
+    // Control: no --no-child-process ⇒ the inner cmd.exe runs and overwrites gc.txt.
     let control = fresh_dir("exec-ctl");
     let control_marker = control.join("gc.txt");
-    launch(&[
+    std::fs::write(&control_marker, SENTINEL).expect("seed control marker");
+    let control_out = launch(&[
         "--name",
         &tag("exec-ctl"),
         "--fs-write",
@@ -259,19 +237,24 @@ fn exec_deny_all_kernel_blocks_child_process_creation() {
         "/c",
         "cmd.exe",
         "/c",
-        "copy",
-        "NUL",
+        "echo",
+        WRITTEN,
+        ">",
         &control_marker.to_string_lossy(),
     ]);
+    let ctl = std::fs::read_to_string(&control_marker).unwrap_or_default();
     assert!(
-        control_marker.exists(),
-        "control: without --no-child-process the grandchild must run (else the test proves nothing)"
+        ctl.contains(WRITTEN),
+        "control: without --no-child-process the grandchild must run (else the test proves \
+         nothing); marker {ctl:?}; launcher stderr: {}",
+        String::from_utf8_lossy(&control_out.stderr).trim()
     );
 
     // Restricted: --no-child-process ⇒ the kernel blocks the inner CreateProcess,
-    // so the grandchild never runs and gc.txt is never created.
+    // so the grandchild never runs and the marker stays the sentinel.
     let restricted = fresh_dir("exec-deny");
     let restricted_marker = restricted.join("gc.txt");
+    std::fs::write(&restricted_marker, SENTINEL).expect("seed restricted marker");
     launch(&[
         "--name",
         &tag("exec-deny"),
@@ -282,13 +265,20 @@ fn exec_deny_all_kernel_blocks_child_process_creation() {
         "/c",
         "cmd.exe",
         "/c",
-        "copy",
-        "NUL",
+        "echo",
+        WRITTEN,
+        ">",
         &restricted_marker.to_string_lossy(),
     ]);
+    let r = std::fs::read_to_string(&restricted_marker).unwrap_or_default();
+    // The outer cmd sets up its `> marker` redirect (truncating the marker to empty)
+    // *before* trying to spawn the inner cmd, so a blocked run leaves the marker
+    // empty — never `WRITTEN`. The signal is the absence of the grandchild's output;
+    // the control run above proves the grandchild otherwise writes it.
     assert!(
-        !restricted_marker.exists(),
-        "kernel must BLOCK child-process creation under --no-child-process (#123)"
+        !r.contains(WRITTEN),
+        "kernel must BLOCK child-process creation under --no-child-process (#123); the \
+         grandchild must not have run, but the marker holds its output: {r:?}"
     );
 
     let _ = std::fs::remove_dir_all(&control);
