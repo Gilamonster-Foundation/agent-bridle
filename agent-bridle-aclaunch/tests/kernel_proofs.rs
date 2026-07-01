@@ -123,7 +123,7 @@ fn fs_write_kernel_allows_granted_denies_ungranted() {
 
     // One confined child attempts BOTH writes (`copy NUL <path>` creates an empty
     // file with no `>` redirection to quote). Only the granted one may land.
-    launch(&[
+    let out = launch(&[
         "--name",
         &tag("fsw"),
         "--fs-write",
@@ -139,9 +139,28 @@ fn fs_write_kernel_allows_granted_denies_ungranted() {
         &d_file.to_string_lossy(),
     ]);
 
+    // Rich failure diagnostics (this proof behaves differently on elevated hosts):
+    // the launcher's own output (does it report a failed ACL grant?) and the actual
+    // resulting ACL + integrity label on the granted dir.
+    let diag = || {
+        let acl = Command::new("icacls")
+            .arg(&granted)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        format!(
+            "\n  temp_dir = {}\n  launcher stdout: {}\n  launcher stderr: {}\n  granted ACL:\n{}",
+            std::env::temp_dir().display(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+            acl
+        )
+    };
+
     assert!(
         g_file.exists(),
-        "kernel must ALLOW the write to the --fs-write-granted path"
+        "kernel must ALLOW the write to the --fs-write-granted path{}",
+        diag()
     );
     assert!(
         !d_file.exists(),
