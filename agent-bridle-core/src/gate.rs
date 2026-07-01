@@ -36,14 +36,14 @@ use crate::{
 /// `exec:Only` / `net:Only` run today (exec/net are not yet kernel-enforceable)
 /// and must land together with the call-site/test updates that behavior change
 /// requires. A strong principal opts in now via [`Gate::with_strength_floor`].
-const DEFAULT_STRENGTH_FLOOR: AxisEnforcement = AxisEnforcement::Advisory;
+pub(crate) const DEFAULT_STRENGTH_FLOOR: AxisEnforcement = AxisEnforcement::Advisory;
 
 /// Defensive cap on the freshness-window scan (ADR 0007 D4). The gate recomputes
 /// the bound challenge once per generation in the window, so an unbounded
 /// `freshness_generations` would be an unbounded loop. A discharge may be reused
 /// for at most this many generations regardless of a larger requested window —
 /// the cap **tightens** the window (fail-closed), never loosens it.
-const MAX_FRESHNESS_WINDOW: u64 = 4096;
+pub(crate) const MAX_FRESHNESS_WINDOW: u64 = 4096;
 
 /// The leash enforcer. One gate backs a session (or a sub-delegation); it
 /// tracks the remaining call budget and the generation it is valid for.

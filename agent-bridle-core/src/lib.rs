@@ -26,6 +26,7 @@
 // ── The leash: canonical authority lattice (re-exported, single source) ──────
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 
+mod config;
 mod context;
 mod envelope;
 mod error;
@@ -39,6 +40,11 @@ mod spawn;
 mod step_up;
 mod tool;
 
+pub use config::{
+    BackendToggles, BridleConfig, BridleMode, GatePolicy, HostMatch, LimitsPolicy, NetDefault,
+    NetPolicy, NetRule, NormalizationPolicy, PathList, RootfsPolicy, SandboxPolicy, VmPolicy,
+    WebPolicy,
+};
 pub use context::ToolContext;
 pub use envelope::{Denial, DenialKind, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
