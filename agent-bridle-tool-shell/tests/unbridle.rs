@@ -73,6 +73,11 @@ async fn unbridled_runs_native_discloses_and_still_gates_the_grant() {
         out["disclosure"]["unbridled"], true,
         "every envelope must disclose unbridled: {out}"
     );
+    // Default posture is Supervised-free — the human gate stays on (R5/D11).
+    assert_eq!(
+        out["disclosure"]["human_gate"], "passkey",
+        "unbridled without the no-step-up ack is Supervised-free (human gate on): {out}"
+    );
 
     // The L2 OCAP gate still holds: an out-of-scope exec is denied even unbridled.
     let denied = ShellTool::new()
