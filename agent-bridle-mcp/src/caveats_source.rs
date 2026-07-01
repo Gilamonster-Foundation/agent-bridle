@@ -33,6 +33,13 @@ const ENV_UNBRIDLE_ACK: &str = "AGENT_BRIDLE_UNBRIDLE";
 /// memory or pasted without reading it (ADR 0018 D3).
 const UNBRIDLE_ACK_TOKEN: &str = "i-understand-this-is-dangerous";
 
+/// The **second** ack (ADR 0018 D10) — removes the human step-up gate too, only
+/// legal when already unbridled. Reaching the Autonomous posture costs all three
+/// tokens (mode + unbridle ack + this).
+const ENV_NO_STEPUP_ACK: &str = "AGENT_BRIDLE_NO_STEPUP";
+/// The exact no-step-up ack token.
+const NO_STEPUP_TOKEN: &str = "i-accept-no-human-in-the-loop";
+
 /// The fail-closed bottom: no authority on any axis. The dual of `Caveats::top()`
 /// — used as the default when no grant is configured (§9.3). `agent-mesh-protocol`
 /// ships `top()` but no lattice bottom yet; constructed here until it does.
@@ -60,7 +67,9 @@ pub enum CaveatsSource {
     /// **Unbridled** (ADR 0018): the two-key escape hatch engaged. The configured
     /// grant is kept (never widened); the L3 confinement mechanism is off. `ack` is
     /// the acknowledgement token the operator supplied, recorded for the audit trail.
-    Unbridled { ack: String },
+    /// `autonomous` = the human step-up gate was *also* removed (D10 — the second
+    /// ack): `false` is *Supervised-free* (human gate stays), `true` is *Autonomous*.
+    Unbridled { ack: String, autonomous: bool },
     /// `BRIDLE_MODE=unbridle` was requested **without** the required ack — refused
     /// and failed closed to DENY-ALL (never a silent unbridle, ADR 0018 D3).
     UnbridleRefused { reason: String },
@@ -89,7 +98,13 @@ impl GrantedCaveats {
         let base = Self::resolve(env.as_deref(), home.as_deref())?;
         let mode = std::env::var(ENV_MODE).ok();
         let ack = std::env::var(ENV_UNBRIDLE_ACK).ok();
-        Ok(Self::apply_unbridle(base, mode.as_deref(), ack.as_deref()))
+        let no_step_up = std::env::var(ENV_NO_STEPUP_ACK).ok();
+        Ok(Self::apply_unbridle(
+            base,
+            mode.as_deref(),
+            ack.as_deref(),
+            no_step_up.as_deref(),
+        ))
     }
 
     /// Apply the ADR 0018 unbridle escape hatch on top of a resolved grant.
@@ -104,15 +119,25 @@ impl GrantedCaveats {
     /// [`CaveatsSource::UnbridleRefused`] provenance — never a silent unbridle.
     /// Neither key alone does anything. Pure/testable.
     #[must_use]
-    pub fn apply_unbridle(base: Self, mode: Option<&str>, ack: Option<&str>) -> Self {
+    pub fn apply_unbridle(
+        base: Self,
+        mode: Option<&str>,
+        ack: Option<&str>,
+        no_step_up_ack: Option<&str>,
+    ) -> Self {
         if mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() != Some("unbridle") {
             return base; // not requested — leave the resolved grant as-is
         }
         if ack == Some(UNBRIDLE_ACK_TOKEN) {
+            // The human gate is removed (Autonomous) ONLY with the distinct second
+            // ack, and only here (already unbridled). The unbridle ack never
+            // implies it; a missing/wrong second ack stays Supervised-free (D10).
+            let autonomous = no_step_up_ack == Some(NO_STEPUP_TOKEN);
             Self {
                 caveats: base.caveats, // KEEP the configured grant (not top())
                 source: CaveatsSource::Unbridled {
                     ack: UNBRIDLE_ACK_TOKEN.to_string(),
+                    autonomous,
                 },
             }
         } else {
@@ -132,6 +157,20 @@ impl GrantedCaveats {
     #[must_use]
     pub fn is_unbridled(&self) -> bool {
         matches!(self.source, CaveatsSource::Unbridled { .. })
+    }
+
+    /// Whether the resolution reached the **Autonomous** posture (unbridled *and*
+    /// the human step-up gate removed via the second ack, D10). `false` for a
+    /// Supervised-free or bridled run.
+    #[must_use]
+    pub fn is_autonomous(&self) -> bool {
+        matches!(
+            self.source,
+            CaveatsSource::Unbridled {
+                autonomous: true,
+                ..
+            }
+        )
     }
 
     /// Pure resolution given the (optional) env value and (optional) home dir.
@@ -190,16 +229,25 @@ impl GrantedCaveats {
                  (fail-closed); every tool is refused. Set ${ENV_CAVEATS} or \
                  [caveats] to grant authority."
             ),
-            CaveatsSource::Unbridled { .. } => format!(
-                "\n\
-                 ============================ !!! UNBRIDLED !!! ============================\n\
-                 agent-bridle-mcp: the confinement MECHANISM is OFF (ADR 0018) — tools run\n\
-                 NATIVELY, with no OS sandbox. Your configured OCAP grant still gates each\n\
-                 call (advisory) and the human step-up gate still applies; every result\n\
-                 discloses `unbridled`. Acked via ${ENV_UNBRIDLE_ACK}. Unset ${ENV_MODE}\n\
-                 to run confined again.\n\
-                 =========================================================================="
-            ),
+            CaveatsSource::Unbridled { autonomous, .. } => {
+                let posture = if *autonomous {
+                    "AUTONOMOUS — the human step-up gate is ALSO OFF (no human in the\n\
+                     loop). Acked via ${ENV_NO_STEPUP_ACK}. This is the loudest, most\n\
+                     dangerous posture: neither machine nor human leash."
+                } else {
+                    "Supervised-free — your configured OCAP grant still gates each call\n\
+                     (advisory) and the human step-up gate still applies."
+                };
+                format!(
+                    "\n\
+                     ============================ !!! UNBRIDLED !!! ============================\n\
+                     agent-bridle-mcp: the confinement MECHANISM is OFF (ADR 0018) — tools run\n\
+                     NATIVELY, with no OS sandbox. {posture}\n\
+                     Every result discloses `unbridled`. Acked via ${ENV_UNBRIDLE_ACK}. Unset\n\
+                     ${ENV_MODE} to run confined again.\n\
+                     =========================================================================="
+                )
+            }
             CaveatsSource::UnbridleRefused { reason } => format!(
                 "agent-bridle-mcp: WARNING — {reason}. REFUSING to unbridle; running \
                  DENY-ALL (fail-closed). Set ${ENV_UNBRIDLE_ACK}={UNBRIDLE_ACK_TOKEN} to \
@@ -338,13 +386,57 @@ valid_for_generation = "all"
             base_grant(grant.clone()),
             Some("unbridle"),
             Some("i-understand-this-is-dangerous"),
+            None, // no second ack ⇒ Supervised-free (human gate stays)
         );
         assert!(g.is_unbridled());
+        assert!(
+            !g.is_autonomous(),
+            "no second ack ⇒ Supervised-free, not Autonomous"
+        );
         assert!(matches!(g.source, CaveatsSource::Unbridled { .. }));
         // The configured grant is KEPT — unbridle never widens authority to top().
         assert_eq!(g.caveats, grant);
         assert_ne!(g.caveats, Caveats::top());
         assert!(g.banner().contains("UNBRIDLED"), "banner: {}", g.banner());
+        assert!(
+            g.banner().contains("Supervised-free"),
+            "banner: {}",
+            g.banner()
+        );
+    }
+
+    #[test]
+    fn autonomous_requires_the_second_ack_and_stays_supervised_free_without_it() {
+        let unbridle_ack = Some("i-understand-this-is-dangerous");
+        // Both acks ⇒ Autonomous (human gate off) — the loudest posture.
+        let auto = GrantedCaveats::apply_unbridle(
+            base_grant(Caveats::top()),
+            Some("unbridle"),
+            unbridle_ack,
+            Some("i-accept-no-human-in-the-loop"),
+        );
+        assert!(auto.is_unbridled());
+        assert!(auto.is_autonomous(), "both acks ⇒ Autonomous");
+        assert!(
+            auto.banner().contains("AUTONOMOUS"),
+            "banner: {}",
+            auto.banner()
+        );
+        // The unbridle ack alone never implies no-step-up; a wrong/missing second
+        // ack stays Supervised-free (fail-closed to keeping the human gate).
+        for second in [None, Some(""), Some("1"), Some("yes"), Some("i-accept")] {
+            let g = GrantedCaveats::apply_unbridle(
+                base_grant(Caveats::top()),
+                Some("unbridle"),
+                unbridle_ack,
+                second,
+            );
+            assert!(g.is_unbridled());
+            assert!(
+                !g.is_autonomous(),
+                "second ack={second:?} must NOT reach Autonomous"
+            );
+        }
     }
 
     #[test]
@@ -357,8 +449,12 @@ valid_for_generation = "all"
             Some("true"),
             Some("i-understand"),
         ] {
-            let g =
-                GrantedCaveats::apply_unbridle(base_grant(Caveats::top()), Some("unbridle"), ack);
+            let g = GrantedCaveats::apply_unbridle(
+                base_grant(Caveats::top()),
+                Some("unbridle"),
+                ack,
+                None,
+            );
             assert!(
                 matches!(g.source, CaveatsSource::UnbridleRefused { .. }),
                 "ack={ack:?} must be refused"
@@ -380,6 +476,7 @@ valid_for_generation = "all"
             base_grant(grant.clone()),
             None,
             Some("i-understand-this-is-dangerous"),
+            None,
         );
         assert_eq!(g1.source, CaveatsSource::Env);
         assert!(!g1.is_unbridled());
@@ -388,6 +485,7 @@ valid_for_generation = "all"
             base_grant(grant),
             Some("bridled"),
             Some("i-understand-this-is-dangerous"),
+            None,
         );
         assert_eq!(g2.source, CaveatsSource::Env);
     }
