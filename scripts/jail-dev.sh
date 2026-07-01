@@ -40,5 +40,11 @@ if [[ -z "${EXE}" || ! -x "${EXE}" ]]; then
   exit 1
 fi
 
-echo "== privileged jail proofs (#109): ${EXE} =="
+# The Tier-2 micro-VM proof (#111) needs the compiled guest init; it sits next to
+# the test binary's target/debug.
+TARGET_DEBUG=$(dirname "$(dirname "${EXE}")")
+export BRIDLE_JAIL_INIT="${TARGET_DEBUG}/bridle-jail-init"
+
+echo "== privileged jail proofs: ${EXE} =="
+[[ -x "${BRIDLE_JAIL_INIT}" ]] && echo "   (micro-VM guest init: ${BRIDLE_JAIL_INIT})"
 exec "${EXE}" --ignored --nocapture

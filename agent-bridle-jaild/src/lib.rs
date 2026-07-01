@@ -56,6 +56,11 @@ mod broker;
 #[cfg(target_os = "linux")]
 pub use broker::{handle_connection, handle_request, peer_cred, serve};
 
+#[cfg(target_os = "linux")]
+mod vm;
+#[cfg(target_os = "linux")]
+pub use vm::{microvm_is_supported, run_microvm, VmOutcome};
+
 /// Run `program` (an absolute path) with `args` inside a Tier-1.5 mount-namespace
 /// jail materialized from `plan`, capturing its output.
 ///
