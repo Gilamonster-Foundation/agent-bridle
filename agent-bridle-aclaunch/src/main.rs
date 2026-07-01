@@ -386,6 +386,11 @@ mod windows {
 
     /// Create an AppContainer profile, spawn `exe` inside it, wait, and return
     /// the child's exit code.  Cleans up the profile before returning.
+    // Each parameter is a distinct, independent Win32 spawn knob (network
+    // capabilities, loopback exemption, child-process policy, the two fs ACL
+    // lists, and the exec target) — bundling them into a struct would only move
+    // the same fields behind one more indirection without improving clarity.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn spawn_in_container(
         name: &str,
         net_allow: bool,
