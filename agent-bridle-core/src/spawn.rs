@@ -445,7 +445,11 @@ mod tests {
         };
         // AppContainer does not engage for fs-only (launcher doesn't enforce it).
         let governing = effective_sandbox_kind(SandboxKind::AppContainer, &fs);
-        assert_eq!(governing, SandboxKind::None, "fs-only must not engage AppContainer");
+        assert_eq!(
+            governing,
+            SandboxKind::None,
+            "fs-only must not engage AppContainer"
+        );
         // Without a kernel-confining backend, fs→Interceptor → unenforceable.
         assert!(
             confinement_unenforceable(governing, &fs, AxisEnforcement::Advisory),
