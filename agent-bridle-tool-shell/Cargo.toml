@@ -13,6 +13,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# The live egress-audit monitor (#124, ADR 0016). Needs the `shell` feature (for
+# the `NetAuditEvent` type it renders), so it is not built in a `shell`-less build.
+[[bin]]
+name = "bridle-netmon"
+required-features = ["shell"]
+
 [features]
 # `shell` is on by default so agent-bridle's registry() includes the tool.
 # It pulls tokio (spawn_blocking + timeout) for confined execution.
