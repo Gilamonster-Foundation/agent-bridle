@@ -432,34 +432,25 @@ mod tests {
         ));
     }
 
-    /// Regression (adversarial review of ADR 0012 D4): the fail-closed check must
-    /// be decided against the kind the spawn path ACTUALLY applies
-    /// (`effective_sandbox_kind`), never the raw probe. Now that the AppContainer
-    /// launcher is built (#51), AppContainer is the governing kind for a restricted
-    /// fs scope — and since `enforcement_report` reports fs→Kernel for AppContainer,
-    /// the spawn is ENFORCEABLE (not fail-closed). The `SandboxKind::None` case
-    /// (no sandbox available) still fails closed.
+    /// Honesty fix (#136): AppContainer does NOT kernel-confine the fs axis (ACL
+    /// narrowing is deferred). A restricted fs scope must NOT engage AppContainer
+    /// as the governing kind — effective_sandbox_kind returns None — so the spawn
+    /// fails closed via confinement_unenforceable (fs→Interceptor < Kernel).
+    /// This is the same fail-closed behavior as SandboxKind::None.
     #[test]
-    fn fs_floor_uses_the_governing_kind_not_the_raw_probe_for_appcontainer() {
+    fn fs_restricted_under_appcontainer_is_unenforceable_until_acl_wiring() {
         let fs = Caveats {
             fs_write: Scope::only(["/tmp/x".to_string()]),
             ..Caveats::top()
         };
-        // With the launcher built, AppContainer is the governing kind (not None).
+        // AppContainer does not engage for fs-only (launcher doesn't enforce it).
         let governing = effective_sandbox_kind(SandboxKind::AppContainer, &fs);
-        assert_eq!(governing, SandboxKind::AppContainer);
-        // AppContainer reports fs→Kernel; the spawn is enforceable.
-        assert!(!confinement_unenforceable(
-            governing,
-            &fs,
-            AxisEnforcement::Advisory
-        ));
-        // Without a sandbox (None), the same restricted fs IS unenforceable.
-        assert!(confinement_unenforceable(
-            SandboxKind::None,
-            &fs,
-            AxisEnforcement::Advisory
-        ));
+        assert_eq!(governing, SandboxKind::None, "fs-only must not engage AppContainer");
+        // Without a kernel-confining backend, fs→Interceptor → unenforceable.
+        assert!(
+            confinement_unenforceable(governing, &fs, AxisEnforcement::Advisory),
+            "restricted fs with no kernel backend must fail closed"
+        );
     }
 
     /// Builds with **no** available OS sandbox: a restrictive `fs_write` must be

@@ -68,14 +68,49 @@ mod windows {
     }
 
     /// Build a Windows command-line string from (program, args) for
-    /// `CreateProcessW`. Tokens containing spaces or `"` are quoted.
+    /// `CreateProcessW`. Uses the canonical MSVC `CommandLineToArgvW` quoting
+    /// rules: backslash runs before `"` (or at string end inside a quoted token)
+    /// are doubled; `"` is escaped as `\"`. Plain tokens (no whitespace or `"`)
+    /// are emitted verbatim.
     fn build_cmdline(program: &str, args: &[String]) -> Vec<u16> {
         fn quote(s: &str) -> String {
-            if s.chars().any(|c| c == '"' || c == ' ' || c == '\t') {
-                format!("\"{}\"", s.replace('"', "\\\""))
-            } else {
-                s.to_string()
+            let needs_quoting = s.is_empty()
+                || s.chars().any(|c| matches!(c, '"' | ' ' | '\t'));
+            if !needs_quoting {
+                return s.to_string();
             }
+            let mut out = String::from('"');
+            let chars: Vec<char> = s.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let bs_start = i;
+                while i < chars.len() && chars[i] == '\\' {
+                    i += 1;
+                }
+                let n_bs = i - bs_start;
+                if i == chars.len() {
+                    // Trailing backslashes precede the closing `"` — must be doubled.
+                    for _ in 0..n_bs * 2 {
+                        out.push('\\');
+                    }
+                } else if chars[i] == '"' {
+                    // Backslashes before `"`: double them, then escape the `"`.
+                    for _ in 0..n_bs * 2 {
+                        out.push('\\');
+                    }
+                    out.push_str("\\\"");
+                    i += 1;
+                } else {
+                    // Backslashes not adjacent to `"`: literal.
+                    for _ in 0..n_bs {
+                        out.push('\\');
+                    }
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            out.push('"');
+            out
         }
         let mut cmd = quote(program);
         for a in args {
@@ -102,7 +137,7 @@ mod windows {
                     "agent-bridle-aclaunch: CreateWellKnownSid({t}) failed: {:?}",
                     std::io::Error::last_os_error()
                 );
-                continue;
+                std::process::exit(1);
             }
             let ptr = buf.as_mut_ptr().cast();
             bufs.push(buf);
@@ -221,7 +256,7 @@ mod windows {
                 "agent-bridle-aclaunch: InitializeProcThreadAttributeList failed: {:?}",
                 std::io::Error::last_os_error()
             );
-            do_cleanup(name, ac_sid, &cap_sids);
+            do_cleanup(name, ac_sid);
             std::process::exit(1);
         }
 
@@ -240,7 +275,7 @@ mod windows {
                 std::io::Error::last_os_error()
             );
             DeleteProcThreadAttributeList(attr_list);
-            do_cleanup(name, ac_sid, &cap_sids);
+            do_cleanup(name, ac_sid);
             std::process::exit(1);
         }
 
@@ -279,7 +314,7 @@ mod windows {
                 "agent-bridle-aclaunch: CreateProcessW({exe:?}) failed: {:?}",
                 std::io::Error::last_os_error()
             );
-            do_cleanup(name, ac_sid, &cap_sids);
+            do_cleanup(name, ac_sid);
             std::process::exit(1);
         }
 
@@ -293,22 +328,17 @@ mod windows {
         CloseHandle(proc_info.hProcess as HANDLE);
 
         // 7. Cleanup: free SIDs and delete the profile.
-        do_cleanup(name, ac_sid, &cap_sids);
+        do_cleanup(name, ac_sid);
 
         exit_code
     }
 
-    unsafe fn do_cleanup(
-        name: &str,
-        ac_sid: *mut std::ffi::c_void,
-        cap_sids: &[SID_AND_ATTRIBUTES],
-    ) {
-        // Capability SIDs were allocated by CreateWellKnownSid; free them.
-        for sid in cap_sids {
-            if !sid.Sid.is_null() {
-                FreeSid(sid.Sid);
-            }
-        }
+    unsafe fn do_cleanup(name: &str, ac_sid: *mut std::ffi::c_void) {
+        // ac_sid was returned by CreateAppContainerProfile; free it with FreeSid
+        // per the Win32 docs. The capability SIDs (from CreateWellKnownSid into
+        // caller-owned Vec<u8> buffers) must NOT be passed to FreeSid — that is
+        // only valid for AllocateAndInitializeSid memory. They are freed when
+        // cap_bufs drops in the caller.
         if !ac_sid.is_null() {
             FreeSid(ac_sid);
         }
