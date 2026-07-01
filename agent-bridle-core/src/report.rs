@@ -186,9 +186,17 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             // at least as strict as any allowlist, so `kernel` is honest.
             SandboxKind::AppContainer | SandboxKind::MicroVm => AxisEnforcement::Kernel,
             // Seatbelt kernel-denies *all* egress when the net scope is empty
-            // (`(deny network*)`); a non-empty host allowlist it cannot express,
-            // so that stays advisory. Landlock does not gate net this increment.
-            SandboxKind::Seatbelt if crate::sandbox::net_fully_denied(effective) => {
+            // (`(deny network*)`), and confines a **loopback-only** allowlist to
+            // the loopback interface (`(allow network* (remote ip "localhost:*"))`)
+            // so the process's own off-box socket egress is kernel-denied (ADR
+            // 0015) — both honest `kernel`. A general remote host is inexpressible
+            // in SBPL (only
+            // `*`/`localhost` + ports), so it stays advisory. Landlock does not gate
+            // net this increment.
+            SandboxKind::Seatbelt
+                if crate::sandbox::net_fully_denied(effective)
+                    || crate::sandbox::net_loopback_only(effective) =>
+            {
                 AxisEnforcement::Kernel
             }
             // The minimal-rootfs jail does not namespace the network this tier, so
@@ -245,9 +253,10 @@ mod tests {
 
     /// Seatbelt (macOS) governs the fs axes in the kernel like Landlock, **and**
     /// the `exec` axis via `process-exec*` (ADR 0014) — so exec is `kernel`, not
-    /// `interceptor`. `net` here is a non-empty host allowlist, which SBPL cannot
-    /// express, so it stays advisory (the empty-net kernel case is covered by
-    /// [`seatbelt_net_is_kernel_only_when_fully_denied`]).
+    /// `interceptor`. `net` here is a general remote host allowlist, which SBPL
+    /// cannot express, so it stays advisory (the empty-net and loopback-only kernel
+    /// cases are covered by
+    /// [`seatbelt_net_kernel_for_empty_and_loopback_advisory_for_remote_host`]).
     #[test]
     fn seatbelt_marks_fs_and_exec_kernel_net_advisory() {
         let r = enforcement_report(&fully_restricted(), SandboxKind::Seatbelt);
@@ -336,27 +345,44 @@ mod tests {
         assert_eq!(r.net, Some(AxisEnforcement::Kernel));
     }
 
-    /// Seatbelt's net honesty is emptiness-dependent: an **empty** net scope is
-    /// kernel-denied (`(deny network*)`), but a non-empty host allowlist is not
-    /// expressible in SBPL, so it stays advisory — never claimed as confined.
+    /// Seatbelt's net honesty is scope-shaped (ADR 0015): kernel for the two
+    /// policies SBPL can express — an **empty** scope (`(deny network*)`) and a
+    /// **loopback-only** allowlist (egress confined to the loopback interface) —
+    /// and advisory for a general remote host, which SBPL cannot name.
     #[test]
-    fn seatbelt_net_is_kernel_only_when_fully_denied() {
+    fn seatbelt_net_kernel_for_empty_and_loopback_advisory_for_remote_host() {
+        let net_report = |net| {
+            enforcement_report(
+                &Caveats {
+                    net,
+                    ..Caveats::top()
+                },
+                SandboxKind::Seatbelt,
+            )
+            .net
+        };
+
         // Empty net (all egress denied) → kernel.
-        let denied = Caveats {
-            net: Scope::none(),
-            ..Caveats::top()
-        };
+        assert_eq!(net_report(Scope::none()), Some(AxisEnforcement::Kernel));
+        // Loopback-only allowlist (off-box egress kernel-impossible) → kernel.
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            assert_eq!(
+                net_report(Scope::only([host.to_string()])),
+                Some(AxisEnforcement::Kernel),
+                "loopback host {host} must report kernel"
+            );
+        }
+        // A general remote host → advisory (inexpressible in SBPL).
         assert_eq!(
-            enforcement_report(&denied, SandboxKind::Seatbelt).net,
-            Some(AxisEnforcement::Kernel)
+            net_report(Scope::only(["example.com".to_string()])),
+            Some(AxisEnforcement::Advisory)
         );
-        // Non-empty host allowlist → advisory (cannot be enforced in SBPL).
-        let allowlist = Caveats {
-            net: Scope::only(["example.com".to_string()]),
-            ..Caveats::top()
-        };
+        // A single remote host taints an otherwise-loopback set → advisory.
         assert_eq!(
-            enforcement_report(&allowlist, SandboxKind::Seatbelt).net,
+            net_report(Scope::only([
+                "localhost".to_string(),
+                "example.com".to_string()
+            ])),
             Some(AxisEnforcement::Advisory)
         );
     }

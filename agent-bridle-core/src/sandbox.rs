@@ -157,6 +157,38 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
 }
 
+/// The host tokens that name the machine's own **loopback interface**. SBPL's
+/// `(remote ip "localhost:*")` filter matches exactly these destinations
+/// (`127.0.0.1` and `::1`) — empirically the *only* remote a non-empty SBPL net
+/// rule can name (an arbitrary IP is rejected: "host must be * or localhost").
+const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// `true` if the `net` axis is restricted to a **non-empty** allow-list whose
+/// every host is a [loopback identifier](LOOPBACK_HOSTS) — the one non-deny-all
+/// net policy SBPL *can* kernel-enforce (`(deny network*)` + `(allow network*
+/// (remote ip "localhost:*"))`), confining egress to the loopback interface so the
+/// process's **own off-box socket egress is kernel-denied** (ADR 0015; the
+/// system-resolver DNS residual is shared with the empty-net case). A general remote
+/// host cannot be named in SBPL (only `*`/`localhost` + ports), so a mixed or
+/// non-loopback allow-list is **not** loopback-only and stays advisory — never
+/// silently dropped. Mutually exclusive with [`net_fully_denied`] (empty set).
+///
+/// The kernel rule confines egress to the loopback *interface* — `localhost` =
+/// `127.0.0.1` **and** `::1`, the finest grain SBPL can name. For a **spawned
+/// child** (governed only by the kernel rule, not the in-process leash) that
+/// interface *is* the boundary, so a grant naming a single loopback address
+/// (e.g. `127.0.0.1`) still permits the other (`::1`) — a widening strictly
+/// *within* loopback, never off-box. Admission (`ToolContext::check_net`,
+/// exact-match) narrows to the granted host for the engine's *own* operations.
+/// Unlike the fs `(subpath root)` case — where the kernel subtree and the granted
+/// root denote the same set — the loopback interface can exceed a single-address
+/// grant; see ADR 0015 D2.
+#[must_use]
+pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s)
+        if !s.is_empty() && s.iter().all(|h| LOOPBACK_HOSTS.contains(&h.as_str())))
+}
+
 /// The [`SandboxKind`] honestly in force for `caveats` given the strongest
 /// `available` backend: the backend's own kind when it will actually confine
 /// *something*, else [`SandboxKind::None`]. The single honesty rule shared by the
@@ -165,16 +197,20 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
 ///
 /// Capabilities differ per backend, so the engaging condition does too: Landlock
 /// governs the filesystem axes; Seatbelt governs those, kernel-denies all egress
-/// when `net` is empty ([`net_fully_denied`]), **and** confines the `exec` axis
-/// via `process-exec*` ([`restricts_exec`]) — a confinement Landlock cannot
-/// supply (ADR 0014). Landlock's exec axis stays held (agent-bridle#31/#57), so a
-/// Landlock host does not engage on `exec` alone.
+/// when `net` is empty ([`net_fully_denied`]) or confines it to the loopback
+/// interface for a loopback-only allow-list ([`net_loopback_only`], ADR 0015),
+/// **and** confines the `exec` axis via `process-exec*` ([`restricts_exec`]) — a
+/// confinement Landlock cannot supply (ADR 0014). Landlock's exec axis stays held
+/// (agent-bridle#31/#57), so a Landlock host does not engage on `exec` alone.
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
         SandboxKind::Landlock if restricts_fs(caveats) => SandboxKind::Landlock,
         SandboxKind::Seatbelt
-            if restricts_fs(caveats) || net_fully_denied(caveats) || restricts_exec(caveats) =>
+            if restricts_fs(caveats)
+                || net_fully_denied(caveats)
+                || net_loopback_only(caveats)
+                || restricts_exec(caveats) =>
         {
             SandboxKind::Seatbelt
         }
@@ -685,12 +721,13 @@ mod seatbelt_impl {
         }
 
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // Nothing on a governed axis (fs, all-egress-denied net, or a
-            // restricted exec allow-list) => nothing to confine; run unwrapped
-            // (coarse honesty falls to `None` upstream, and the per-axis report
-            // omits unrestricted axes).
+            // Nothing on a governed axis (fs, all-egress-denied or loopback-only
+            // net, or a restricted exec allow-list) => nothing to confine; run
+            // unwrapped (coarse honesty falls to `None` upstream, and the per-axis
+            // report omits unrestricted axes).
             if !super::restricts_fs(effective)
                 && !super::net_fully_denied(effective)
+                && !super::net_loopback_only(effective)
                 && !super::restricts_exec(effective)
             {
                 return Ok(Vec::new());
@@ -761,13 +798,21 @@ mod seatbelt_impl {
             p.push_str(")\n");
         }
 
-        // net: deny *all* egress when the net scope is empty — the only network
-        // policy SBPL can soundly express (see `net_fully_denied`). This confines
-        // the spawned interior's network the way no Landlock increment can: a
-        // permitted child's `curl`/`connect` is kernel-denied. A non-empty host
-        // allowlist is left ambient (reported advisory), never silently dropped.
+        // net: SBPL can name only `*`/`localhost` + ports as a remote (an
+        // arbitrary IP is rejected: "host must be * or localhost"; ADR 0015), so a
+        // general host allowlist is inexpressible and left ambient (reported
+        // advisory, never silently dropped). The two policies it *can* enforce:
+        //   • empty scope  → `(deny network*)`: every socket kernel-denied — a
+        //     confinement no Landlock increment can supply.
+        //   • loopback-only allowlist → deny all, then re-allow the loopback
+        //     interface (`localhost` = 127.0.0.1 + ::1). The process's own off-box
+        //     socket egress stays kernel-denied; the exact loopback host is narrowed
+        //     by admission. Last-match-wins, so the allow overrides.
         if super::net_fully_denied(effective) {
             p.push_str("(deny network*)\n");
+        } else if super::net_loopback_only(effective) {
+            p.push_str("(deny network*)\n");
+            p.push_str("(allow network* (remote ip \"localhost:*\"))\n");
         }
 
         // exec: deny *all* further execs, then re-allow exactly the granted
@@ -933,8 +978,9 @@ mod seatbelt_impl {
 
         #[test]
         fn nonempty_net_allowlist_is_not_denied() {
-            // A host allowlist is not expressible in SBPL, so no `(deny network*)`
-            // is emitted — left ambient (advisory), never silently dropped.
+            // A general (non-loopback) host allowlist is not expressible in SBPL —
+            // it can name only `*`/`localhost` + ports as a remote — so no network
+            // rule is emitted; left ambient (advisory), never silently dropped.
             let cav = Caveats {
                 net: Scope::only(["example.com".to_string()]),
                 ..Caveats::top()
@@ -942,7 +988,49 @@ mod seatbelt_impl {
             let prof = seatbelt_profile(&cav);
             assert!(
                 !prof.contains("network"),
-                "non-empty net must stay ambient: {prof}"
+                "non-loopback net must stay ambient: {prof}"
+            );
+        }
+
+        #[test]
+        fn loopback_only_net_confines_to_loopback_and_engages() {
+            // A loopback-only allowlist IS expressible: deny all egress, then
+            // re-allow the loopback interface (ADR 0015). Off-box egress stays
+            // kernel-denied; the wrapper engages even with fs/exec unrestricted.
+            for host in ["localhost", "127.0.0.1", "::1"] {
+                let cav = Caveats {
+                    net: Scope::only([host.to_string()]),
+                    ..Caveats::top()
+                };
+                let prof = seatbelt_profile(&cav);
+                assert!(prof.contains("(deny network*)"), "{host}: {prof}");
+                assert!(
+                    prof.contains("(allow network* (remote ip \"localhost:*\"))"),
+                    "{host}: loopback re-allow missing: {prof}"
+                );
+                assert!(
+                    !SeatbeltSandbox::new()
+                        .command_prefix(&cav)
+                        .unwrap()
+                        .is_empty(),
+                    "{host}: a loopback-only net grant must engage the wrapper"
+                );
+            }
+        }
+
+        #[test]
+        fn mixed_loopback_and_remote_host_stays_ambient() {
+            // A single non-loopback host taints the set: SBPL cannot express the
+            // remote, so the whole allowlist stays ambient (advisory) rather than
+            // emit a rule that would silently drop `example.com`.
+            let cav = Caveats {
+                net: Scope::only(["localhost".to_string(), "example.com".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(
+                !prof.contains("network"),
+                "a mixed loopback+remote allowlist must stay ambient: {prof}"
             );
         }
 
@@ -1961,6 +2049,93 @@ mod seatbelt_kernel_tests {
             confined.code(),
             Some(7),
             "egress under net:none must be kernel-denied at the socket (curl exit 7)"
+        );
+    }
+
+    /// A one-shot loopback listener answering a single HTTP request, so an ALLOW
+    /// assertion tests a *reachable* socket (curl 0) — not "connection refused"
+    /// (also 7). Detached, so an unexpected deny can't hang the test on a
+    /// never-accepted connection. Returns the bound `SocketAddr`, or `None` if the
+    /// family is unavailable on this host (e.g. no `::1`), so a caller can skip.
+    fn spawn_loopback_http(bind: &str) -> Option<std::net::SocketAddr> {
+        let listener = std::net::TcpListener::bind(bind).ok()?;
+        let addr = listener.local_addr().ok()?;
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        Some(addr)
+    }
+
+    /// A loopback-only `net` grant kernel-confines egress to the loopback
+    /// *interface* (ADR 0015): the process reaches loopback (v4 **and** v6, since
+    /// SBPL's `localhost` denotes both) and is kernel-DENIED any off-box host. The
+    /// grant here names a **single** v4 address (`127.0.0.1`) yet `::1` is still
+    /// reachable — the documented interface-granular widening (D2): a spawned child
+    /// is governed only by the kernel rule, not the exact-host admission leash.
+    #[test]
+    fn net_loopback_only_permits_loopback_interface_denies_offbox() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let curl = "/usr/bin/curl";
+        if !std::path::Path::new(curl).exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let v4 = spawn_loopback_http("127.0.0.1:0").expect("bind v4 loopback");
+
+        // A single v4 loopback address — the case that widens to the interface.
+        let cav = Caveats {
+            net: Scope::only(["127.0.0.1".to_string()]),
+            ..Caveats::top()
+        };
+        // Positive control: a benign non-network command runs — the loopback
+        // profile parsed (a malformed one exits 65 and never launches the child).
+        assert!(
+            run_wrapped(&cav, "/bin/echo", &["ok"]).success(),
+            "loopback-only profile must still run non-network commands (must parse)"
+        );
+        // ALLOW (v4): egress to the loopback listener succeeds (curl exit 0). A
+        // deny-all or malformed rule would fail this — so it cannot pass vacuously.
+        let v4_url = format!("http://127.0.0.1:{}/", v4.port());
+        assert!(
+            run_wrapped(&cav, curl, &["-sS", "--max-time", "5", &v4_url]).success(),
+            "net:Only([127.0.0.1]) must kernel-PERMIT v4 loopback egress"
+        );
+        // ALLOW (v6): `::1` is reachable too — locking the interface-granular
+        // widening documented in ADR 0015 D2 (kernel `localhost` = 127.0.0.1 + ::1,
+        // broader than the single-address grant). Skipped only if v6 loopback is
+        // unavailable on the host (never on stock macOS).
+        if let Some(v6) = spawn_loopback_http("[::1]:0") {
+            let v6_url = format!("http://[::1]:{}/", v6.port());
+            assert!(
+                run_wrapped(&cav, curl, &["-sS", "--max-time", "5", &v6_url]).success(),
+                "net:Only([127.0.0.1]) kernel-permits the whole loopback interface, incl. ::1 (ADR 0015 D2)"
+            );
+        }
+        // DENY: off-box egress to a literal IP (no DNS) is kernel-denied at the
+        // socket. Assert both curl exit 7 AND the EPERM signal ("Operation not
+        // permitted") in stderr — so a no-internet runner (ENETUNREACH, also exit
+        // 7) cannot make this pass vacuously; it must be a *permission* denial.
+        let offbox = run_wrapped_output(
+            &cav,
+            curl,
+            &["-sS", "-v", "--max-time", "5", "http://1.1.1.1/"],
+        );
+        assert_eq!(
+            offbox.status.code(),
+            Some(7),
+            "net:Only([127.0.0.1]) must kernel-DENY off-box egress (curl exit 7)"
+        );
+        let stderr = String::from_utf8_lossy(&offbox.stderr);
+        assert!(
+            stderr.contains("Operation not permitted"),
+            "off-box denial must be a kernel EPERM, not a routing failure: {stderr}"
         );
     }
 
