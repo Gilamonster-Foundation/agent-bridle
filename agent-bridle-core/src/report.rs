@@ -199,6 +199,15 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             {
                 AxisEnforcement::Kernel
             }
+            // Landlock V4 (kernel ≥ 6.7) can deny-all TCP when the net scope is
+            // empty (no NetPort rules → deny-by-default). Non-empty host allowlists
+            // are not expressible (port-based, not hostname-based) and stay advisory.
+            SandboxKind::Landlock
+                if crate::sandbox::net_fully_denied(effective)
+                    && crate::sandbox::landlock_net_capable() =>
+            {
+                AxisEnforcement::Kernel
+            }
             // The minimal-rootfs jail does not namespace the network this tier, so
             // egress is unconfined — advisory, never overclaimed (ADR 0013 D5).
             SandboxKind::Landlock
@@ -249,6 +258,33 @@ mod tests {
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    /// Landlock V4 (kernel ≥ 6.7) kernel-denies ALL TCP when `net` is the empty
+    /// set (deny-all), because we declare `AccessNet` without adding any `NetPort`
+    /// rules — deny-by-default. On pre-V4 kernels the `handle_access` is a BestEffort
+    /// no-op so `net` stays advisory. The test dynamically queries the probe to stay
+    /// correct in both environments (ADR 0013 net-axis Landlock extension, issue #35).
+    #[test]
+    fn landlock_marks_net_kernel_when_net_fully_denied_and_v4_capable() {
+        let net_denied = crate::Caveats {
+            net: crate::Scope::none(),
+            ..crate::Caveats::top()
+        };
+        let r = enforcement_report(&net_denied, SandboxKind::Landlock);
+        let expected = if crate::sandbox::landlock_net_capable() {
+            Some(AxisEnforcement::Kernel)
+        } else {
+            Some(AxisEnforcement::Advisory)
+        };
+        assert_eq!(
+            r.net, expected,
+            "Landlock net enforcement depends on V4 kernel support"
+        );
+        // fs is not restricted, so those axes must be absent
+        assert_eq!(r.fs_read, None);
+        assert_eq!(r.fs_write, None);
+        assert_eq!(r.exec, None);
     }
 
     /// Seatbelt (macOS) governs the fs axes in the kernel like Landlock, **and**

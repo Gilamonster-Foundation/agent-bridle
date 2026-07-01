@@ -51,7 +51,7 @@ pub use sandbox::{
     best_available_sandbox, effective_sandbox_kind, NoopSandbox, Sandbox, SandboxKind,
 };
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
-pub use sandbox::{landlock_is_supported, LandlockSandbox};
+pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
 pub use spawn::{
