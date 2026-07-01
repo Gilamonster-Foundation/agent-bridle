@@ -57,6 +57,34 @@ async fn real_echo_runs_and_captures_stdout() {
     assert!(out.get("denied").is_none());
 }
 
+/// #143 regression: the captured-output cap is config-driven (not a hard-coded
+/// const). A `ShellTool` built with a tiny `max_output_bytes` truncates a chatty
+/// command's stdout at the configured bound and flags it truncated.
+#[tokio::test]
+async fn real_output_cap_is_config_driven() {
+    let limits = agent_bridle_core::LimitsPolicy {
+        max_output_bytes: 8,
+        ..agent_bridle_core::LimitsPolicy::default()
+    };
+    let out = ShellTool::with_config(limits)
+        .invoke(
+            serde_json::json!({"program": "echo", "args": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}),
+            &ctx(exec_only(&["echo"])),
+        )
+        .await
+        .expect("invoke");
+    let stdout = out["stdout"].as_str().expect("stdout string");
+    assert!(
+        stdout.len() <= 8,
+        "output must be capped at the configured 8 bytes, got {}",
+        stdout.len()
+    );
+    assert_eq!(
+        out["stdout_truncated"], true,
+        "a source past the configured cap is flagged truncated"
+    );
+}
+
 #[tokio::test]
 async fn real_pipeline_passes_data_between_stages() {
     // echo's stdout becomes cat's stdin; cat echoes it back.
