@@ -148,10 +148,13 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
         is_restricted(scope).then_some(match active {
             // Real OS sandboxes that govern the filesystem axes — Landlock
             // (Linux), Seatbelt (macOS), AppContainer (Windows) — enforce them in
-            // the kernel.
-            SandboxKind::Landlock | SandboxKind::Seatbelt | SandboxKind::AppContainer => {
-                AxisEnforcement::Kernel
-            }
+            // the kernel. The minimal-rootfs jail (Linux) confines the filesystem
+            // by the read-only/read-write bind-mounts inside its mount namespace —
+            // also kernel-enforced (ADR 0013 D3/D4).
+            SandboxKind::Landlock
+            | SandboxKind::Seatbelt
+            | SandboxKind::AppContainer
+            | SandboxKind::MinimalRootfs => AxisEnforcement::Kernel,
             SandboxKind::None => AxisEnforcement::Interceptor,
         })
     };
@@ -159,13 +162,16 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
         fs_read: fs(&effective.fs_read),
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(match active {
-            // Seatbelt (macOS) confines the exec axis in the kernel via
-            // `process-exec*` — interior-covering, with no trampoline bypass on
-            // Apple Silicon (ADR 0014). Landlock's exec axis is held
+            // `exec → kernel` is reserved for modes that close the axis by
+            // *identity*: Seatbelt (macOS) via `process-exec*` — interior-covering,
+            // no trampoline bypass on Apple Silicon (ADR 0014) — and the Linux
+            // minimal-rootfs jail, where no un-granted binary physically *exists*
+            // to run or to `ld.so`-trampoline into (ADR 0013 D5, ADR 0011 D7's
+            // precondition made physically true). Landlock's exec axis is held
             // (agent-bridle#31/#57) and a Noop host has no OS allow-list, so both
-            // fall to the in-process interceptor. AppContainer's exec story is not
-            // wired this increment, so it stays interceptor (never overclaimed).
-            SandboxKind::Seatbelt => AxisEnforcement::Kernel,
+            // stay interceptor; AppContainer's exec story is not wired this
+            // increment, so it stays interceptor too (never overclaimed).
+            SandboxKind::Seatbelt | SandboxKind::MinimalRootfs => AxisEnforcement::Kernel,
             SandboxKind::Landlock | SandboxKind::AppContainer | SandboxKind::None => {
                 AxisEnforcement::Interceptor
             }
@@ -179,9 +185,12 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             SandboxKind::Seatbelt if crate::sandbox::net_fully_denied(effective) => {
                 AxisEnforcement::Kernel
             }
-            SandboxKind::Landlock | SandboxKind::Seatbelt | SandboxKind::None => {
-                AxisEnforcement::Advisory
-            }
+            // The minimal-rootfs jail does not namespace the network this tier, so
+            // egress is unconfined — advisory, never overclaimed (ADR 0013 D5).
+            SandboxKind::Landlock
+            | SandboxKind::Seatbelt
+            | SandboxKind::MinimalRootfs
+            | SandboxKind::None => AxisEnforcement::Advisory,
         }),
     }
 }
@@ -262,6 +271,39 @@ mod tests {
         assert_eq!(
             enforcement_report(&cav, SandboxKind::None).exec,
             Some(AxisEnforcement::Interceptor)
+        );
+    }
+
+    /// ADR 0013 D5 (#110): a minimal-rootfs jail run governs the filesystem axes
+    /// (bind-mounts) **and** the `exec` axis (identity by existence) in the kernel;
+    /// `net` is not namespaced this tier, so it stays advisory.
+    #[test]
+    fn minimal_rootfs_marks_fs_and_exec_kernel_net_advisory() {
+        let r = enforcement_report(&fully_restricted(), SandboxKind::MinimalRootfs);
+        assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.exec, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    /// ADR 0013 D5 (#110) acceptance: a restricted `exec` is `kernel` in the
+    /// minimal-rootfs mode but only `interceptor` under a Landlock-only boundary
+    /// (its exec axis is held — ADR 0011). `kernel` is reserved for the rootfs mode.
+    #[test]
+    fn exec_is_kernel_under_minimal_rootfs_interceptor_under_landlock() {
+        let cav = Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            enforcement_report(&cav, SandboxKind::MinimalRootfs).exec,
+            Some(AxisEnforcement::Kernel),
+            "minimal-rootfs closes exec by identity ⇒ kernel"
+        );
+        assert_eq!(
+            enforcement_report(&cav, SandboxKind::Landlock).exec,
+            Some(AxisEnforcement::Interceptor),
+            "a Landlock-only boundary run stays exec→interceptor (ADR 0011)"
         );
     }
 
