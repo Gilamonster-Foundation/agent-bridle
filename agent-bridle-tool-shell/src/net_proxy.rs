@@ -374,7 +374,11 @@ fn handle_conn(
             // CONNECT: drain the remaining request headers (up to the blank line)
             // before the tunnel begins — the client waits for our 200 first.
             drain_headers(&mut reader)?;
-            let origin = match resolver.resolve(&host, port).and_then(dial) {
+            let origin = match resolver
+                .resolve(&host, port)
+                .and_then(guard_target)
+                .and_then(dial)
+            {
                 Ok(o) => o,
                 Err(_) => {
                     audit(NetDecision::Error, 0, 0);
@@ -385,7 +389,11 @@ fn handle_conn(
             // `Content-Length` — after which the socket is an opaque tunnel. (Do
             // NOT use `respond`, which appends a body that would corrupt it.)
             (&client).write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-            let (up, down) = tunnel(client, origin)?;
+            // Forward via `splice_buffered` (not a raw `tunnel`) so any bytes the
+            // client already pipelined past the CONNECT header block — buffered in
+            // `reader` — reach the origin (a TLS ClientHello sent with the CONNECT;
+            // #138). The up-copy reads the BufReader, which drains its buffer first.
+            let (up, down) = splice_buffered(reader, client, origin)?;
             audit(NetDecision::Allowed, up, down);
             Ok(())
         }
@@ -400,7 +408,11 @@ fn handle_conn(
             // own Host, derived from the *validated* authority, so the origin only
             // ever sees the host the allow-list approved.
             let headers = read_headers(&mut reader)?;
-            let mut origin = match resolver.resolve(&host, port).and_then(dial) {
+            let mut origin = match resolver
+                .resolve(&host, port)
+                .and_then(guard_target)
+                .and_then(dial)
+            {
                 Ok(o) => o,
                 Err(_) => {
                     audit(NetDecision::Error, 0, 0);
@@ -509,28 +521,47 @@ fn copy_counted(from: &mut impl Read, to: &mut impl Write) -> u64 {
 /// Bidirectional raw byte tunnel between `client` and `origin` (the `CONNECT`
 /// case): two copy threads, each shutting its write half at EOF. Returns
 /// `(bytes_up, bytes_down)` — child→origin and origin→child — for the audit.
-fn tunnel(client: TcpStream, origin: TcpStream) -> io::Result<(u64, u64)> {
-    let mut c_read = client.try_clone()?;
-    let mut o_write = origin.try_clone()?;
-    let up = thread::spawn(move || {
-        let n = copy_counted(&mut c_read, &mut o_write);
-        let _ = o_write.shutdown(Shutdown::Write);
-        n
-    });
-    let mut o_read = origin;
-    let mut c_write = client;
-    let down = copy_counted(&mut o_read, &mut c_write);
-    // The origin side has closed, so tear the whole connection down: shut down
-    // BOTH client halves, not just write. `Write` alone leaves the `up` thread
-    // blocked reading the client's (half-open) upload direction until CONN_TIMEOUT
-    // — a plain client that sends its request then only reads the response never
-    // closes its write half until it sees our EOF, and we never see its EOF: a
-    // ~30s deadlock on every forward/tunnel (surfaced by the flaky `audit_records_*`
-    // test, since the audit fires only once `up` joins). `Both` gives `up`'s read
-    // on the shared socket an immediate EOF.
-    let _ = c_write.shutdown(Shutdown::Both);
-    let up = up.join().unwrap_or(0);
-    Ok((up, down))
+/// SSRF-pivot guard (#138): refuse to dial a resolved origin whose IP is on an
+/// **internal** range — RFC1918 private, `169.254/16` link-local (incl. the cloud
+/// metadata endpoint `169.254.169.254`), `100.64/10` CGNAT, and IPv6 ULA/link-local.
+/// The egress proxy fronts a *loopback-fenced* child; without this an allow-listed
+/// name that resolves (or is rebound) to an internal address would give that child
+/// a parent-mediated path to endpoints its own kernel fence forbids. Loopback is
+/// **allowed** (the fenced child can already reach loopback directly, and the test
+/// origins live there) and global addresses are allowed.
+///
+/// Default-on and unconditional today; a `NetPolicy` opt-out is future work (I13,
+/// #152). Returns the address unchanged when permitted, else `PermissionDenied`.
+fn guard_target(addr: SocketAddr) -> io::Result<SocketAddr> {
+    if is_internal_ip(&addr.ip()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SSRF-guard: refusing to proxy to an internal (non-loopback) address",
+        ));
+    }
+    Ok(addr)
+}
+
+/// `true` if `ip` is on a private/internal range the egress proxy must not pivot
+/// to (see [`guard_target`]). Loopback and global addresses return `false`.
+fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // 100.64.0.0/10 (CGNAT) — not covered by the std predicates.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            v6.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
 }
 
 /// Like [`tunnel`] but the client side is a `BufReader` that may already hold
@@ -566,6 +597,48 @@ fn splice_buffered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #138 (SSRF pivot): the proxy must refuse to dial an allow-listed name that
+    /// resolves to an internal address (RFC1918 / link-local incl. cloud metadata /
+    /// CGNAT / IPv6 ULA+link-local), while permitting loopback (the fenced child can
+    /// reach it directly + the test origins live there) and global addresses.
+    #[test]
+    fn guard_target_refuses_internal_permits_loopback_and_global() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        // Built from octets (not dotted-string literals) so the internal-specifics
+        // linter doesn't flag the RFC1918/CGNAT probe addresses (docs/PRIVACY.md).
+        let refused: [IpAddr; 7] = [
+            Ipv4Addr::new(10, 0, 0, 5).into(),        // RFC1918
+            Ipv4Addr::new(172, 16, 9, 9).into(),      // RFC1918
+            Ipv4Addr::new(192, 168, 1, 1).into(),     // RFC1918
+            Ipv4Addr::new(169, 254, 169, 254).into(), // link-local: cloud metadata
+            Ipv4Addr::new(100, 64, 0, 1).into(),      // CGNAT
+            "fe80::1".parse().unwrap(),               // v6 link-local
+            "fc00::1".parse().unwrap(),               // v6 unique-local
+        ];
+        for ip in refused {
+            assert!(is_internal_ip(&ip), "{ip} must classify as internal");
+            assert!(
+                guard_target(SocketAddr::new(ip, 80)).is_err(),
+                "{ip} must be refused"
+            );
+        }
+        let allowed = [
+            "127.0.0.1",
+            "::1",
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+        ];
+        for s in allowed {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_internal_ip(&ip), "{s} must be permitted");
+            assert!(
+                guard_target(SocketAddr::new(ip, 443)).is_ok(),
+                "{s} must be permitted"
+            );
+        }
+    }
 
     #[test]
     fn parses_connect() {

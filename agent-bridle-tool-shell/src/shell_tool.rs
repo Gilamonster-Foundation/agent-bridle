@@ -2454,4 +2454,32 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+
+    /// #138 (audit robustness): a *bad* audit path must degrade to the null sink so
+    /// the run continues — a broken audit config can never break confinement. The
+    /// sink records without panic and no file is created at the unopenable path.
+    #[test]
+    fn net_audit_sink_bad_path_degrades_to_null() {
+        use crate::net_proxy::{NetAuditEvent, NetDecision, NetKind};
+        let ev = NetAuditEvent {
+            ts_ms: 0,
+            host: "example.test".to_string(),
+            port: 443,
+            kind: NetKind::Http,
+            decision: NetDecision::Allowed,
+            bytes_up: 1,
+            bytes_down: 2,
+            dur_ms: 3,
+        };
+        // A path under a nonexistent directory can't be created → NullSink fallback.
+        let bad = std::env::temp_dir()
+            .join(format!("ab-nope-{}", std::process::id()))
+            .join("does/not/exist/audit.jsonl");
+        let sink = net_audit_sink(bad.to_str());
+        sink.record(&ev); // must not panic
+        assert!(
+            !bad.exists(),
+            "a bad audit path must not create a file (degraded to null): {bad:?}"
+        );
+    }
 }
