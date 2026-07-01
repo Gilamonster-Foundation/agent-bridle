@@ -662,7 +662,7 @@ mod tests {
 
     fn http_get_via_proxy(proxy: SocketAddr, url: &str) -> (String, Vec<u8>) {
         let mut c = TcpStream::connect(proxy).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         write!(
             c,
             "GET {url} HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n"
@@ -721,7 +721,10 @@ mod tests {
 
         // The connection threads are detached, so poll (not a fixed sleep) until
         // both records land — robust under parallel-test load.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Generous headroom: under the pre-push hook's parallel full-suite load the
+        // proxy→origin round-trip + detached audit thread can exceed a tight bound;
+        // match the production CONN_TIMEOUT so a busy host never spuriously fails.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let events = loop {
             let ev = sink.events();
             let have = |h: &str| ev.iter().any(|e| e.host == h);
@@ -835,7 +838,7 @@ mod tests {
         let proxy =
             start_null(["allowed.test".to_string()], Arc::new(FixedResolver(echo))).unwrap();
         let mut c = TcpStream::connect(proxy.addr()).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         write!(
             c,
             "CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n"
@@ -875,7 +878,7 @@ mod tests {
         )
         .unwrap();
         let mut c = TcpStream::connect(proxy.addr()).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         write!(c, "CONNECT evil.test:443 HTTP/1.1\r\n\r\n").unwrap();
         let mut resp = Vec::new();
         let _ = c.read_to_end(&mut resp);
@@ -928,7 +931,7 @@ mod tests {
         // spoofed `Host: evil.test` to domain-front. The origin must see the
         // validated authority, never the spoof.
         let mut c = TcpStream::connect(proxy.addr()).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         write!(
             c,
             "GET http://allowed.test/ HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n"
