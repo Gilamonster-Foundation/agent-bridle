@@ -46,7 +46,7 @@ pub use config::{
     WebPolicy,
 };
 pub use context::ToolContext;
-pub use envelope::{Denial, DenialKind, ToolEnvelope};
+pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use registry::{Registry, RegistryBuilder};

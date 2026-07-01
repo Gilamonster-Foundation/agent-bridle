@@ -39,6 +39,52 @@ pub struct Denial {
     pub reason: String,
 }
 
+/// Operator-facing **disclosure** — what an operator *should know* about how this
+/// run was shaped, kept **strictly separate** from the [`EnforcementReport`]
+/// (ADR 0016 precedent / ADR 0017 D6). Disclosure is informational: it records
+/// over-delivery, disabled normalizations, a forced backend, and the loud
+/// `unbridled` opt-in. It **never** participates in [`crate::fence_strength`] or
+/// the enforcement claim — a run can never *raise* its confinement claim by
+/// disclosing something, and disclosing something can never *lower* it either.
+///
+/// Quiet by default: the whole block is omitted from JSON when nothing is worth
+/// disclosing (the common bridled path). The one field that always surfaces when
+/// set is [`Self::unbridled`] — an unbridled run is never quietly hidden.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Disclosure {
+    /// The run was explicitly **unbridled** (confinement off — `Caveats::top()` +
+    /// advisory floor + `SandboxKind::None`), an acknowledged operator opt-in
+    /// (#151/I12). Always emitted when `true`; never reachable by omission.
+    #[serde(skip_serializing_if = "is_false")]
+    pub unbridled: bool,
+    /// Automatic normalizations the operator turned off, by name (e.g.
+    /// `ldd_closure`, `nss_closure_fallback`) — so a degraded run is legible.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub normalizations_disabled: Vec<String>,
+    /// A restricted `net` allow-list is enforced **above** the reported floor —
+    /// the loopback egress proxy admits exactly the granted hosts while the report
+    /// honestly keeps the axis `advisory` (proxy-, not kernel-, enforced; #124/#128,
+    /// ADR 0016). Discloses the over-delivery without raising the claim.
+    #[serde(skip_serializing_if = "is_false")]
+    pub net_over_delivery: bool,
+    /// A sandbox backend was overridden from the default selection (downgrade /
+    /// select-available only; #149/I10). Names the backend actually applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_forced: Option<String>,
+}
+
+impl Disclosure {
+    /// `true` when there is nothing to disclose — the whole block is then omitted
+    /// from JSON. (An `unbridled` run is *not* quiet, so it always surfaces.)
+    #[must_use]
+    pub fn is_quiet(&self) -> bool {
+        !self.unbridled
+            && self.normalizations_disabled.is_empty()
+            && !self.net_over_delivery
+            && self.backend_forced.is_none()
+    }
+}
+
 /// A structured execution result. Serialized to the MCP content shape via
 /// [`ToolEnvelope::into_json`]; absent fields are omitted.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -83,6 +129,11 @@ pub struct ToolEnvelope {
     /// from JSON when no axis is restricted.
     #[serde(skip_serializing_if = "EnforcementReport::is_empty", default)]
     pub enforcement: EnforcementReport,
+    /// Operator-facing disclosure (ADR 0017 D6) — informational only, **never**
+    /// part of the enforcement claim. Quiet by default (omitted when nothing is
+    /// worth disclosing); an `unbridled` run always surfaces here.
+    #[serde(skip_serializing_if = "Disclosure::is_quiet", default)]
+    pub disclosure: Disclosure,
 }
 
 /// `skip_serializing_if` helper: omit `denied` from JSON when it is `false`.
@@ -156,6 +207,15 @@ impl ToolEnvelope {
     #[must_use]
     pub fn with_enforcement(mut self, enforcement: EnforcementReport) -> Self {
         self.enforcement = enforcement;
+        self
+    }
+
+    /// Attach the operator-facing disclosure (builder style; ADR 0017 D6).
+    /// Purely informational — it does not affect [`Self::enforcement`],
+    /// [`Self::sandbox_kind`], or any confinement claim.
+    #[must_use]
+    pub fn with_disclosure(mut self, disclosure: Disclosure) -> Self {
+        self.disclosure = disclosure;
         self
     }
 
@@ -247,6 +307,75 @@ mod tests {
             v2.get("enforcement").is_none(),
             "empty report omitted: {v2}"
         );
+    }
+
+    #[test]
+    fn disclosure_is_quiet_by_default_and_omitted() {
+        // The common bridled path discloses nothing → the block is absent.
+        let v = ToolEnvelope::new(SandboxKind::Landlock)
+            .with_exit_code(0)
+            .into_json();
+        assert!(
+            v.get("disclosure").is_none(),
+            "a quiet disclosure must be omitted: {v}"
+        );
+        assert!(Disclosure::default().is_quiet());
+    }
+
+    #[test]
+    fn unbridled_disclosure_always_surfaces() {
+        let v = ToolEnvelope::new(SandboxKind::None)
+            .with_disclosure(Disclosure {
+                unbridled: true,
+                ..Disclosure::default()
+            })
+            .into_json();
+        assert_eq!(
+            v["disclosure"]["unbridled"], true,
+            "an unbridled run must never be quietly hidden: {v}"
+        );
+    }
+
+    #[test]
+    fn disclosure_fields_surface_when_set() {
+        let v = ToolEnvelope::new(SandboxKind::Seatbelt)
+            .with_disclosure(Disclosure {
+                normalizations_disabled: vec!["ldd_closure".to_string()],
+                net_over_delivery: true,
+                backend_forced: Some("seatbelt".to_string()),
+                ..Disclosure::default()
+            })
+            .into_json();
+        assert_eq!(v["disclosure"]["normalizations_disabled"][0], "ldd_closure");
+        assert_eq!(v["disclosure"]["net_over_delivery"], true);
+        assert_eq!(v["disclosure"]["backend_forced"], "seatbelt");
+        // A quiet sub-field (unbridled=false) stays omitted within the block.
+        assert!(v["disclosure"].get("unbridled").is_none());
+    }
+
+    #[test]
+    fn disclosure_never_affects_the_enforcement_claim() {
+        use crate::{enforcement_report, Caveats, Scope};
+        // The honesty invariant (ADR 0017 D6): disclosure is informational — it
+        // cannot change the sandbox_kind or the enforcement report.
+        let caveats = Caveats {
+            fs_write: Scope::only(["/w".to_string()]),
+            ..Caveats::top()
+        };
+        let report = enforcement_report(&caveats, SandboxKind::Landlock);
+        let bare = ToolEnvelope::new(SandboxKind::Landlock).with_enforcement(report);
+        let disclosed = ToolEnvelope::new(SandboxKind::Landlock)
+            .with_enforcement(report)
+            .with_disclosure(Disclosure {
+                unbridled: true,
+                net_over_delivery: true,
+                ..Disclosure::default()
+            });
+        assert_eq!(bare.sandbox_kind, disclosed.sandbox_kind);
+        assert_eq!(bare.enforcement, disclosed.enforcement);
+        let (bv, dv) = (bare.into_json(), disclosed.into_json());
+        assert_eq!(bv["sandbox_kind"], dv["sandbox_kind"]);
+        assert_eq!(bv["enforcement"], dv["enforcement"]);
     }
 
     #[test]
