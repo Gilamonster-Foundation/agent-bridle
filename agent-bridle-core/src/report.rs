@@ -129,8 +129,12 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 ///   `process-exec*` is kernel-checked on the confined process *and everything it
 ///   spawns*, so a permitted child's own `exec` is confined too. Apple-Silicon
 ///   hardware W^X + code signing close the `mmap(PROT_EXEC)` / loader-trampoline
-///   bypass with no seccomp backstop (ADR 0014). Under **Landlock** and a
-///   **Noop** host it stays `interceptor`: the spawn funnel (`before_exec` /
+///   bypass with no seccomp backstop (ADR 0014). Also `kernel` under
+///   **AppContainer** (Windows): the deny-by-default token blocks reads and
+///   execution of files not explicitly ACL-granted to the AppContainer SID, and
+///   `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` kernel-blocks child creation for
+///   the empty-scope case (ADR 0013 D7, agent-bridle#123). Under **Landlock** and
+///   a **Noop** host it stays `interceptor`: the spawn funnel (`before_exec` /
 ///   `check_exec`) gates the engine's own spawns, but no OS execute allow-list
 ///   confines a child's interior (the Landlock exec axis is held —
 ///   agent-bridle#31/#57).
@@ -165,19 +169,21 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
         exec: is_restricted(&effective.exec).then_some(match active {
             // `exec → kernel` is reserved for modes that close the axis by
             // *identity*: Seatbelt (macOS) via `process-exec*` — interior-covering,
-            // no trampoline bypass on Apple Silicon (ADR 0014) — and the Linux
+            // no trampoline bypass on Apple Silicon (ADR 0014); the Linux
             // minimal-rootfs jail, where no un-granted binary physically *exists*
             // to run or to `ld.so`-trampoline into (ADR 0013 D5, ADR 0011 D7's
-            // precondition made physically true). Landlock's exec axis is held
-            // (agent-bridle#31/#57) and a Noop host has no OS allow-list, so both
-            // stay interceptor; AppContainer's exec story is not wired this
-            // increment, so it stays interceptor too (never overclaimed).
-            SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
-                AxisEnforcement::Kernel
-            }
-            SandboxKind::Landlock | SandboxKind::AppContainer | SandboxKind::None => {
-                AxisEnforcement::Interceptor
-            }
+            // precondition made physically true); and **AppContainer** (Windows),
+            // where the deny-by-default token means a process cannot read or
+            // execute any file the launcher hasn't explicitly ACL-granted, and
+            // `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` kernel-blocks all child
+            // creation for the empty-scope case (ADR 0013 D7, agent-bridle#123).
+            // Landlock's exec axis is held (agent-bridle#31/#57) and a Noop host
+            // has no OS allow-list — both stay interceptor (never overclaimed).
+            SandboxKind::Seatbelt
+            | SandboxKind::AppContainer
+            | SandboxKind::MinimalRootfs
+            | SandboxKind::MicroVm => AxisEnforcement::Kernel,
+            SandboxKind::Landlock | SandboxKind::None => AxisEnforcement::Interceptor,
         }),
         net: is_restricted(&effective.net).then_some(match active {
             // AppContainer's capability model governs network too. The Tier-2
@@ -257,11 +263,11 @@ mod tests {
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
     }
 
-    /// The macOS exec-axis honesty distinction from Landlock: a restricted `exec`
-    /// is `kernel` under Seatbelt but only `interceptor` under Landlock (its exec
-    /// axis is held) and a Noop host. ADR 0014.
+    /// exec-axis honesty by backend: `kernel` under Seatbelt (ADR 0014) and
+    /// AppContainer (ADR 0013 D7, #123); `interceptor` under Landlock (exec axis
+    /// held, #31/#57) and a Noop host.
     #[test]
-    fn exec_is_kernel_under_seatbelt_interceptor_elsewhere() {
+    fn exec_is_kernel_under_seatbelt_and_appcontainer_interceptor_elsewhere() {
         let cav = Caveats {
             exec: Scope::only(["git".to_string()]),
             ..Caveats::top()
@@ -269,6 +275,11 @@ mod tests {
         assert_eq!(
             enforcement_report(&cav, SandboxKind::Seatbelt).exec,
             Some(AxisEnforcement::Kernel)
+        );
+        assert_eq!(
+            enforcement_report(&cav, SandboxKind::AppContainer).exec,
+            Some(AxisEnforcement::Kernel),
+            "AppContainer closes exec by identity (deny-by-default + ACL grants, ADR 0013 D7)"
         );
         assert_eq!(
             enforcement_report(&cav, SandboxKind::Landlock).exec,
@@ -327,12 +338,16 @@ mod tests {
         assert_eq!(fence_strength(&r), Some(AxisEnforcement::Kernel));
     }
 
+    /// ADR 0013 D7 (#123): AppContainer closes exec by identity — the deny-by-default
+    /// token blocks reads+execution of files not ACL-granted, and
+    /// `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` kernel-blocks child creation for
+    /// the empty-scope case — so `exec → kernel` is honest here (not `interceptor`).
     #[test]
-    fn appcontainer_marks_fs_kernel_exec_interceptor_net_kernel() {
+    fn appcontainer_marks_fs_and_exec_kernel_net_kernel() {
         let r = enforcement_report(&fully_restricted(), SandboxKind::AppContainer);
         assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
-        assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
+        assert_eq!(r.exec, Some(AxisEnforcement::Kernel));
         assert_eq!(r.net, Some(AxisEnforcement::Kernel));
     }
 

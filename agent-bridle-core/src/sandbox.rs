@@ -180,7 +180,9 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
         {
             SandboxKind::Seatbelt
         }
-        SandboxKind::AppContainer if restricts_fs(caveats) || net_fully_denied(caveats) => {
+        SandboxKind::AppContainer
+            if restricts_fs(caveats) || net_fully_denied(caveats) || restricts_exec(caveats) =>
+        {
             SandboxKind::AppContainer
         }
         _ => SandboxKind::None,
@@ -231,7 +233,7 @@ pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 pub(crate) mod appcontainer_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{net_fully_denied, restricts_fs, Sandbox, SandboxKind};
+    use super::{net_fully_denied, restricts_exec, restricts_fs, Sandbox, SandboxKind};
     use crate::{Caveats, Scope, ToolError, ToolResult};
 
     /// Monotonic counter for unique container names (PID + counter → no clock).
@@ -298,9 +300,24 @@ pub(crate) mod appcontainer_impl {
         /// (so the spawn runs unwrapped — the backend engages only when it
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
+        ///
+        /// **Exec axis** — when `exec` is `Only([])` (deny all spawning),
+        /// `--exec-deny-spawn` is passed to engage `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`
+        /// (kernel-enforced, no child processes). When `exec` is `Only([paths])`,
+        /// `--exec-allow <path>` is emitted for each resolved path so the launcher
+        /// can grant `FILE_GENERIC_READ | FILE_EXECUTE` ACEs to the AppContainer
+        /// SID, restricting which programs the container may read+execute.
+        ///
+        /// **Filesystem axes** — `--fs-read <path>` and `--fs-write <path>` are
+        /// emitted for each granted path so the launcher grants the appropriate
+        /// DACL ACEs to the AppContainer SID before spawning and revokes them
+        /// after the child exits.
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // Nothing to confine — no wrapper needed.
-            if !restricts_fs(effective) && !net_fully_denied(effective) {
+            // Nothing on any governed axis — no wrapper needed.
+            if !restricts_fs(effective)
+                && !net_fully_denied(effective)
+                && !restricts_exec(effective)
+            {
                 return Ok(Vec::new());
             }
 
@@ -323,6 +340,41 @@ pub(crate) mod appcontainer_impl {
             // the AppContainer's deny-by-default network policy.
             if matches!(effective.net, Scope::All) {
                 prefix.push("--net-allow".to_string());
+            }
+
+            // exec axis: deny-all or per-path ACL grants.
+            match &effective.exec {
+                Scope::Only(paths) if paths.is_empty() => {
+                    // Empty exec scope: deny ALL child process creation via the
+                    // PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY kernel attribute.
+                    prefix.push("--exec-deny-spawn".to_string());
+                }
+                Scope::Only(paths) => {
+                    // Non-empty exec scope: grant READ+EXECUTE on each allowed
+                    // path so AppContainer's deny-by-default restricts which
+                    // executables the child can read and launch.
+                    for p in paths {
+                        prefix.push("--exec-allow".to_string());
+                        prefix.push(p.clone());
+                    }
+                }
+                Scope::All => {}
+            }
+
+            // fs_read axis: grant FILE_GENERIC_READ on each allowed path.
+            if let Scope::Only(paths) = &effective.fs_read {
+                for p in paths {
+                    prefix.push("--fs-read".to_string());
+                    prefix.push(p.clone());
+                }
+            }
+
+            // fs_write axis: grant FILE_GENERIC_WRITE on each allowed path.
+            if let Scope::Only(paths) = &effective.fs_write {
+                for p in paths {
+                    prefix.push("--fs-write".to_string());
+                    prefix.push(p.clone());
+                }
             }
 
             Ok(prefix)
@@ -1237,9 +1289,7 @@ mod tests {
     #[test]
     fn effective_kind_downgrades_to_none_when_no_fs_axis_restricted() {
         // The honesty rule (I9): a backend that confines nothing must not be
-        // reported. With every axis `All`, even a real backend → None. (For
-        // AppContainer the rule keeps it `None` here regardless — its shell/spawn
-        // launcher is a follow-up, so it is not engaged via this path yet.)
+        // reported. With every axis `All`, even a real backend → None.
         for available in [
             SandboxKind::Landlock,
             SandboxKind::Seatbelt,
@@ -1311,6 +1361,37 @@ mod tests {
         } else {
             assert!(sb.apply(&Caveats::top()).is_ok());
         }
+    }
+
+    /// AppContainer engages on a restricted exec axis — the launcher wires exec
+    /// confinement now (ADR 0013 D7, #123).
+    #[test]
+    fn appcontainer_engages_on_restricted_exec() {
+        let exec_only = Caveats {
+            exec: Scope::only(["notepad.exe".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &exec_only),
+            SandboxKind::AppContainer,
+            "restricted exec must engage AppContainer"
+        );
+    }
+
+    /// Landlock does NOT engage on a restricted exec axis alone (axis is held,
+    /// agent-bridle#31/#57) — the AppContainer change must not inadvertently
+    /// change Landlock's behaviour.
+    #[test]
+    fn landlock_does_not_engage_on_exec_alone() {
+        let exec_only = Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Landlock, &exec_only),
+            SandboxKind::None,
+            "Landlock must not engage on exec alone (axis is held)"
+        );
     }
 
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
