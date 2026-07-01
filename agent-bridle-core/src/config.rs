@@ -209,24 +209,9 @@ pub struct RootfsPolicy {
 impl Default for RootfsPolicy {
     fn default() -> Self {
         Self {
-            data_paths: PathList::from_defaults(&[
-                "/usr/share",
-                "/usr/lib/locale",
-                "/etc/ld.so.cache",
-                "/etc/ld.so.preload",
-                "/etc/alternatives",
-                "/etc/nsswitch.conf",
-                "/etc/localtime",
-                "/etc/resolv.conf",
-                "/etc/ssl",
-                "/etc/ca-certificates",
-                "/proc/self",
-                "/dev/null",
-                "/dev/zero",
-                "/dev/full",
-                "/dev/urandom",
-                "/dev/random",
-            ]),
+            // Single source of truth: the rootfs builder reads this policy, and
+            // the policy default IS the const — so the two cannot drift (I5, #144).
+            data_paths: PathList::from_defaults(crate::rootfs::DATA_PATHS),
             search_dirs: to_vec(&[
                 "/usr/local/bin",
                 "/usr/bin",
@@ -540,15 +525,6 @@ mod tests {
         assert_eq!(
             SandboxPolicy::default().loopback_hosts,
             to_vec(crate::sandbox::LOOPBACK_HOSTS)
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn rootfs_data_paths_default_matches_constant() {
-        assert_eq!(
-            RootfsPolicy::default().data_paths.resolve(),
-            to_vec(crate::rootfs::DATA_PATHS)
         );
     }
 

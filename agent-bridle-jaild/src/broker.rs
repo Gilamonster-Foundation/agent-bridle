@@ -16,7 +16,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use agent_bridle_core::{build_rootfs_plan, Scope};
+use agent_bridle_core::{build_rootfs_plan, RootfsPolicy, Scope};
 
 use crate::protocol::{read_frame, write_frame, JailRequest, JailResponse};
 
@@ -50,7 +50,9 @@ pub fn handle_request(req: &JailRequest, client: Option<(u32, u32)>) -> JailResp
         };
     }
 
-    let plan = match build_rootfs_plan(&req.caveats) {
+    // The daemon uses the built-in rootfs defaults until config is plumbed
+    // through the jail protocol (I8, #147). Defaults == today's behavior.
+    let plan = match build_rootfs_plan(&req.caveats, &RootfsPolicy::default()) {
         Ok(p) => p,
         Err(e) => {
             return JailResponse::Rejected {
