@@ -348,6 +348,37 @@ mod tests {
         );
     }
 
+    /// R3 (ADR 0018 D8): the step-up (human) axis is **independent of authority**.
+    /// Even a `top()` grant — the maximally-permissive extreme an unbridled
+    /// principal carries — does not lower the step-up floor: a demanded gesture is
+    /// still required. Caveats decide *whether the authority exists*; step-up
+    /// decides *what gesture admits its use*. Nothing launders one into the other.
+    #[test]
+    fn step_up_holds_at_maximal_authority() {
+        let policy = crate::StepUpPolicy::new(
+            vec![crate::Rule {
+                selector: "probe".to_string(),
+                requirement: crate::AttestRequirement::passkey_recorded(),
+            }],
+            crate::AttestRequirement::NONE,
+        );
+        let r = Registry::builder()
+            .tool(Arc::new(ProbeTool))
+            .step_up(policy, Arc::new(FailingProvider), Arc::new(StubVerifier))
+            .build();
+        // top() authority does NOT bypass the demanded gesture.
+        let err = block_on(r.dispatch(
+            "probe",
+            serde_json::json!({ "program": "echo" }),
+            &Caveats::top(),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Denied { .. }),
+            "maximal (top) authority must still owe the step-up gesture: {err:?}"
+        );
+    }
+
     #[test]
     fn tool_definitions_have_name_and_schema() {
         let r = reg();
