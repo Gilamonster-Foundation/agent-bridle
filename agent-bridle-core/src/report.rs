@@ -191,13 +191,17 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             }
         }),
         net: is_restricted(&effective.net).then_some(match active {
-            // AppContainer: the capability model kernel-denies egress only when ALL
-            // network capabilities are withheld, i.e. when `net` is the empty set
-            // (deny-all). A non-empty allow-list cannot be kernel-expressed in the
-            // current launcher (no proxy, only the raw capability toggle), so it
-            // stays advisory — the in-process leash checks it, but a rogue child
-            // could bypass (#133). MicroVM: no guest NIC at all → always Kernel.
-            SandboxKind::AppContainer if crate::sandbox::net_fully_denied(effective) => {
+            // AppContainer (#133, ADR 0016): the capability model kernel-denies all
+            // off-box egress when no internet capability SIDs are granted. Two net
+            // scopes reach Kernel: deny-all (empty set) and loopback-only — both
+            // route through the AppContainer capability block + loopback exemption.
+            // A general remote-host allow-list is enforced userspace by the egress
+            // proxy; net stays Advisory there (the proxy over-delivers above the
+            // AppContainer floor, ADR 0006). MicroVM: no guest NIC → always Kernel.
+            SandboxKind::AppContainer
+                if crate::sandbox::net_fully_denied(effective)
+                    || crate::sandbox::net_loopback_only(effective) =>
+            {
                 AxisEnforcement::Kernel
             }
             SandboxKind::AppContainer => AxisEnforcement::Advisory,
@@ -419,6 +423,26 @@ mod tests {
         assert_eq!(r.fs_read, None);
         assert_eq!(r.fs_write, None);
         assert_eq!(r.exec, None);
+    }
+
+    /// net → Kernel for loopback-only under AppContainer (#133, ADR 0016): the
+    /// container has no internet capability SIDs so off-box egress is kernel-denied;
+    /// the loopback exemption allows 127.0.0.1→proxy. Mirrors Seatbelt's
+    /// loopback-only Kernel claim (ADR 0015).
+    #[test]
+    fn appcontainer_marks_net_kernel_for_loopback_only() {
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            let loopback_only = Caveats {
+                net: Scope::only([host.to_string()]),
+                ..Caveats::top()
+            };
+            let r = enforcement_report(&loopback_only, SandboxKind::AppContainer);
+            assert_eq!(
+                r.net,
+                Some(AxisEnforcement::Kernel),
+                "loopback host {host} must be Kernel under AppContainer"
+            );
+        }
     }
 
     /// exec → Kernel for AppContainer only when the scope is empty (deny-all):

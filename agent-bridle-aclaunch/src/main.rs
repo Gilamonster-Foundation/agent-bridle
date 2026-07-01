@@ -47,6 +47,9 @@ mod windows {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, TRUE};
+    use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
+        NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
+    };
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
         GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
@@ -61,6 +64,7 @@ mod windows {
         WinCapabilityPrivateNetworkClientServerSid, ACL, CONTAINER_INHERIT_ACE,
         DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     };
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
         InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
@@ -178,6 +182,58 @@ mod windows {
         LocalFree(p_sd);
     }
 
+    /// Grant the AppContainer SID loopback network access (#133, ADR 0016).
+    ///
+    /// AppContainers cannot connect to the loopback interface (127.0.0.1) by
+    /// default — the Windows network isolation layer blocks it. We get the
+    /// current exemption list, add our container SID, and apply the new list.
+    /// Returns the saved original list + count so the caller can restore them
+    /// after the child exits.  Non-fatal on failure: returns (null, 0).
+    ///
+    /// The returned pointer must be freed with `HeapFree(GetProcessHeap(), ...)`.
+    unsafe fn enable_loopback_exemption(
+        ac_sid: *mut std::ffi::c_void,
+    ) -> (*mut SID_AND_ATTRIBUTES, u32) {
+        let mut count: u32 = 0;
+        let mut existing: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+        if NetworkIsolationGetAppContainerConfig(&mut count, &mut existing) != 0 {
+            return (std::ptr::null_mut(), 0);
+        }
+        // Build new list = existing entries + our SID.
+        let mut new_list: Vec<SID_AND_ATTRIBUTES> = Vec::with_capacity(count as usize + 1);
+        for i in 0..count as usize {
+            new_list.push(*existing.add(i));
+        }
+        new_list.push(SID_AND_ATTRIBUTES {
+            Sid: ac_sid.cast(),
+            Attributes: 0,
+        });
+        let ok = NetworkIsolationSetAppContainerConfig(new_list.len() as u32, new_list.as_ptr());
+        if ok != 0 {
+            eprintln!(
+                "agent-bridle-aclaunch: NetworkIsolationSetAppContainerConfig failed (loopback \
+                 exemption): error={ok}"
+            );
+            if !existing.is_null() {
+                HeapFree(GetProcessHeap(), 0, existing as *mut _);
+            }
+            return (std::ptr::null_mut(), 0);
+        }
+        (existing, count)
+    }
+
+    /// Restore the loopback exemption list saved by `enable_loopback_exemption`.
+    unsafe fn restore_loopback_exemption(existing: *mut SID_AND_ATTRIBUTES, count: u32) {
+        if count == 0 {
+            let _ = NetworkIsolationSetAppContainerConfig(0, std::ptr::null());
+        } else if !existing.is_null() {
+            let _ = NetworkIsolationSetAppContainerConfig(count, existing);
+        }
+        if !existing.is_null() {
+            HeapFree(GetProcessHeap(), 0, existing as *mut _);
+        }
+    }
+
     /// Build a Windows command-line string from (program, args) for
     /// `CreateProcessW`. Uses the canonical MSVC `CommandLineToArgvW` quoting
     /// rules: backslash runs before `"` (or at string end inside a quoted token)
@@ -265,6 +321,7 @@ mod windows {
         // Parse optional launcher flags and find the exe + child args.
         let mut container_name: Option<String> = None;
         let mut net_allow = false;
+        let mut loopback_exemption = false;
         let mut no_child_process = false;
         let mut fs_read: Vec<String> = Vec::new();
         let mut fs_write: Vec<String> = Vec::new();
@@ -277,6 +334,9 @@ mod windows {
                 }
                 "--net-allow" => {
                     net_allow = true;
+                }
+                "--loopback-exemption" => {
+                    loopback_exemption = true;
                 }
                 "--no-child-process" => {
                     no_child_process = true;
@@ -299,7 +359,7 @@ mod windows {
         }
         if i >= args.len() {
             eprintln!(
-                "usage: agent-bridle-aclaunch [--name <n>] [--net-allow] \
+                "usage: agent-bridle-aclaunch [--name <n>] [--net-allow] [--loopback-exemption] \
                  [--no-child-process] [--fs-read <path>]... [--fs-write <path>]... \
                  <exe> [args...]"
             );
@@ -313,6 +373,7 @@ mod windows {
             spawn_in_container(
                 &name,
                 net_allow,
+                loopback_exemption,
                 no_child_process,
                 &fs_read,
                 &fs_write,
@@ -328,6 +389,7 @@ mod windows {
     unsafe fn spawn_in_container(
         name: &str,
         net_allow: bool,
+        loopback_exemption: bool,
         no_child_process: bool,
         fs_read: &[String],
         fs_write: &[String],
@@ -397,7 +459,18 @@ mod windows {
             fs_grants.push((path.clone(), psd));
         }
 
-        // 2b. Capability SIDs for network.
+        // 2b. Loopback exemption (#133, ADR 0016): AppContainers cannot reach the
+        //     loopback interface (127.0.0.1) by default. When the egress proxy
+        //     pattern is active, the sandboxed child must connect to the parent's
+        //     proxy on loopback, so we grant the exemption here. We save the
+        //     previous exemption list for restoration after the child exits.
+        let (loopback_prev, loopback_prev_count) = if loopback_exemption {
+            enable_loopback_exemption(ac_sid)
+        } else {
+            (std::ptr::null_mut(), 0)
+        };
+
+        // 2c. Capability SIDs for network.
         let cap_types: Vec<i32> = if net_allow {
             vec![
                 WinCapabilityInternetClientSid,
@@ -540,7 +613,12 @@ mod windows {
             restore_path_dacl(&path, psd);
         }
 
-        // 7b. Cleanup: free SIDs and delete the profile.
+        // 7b. Restore loopback exemption list if we modified it.
+        if loopback_exemption {
+            restore_loopback_exemption(loopback_prev, loopback_prev_count);
+        }
+
+        // 7c. Cleanup: free SIDs and delete the profile.
         do_cleanup(name, ac_sid);
 
         exit_code

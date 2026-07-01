@@ -20,8 +20,10 @@ path = "src/main.rs"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFirewall",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
+    "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
