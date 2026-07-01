@@ -315,41 +315,54 @@ mod windows {
         out
     }
 
-    pub fn run() {
-        let args: Vec<String> = std::env::args().collect();
+    /// A parsed launcher invocation: the confinement knobs plus the exec target.
+    /// Kept as a plain value (no Win32 handles) so [`parse_launcher_args`] is a
+    /// pure function the unit tests can exercise without spawning anything.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) struct LauncherArgs {
+        pub container_name: Option<String>,
+        pub net_allow: bool,
+        pub loopback_exemption: bool,
+        pub no_child_process: bool,
+        pub fs_read: Vec<String>,
+        pub fs_write: Vec<String>,
+        pub exe: String,
+        pub child_args: Vec<String>,
+    }
 
-        // Parse optional launcher flags and find the exe + child args.
+    /// Parse the launcher arguments (everything after `argv[0]`) into a
+    /// [`LauncherArgs`], or `Err(exit_code)` on a usage error (no exec target).
+    ///
+    /// Leading `--flag` tokens are the launcher's own; the **first non-flag token**
+    /// is the exec target and everything after it is forwarded verbatim as the
+    /// child's args (so a child may legitimately take its own `--`-prefixed flags).
+    /// Pure — no env reads, no process exit — so it is unit-testable.
+    pub(crate) fn parse_launcher_args(argv: &[String]) -> Result<LauncherArgs, u32> {
         let mut container_name: Option<String> = None;
         let mut net_allow = false;
         let mut loopback_exemption = false;
         let mut no_child_process = false;
         let mut fs_read: Vec<String> = Vec::new();
         let mut fs_write: Vec<String> = Vec::new();
-        let mut i = 1usize;
-        while i < args.len() {
-            match args[i].as_str() {
+        let mut i = 0usize;
+        while i < argv.len() {
+            match argv[i].as_str() {
                 "--name" => {
                     i += 1;
-                    container_name = args.get(i).cloned();
+                    container_name = argv.get(i).cloned();
                 }
-                "--net-allow" => {
-                    net_allow = true;
-                }
-                "--loopback-exemption" => {
-                    loopback_exemption = true;
-                }
-                "--no-child-process" => {
-                    no_child_process = true;
-                }
+                "--net-allow" => net_allow = true,
+                "--loopback-exemption" => loopback_exemption = true,
+                "--no-child-process" => no_child_process = true,
                 "--fs-read" => {
                     i += 1;
-                    if let Some(p) = args.get(i) {
+                    if let Some(p) = argv.get(i) {
                         fs_read.push(p.clone());
                     }
                 }
                 "--fs-write" => {
                     i += 1;
-                    if let Some(p) = args.get(i) {
+                    if let Some(p) = argv.get(i) {
                         fs_write.push(p.clone());
                     }
                 }
@@ -357,28 +370,48 @@ mod windows {
             }
             i += 1;
         }
-        if i >= args.len() {
-            eprintln!(
-                "usage: agent-bridle-aclaunch [--name <n>] [--net-allow] [--loopback-exemption] \
-                 [--no-child-process] [--fs-read <path>]... [--fs-write <path>]... \
-                 <exe> [args...]"
-            );
-            std::process::exit(2);
+        if i >= argv.len() {
+            return Err(2);
         }
-        let exe = &args[i];
-        let child_args = &args[i + 1..];
+        Ok(LauncherArgs {
+            container_name,
+            net_allow,
+            loopback_exemption,
+            no_child_process,
+            fs_read,
+            fs_write,
+            exe: argv[i].clone(),
+            child_args: argv[i + 1..].to_vec(),
+        })
+    }
 
-        let name = container_name.unwrap_or_else(|| format!("ab{}", std::process::id()));
+    pub fn run() {
+        let args: Vec<String> = std::env::args().collect();
+        let parsed = match parse_launcher_args(&args[1..]) {
+            Ok(p) => p,
+            Err(code) => {
+                eprintln!(
+                    "usage: agent-bridle-aclaunch [--name <n>] [--net-allow] \
+                     [--loopback-exemption] [--no-child-process] [--fs-read <path>]... \
+                     [--fs-write <path>]... <exe> [args...]"
+                );
+                std::process::exit(code as i32);
+            }
+        };
+
+        let name = parsed
+            .container_name
+            .unwrap_or_else(|| format!("ab{}", std::process::id()));
         let exit_code = unsafe {
             spawn_in_container(
                 &name,
-                net_allow,
-                loopback_exemption,
-                no_child_process,
-                &fs_read,
-                &fs_write,
-                exe,
-                child_args,
+                parsed.net_allow,
+                parsed.loopback_exemption,
+                parsed.no_child_process,
+                &parsed.fs_read,
+                &parsed.fs_write,
+                &parsed.exe,
+                &parsed.child_args,
             )
         };
         std::process::exit(exit_code as i32);
@@ -646,6 +679,111 @@ mod windows {
                 "agent-bridle-aclaunch: DeleteAppContainerProfile({name:?}) failed: \
                  HRESULT={hr:#010x} (profile may need manual cleanup)"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{build_cmdline, parse_launcher_args, LauncherArgs};
+
+        fn v(items: &[&str]) -> Vec<String> {
+            items.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        /// Decode the NUL-terminated UTF-16 `CreateProcessW` command line back to a
+        /// `String` (dropping the trailing NUL) so quoting can be asserted directly.
+        fn cmdline(program: &str, args: &[&str]) -> String {
+            let w = build_cmdline(program, &v(args));
+            assert_eq!(w.last(), Some(&0), "command line must be NUL-terminated");
+            String::from_utf16(&w[..w.len() - 1]).expect("valid utf-16")
+        }
+
+        #[test]
+        fn parse_bare_exe_only() {
+            let a = parse_launcher_args(&v(&["cmd.exe"])).expect("parses");
+            assert_eq!(
+                a,
+                LauncherArgs {
+                    container_name: None,
+                    net_allow: false,
+                    loopback_exemption: false,
+                    no_child_process: false,
+                    fs_read: vec![],
+                    fs_write: vec![],
+                    exe: "cmd.exe".to_string(),
+                    child_args: vec![],
+                }
+            );
+        }
+
+        #[test]
+        fn parse_all_flags_with_repeated_fs_paths() {
+            let a = parse_launcher_args(&v(&[
+                "--name",
+                "ab42",
+                "--net-allow",
+                "--loopback-exemption",
+                "--no-child-process",
+                "--fs-write",
+                "C:/ws",
+                "--fs-read",
+                "C:/etc",
+                "--fs-read",
+                "C:/lib",
+                "child.exe",
+                "arg1",
+            ]))
+            .expect("parses");
+            assert_eq!(a.container_name.as_deref(), Some("ab42"));
+            assert!(a.net_allow && a.loopback_exemption && a.no_child_process);
+            assert_eq!(a.fs_write, v(&["C:/ws"]));
+            assert_eq!(a.fs_read, v(&["C:/etc", "C:/lib"]));
+            assert_eq!(a.exe, "child.exe");
+            assert_eq!(a.child_args, v(&["arg1"]));
+        }
+
+        #[test]
+        fn first_non_flag_is_exe_rest_are_child_args_even_if_dash_prefixed() {
+            // A child's own `--foo` must be forwarded, not eaten by the launcher.
+            let a = parse_launcher_args(&v(&["--net-allow", "child.exe", "--foo", "--fs-read"]))
+                .expect("parses");
+            assert!(a.net_allow);
+            assert_eq!(a.exe, "child.exe");
+            assert_eq!(a.child_args, v(&["--foo", "--fs-read"]));
+        }
+
+        #[test]
+        fn missing_exec_target_is_usage_error() {
+            assert_eq!(parse_launcher_args(&v(&[])), Err(2));
+            assert_eq!(parse_launcher_args(&v(&["--net-allow"])), Err(2));
+            // `--name` consuming the last token leaves no exe.
+            assert_eq!(parse_launcher_args(&v(&["--name", "ab1"])), Err(2));
+            // A dangling value-flag with no exe after it.
+            assert_eq!(parse_launcher_args(&v(&["--fs-read", "C:/x"])), Err(2));
+        }
+
+        #[test]
+        fn cmdline_leaves_plain_tokens_unquoted() {
+            assert_eq!(cmdline("cmd.exe", &["echo", "hi"]), "cmd.exe echo hi");
+        }
+
+        #[test]
+        fn cmdline_quotes_whitespace_and_empty() {
+            assert_eq!(
+                cmdline("C:/Program Files/a.exe", &["", "a b"]),
+                "\"C:/Program Files/a.exe\" \"\" \"a b\""
+            );
+        }
+
+        #[test]
+        fn cmdline_escapes_embedded_quotes_and_backslashes() {
+            // MSVC CommandLineToArgvW rules: `"` → `\"`; a backslash run before a
+            // `"` is doubled; a trailing backslash inside a quoted token is doubled.
+            assert_eq!(cmdline("p", &["a\"b"]), "p \"a\\\"b\"");
+            assert_eq!(cmdline("p", &["a\\b"]), "p a\\b"); // no quoting needed
+            assert_eq!(cmdline("p", &["a\\ b"]), "p \"a\\ b\""); // space ⇒ quoted, lone `\` literal
+            assert_eq!(cmdline("p", &["a\\"]), "p a\\"); // no whitespace ⇒ unquoted, verbatim
+            assert_eq!(cmdline("p", &["a\\\"b"]), "p \"a\\\\\\\"b\""); // `\"` ⇒ `\\\"`
         }
     }
 }
