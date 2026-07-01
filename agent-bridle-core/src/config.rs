@@ -209,6 +209,11 @@ pub struct RootfsPolicy {
 impl Default for RootfsPolicy {
     fn default() -> Self {
         Self {
+            // The curated runtime data paths (formerly `rootfs::DATA_PATHS`).
+            // This policy is the single source of truth — the rootfs builder
+            // reads it directly (I5, #144). Kept here (not in `rootfs.rs`) so the
+            // default is platform-independent: `rootfs` is a Linux-only module,
+            // but `BridleConfig` must construct on every host.
             data_paths: PathList::from_defaults(&[
                 "/usr/share",
                 "/usr/lib/locale",
@@ -540,15 +545,6 @@ mod tests {
         assert_eq!(
             SandboxPolicy::default().loopback_hosts,
             to_vec(crate::sandbox::LOOPBACK_HOSTS)
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn rootfs_data_paths_default_matches_constant() {
-        assert_eq!(
-            RootfsPolicy::default().data_paths.resolve(),
-            to_vec(crate::rootfs::DATA_PATHS)
         );
     }
 

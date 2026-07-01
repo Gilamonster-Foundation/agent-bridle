@@ -302,7 +302,7 @@ fn unique_jail_root() -> io::Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::{is_root, run_jailed};
-    use agent_bridle_core::{build_rootfs_plan, Caveats, Scope};
+    use agent_bridle_core::{build_rootfs_plan, Caveats, RootfsPolicy, Scope};
 
     fn unique_work(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -353,7 +353,7 @@ mod tests {
             fs_write: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav).expect("rootfs plan");
+        let plan = build_rootfs_plan(&cav, &RootfsPolicy::default()).expect("rootfs plan");
 
         // The granted binary's absolute path (as it will exist inside the jail).
         let cat = plan
@@ -405,7 +405,7 @@ mod tests {
             fs_write: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = match build_rootfs_plan(&cav) {
+        let plan = match build_rootfs_plan(&cav, &RootfsPolicy::default()) {
             Ok(p) => p,
             Err(_) => return, // python3 absent on this host ⇒ skip
         };

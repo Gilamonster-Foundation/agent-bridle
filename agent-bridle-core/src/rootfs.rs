@@ -24,37 +24,19 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{Caveats, Scope};
+use crate::{Caveats, RootfsPolicy, Scope};
 
-/// Curated DATA paths a permitted program reads at runtime — **never
-/// executables** (so they do not reopen the loader trampoline): locale, timezone,
-/// CA bundles, the resolver/loader config, and the `/dev` + `/proc/self`
-/// essentials. The shared libraries are added *specifically* from the per-binary
-/// `ldd` closure, NOT by binding `/usr/lib` wholesale, so only the `.so`s the
-/// granted binaries actually need are present.
-pub(crate) const DATA_PATHS: &[&str] = &[
-    "/usr/share",
-    "/usr/lib/locale",
-    "/etc/ld.so.cache",
-    "/etc/ld.so.preload",
-    "/etc/alternatives",
-    "/etc/nsswitch.conf",
-    "/etc/localtime",
-    "/etc/resolv.conf",
-    "/etc/ssl",
-    "/etc/ca-certificates",
-    "/proc/self",
-    "/dev/null",
-    "/dev/zero",
-    "/dev/full",
-    "/dev/urandom",
-    "/dev/random",
-];
+// The curated runtime data paths a permitted program reads (locale, timezone, CA
+// bundles, resolver/loader config, `/dev` + `/proc/self` essentials) are supplied
+// by `RootfsPolicy::data_paths` (config.rs) — never executables (so they do not
+// reopen the loader trampoline). The shared libraries are added *specifically*
+// from the per-binary `ldd` closure, NOT by binding `/usr/lib` wholesale, so only
+// the `.so`s the granted binaries actually need are present.
 
 /// The directories a bare program name is resolved against (mirrors the loader's
-/// search, `$PATH` then a conventional fallback). Only used to find the granted
+/// search, `$PATH` then the configured `fallback`). Only used to find the granted
 /// binaries' real paths for the plan.
-fn search_dirs() -> Vec<PathBuf> {
+fn search_dirs(fallback: &[String]) -> Vec<PathBuf> {
     if let Ok(path) = std::env::var("PATH") {
         let dirs: Vec<PathBuf> = path
             .split(':')
@@ -65,27 +47,17 @@ fn search_dirs() -> Vec<PathBuf> {
             return dirs;
         }
     }
-    [
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-        "/usr/local/sbin",
-        "/usr/sbin",
-        "/sbin",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect()
+    fallback.iter().map(PathBuf::from).collect()
 }
 
 /// Resolve a granted `exec` entry (a bare name or a path) to an absolute, existing
 /// program file — canonicalized so the plan anchors the real inode.
-fn resolve_program(entry: &str) -> Option<PathBuf> {
+fn resolve_program(entry: &str, search_fallback: &[String]) -> Option<PathBuf> {
     let candidate = if entry.contains('/') {
         let p = PathBuf::from(entry);
         p.is_file().then_some(p)
     } else {
-        search_dirs()
+        search_dirs(search_fallback)
             .into_iter()
             .map(|d| d.join(entry))
             .find(|c| c.is_file())
@@ -226,15 +198,16 @@ fn add_runtime_closure_fallback(
 /// be **confined** (`Only`) — a minimal rootfs is meaningless when any program may
 /// run, so an ambient `exec` is rejected (the caller falls back to the Tier-1
 /// boundary). The plan contains: the resolved granted program files + each one's
-/// `ldd` shared-library closure (incl. the loader) + the curated [`DATA_PATHS`] +
+/// `ldd` shared-library closure (incl. the loader) + the configured data paths +
 /// the granted `fs_read` (ro) / `fs_write` (rw) roots — and nothing else.
-pub fn build_rootfs_plan(effective: &Caveats) -> Result<RootfsPlan, String> {
+pub fn build_rootfs_plan(effective: &Caveats, rootfs: &RootfsPolicy) -> Result<RootfsPlan, String> {
     let programs = match &effective.exec {
         Scope::All => {
             return Err("minimal rootfs requires a confined exec scope (exec: Only)".to_string())
         }
         Scope::Only(set) => set,
     };
+    let search_fallback = &rootfs.search_dirs;
 
     // (src, writable, is_dir) accumulated then deduped.
     let mut files: BTreeSet<PathBuf> = BTreeSet::new(); // ro files (binaries + .so + loader + data files)
@@ -242,8 +215,8 @@ pub fn build_rootfs_plan(effective: &Caveats) -> Result<RootfsPlan, String> {
     let mut rw_dirs: BTreeSet<PathBuf> = BTreeSet::new();
 
     for prog in programs {
-        let bin =
-            resolve_program(prog).ok_or_else(|| format!("granted program not found: {prog}"))?;
+        let bin = resolve_program(prog, search_fallback)
+            .ok_or_else(|| format!("granted program not found: {prog}"))?;
         for so in ldd_closure(&bin) {
             files.insert(so);
         }
@@ -256,8 +229,8 @@ pub fn build_rootfs_plan(effective: &Caveats) -> Result<RootfsPlan, String> {
     // identity invariant still holds.
     add_runtime_closure_fallback(programs, &mut files, &mut ro_dirs);
 
-    for d in DATA_PATHS {
-        let p = PathBuf::from(d);
+    for d in rootfs.data_paths.resolve() {
+        let p = PathBuf::from(&d);
         match p.metadata() {
             Ok(m) if m.is_dir() => {
                 ro_dirs.insert(p);
@@ -431,7 +404,7 @@ mod tests {
     #[test]
     fn ambient_exec_is_rejected() {
         // exec: All ⇒ no minimal rootfs (any program could run).
-        let err = build_rootfs_plan(&Caveats::top()).unwrap_err();
+        let err = build_rootfs_plan(&Caveats::top(), &crate::RootfsPolicy::default()).unwrap_err();
         assert!(err.contains("confined exec scope"), "{err}");
     }
 
@@ -446,7 +419,7 @@ mod tests {
             fs_write: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav).expect("plan");
+        let plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
 
         // The granted binary and at least one library (its closure) are planned.
         let has_cat = plan
@@ -515,6 +488,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
+    /// #144 (I5): the curated data-path list is config-driven — a `replace`d empty
+    /// `data_paths` drops the built-in DATA_PATHS (e.g. `/usr/share`) from the
+    /// plan, proving the builder reads the policy and not the const. Would fail on
+    /// the old const path (which always injected `/usr/share`).
+    #[test]
+    fn rootfs_data_paths_are_config_driven() {
+        let cav = Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            ..Caveats::top()
+        };
+        let has_usr_share =
+            |p: &RootfsPlan| p.entries.iter().any(|e| e.src == Path::new("/usr/share"));
+
+        // Default policy: /usr/share (a DATA_PATHS dir) is planned.
+        let default_plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
+        assert!(
+            has_usr_share(&default_plan),
+            "default plan must include the built-in /usr/share data dir"
+        );
+
+        // Empty, `replace`d data_paths ⇒ /usr/share is gone (the policy drives it).
+        let stripped = crate::RootfsPolicy {
+            data_paths: crate::PathList {
+                base: vec![],
+                extra: vec![],
+                replace: true,
+            },
+            ..crate::RootfsPolicy::default()
+        };
+        let stripped_plan = build_rootfs_plan(&cav, &stripped).expect("plan");
+        assert!(
+            !has_usr_share(&stripped_plan),
+            "a replace'd empty data_paths must drop /usr/share from the plan"
+        );
+    }
+
     /// #112: the cache key is stable for the same grant and varies with the
     /// granted-program set (the D7 content-key).
     #[test]
@@ -525,9 +534,15 @@ mod tests {
             fs_read: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let k_cat = RootfsCache::key(&build_rootfs_plan(&mk("cat")).unwrap());
-        let k_cat2 = RootfsCache::key(&build_rootfs_plan(&mk("cat")).unwrap());
-        let k_grep = RootfsCache::key(&build_rootfs_plan(&mk("grep")).unwrap());
+        let k_cat = RootfsCache::key(
+            &build_rootfs_plan(&mk("cat"), &crate::RootfsPolicy::default()).unwrap(),
+        );
+        let k_cat2 = RootfsCache::key(
+            &build_rootfs_plan(&mk("cat"), &crate::RootfsPolicy::default()).unwrap(),
+        );
+        let k_grep = RootfsCache::key(
+            &build_rootfs_plan(&mk("grep"), &crate::RootfsPolicy::default()).unwrap(),
+        );
         assert_eq!(k_cat, k_cat2, "same grant ⇒ stable key");
         assert_ne!(k_cat, k_grep, "different exec scope ⇒ different key");
         assert_eq!(k_cat.len(), 64, "hex of a 32-byte BLAKE3 content id");
@@ -545,7 +560,7 @@ mod tests {
             fs_write: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav).expect("plan");
+        let plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
         let cache_root = unique_dir("cache");
         let cache = RootfsCache::new(&cache_root);
 
@@ -580,7 +595,7 @@ mod tests {
             fs_read: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = match build_rootfs_plan(&cav) {
+        let plan = match build_rootfs_plan(&cav, &crate::RootfsPolicy::default()) {
             Ok(p) => p,
             Err(_) => return, // python3 not installed ⇒ nothing to prove
         };
@@ -622,7 +637,7 @@ mod tests {
             fs_read: Scope::only([work.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
-        let plan = build_rootfs_plan(&cav).expect("plan");
+        let plan = build_rootfs_plan(&cav, &crate::RootfsPolicy::default()).expect("plan");
         let nss_in_plan = |p: &RootfsPlan| {
             p.entries.iter().any(|e| {
                 e.src
