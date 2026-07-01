@@ -255,9 +255,11 @@ pub fn loopback_fenced_caveats(caveats: &Caveats) -> Caveats {
 /// **and** confines the `exec` axis via `process-exec*` ([`restricts_exec`]) — a
 /// confinement Landlock cannot supply (ADR 0014). Landlock's exec axis stays held
 /// (agent-bridle#31/#57), so a Landlock host does not engage on `exec` alone.
-/// AppContainer (Windows) engages on any restricted fs axis or a fully-denied
-/// `net` — matching the honesty condition for what the launcher actually confines
-/// (ADR 0006 / #51).
+/// AppContainer (Windows) engages only when `net` is fully denied — the only axis
+/// the launcher currently kernel-confines (deny-by-default capability model, ADR 0006
+/// / #51). Filesystem ACL narrowing is deferred (#136); until it lands, a restricted
+/// fs axis does NOT engage AppContainer (the spawn fails closed via
+/// `confinement_unenforceable` instead of overclaiming kernel enforcement).
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
     match available {
@@ -274,9 +276,7 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
         {
             SandboxKind::Seatbelt
         }
-        SandboxKind::AppContainer if restricts_fs(caveats) || net_fully_denied(caveats) => {
-            SandboxKind::AppContainer
-        }
+        SandboxKind::AppContainer if net_fully_denied(caveats) => SandboxKind::AppContainer,
         _ => SandboxKind::None,
     }
 }
@@ -378,13 +378,12 @@ pub(crate) mod appcontainer_impl {
             SandboxKind::AppContainer
         }
 
-        /// Fail closed: AppContainer is applied at process creation via the
-        /// `agent-bridle-aclaunch` launcher prefix, not via this thread.
+        /// No-op: AppContainer confinement is applied at process creation via the
+        /// `command_prefix` launcher wrapper (`agent-bridle-aclaunch`), not via
+        /// this thread. `apply` is reached only when `command_prefix` returned an
+        /// empty prefix (nothing to confine), so a no-op is correct here.
         fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
-            Err(ToolError::denied(
-                "AppContainer must be applied at Windows process creation via the \
-                 agent-bridle-aclaunch launcher; call command_prefix instead",
-            ))
+            Ok(())
         }
 
         /// Build the `["agent-bridle-aclaunch.exe", ...]` prefix that wraps the
@@ -395,8 +394,10 @@ pub(crate) mod appcontainer_impl {
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // Nothing to confine — no wrapper needed.
-            if !restricts_fs(effective) && !net_fully_denied(effective) {
+            // Nothing the launcher currently confines — no wrapper needed.
+            // Filesystem ACL narrowing is deferred (#136); only `net_fully_denied`
+            // triggers the AppContainer wrapper (deny-by-default network policy).
+            if !net_fully_denied(effective) {
                 return Ok(Vec::new());
             }
 

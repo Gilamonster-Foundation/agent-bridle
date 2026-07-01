@@ -146,17 +146,19 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
     // must decide its mapping rather than silently defaulting.
     let fs = |scope: &Scope<String>| {
         is_restricted(scope).then_some(match active {
-            // Real OS sandboxes that govern the filesystem axes — Landlock
-            // (Linux), Seatbelt (macOS), AppContainer (Windows) — enforce them in
-            // the kernel. The minimal-rootfs jail (Linux) confines the filesystem
-            // by the read-only/read-write bind-mounts inside its mount namespace —
-            // also kernel-enforced (ADR 0013 D3/D4).
+            // Real OS sandboxes that govern the filesystem axes in the kernel —
+            // Landlock (Linux, FS allow-list via restrict_self), Seatbelt (macOS,
+            // SBPL read/write rules), and the Linux minimal-rootfs jail (read-only/
+            // read-write bind-mounts inside its mount namespace, ADR 0013 D3/D4).
             SandboxKind::Landlock
             | SandboxKind::Seatbelt
-            | SandboxKind::AppContainer
             | SandboxKind::MinimalRootfs
             | SandboxKind::MicroVm => AxisEnforcement::Kernel,
-            SandboxKind::None => AxisEnforcement::Interceptor,
+            // AppContainer: FS ACL narrowing is deferred (#136). Until per-path
+            // ACEs are wired in the launcher the fs axis is NOT kernel-enforced —
+            // only the in-process leash (tool-call boundary) checks it. Reporting
+            // Kernel here would be an honesty overclaim (ADR 0006 / #136).
+            SandboxKind::AppContainer | SandboxKind::None => AxisEnforcement::Interceptor,
         })
     };
     EnforcementReport {
@@ -180,11 +182,17 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             }
         }),
         net: is_restricted(&effective.net).then_some(match active {
-            // AppContainer's capability model governs network too. The Tier-2
-            // micro-VM has no guest network device at all, so egress is
-            // kernel-impossible regardless of the requested scope (ADR 0013 D3) —
-            // at least as strict as any allowlist, so `kernel` is honest.
-            SandboxKind::AppContainer | SandboxKind::MicroVm => AxisEnforcement::Kernel,
+            // AppContainer: the capability model kernel-denies egress only when ALL
+            // network capabilities are withheld, i.e. when `net` is the empty set
+            // (deny-all). A non-empty allow-list cannot be kernel-expressed in the
+            // current launcher (no proxy, only the raw capability toggle), so it
+            // stays advisory — the in-process leash checks it, but a rogue child
+            // could bypass (#133). MicroVM: no guest NIC at all → always Kernel.
+            SandboxKind::AppContainer if crate::sandbox::net_fully_denied(effective) => {
+                AxisEnforcement::Kernel
+            }
+            SandboxKind::AppContainer => AxisEnforcement::Advisory,
+            SandboxKind::MicroVm => AxisEnforcement::Kernel,
             // Seatbelt kernel-denies *all* egress when the net scope is empty
             // (`(deny network*)`), and confines a **loopback-only** allowlist to
             // the loopback interface (`(allow network* (remote ip "localhost:*"))`)
@@ -372,13 +380,36 @@ mod tests {
         assert_eq!(fence_strength(&r), Some(AxisEnforcement::Kernel));
     }
 
+    /// AppContainer honesty (#136): fs is NOT kernel-enforced (ACL narrowing is
+    /// deferred) → Interceptor. net is Kernel only for deny-all (empty scope) — a
+    /// general remote-host allowlist cannot be kernel-expressed without the egress
+    /// proxy (#133), so it stays Advisory. exec stays Interceptor (ACE wiring for
+    /// exec is #123, not yet landed).
     #[test]
-    fn appcontainer_marks_fs_kernel_exec_interceptor_net_kernel() {
+    fn appcontainer_marks_fs_interceptor_exec_interceptor_net_advisory_for_allowlist() {
+        // `fully_restricted()` uses net: Only(["example.com"]) — a non-empty
+        // allowlist the launcher cannot kernel-express → Advisory.
         let r = enforcement_report(&fully_restricted(), SandboxKind::AppContainer);
-        assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
-        assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.fs_read, Some(AxisEnforcement::Interceptor));
+        assert_eq!(r.fs_write, Some(AxisEnforcement::Interceptor));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
+        assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    /// net → Kernel only when the scope is empty (deny-all): the AppContainer
+    /// capability model withholds all network SIDs → kernel-denied egress.
+    #[test]
+    fn appcontainer_marks_net_kernel_for_deny_all() {
+        let net_deny_all = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let r = enforcement_report(&net_deny_all, SandboxKind::AppContainer);
         assert_eq!(r.net, Some(AxisEnforcement::Kernel));
+        // fs/exec are unrestricted (top) — not in the report.
+        assert_eq!(r.fs_read, None);
+        assert_eq!(r.fs_write, None);
+        assert_eq!(r.exec, None);
     }
 
     /// Seatbelt's net honesty is scope-shaped (ADR 0015): kernel for the two
