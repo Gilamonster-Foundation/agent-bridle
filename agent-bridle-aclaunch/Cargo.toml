@@ -14,6 +14,12 @@ description = "Windows AppContainer process launcher for agent-bridle (agent-bri
 name = "agent-bridle-aclaunch"
 path = "src/main.rs"
 
+# A tiny std-only TCP-connect probe used as the confined child of the AppContainer
+# net kernel proofs (tests/net_proofs.rs). Cross-platform; harmless off Windows.
+[[bin]]
+name = "ab-netprobe"
+path = "src/bin/ab-netprobe.rs"
+
 # Windows-only deps: the Win32 API surface for AppContainer + CreateProcessW.
 # Guarded by target triple so cross-compile (Linux host, Windows target) still
 # pulls the right set of features without cargo resolving windows-sys on Linux.
