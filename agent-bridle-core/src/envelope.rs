@@ -5,7 +5,7 @@
 //! recorded [`crate::SandboxKind`] travels with every result (DESIGN §6: "the
 //! Gate records `sandbox_kind` in **every** `ToolResult`").
 
-use crate::{EnforcementReport, SandboxKind};
+use crate::{EnforcementReport, HumanGate, SandboxKind};
 
 /// Which kind of capability operation the leash refused.
 ///
@@ -71,6 +71,12 @@ pub struct Disclosure {
     /// select-available only; #149/I10). Names the backend actually applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_forced: Option<String>,
+    /// The human step-up gate still in force (ADR 0018 D11 / R5). Distinguishes an
+    /// unbridled run's two postures — `passkey`/`prompt` = *Supervised-free* (a
+    /// gesture still gates HIGH-consequence acts), `none` = *Autonomous* (no human
+    /// in the loop). Shown whenever the block is emitted (i.e. when unbridled), so
+    /// a consumer can never confuse "free but FIDO-gated" with "no human at all".
+    pub human_gate: HumanGate,
 }
 
 impl Disclosure {
@@ -351,6 +357,28 @@ mod tests {
         assert_eq!(v["disclosure"]["backend_forced"], "seatbelt");
         // A quiet sub-field (unbridled=false) stays omitted within the block.
         assert!(v["disclosure"].get("unbridled").is_none());
+    }
+
+    #[test]
+    fn disclosure_human_gate_distinguishes_postures() {
+        // Supervised-free: unbridled but the passkey gate remains.
+        let sf = ToolEnvelope::new(SandboxKind::None)
+            .with_disclosure(Disclosure {
+                unbridled: true,
+                human_gate: HumanGate::Passkey,
+                ..Disclosure::default()
+            })
+            .into_json();
+        assert_eq!(sf["disclosure"]["human_gate"], "passkey");
+        // Autonomous: unbridled AND no human in the loop — must be distinguishable.
+        let auto = ToolEnvelope::new(SandboxKind::None)
+            .with_disclosure(Disclosure {
+                unbridled: true,
+                human_gate: HumanGate::None,
+                ..Disclosure::default()
+            })
+            .into_json();
+        assert_eq!(auto["disclosure"]["human_gate"], "none");
     }
 
     #[test]

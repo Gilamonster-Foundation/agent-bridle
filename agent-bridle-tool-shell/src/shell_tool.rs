@@ -40,9 +40,9 @@ use std::time::Duration;
 
 use agent_bridle_core::{
     best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
-    is_unbridled, loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial, DenialKind,
-    Disclosure, EnforcementReport, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext,
-    ToolEnvelope, ToolError, ToolResult,
+    human_gate, is_unbridled, loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial,
+    DenialKind, Disclosure, EnforcementReport, LimitsPolicy, SandboxKind, SandboxPolicy, Tool,
+    ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -728,9 +728,10 @@ impl Tool for ShellTool {
             sandbox: Arc::clone(&self.sandbox),
             unbridled,
         };
-        // Disclosed on every envelope this run returns (ADR 0018 D5 / I11).
+        // Disclosed on every envelope this run returns (ADR 0018 D5/D11 / I11).
         let disclosure = Disclosure {
             unbridled,
+            human_gate: human_gate(),
             ..Disclosure::default()
         };
         // Host/operator-supplied environment (the env seam, newt #783): carried
@@ -835,6 +836,7 @@ fn deny(
 fn unbridle_disclosure() -> Disclosure {
     Disclosure {
         unbridled: is_unbridled(),
+        human_gate: human_gate(),
         ..Disclosure::default()
     }
 }
