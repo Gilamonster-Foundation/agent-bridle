@@ -84,7 +84,9 @@ pub(crate) trait Spawner: Send + Sync {
     /// ambient env). `env` is structured host input, never model-authored command
     /// text, so it grants no new authority — the exec/fs leash is unaffected.
     /// `max_output` bounds the captured stdout/stderr (the configured output cap,
-    /// [`LimitsPolicy::max_output_bytes`]).
+    /// [`LimitsPolicy::max_output_bytes`]). `audit_sink` is the configured egress
+    /// audit path ([`LimitsPolicy::audit_sink`]; `None` = off) — used only on the
+    /// egress-proxy path.
     fn run(
         &self,
         stages: &[Command],
@@ -92,6 +94,7 @@ pub(crate) trait Spawner: Send + Sync {
         caveats: &Caveats,
         env: &BTreeMap<String, String>,
         max_output: usize,
+        audit_sink: Option<&str>,
     ) -> ToolResult<Captured>;
 }
 
@@ -107,13 +110,22 @@ impl Spawner for OsSpawner {
         caveats: &Caveats,
         env: &BTreeMap<String, String>,
         max_output: usize,
+        audit_sink: Option<&str>,
     ) -> ToolResult<Captured> {
         // A general remote-host `net` allow-list that cannot be named in SBPL is
         // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
         // to loopback and route it through the proxy. Self-gating — `Some` only
         // where the fence is actually emittable (macOS + seatbelt).
         if let Some((allow_hosts, fenced)) = egress_proxy_plan(caveats) {
-            return run_with_egress_proxy(stages, cwd, &fenced, env, allow_hosts, max_output);
+            return run_with_egress_proxy(
+                stages,
+                cwd,
+                &fenced,
+                env,
+                allow_hosts,
+                max_output,
+                audit_sink,
+            );
         }
         // When an OS sandbox (Landlock/Seatbelt) will actually confine this run,
         // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
@@ -158,16 +170,17 @@ fn run_with_egress_proxy(
     env: &BTreeMap<String, String>,
     allow_hosts: Vec<String>,
     max_output: usize,
+    audit_sink: Option<&str>,
 ) -> ToolResult<Captured> {
     // (1) Fence prefix first (pure, cheap) — fail-closed if the wrapper is gone.
     let prefix = best_available_sandbox().command_prefix(fenced)?;
     // (2) Start the proxy — fail-closed if it cannot bind loopback (never spawn
     //     an unfenced child that would then egress freely). Audit is opt-in via the
-    //     `BRIDLE_NET_AUDIT` setting (observability only; off = zero overhead).
+    //     configured audit sink (observability only; off = zero overhead).
     let proxy = net_proxy::start(
         allow_hosts,
         Arc::new(net_proxy::StdResolver),
-        net_audit_sink(),
+        net_audit_sink(audit_sink),
     )
     .map_err(ToolError::Exec)?;
     // (3) Point the child at the proxy via the env seam (a clone — never mutate
@@ -195,18 +208,20 @@ fn run_with_egress_proxy(
     captured
 }
 
-/// Build the egress audit sink from the `BRIDLE_NET_AUDIT` operator setting
-/// (#124, ADR 0016). Unset/empty → **no audit** (the default; zero overhead). A
-/// path → append each proxied connection as one JSON line (host, port, decision,
-/// bytes, duration) for `bridle-netmon` to render live. Audit is **observability
-/// only** — it never changes an enforcement decision — so a path that cannot be
-/// opened falls back to the null sink rather than failing the run.
-fn net_audit_sink() -> Arc<dyn net_proxy::AuditSink> {
-    match std::env::var("BRIDLE_NET_AUDIT") {
-        Ok(path) if !path.is_empty() => std::fs::OpenOptions::new()
+/// Build the egress audit sink from the configured audit path (#124, ADR 0016;
+/// `LimitsPolicy::audit_sink`, which the config loader maps from the legacy
+/// `BRIDLE_NET_AUDIT` setting — I6, #145). `None`/empty → **no audit** (the
+/// default; zero overhead). A path → append each proxied connection as one JSON
+/// line (host, port, decision, bytes, duration) for `bridle-netmon` to render
+/// live. Audit is **observability only** — it never changes an enforcement
+/// decision — so a path that cannot be opened falls back to the null sink rather
+/// than failing the run.
+fn net_audit_sink(configured: Option<&str>) -> Arc<dyn net_proxy::AuditSink> {
+    match configured {
+        Some(path) if !path.is_empty() => std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .map(|f| Arc::new(net_proxy::JsonlSink::new(f)) as Arc<dyn net_proxy::AuditSink>)
             .unwrap_or_else(|_| Arc::new(net_proxy::NullSink)),
         _ => Arc::new(net_proxy::NullSink),
@@ -662,6 +677,7 @@ impl Tool for ShellTool {
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
         let max_output = self.limits.max_output_bytes;
+        let audit_sink = self.limits.audit_sink.clone();
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
         let env = parsed.env;
@@ -674,6 +690,7 @@ impl Tool for ShellTool {
                 &caveats,
                 &env,
                 max_output,
+                audit_sink.as_deref(),
             )
         });
         match tokio::time::timeout(timeout, run).await {
@@ -708,6 +725,7 @@ fn run_script(
     caveats: &Caveats,
     env: &BTreeMap<String, String>,
     max_output: usize,
+    audit_sink: Option<&str>,
 ) -> ToolResult<Captured> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -722,7 +740,8 @@ fn run_script(
             Sep::Or => status != 0,
         };
         if run_it {
-            let captured = spawner.run(&item.pipeline, cwd, caveats, env, max_output)?;
+            let captured =
+                spawner.run(&item.pipeline, cwd, caveats, env, max_output, audit_sink)?;
             stdout.push_str(&captured.stdout);
             stderr.push_str(&captured.stderr);
             stdout_truncated |= captured.stdout_truncated;
@@ -1537,6 +1556,7 @@ mod tests {
             _caveats: &Caveats,
             env: &BTreeMap<String, String>,
             _max_output: usize,
+            _audit_sink: Option<&str>,
         ) -> ToolResult<Captured> {
             self.calls.lock().unwrap().push(stages.to_vec());
             self.envs.lock().unwrap().push(env.clone());
@@ -2383,5 +2403,39 @@ mod tests {
         // A default-allowlisted name (HOME) is denied when configured out.
         assert!(!is_allowed_var("HOME", &["PWD".to_string()]));
         assert!(is_allowed_var("PWD", &["PWD".to_string()]));
+    }
+
+    /// #145 (I6): the egress audit sink is built from the configured path
+    /// (`LimitsPolicy::audit_sink`), not a direct `BRIDLE_NET_AUDIT` env read.
+    /// `None` ⇒ the null sink (no file); `Some(path)` ⇒ a JSONL sink writing to
+    /// exactly that path. Would fail on the old env-only path.
+    #[test]
+    fn net_audit_sink_is_config_driven() {
+        use crate::net_proxy::{NetAuditEvent, NetDecision, NetKind};
+        let ev = NetAuditEvent {
+            ts_ms: 0,
+            host: "example.test".to_string(),
+            port: 443,
+            kind: NetKind::Connect,
+            decision: NetDecision::Allowed,
+            bytes_up: 1,
+            bytes_down: 2,
+            dur_ms: 3,
+        };
+        // None → null sink: records silently, no file.
+        net_audit_sink(None).record(&ev);
+
+        // Some(path) → JSONL sink appends the event to that exact path.
+        let path = std::env::temp_dir().join(format!("ab-audit-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let sink = net_audit_sink(path.to_str());
+        sink.record(&ev);
+        drop(sink);
+        let contents = std::fs::read_to_string(&path).expect("configured audit file written");
+        assert!(
+            contents.contains("example.test"),
+            "the configured sink must write the event: {contents}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
