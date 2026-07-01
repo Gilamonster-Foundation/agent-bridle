@@ -154,7 +154,8 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             SandboxKind::Landlock
             | SandboxKind::Seatbelt
             | SandboxKind::AppContainer
-            | SandboxKind::MinimalRootfs => AxisEnforcement::Kernel,
+            | SandboxKind::MinimalRootfs
+            | SandboxKind::MicroVm => AxisEnforcement::Kernel,
             SandboxKind::None => AxisEnforcement::Interceptor,
         })
     };
@@ -171,14 +172,19 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             // (agent-bridle#31/#57) and a Noop host has no OS allow-list, so both
             // stay interceptor; AppContainer's exec story is not wired this
             // increment, so it stays interceptor too (never overclaimed).
-            SandboxKind::Seatbelt | SandboxKind::MinimalRootfs => AxisEnforcement::Kernel,
+            SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
+                AxisEnforcement::Kernel
+            }
             SandboxKind::Landlock | SandboxKind::AppContainer | SandboxKind::None => {
                 AxisEnforcement::Interceptor
             }
         }),
         net: is_restricted(&effective.net).then_some(match active {
-            // AppContainer's capability model governs network too.
-            SandboxKind::AppContainer => AxisEnforcement::Kernel,
+            // AppContainer's capability model governs network too. The Tier-2
+            // micro-VM has no guest network device at all, so egress is
+            // kernel-impossible regardless of the requested scope (ADR 0013 D3) —
+            // at least as strict as any allowlist, so `kernel` is honest.
+            SandboxKind::AppContainer | SandboxKind::MicroVm => AxisEnforcement::Kernel,
             // Seatbelt kernel-denies *all* egress when the net scope is empty
             // (`(deny network*)`); a non-empty host allowlist it cannot express,
             // so that stays advisory. Landlock does not gate net this increment.
@@ -305,6 +311,20 @@ mod tests {
             Some(AxisEnforcement::Interceptor),
             "a Landlock-only boundary run stays exec→interceptor (ADR 0011)"
         );
+    }
+
+    /// ADR 0013 D3 (#111): the Tier-2 micro-VM confines every OS axis in the
+    /// kernel — fs + exec by the guest boundary (identity by existence), and net
+    /// because the guest has no network device (egress impossible). The strongest
+    /// tier: `fence_strength` is therefore `Kernel` even with all axes restricted.
+    #[test]
+    fn micro_vm_marks_all_axes_kernel() {
+        let r = enforcement_report(&fully_restricted(), SandboxKind::MicroVm);
+        assert_eq!(r.fs_read, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.exec, Some(AxisEnforcement::Kernel));
+        assert_eq!(r.net, Some(AxisEnforcement::Kernel));
+        assert_eq!(fence_strength(&r), Some(AxisEnforcement::Kernel));
     }
 
     #[test]

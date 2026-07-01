@@ -54,6 +54,14 @@ pub enum SandboxKind {
     /// mode: a Landlock-only boundary run stays [`SandboxKind::Landlock`] (its exec
     /// axis is held — ADR 0011).
     MinimalRootfs,
+    /// A Linux **Tier-2 micro-VM** is active (ADR 0013 D3, ADR 0009 D2,
+    /// agent-bridle#111): the same minimal rootfs booted as a qemu guest under a
+    /// separate kernel. Identity is closed as in [`SandboxKind::MinimalRootfs`]
+    /// (only the granted program exists in the guest) and the filesystem is confined
+    /// by the guest boundary; with no guest network device, egress is impossible —
+    /// so `exec`, the fs axes, **and** `net` are all kernel-confined, and a
+    /// guest-kernel compromise is still contained. The strongest tier.
+    MicroVm,
     /// No OS-level sandbox — the leash is in-process/advisory only. This is the
     /// honest default on a host with no compiled-and-capable backend.
     #[default]
@@ -1147,6 +1155,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SandboxKind::MinimalRootfs).unwrap(),
             "\"minimal_rootfs\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::MicroVm).unwrap(),
+            "\"micro_vm\""
         );
     }
 
