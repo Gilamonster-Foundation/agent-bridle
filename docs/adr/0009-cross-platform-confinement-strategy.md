@@ -73,6 +73,50 @@ Each backend adds a `SandboxKind` variant (`Seatbelt`, `AppContainer`, `MicroVm`
 result envelope reports the boundary actually in force; `apply()` fails closed. (ADR 0006
 D3/D4, extended across tiers, and surfaced at axis grain by ADR 0004 D1 / #30.)
 
+### D6 — Windows AppContainer: axis coverage, kernel proofs, and accepted limitations (as implemented)
+
+The Tier-1 Windows backend is complete. What it enforces, honestly reports, and deliberately
+does **not** attempt:
+
+**Kernel-enforced (reported `Kernel`), with real spawn proofs.** Proven by
+`agent-bridle-aclaunch/tests/{kernel,net}_proofs.rs`, which launch a confined child and assert
+the kernel — not the launcher logic — blocks out-of-scope operations (the Windows analog of
+Linux `landlock_kernel_tests` / macOS `seatbelt_kernel_tests`):
+
+- **`fs_read` / `fs_write`** — per-path DACL ACEs for the AppContainer SID over the
+  container's default deny-of-user-directories (#51).
+- **`exec` deny-all** — `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` blocks all child-process
+  creation (#123).
+- **`net` deny-all and loopback-only** — the capability-SID model (no `INTERNET_CLIENT`)
+  kernel-denies off-box egress; `NetworkIsolationSetAppContainerConfig` grants the loopback
+  exemption the egress proxy rides (#133, ADR 0016).
+
+The proofs are hard-required in CI (`check-windows` + `nightly-windows`) via
+`BRIDLE_REQUIRE_APPCONTAINER` — the Windows analog of #74's `BRIDLE_REQUIRE_LANDLOCK/SEATBELT`,
+so a green build must have exercised the real boundary.
+
+**Honestly reported weaker (no overclaim).**
+
+- **`exec` allow-list → `Interceptor`.** A non-empty allow-list cannot be kernel-expressed
+  without **WDAC** (Windows Defender Application Control) — a privileged, code-signed, policy-
+  managed subsystem outside the scope of an in-process library. The in-process leash checks it;
+  the report never claims `Kernel`.
+- **general remote-host `net` allow-list → `Advisory`.** Enforced by the loopback egress proxy
+  over the AppContainer no-internet floor (ADR 0016), which *over-delivers* above an advisory
+  floor rather than raising the honest kernel claim.
+
+**Accepted non-goals (intentional, not omissions).**
+
+- **WDAC-based `exec` allow-list** — heavyweight infra; `Interceptor` is the honest fallback.
+- **Registry / named-pipe isolation** — not among the four OS-confinement axes (fs_read/write,
+  exec, net); AppContainer offers no kernel API to confine registry, and these channels are
+  governed *indirectly* (fs_write confinement stops writing secrets to `%APPDATA%`; local IPC
+  over sockets is gated by the net axis).
+- **Job Objects (memory / CPU / process-count)** — resource limits, not a capability boundary
+  (D4); may layer on later as an optional resource backstop, but orthogonal to the OCAP axes.
+- **LPAC / named-object (Desktop, WindowStation) isolation** — optional hardening beyond the
+  four axes; the DACL + capability-SID boundary already enforces the core contract.
+
 ## Consequences
 
 - Tier 1 is the portable baseline; Tier 2 the strong opt-in (virt-gated); Tier 3 a separate
