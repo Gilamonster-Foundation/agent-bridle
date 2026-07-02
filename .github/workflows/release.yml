@@ -38,9 +38,19 @@ jobs:
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
+            ext: ""
           - platform: macos-latest
             target: aarch64-apple-darwin
             label: macos-arm64
+            ext: ""
+          # Windows also ships agent-bridle-aclaunch.exe — the AppContainer launcher
+          # the L3 backend shells out to (agent-bridle#51); without it a Windows
+          # release cannot use kernel confinement.
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            ext: ".exe"
+            aclaunch: "1"
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -51,16 +61,27 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Build agent-bridle-mcp
-        run: cargo build --release --locked --target ${{ matrix.target }} -p agent-bridle-mcp
+      - name: Build agent-bridle-mcp (+ aclaunch on Windows)
+        shell: bash
+        run: |
+          pkgs="-p agent-bridle-mcp"
+          # The AppContainer launcher is Windows-only; build it there so it ships.
+          [ -n "${{ matrix.aclaunch }}" ] && pkgs="$pkgs -p agent-bridle-aclaunch"
+          cargo build --release --locked --target ${{ matrix.target }} $pkgs
 
-      - name: Stage archive (Unix)
+      - name: Stage archive
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME//\//-}"
+          [ -n "$VERSION" ] || VERSION="dev"
           STAGE="agent-bridle-mcp-${VERSION}-${{ matrix.label }}"
+          BIN="target/${{ matrix.target }}/release"
           mkdir -p "$STAGE"
-          cp target/${{ matrix.target }}/release/agent-bridle-mcp "$STAGE/"
+          cp "$BIN/agent-bridle-mcp${{ matrix.ext }}" "$STAGE/"
+          # Windows: bundle the AppContainer launcher (required by the L3 backend).
+          if [ -n "${{ matrix.aclaunch }}" ]; then
+            cp "$BIN/agent-bridle-aclaunch${{ matrix.ext }}" "$STAGE/"
+          fi
           cp LICENSE README.md "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
           echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
