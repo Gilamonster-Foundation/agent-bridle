@@ -1,0 +1,150 @@
+# agent-bridle — Weekly combinatorial regression sweep.
+#
+# WHY THIS EXISTS: the per-PR `ci.yml` only exercises the two *corners* of the
+# feature cube — `--all-features` (everything on) and `--no-default-features`
+# (everything off). The entire interior (every individual feature and every
+# pairing) is untested there, and that interior is exactly where cfg/feature-gate
+# regressions hide: a `#[cfg(feature = "X")]` that only compiles when another
+# feature is also on, an engine that only links with a specific L3 backend, a
+# `?`-weak optional-dep feature that breaks in isolation. This job walks the FULL
+# power set of features with `cargo hack --feature-powerset`, per OS, so every
+# reachable combination is built, clippy-clean, and tested at least once a week.
+#
+# HOOK PARITY: intentionally NONE. This is a long-running weekly *superset* of the
+# gate, not a per-push check — it cannot be mirrored by `.githooks/pre-push`
+# without making every push take tens of minutes. `ci.yml` remains the hook-mirrored
+# gate; this sweep is additive regression insurance (see CLAUDE.md "Push Hook
+# Governance": the hook mirrors the *pipeline gate*, and a weekly powerset is not
+# one). When adding a feature to any crate, you get exhaustive coverage here for
+# free — no hook change required.
+#
+# HONESTY PRESERVED: each OS leg sets its `BRIDLE_REQUIRE_<BACKEND>` flag so the
+# kernel-enforcement proofs hard-FAIL rather than silent-skip inside the sweep too
+# (agent-bridle#74) — an exhaustive run that skipped the boundary would be a lie.
+
+name: Weekly Regression Sweep
+
+on:
+  schedule:
+    # Mondays 08:00 UTC — weekly, off the daily nightly-windows slot.
+    - cron: "0 8 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Linux: the native L3 backend is Landlock. The power set here toggles
+  # {shell, host-shell, web, linux-landlock}; the macOS/Windows backends are
+  # inert off-OS, so excluding them keeps every combination *meaningful* (no
+  # doubling on a feature that compiles to nothing here) while staying exhaustive
+  # over the axes that actually vary on Linux.
+  powerset-linux:
+    name: feature-powerset — Linux (Landlock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      # Clippy across the full power set: catches feature-gate combinations that
+      # don't compile or that trip a lint only in a specific corner.
+      - name: Clippy — full feature power set
+        run: >-
+          cargo hack --workspace --exclude agent-bridle-py
+          --feature-powerset --optional-deps
+          --exclude-features macos-seatbelt,windows-appcontainer,os-sandbox
+          clippy --all-targets -- -D warnings
+
+      # Test across the full power set. Single-threaded: the real-resource
+      # (Landlock / subprocess / fs) tests contend under parallel load
+      # (Permission denied os error 13). BRIDLE_REQUIRE_LANDLOCK makes the
+      # kernel-enforcement proofs a hard requirement in every combo that compiles
+      # them.
+      - name: Test — full feature power set (require Landlock proofs)
+        env:
+          BRIDLE_REQUIRE_LANDLOCK: "1"
+        run: >-
+          cargo hack --workspace --exclude agent-bridle-py
+          --feature-powerset --optional-deps
+          --exclude-features macos-seatbelt,windows-appcontainer,os-sandbox
+          test -- --test-threads=1
+
+  # macOS: the native L3 backend is Seatbelt. Same exhaustive power set with the
+  # Linux/Windows backends excluded (inert here). This is the ONLY scheduled place
+  # every `macos-seatbelt` feature combination is compiled and its kernel proofs
+  # run (e.g. a shell engine's Seatbelt fence test).
+  powerset-macos:
+    name: feature-powerset — macOS (Seatbelt)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: Clippy — full feature power set
+        run: >-
+          cargo hack --workspace --exclude agent-bridle-py
+          --feature-powerset --optional-deps
+          --exclude-features linux-landlock,windows-appcontainer,os-sandbox
+          clippy --all-targets -- -D warnings
+
+      - name: Test — full feature power set (require Seatbelt proofs)
+        env:
+          BRIDLE_REQUIRE_SEATBELT: "1"
+        run: >-
+          cargo hack --workspace --exclude agent-bridle-py
+          --feature-powerset --optional-deps
+          --exclude-features linux-landlock,windows-appcontainer,os-sandbox
+          test -- --test-threads=1
+
+  # Windows: the native L3 backend is AppContainer. The shell integration suites
+  # assume a Unix host (POSIX paths, the `echo` binary), so the power-set *test*
+  # leg is scoped to the crates whose Windows code path is real — core (the
+  # AppContainer backend) and the aclaunch launcher — while clippy still walks the
+  # whole workspace power set to catch cfg-gate breakage everywhere.
+  powerset-windows:
+    name: feature-powerset — Windows (AppContainer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: Clippy — full feature power set
+        run: >-
+          cargo hack --workspace --exclude agent-bridle-py
+          --feature-powerset --optional-deps
+          --exclude-features linux-landlock,macos-seatbelt,os-sandbox
+          clippy --all-targets -- -D warnings
+
+      - name: Test — core + launcher feature power set (require AppContainer proofs)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: >-
+          cargo hack -p agent-bridle-core -p agent-bridle-aclaunch
+          --feature-powerset --optional-deps
+          --exclude-features linux-landlock,macos-seatbelt,os-sandbox
+          test -- --test-threads=1
