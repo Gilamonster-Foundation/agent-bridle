@@ -35,7 +35,7 @@ use std::io::{PipeReader, PipeWriter, Read};
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
@@ -307,6 +307,17 @@ fn run_confined(
         .map_err(|_| ToolError::Exec(std::io::Error::other("confined execution thread panicked")))?
 }
 
+/// The tool's input schema, parsed once from the embedded `shell_tool.schema.json`
+/// data file — the schema is *knowledge*, so it lives in plain-text data, not an
+/// inline `json!` literal (three-Cs: knowledge in data, not logic). `include_str!`
+/// binds it at compile time, so a malformed edit fails the build's tests, never a
+/// live dispatch. The per-instance `timeout_secs` ceiling is injected by
+/// [`Tool::schema`] over this base.
+static SHELL_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("shell_tool.schema.json"))
+        .expect("embedded shell_tool.schema.json must be valid JSON")
+});
+
 /// The confined shell tool.
 ///
 /// Registers under `"shell"`. Accepts either argv form (`program` + `args`) or a
@@ -417,57 +428,15 @@ impl Tool for ShellTool {
     }
 
     fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "program": {
-                    "type": "string",
-                    "description": "Argv form: the command to run (argv[0]). \
-                        Gated by the `exec` caveat. Mutually exclusive with `cmd`."
-                },
-                "args": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Argv form: arguments passed to `program` (argv[1..]). Taken \
-                        literally — no globbing/quoting interpretation."
-                },
-                "cmd": {
-                    "type": "string",
-                    "description": "Free-form command line run by the confined safe-subset engine: \
-                        pipelines (a | b) joined by &&/||/;, with quoted arguments, redirections \
-                        (> out, >> out, < in, 2> err, 2>&1; file targets gated by fs_write/fs_read), \
-                        filename globbing (*, ?, [..]; gated by fs_read on the listed directory), \
-                        and $VAR/${VAR} expansion (incl. mixed words like $HOME/config and \
-                        inside double quotes) for an allowlisted, secret-free set (HOME, PWD, \
-                        USER, TMPDIR, ...). Dynamic constructs ($(...), backticks, subshells) are \
-                        refused by design; a $VAR outside the allowlist, a $VAR in a redirect \
-                        target or combined with a glob, and fd redirections other than \
-                        1>/2>/0</2>&1, are refused. Mutually exclusive with `program`."
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the command (must be within fs_read scope)."
-                },
-                "env": {
-                    "type": "object",
-                    "additionalProperties": { "type": "string" },
-                    "description": "Host/operator-supplied environment variables (string \
-                        values) set on the spawned child process(es), additive over the \
-                        inherited ambient environment. Pass real env vars here instead of \
-                        prepending `export VAR=…;` statements to `cmd` — an `export` builtin \
-                        is not a program and the confined engine refuses it. These values are \
-                        host input, not model-authored command text, and do NOT widen the \
-                        leash: the exec/fs check is on the real program, never on env."
-                },
-                "timeout_secs": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": self.limits.max_timeout_secs,
-                    "description": "Wall-clock timeout bound (not a coordination primitive)."
-                }
-            },
-            "additionalProperties": false
-        })
+        // Structure + descriptions live in the `shell_tool.schema.json` data
+        // file (knowledge in data, not an inline literal). The `timeout_secs`
+        // ceiling is a per-instance property — the configured `LimitsPolicy`
+        // (`with_config`) — so it is injected over the data-file base here rather
+        // than baked into the file, keeping the bound's source of truth in Rust.
+        let mut schema = SHELL_SCHEMA.clone();
+        schema["properties"]["timeout_secs"]["maximum"] =
+            serde_json::Value::from(self.limits.max_timeout_secs);
+        schema
     }
 
     async fn invoke(
@@ -1609,6 +1578,39 @@ mod tests {
     use agent_bridle_core::{Caveats, Gate, Scope};
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// The schema loads from the embedded `shell_tool.schema.json` data file (not
+    /// an inline literal) with the expected shape. Guards the data file against
+    /// corruption — a bad edit fails here, not in prod.
+    #[test]
+    fn schema_loads_from_data_file_with_expected_shape() {
+        let s = ShellTool::new().schema();
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["additionalProperties"], false);
+        for key in ["program", "args", "cmd", "cwd", "env", "timeout_secs"] {
+            assert!(
+                s["properties"].get(key).is_some(),
+                "schema is missing the `{key}` property: {s}"
+            );
+        }
+    }
+
+    /// The `timeout_secs.maximum` is a per-instance property injected over the
+    /// data-file base — it tracks the configured `LimitsPolicy`, so `with_config`
+    /// changes the advertised ceiling.
+    #[test]
+    fn schema_timeout_maximum_tracks_the_configured_limits() {
+        let limits = agent_bridle_core::LimitsPolicy {
+            max_timeout_secs: 7,
+            ..agent_bridle_core::LimitsPolicy::default()
+        };
+        let s = ShellTool::with_config(limits).schema();
+        assert_eq!(s["properties"]["timeout_secs"]["maximum"], 7);
+        // The data file itself carries no `maximum` — the bound is Rust-owned.
+        assert!(SHELL_SCHEMA["properties"]["timeout_secs"]
+            .get("maximum")
+            .is_none());
+    }
 
     /// A spawner that records every pipeline it runs and returns a canned exit
     /// code per program (argv0), default 0 — no real processes.
