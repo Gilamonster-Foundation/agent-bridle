@@ -1,6 +1,7 @@
 //! The confined [`WebFetchTool`] — `web_fetch(url)` → structured markdown.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use agent_bridle_core::{Caveats, Scope, Tool, ToolContext, ToolError, ToolResult};
@@ -18,6 +19,17 @@ const MAX_REDIRECTS: usize = 10;
 const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
 /// Absolute ceiling on `max_bytes` regardless of the request.
 const HARD_MAX_BYTES: usize = 25 * 1024 * 1024;
+
+/// The tool's input schema, parsed once from the embedded `web_fetch.schema.json`
+/// data file — the schema is *knowledge*, so it lives in plain-text data, not an
+/// inline `json!` literal (three-Cs: knowledge in data, not logic). `include_str!`
+/// binds it at compile time, so a malformed edit fails the build's tests, never a
+/// live dispatch. The `max_bytes` ceiling is injected by [`Tool::schema`] from
+/// [`HARD_MAX_BYTES`], keeping that bound's source of truth in Rust.
+static WEB_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("web_fetch.schema.json"))
+        .expect("embedded web_fetch.schema.json must be valid JSON")
+});
 /// Per-request wall-clock timeout (bounds work; not a coordination primitive).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -96,23 +108,14 @@ impl Tool for WebFetchTool {
     }
 
     fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The http(s) URL to fetch. Its host (and every redirect host) is gated by the `net` caveat and SSRF-screened."
-                },
-                "max_bytes": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": HARD_MAX_BYTES,
-                    "description": "Optional cap on response bytes read before extraction."
-                }
-            },
-            "required": ["url"],
-            "additionalProperties": false
-        })
+        // Structure + descriptions live in the `web_fetch.schema.json` data file
+        // (knowledge in data, not an inline literal); the `max_bytes` ceiling is
+        // injected from the Rust-owned `HARD_MAX_BYTES` so the bound has one
+        // source of truth.
+        let mut schema = WEB_SCHEMA.clone();
+        schema["properties"]["max_bytes"]["maximum"] =
+            serde_json::Value::from(HARD_MAX_BYTES as u64);
+        schema
     }
 
     /// `web_fetch` declares it needs **no** network authority by default — it
@@ -393,6 +396,15 @@ mod tests {
         assert_eq!(s["properties"]["url"]["type"], "string");
         assert_eq!(s["required"][0], "url");
         assert_eq!(s["additionalProperties"], false);
+        // The `max_bytes` ceiling is injected from HARD_MAX_BYTES over the
+        // data-file base (the file itself carries no `maximum`).
+        assert_eq!(
+            s["properties"]["max_bytes"]["maximum"],
+            HARD_MAX_BYTES as u64
+        );
+        assert!(WEB_SCHEMA["properties"]["max_bytes"]
+            .get("maximum")
+            .is_none());
     }
 
     #[test]
