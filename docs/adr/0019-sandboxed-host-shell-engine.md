@@ -1,6 +1,6 @@
 # ADR 0019 — Sandboxed-host shell engine: full-shell semantics with the guarantee entirely on L3
 
-- Status: **Proposed** (for review)
+- Status: **Accepted** (ratified 2026-07-04 by the owner); implementation on #194
 - Date: 2026-07-04
 - Context: **extends ADR 0005** (the object-capability boundary is L3; the shell
   *engine* is L2 convenience, pluggable behind the D2 seam) and **ADR 0006**
