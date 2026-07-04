@@ -24,6 +24,11 @@ required-features = ["shell"]
 # It pulls tokio (spawn_blocking + timeout) for confined execution.
 default = ["shell"]
 shell = ["dep:tokio"]
+# The sandboxed-host engine (ADR 0019 / #194): a second, complementary engine
+# that runs `/bin/sh -c` with the whole tree inside the L3 jail (no L2 parsing).
+# Opt-in; the embedder registers it instead of the safe-subset ShellTool. Pulls
+# tokio (spawn_blocking) like `shell`; independent of the safe-subset modules.
+host-shell = ["dep:tokio"]
 # Kernel-enforced L3 backstop (Linux). The engine applies the Landlock fs_write
 # ruleset before spawning when fs_write is restricted (agent-bridle#35); off this
 # build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Exec/net axes

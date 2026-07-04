@@ -13,6 +13,12 @@ readme = "../README.md"
 # A host that wants a leaner build can opt out with --no-default-features.
 default = ["shell"]
 shell = ["dep:agent-bridle-tool-shell"]
+# The sandboxed-host engine (ADR 0019 / #194): exposes `HostShellTool` — full
+# shell semantics with the guarantee entirely on L3. Complementary to `shell`,
+# not a replacement (ADR 0019 D3), so the embedder selects it at registry
+# construction; it is NOT auto-added to `registry()` (it and `ShellTool` share
+# the `"shell"` name). Off by default.
+host-shell = ["dep:agent-bridle-tool-shell", "agent-bridle-tool-shell/host-shell"]
 # `web` adds the confined `web_fetch` tool (the `net` enforcer). Off by default
 # so the heavy reqwest/readability/DNS deps only enter a build that asks for it.
 web = ["dep:agent-bridle-tool-web"]

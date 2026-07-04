@@ -80,6 +80,11 @@ pub struct Disclosure {
     /// select-available only; #149/I10). Names the backend actually applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_forced: Option<String>,
+    /// Which shell **engine** ran this operation (ADR 0019 D4 / #194) — e.g.
+    /// `"safe-subset"` or `"sandbox-host"`. Lets an embedder log which engine a
+    /// dispatch used when more than one is registered. `None` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     /// The human step-up gate still in force (ADR 0018 D11 / R5). Distinguishes an
     /// unbridled run's two postures — `passkey`/`prompt` = *Supervised-free* (a
     /// gesture still gates HIGH-consequence acts), `none` = *Autonomous* (no human
@@ -97,6 +102,7 @@ impl Disclosure {
             && self.normalizations_disabled.is_empty()
             && !self.net_over_delivery
             && self.backend_forced.is_none()
+            && self.engine.is_none()
     }
 }
 
