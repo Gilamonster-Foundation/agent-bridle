@@ -12,7 +12,9 @@ use crate::{EnforcementReport, HumanGate, SandboxKind};
 /// Mirrors the brush `CommandInterceptor` hooks: an `exec` denial comes from
 /// `before_exec` (an out-of-scope program, including a path-separator-spelled
 /// one like `/bin/rm`), an `open` denial from `before_open` (a redirection or
-/// `source` target outside `fs_read`/`fs_write`).
+/// `source` target outside `fs_read`/`fs_write`). A `net` denial comes from the
+/// loopback egress proxy refusing an out-of-allow-list host (#196) — the one
+/// axis observed *during* the run rather than at pre-spawn admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DenialKind {
@@ -20,6 +22,12 @@ pub enum DenialKind {
     Exec,
     /// A file open (redirection/`source`) was denied (`before_open`).
     Open,
+    /// A network egress to an out-of-allow-list host was refused by the egress
+    /// proxy (#196). The [`Denial::target`] is the CONNECT host, so a consumer
+    /// can prompt per-host. Only observable where a proxy is in the data path
+    /// (a non-empty `net` allow-list); a pure deny-all is kernel-fenced and
+    /// surfaces no host.
+    Net,
 }
 
 /// One structured leash denial recorded by the in-process interceptor.
@@ -30,10 +38,11 @@ pub enum DenialKind {
 /// non-zero on its own.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Denial {
-    /// Whether an `exec` (spawn) or an `open` (file) was refused.
+    /// Whether an `exec` (spawn), an `open` (file), or a `net` egress was refused.
     pub kind: DenialKind,
     /// The exact target the interceptor saw: the program (e.g. `rm`,
-    /// `/bin/rm`) for an `exec` denial, or the path for an `open` denial.
+    /// `/bin/rm`) for an `exec` denial, the path for an `open` denial, or the
+    /// CONNECT host (e.g. `github.com`) for a `net` denial (#196).
     pub target: String,
     /// The human-readable reason from the leash (safe to surface to an agent).
     pub reason: String,
@@ -415,6 +424,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(DenialKind::Open).unwrap(),
             serde_json::json!("open")
+        );
+        // #196: the net axis serializes as "net" — the exact string a downstream
+        // consumer (newt) matches to lift it into a per-host prompt.
+        assert_eq!(
+            serde_json::to_value(DenialKind::Net).unwrap(),
+            serde_json::json!("net")
+        );
+        assert_eq!(
+            serde_json::from_value::<DenialKind>(serde_json::json!("net")).unwrap(),
+            DenialKind::Net
         );
     }
 }
