@@ -65,6 +65,12 @@ pub(crate) struct Captured {
     pub stdout_truncated: bool,
     /// Whether stderr was clipped at the configured output cap (more was produced).
     pub stderr_truncated: bool,
+    /// #196: structured `net` denials observed DURING the run — one per
+    /// out-of-allow-list host the egress proxy refused. Unlike `exec`/`open`
+    /// denials (decided at pre-spawn admission), a net refusal is only known
+    /// after the child has run, so it rides back on the capture and is attached
+    /// to the result envelope by the caller. Empty on the common path.
+    pub net_denials: Vec<Denial>,
 }
 
 /// The pipeline-execution seam.
@@ -218,8 +224,21 @@ fn run_with_egress_proxy(
         .map_err(|_| {
             ToolError::Exec(std::io::Error::other("confined execution thread panicked"))
         })?;
+    // #196: the child is reaped, so every proxy connection is complete — read the
+    // hosts the proxy refused (out of the allow-list) BEFORE tearing it down, and
+    // surface each as a structured `net` denial on the capture.
+    let refused = proxy.refused_hosts();
     drop(proxy); // hold the proxy until the child is reaped, then tear it down
-    captured
+    let mut captured = captured?;
+    captured.net_denials = refused
+        .into_iter()
+        .map(|host| Denial {
+            kind: DenialKind::Net,
+            reason: format!("net does not permit '{host}'"),
+            target: host,
+        })
+        .collect();
+    Ok(captured)
 }
 
 /// Build the egress audit sink from the configured audit path (#124, ADR 0016;
@@ -745,6 +764,9 @@ impl Tool for ShellTool {
             Ok(joined) => {
                 let captured = joined
                     .map_err(|e| ToolError::Other(anyhow::anyhow!("shell task panicked: {e}")))??;
+                // #196: a run that reached an out-of-allow-list host was refused
+                // by the egress proxy — surface those as structured `net` denials
+                // (sets `denied: true`; empty is a no-op on the common path).
                 Ok(ToolEnvelope::new(sandbox_kind)
                     .with_enforcement(enforcement)
                     .with_disclosure(disclosure)
@@ -752,6 +774,7 @@ impl Tool for ShellTool {
                     .with_truncation(captured.stdout_truncated, captured.stderr_truncated)
                     .with_stdout(captured.stdout)
                     .with_stderr(captured.stderr)
+                    .with_denials(captured.net_denials)
                     .with_timed_out(false)
                     .into_json())
             }
@@ -781,6 +804,8 @@ fn run_script(
     let mut status: i32 = 0;
     let mut stdout_truncated = false;
     let mut stderr_truncated = false;
+    // #196: net denials accumulate across every pipeline stage that runs.
+    let mut net_denials: Vec<Denial> = Vec::new();
 
     for item in script {
         let run_it = match item.sep {
@@ -794,6 +819,7 @@ fn run_script(
             stderr.push_str(&captured.stderr);
             stdout_truncated |= captured.stdout_truncated;
             stderr_truncated |= captured.stderr_truncated;
+            net_denials.extend(captured.net_denials);
             status = captured.exit_code;
         }
     }
@@ -806,6 +832,7 @@ fn run_script(
         exit_code: status,
         stdout: cap_string(stdout, cfg.max_output),
         stderr: cap_string(stderr, cfg.max_output),
+        net_denials,
         stdout_truncated,
         stderr_truncated,
     })
@@ -1513,6 +1540,9 @@ fn run_pipeline(
         stderr: capped_utf8(&stderr, max_output),
         stdout_truncated,
         stderr_truncated,
+        // #196: net denials are attached by run_with_egress_proxy (which owns the
+        // proxy handle), not here — a bare pipeline run observes no proxy refusals.
+        net_denials: Vec::new(),
     })
 }
 
@@ -1590,6 +1620,10 @@ mod tests {
         envs: Mutex<Vec<BTreeMap<String, String>>>,
         exit_by_program: HashMap<String, i32>,
         block_ms: u64,
+        /// #196: net denials the spawner reports back — the shape
+        /// `run_with_egress_proxy` produces from the proxy's refused hosts, so the
+        /// Captured→envelope wiring is verified without a real proxy/child.
+        net_denials: Vec<Denial>,
     }
 
     impl MockSpawner {
@@ -1597,6 +1631,15 @@ mod tests {
             let mut m = Self::default();
             m.exit_by_program.insert(program.to_string(), code);
             m
+        }
+
+        /// #196: a mock whose `run` reports these net denials (as the real proxy
+        /// path would for refused hosts).
+        fn with_net_denials(denials: Vec<Denial>) -> Self {
+            Self {
+                net_denials: denials,
+                ..Self::default()
+            }
         }
     }
 
@@ -1631,6 +1674,7 @@ mod tests {
                     .unwrap_or(0),
                 stdout: String::new(),
                 stderr: String::new(),
+                net_denials: self.net_denials.clone(),
                 ..Default::default()
             })
         }
@@ -1735,6 +1779,38 @@ mod tests {
             serde_json::json!(true),
             "default principal still runs: {out}"
         );
+    }
+
+    /// #196: a net refusal reported by the spawner (the shape
+    /// `run_with_egress_proxy` produces from the proxy's refused hosts) reaches
+    /// the result envelope as a structured `net` denial with `denied: true` — the
+    /// exact signal a consumer (newt) lifts into a per-host prompt. Unlike an
+    /// `exec`/`open` refusal, the command still RAN (the refusal is observed
+    /// during the run, not at pre-spawn admission).
+    #[tokio::test]
+    async fn net_refusal_surfaces_as_a_net_denial_in_the_envelope() {
+        let mock = Arc::new(MockSpawner::with_net_denials(vec![Denial {
+            kind: DenialKind::Net,
+            target: "github.com".to_string(),
+            reason: "net does not permit 'github.com'".to_string(),
+        }]));
+        let out = ShellTool::with_spawner(mock)
+            .invoke(
+                serde_json::json!({ "cmd": "echo hi" }),
+                &ctx(exec_only(&["echo"])),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(
+            out["denied"],
+            serde_json::json!(true),
+            "a net denial sets denied: {out}"
+        );
+        assert_eq!(out["denials"][0]["kind"], "net");
+        assert_eq!(out["denials"][0]["target"], "github.com");
+        // The command still executed — a success envelope (has exit_code), not a
+        // pre-spawn refused envelope.
+        assert!(out.get("exit_code").is_some(), "command still ran: {out}");
     }
 
     fn ran_programs(mock: &Arc<MockSpawner>) -> Vec<String> {

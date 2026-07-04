@@ -237,6 +237,10 @@ pub struct ProxyHandle {
     addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+    /// #196: out-of-allow-list hosts the child tried to reach — refused with 403.
+    /// Accumulated across all connections (independent of the opt-in audit sink)
+    /// so the shell tool can surface them as structured `net` denials.
+    refused: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ProxyHandle {
@@ -245,6 +249,23 @@ impl ProxyHandle {
     #[cfg(test)]
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// #196: the CONNECT hosts this proxy REFUSED (not on the allow-list),
+    /// deduplicated and sorted. The shell tool reads this after the child is
+    /// reaped and turns each into a `Denial { kind: Net, target: host }` so a
+    /// consumer can prompt per-host. Empty when the child only reached
+    /// allow-listed hosts (or none).
+    #[must_use]
+    pub fn refused_hosts(&self) -> Vec<String> {
+        self.refused
+            .lock()
+            .map(|s| {
+                let mut v: Vec<String> = s.iter().cloned().collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default()
     }
 
     /// The `*_PROXY` environment the child needs to route through this proxy.
@@ -295,9 +316,12 @@ pub fn start(
     let addr = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let policy = HostPolicy::new(allow_hosts);
+    // #196: shared refused-host accumulator, populated by each connection thread.
+    let refused: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let accept = {
         let shutdown = Arc::clone(&shutdown);
+        let refused = Arc::clone(&refused);
         thread::Builder::new()
             .name("agent-bridle-egress-proxy".to_string())
             .spawn(move || {
@@ -309,11 +333,18 @@ pub fn start(
                     let policy = policy.clone();
                     let resolver = Arc::clone(&resolver);
                     let sink = Arc::clone(&sink);
+                    let refused = Arc::clone(&refused);
                     // One detached thread per connection; it ends at EOF.
                     let _ = thread::Builder::new()
                         .name("agent-bridle-egress-conn".to_string())
                         .spawn(move || {
-                            let _ = handle_conn(client, &policy, resolver.as_ref(), sink.as_ref());
+                            let _ = handle_conn(
+                                client,
+                                &policy,
+                                resolver.as_ref(),
+                                sink.as_ref(),
+                                &refused,
+                            );
                         });
                 }
             })?
@@ -323,6 +354,7 @@ pub fn start(
         addr,
         shutdown,
         accept: Some(accept),
+        refused,
     })
 }
 
@@ -334,6 +366,7 @@ fn handle_conn(
     policy: &HostPolicy,
     resolver: &dyn Resolver,
     sink: &dyn AuditSink,
+    refused: &Mutex<HashSet<String>>,
 ) -> io::Result<()> {
     client.set_read_timeout(Some(CONN_TIMEOUT))?;
     client.set_write_timeout(Some(CONN_TIMEOUT))?;
@@ -366,6 +399,11 @@ fn handle_conn(
 
     if !policy.allows(&host) {
         audit(NetDecision::Denied, 0, 0); // the exfil-attempt signal
+                                          // #196: record the refused host so the shell tool can surface it as a
+                                          // structured `net` denial (the audit sink is opt-in; this is always on).
+        if let Ok(mut set) = refused.lock() {
+            set.insert(host.clone());
+        }
         return respond(&client, 403, "Forbidden");
     }
 
@@ -808,6 +846,38 @@ mod tests {
         .unwrap();
         let (status, _) = http_get_via_proxy(proxy.addr(), "http://evil.test/x");
         assert!(status.contains("403"), "denied host must get 403: {status}");
+    }
+
+    /// #196: the proxy accumulates every CONNECT host it REFUSES and surfaces
+    /// them via `refused_hosts()` (deduped, sorted) — this is what the shell tool
+    /// turns into structured `net` denials. Allowed hosts are never listed.
+    #[test]
+    fn refused_hosts_surfaces_denied_hosts_deduped_and_omits_allowed() {
+        let _serial = net_test_lock();
+        let origin = spawn_origin();
+        let proxy = start_null(
+            ["allowed.test".to_string()],
+            Arc::new(FixedResolver(origin)),
+        )
+        .unwrap();
+        let _ = http_get_via_proxy(proxy.addr(), "http://allowed.test/x"); // allowed → forwarded
+        let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/y"); // denied → refused
+        let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/z"); // same host → deduped
+                                                                        // Refusals are recorded from detached conn threads (like the audit sink),
+                                                                        // so poll (not a fixed sleep) until the denied host lands.
+        let mut refused = Vec::new();
+        for _ in 0..200 {
+            refused = proxy.refused_hosts();
+            if !refused.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            refused,
+            vec!["evil.test".to_string()],
+            "only the denied host, deduped; allowed host must NOT appear: {refused:?}"
+        );
     }
 
     #[test]
