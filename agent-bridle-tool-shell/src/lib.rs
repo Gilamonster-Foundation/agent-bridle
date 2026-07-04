@@ -31,6 +31,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "host-shell")]
+mod host_shell;
 #[cfg(feature = "shell")]
 mod net_proxy;
 #[cfg(feature = "shell")]
@@ -40,6 +42,12 @@ mod shell_tool;
 
 #[cfg(feature = "shell")]
 pub use shell_tool::ShellTool;
+
+/// The sandboxed-host engine (ADR 0019 / #194): full-shell semantics with the
+/// guarantee entirely on L3. Opt-in via the `host-shell` feature; a
+/// construction-time alternative to [`ShellTool`] behind the ADR 0005 D2 seam.
+#[cfg(feature = "host-shell")]
+pub use host_shell::HostShellTool;
 
 /// Network egress audit surface (#124, ADR 0016): the loopback proxy records
 /// every proxy-visible connection as a [`NetAuditEvent`] through an [`AuditSink`]
