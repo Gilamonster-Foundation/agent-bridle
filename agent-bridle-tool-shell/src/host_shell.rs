@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use agent_bridle_core::{
     Caveats, ConfinedCommand, Denial, DenialKind, Disclosure, SandboxKind, SandboxPolicy, Scope,
@@ -34,6 +34,19 @@ const ENGINE_NAME: &str = "sandbox-host";
 /// engine has no extra config surface for the MVP).
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
 
+/// The engine's input schema, parsed once from the embedded data file. The
+/// schema is **knowledge**, so it lives in `host_shell.schema.json` (plain-text
+/// data), not inline in [`Tool::schema`] — three-Cs: knowledge in data, not
+/// logic. It is the *default* for the tool's overridable `schema` property
+/// ([`HostShellTool::with_schema`]); `include_str!` binds the data at compile
+/// time, so a malformed file fails the build's tests, never a live dispatch.
+static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
+    Arc::new(
+        serde_json::from_str(include_str!("host_shell.schema.json"))
+            .expect("embedded host_shell.schema.json must be valid JSON"),
+    )
+});
+
 /// The sandboxed-host shell engine — a [`Tool`] that runs a free-form command
 /// through the OS shell inside the L3 jail (ADR 0019). Registered under
 /// `"shell"` so it is a construction-time engine choice (the embedder builds the
@@ -44,6 +57,11 @@ pub struct HostShellTool {
     shell: String,
     max_output: usize,
     sandbox: Arc<SandboxPolicy>,
+    /// The tool's input schema — a *property* of this engine instance, not a
+    /// hard-coded literal in [`Tool::schema`]. Defaults to the embedded
+    /// [`DEFAULT_SCHEMA`] data file; overridable via
+    /// [`HostShellTool::with_schema`] (three-Cs: Configuration).
+    schema: Arc<serde_json::Value>,
 }
 
 impl std::fmt::Debug for HostShellTool {
@@ -68,7 +86,18 @@ impl HostShellTool {
             shell: "/bin/sh".to_string(),
             max_output: DEFAULT_MAX_OUTPUT,
             sandbox: Arc::new(SandboxPolicy::default()),
+            schema: DEFAULT_SCHEMA.clone(),
         }
+    }
+
+    /// Override the tool's input schema (three-Cs: Configuration). Defaults to
+    /// the embedded `host_shell.schema.json`; an embedder presenting a different
+    /// `cmd`/`env`/`cwd` contract sets its own schema here rather than forking
+    /// the engine.
+    #[must_use]
+    pub fn with_schema(mut self, schema: serde_json::Value) -> Self {
+        self.schema = Arc::new(schema);
+        self
     }
 
     /// Set the shell binary the engine spawns (embedder-configured, ADR 0019
@@ -127,26 +156,9 @@ impl Tool for HostShellTool {
     }
 
     fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "cmd": {
-                    "type": "string",
-                    "description": "A command line run by the OS shell (`/bin/sh -c`) with the \
-                                    whole process tree inside the kernel filesystem jail. Full \
-                                    shell semantics — pipes, `$(...)`, loops — are allowed \
-                                    because the kernel, not a parser, bounds their filesystem \
-                                    reach. Requires exec+net to be unrestricted (else refused)."
-                },
-                "env": {
-                    "type": "object",
-                    "additionalProperties": { "type": "string" },
-                    "description": "Environment for the child (no ambient inheritance)."
-                },
-                "cwd": { "type": "string", "description": "Working directory (within fs_read)." }
-            },
-            "required": ["cmd"]
-        })
+        // The schema is a property of the engine (default: the embedded
+        // `host_shell.schema.json` data file), not a hard-coded literal here.
+        (*self.schema).clone()
     }
 
     async fn invoke(
@@ -237,4 +249,34 @@ fn cap_utf8(bytes: &[u8], max: usize) -> String {
         end -= 1;
     }
     format!("{}…[truncated]", &s[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default schema loads from the embedded `host_shell.schema.json` data
+    /// file (not an inline literal) and has the `cmd`/`env`/`cwd` shape. Guards
+    /// the data file against corruption — a bad edit fails here, not in prod.
+    #[test]
+    fn default_schema_loads_from_data_file_with_expected_shape() {
+        let s = HostShellTool::new().schema();
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["required"], serde_json::json!(["cmd"]));
+        for key in ["cmd", "env", "cwd"] {
+            assert!(
+                s["properties"].get(key).is_some(),
+                "schema is missing the `{key}` property: {s}"
+            );
+        }
+    }
+
+    /// The schema is a configurable *property* of the engine (three-Cs), so an
+    /// embedder can override it at construction.
+    #[test]
+    fn with_schema_overrides_the_property() {
+        let custom = serde_json::json!({ "type": "object", "properties": {} });
+        let s = HostShellTool::new().with_schema(custom.clone()).schema();
+        assert_eq!(s, custom);
+    }
 }
