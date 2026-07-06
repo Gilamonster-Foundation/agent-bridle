@@ -49,6 +49,14 @@ pub use agent_bridle_tool_shell::HostShellTool;
 // `"shell"` name with ShellTool (ADR 0005 D2), so the embedder selects it.
 #[cfg(feature = "brush")]
 pub use agent_bridle_tool_shell::BrushShellTool;
+// Carried-coreutils dispatch (issue #206): an embedder's binary calls
+// `maybe_dispatch()` at the very top of `main` to become dispatch-capable, so the
+// brush engine's carried `ls`/`cat`/… shims (which re-exec `<self>
+// --invoke-bundled <name>`) resolve in-process against the host binary — carried
+// coreutils with no host tools. `register_shims`/`install_default_providers` are
+// used by the engine internally but re-exported for completeness.
+#[cfg(feature = "carried-coreutils")]
+pub use agent_bridle_tool_shell::{install_default_providers, maybe_dispatch, register_shims};
 #[cfg(feature = "web")]
 pub use agent_bridle_tool_web::WebFetchTool;
 
