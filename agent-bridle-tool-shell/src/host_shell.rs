@@ -184,7 +184,7 @@ impl Tool for HostShellTool {
             return Ok(self.engine_unavailable(DenialKind::Net, "net"));
         }
 
-        let env: BTreeMap<String, String> = args
+        let mut env: BTreeMap<String, String> = args
             .get("env")
             .and_then(serde_json::Value::as_object)
             .map(|m| {
@@ -193,6 +193,17 @@ impl Tool for HostShellTool {
                     .collect()
             })
             .unwrap_or_default();
+        // Full-access PATH seeding (Track 1a / parity). We only reach here when
+        // `exec` is unrestricted (a restricted exec/net was refused above), so the
+        // child is already permitted to run anything on the host. Seed a usable
+        // `PATH` — the ambient `$PATH`, else the conventional search dirs — so bare
+        // program names (`grep`/`ls`/`find`, and tools in non-standard dirs like
+        // `~/.cargo/bin` / `/opt/homebrew/bin`) resolve like the host shell,
+        // instead of leaning on the shell's fragile compiled `_CS_PATH` fallback.
+        // `ConfinedCommand`'s `env_clear` still scrubs everything else; a
+        // caller-provided `PATH` wins.
+        env.entry("PATH".to_string())
+            .or_insert_with(agent_bridle_core::default_exec_path);
         let cwd = args.get("cwd").and_then(serde_json::Value::as_str);
         let max_output = self.max_output;
 
