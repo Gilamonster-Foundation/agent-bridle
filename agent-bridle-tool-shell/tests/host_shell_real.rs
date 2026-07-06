@@ -251,3 +251,67 @@ async fn fully_ambient_grant_runs_the_command() {
         "the dynamic construct must have executed: {out}"
     );
 }
+
+/// Regression (Track 1a — full-access parity): under a fully-authorized grant the
+/// engine seeds a usable `PATH` into the child so bare program names
+/// (`grep`/`ls`/`find`) resolve like the host shell, instead of relying on the
+/// shell's fragile compiled `_CS_PATH` fallback (empty when `env_clear` scrubs
+/// `PATH`). Proven by having the child echo its own `$PATH`: **pre-fix it was
+/// unset (empty); post-fix it equals `default_exec_path()`**. `printf` is a shell
+/// builtin, so this isolates the *seeding* — it needs no PATH itself.
+#[tokio::test]
+async fn full_access_seeds_default_path_into_the_child() {
+    use agent_bridle_core::default_exec_path;
+
+    let out = HostShellTool::new()
+        .invoke(
+            serde_json::json!({ "cmd": "printf '%s' \"$PATH\"" }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    assert_ne!(out["denied"], true, "ambient grant must run: {out}");
+    assert_eq!(
+        out["stdout"].as_str().unwrap_or_default(),
+        default_exec_path(),
+        "the child must see the seeded default PATH (was unset pre-fix): {out}"
+    );
+}
+
+/// A caller-provided `PATH` wins over the seeded default, and a **bare program
+/// name** then resolves and runs inside the engine — the functional end of the
+/// parity fix (grep/ls/find resolving). Deterministic: a temp dir with a marker
+/// tool, no dependence on which host binaries live where.
+#[cfg(unix)]
+#[tokio::test]
+async fn bare_name_resolves_when_path_includes_its_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unique_temp("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tool = dir.join("marker-tool");
+    std::fs::write(&tool, "#!/bin/sh\necho marker-ran\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = HostShellTool::new()
+        .invoke(
+            serde_json::json!({
+                "cmd": "marker-tool",
+                "env": { "PATH": dir.to_string_lossy() },
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    assert_ne!(out["denied"], true, "ambient grant must run: {out}");
+    assert_eq!(out["exit_code"], 0, "the bare-name tool must run: {out}");
+    assert_eq!(
+        out["stdout"].as_str().unwrap_or_default().trim(),
+        "marker-ran",
+        "the bare program name must resolve via the provided PATH: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

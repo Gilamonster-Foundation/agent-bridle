@@ -278,6 +278,33 @@ impl Default for RootfsPolicy {
     }
 }
 
+/// The default `PATH` for a **fully-authorized** (`exec = Scope::All`) confined
+/// child: the ambient `$PATH` when set and non-empty, else the conventional
+/// [`RootfsPolicy`] search dirs, joined with the platform separator.
+///
+/// The sandbox-host engine (`HostShellTool`, in `agent-bridle-tool-shell`) seeds
+/// this into the child so bare program names (`grep`/`ls`/`find`) resolve like
+/// the host shell would, instead of leaning on the shell's fragile compiled
+/// `_CS_PATH` fallback. It is only meaningful — and only called — when
+/// `exec` is unrestricted, so seeding it grants nothing the caller's exec
+/// authority does not already permit; `env_clear` still scrubs everything else.
+/// Mirrors the exec-search-dir precedence that anchors the L3 `Execute`
+/// allow-list (`sandbox::exec_search_dirs`); kept here so it constructs on every
+/// platform.
+#[must_use]
+pub fn default_exec_path() -> String {
+    if let Ok(path) = std::env::var("PATH") {
+        if !path.is_empty() {
+            return path;
+        }
+    }
+    let dirs = RootfsPolicy::default().search_dirs;
+    std::env::join_paths(&dirs)
+        .ok()
+        .and_then(|joined| joined.into_string().ok())
+        .unwrap_or_else(|| dirs.join(if cfg!(windows) { ";" } else { ":" }))
+}
+
 /// Toggles for the automatic "normalizations" (assists) — each defaults to today's
 /// always-on behavior; only *loosening*-safe ones are exposed as on/off (safety
 /// normalizations like fs canonicalization and env-scrub are intentionally absent
