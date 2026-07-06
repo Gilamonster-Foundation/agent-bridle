@@ -8,13 +8,25 @@
 //! regressed, the shell would find no `ls`/`cat` at all.
 #![cfg(feature = "carried-coreutils")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The dispatch-capable helper binary cargo built for us.
 fn dispatch_host() -> &'static str {
     env!("CARGO_BIN_EXE_dispatch_host")
+}
+
+/// Shell-quote a path for splicing into a brush command string. brush's
+/// parser is POSIX-style: an unquoted `\` is an escape character. Windows
+/// paths are backslash-separated, so without this an unquoted path like
+/// `C:\Users\...\hello.txt` gets silently mangled to `C:Users...hello.txt`
+/// (issue #209 W4 finding) — `\U`, `\A`, etc. get collapsed to the escaped
+/// letter. Single-quoting is a no-op on Unix (paths there never contain `'`
+/// in these tests) and makes the Windows path safe. Mirrors
+/// `agent-bridle-jaild::vm::shell_quote`.
+fn shell_quote(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
 
 fn unique_temp(tag: &str) -> PathBuf {
@@ -62,7 +74,7 @@ fn carried_ls_runs_in_process_with_env_scrubbed() {
     std::fs::write(dir.join("MARKER.txt"), b"x").unwrap();
 
     let out = scrubbed()
-        .arg(format!("ls {}", dir.to_string_lossy()))
+        .arg(format!("ls {}", shell_quote(&dir)))
         .output()
         .expect("run dispatch_host");
 
@@ -89,7 +101,7 @@ fn carried_cat_runs_in_process_with_env_scrubbed() {
     std::fs::write(&file, b"carried-cat-ok\n").unwrap();
 
     let out = scrubbed()
-        .arg(format!("cat {}", file.to_string_lossy()))
+        .arg(format!("cat {}", shell_quote(&file)))
         .output()
         .expect("run dispatch_host");
 
