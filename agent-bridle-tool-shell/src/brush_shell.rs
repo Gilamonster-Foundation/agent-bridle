@@ -243,6 +243,26 @@ fn run_in_brush(
             .set_global("PATH", ShellVariable::new(path_value))
             .map_err(|e| ToolError::Exec(brush_io("seed PATH", &e)))?;
 
+        // Windows: a child spawned under `do_not_inherit_env(true)` needs the
+        // OS-minimal vars (`SystemRoot`, …) or `CreateProcess`/CRT init fails to
+        // start it at all. These are not secrets — every Windows process needs
+        // them — so seeding them keeps external commands and the carried-coreutils
+        // re-exec runnable under confinement. Unix needs none of this.
+        #[cfg(windows)]
+        for key in [
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "NUMBER_OF_PROCESSORS",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                let _ = shell.env_mut().set_global(key, ShellVariable::new(val));
+            }
+        }
+
         let result = shell
             .run_dash_c_command(cmd)
             .await
