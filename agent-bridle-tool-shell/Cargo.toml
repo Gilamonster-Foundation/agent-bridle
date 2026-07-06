@@ -29,6 +29,14 @@ shell = ["dep:tokio"]
 # Opt-in; the embedder registers it instead of the safe-subset ShellTool. Pulls
 # tokio (spawn_blocking) like `shell`; independent of the safe-subset modules.
 host-shell = ["dep:tokio"]
+# The carried **brush** engine (agent-bridle#20 / Track 2): a bash-in-Rust shell
+# run in-process, confined by the `CommandInterceptor` L2 leash — the only engine
+# that also confines a *restricted* exec/net grant, and cross-platform. Uses the
+# temporary `brush-ocap-*` fork (reubeno/brush#1184 not yet upstream).
+# NOTE: while `brush` is on, this build carries a GIT dependency and is therefore
+# NOT crates.io-publishable — switch to the published `brush-ocap-*` versions
+# before merging to main (agent-bridle#20). Off by default; publish-clean when off.
+brush = ["dep:tokio", "dep:brush-ocap-core", "dep:brush-ocap-builtins"]
 # Kernel-enforced L3 backstop (Linux). The engine applies the Landlock fs_write
 # ruleset before spawning when fs_write is restricted (agent-bridle#35); off this
 # build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Exec/net axes
@@ -53,10 +61,12 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, optional = true }
 
-# brush deps — intentionally absent. `brush-bridle-core` (a renamed brush fork
-# published to crates.io) is the DEFERRED, REVERSIBLE full-bash alternative
-# engine behind the same registry seam (ADR 0005 D4); it would be added under
-# its own optional feature when adopted, not restored here. See agent-bridle#20.
+# The temporary `brush-ocap-*` fork (github.com/hartsock/brush @ brush-ocap):
+# upstream brush + the CommandInterceptor hook (reubeno/brush#1184), renamed for
+# crates.io. GIT dep for LOCAL validation of the `brush` engine; before merge,
+# publish `brush-ocap-*` and swap these to crates.io version deps (agent-bridle#20).
+brush-ocap-core = { git = "https://github.com/hartsock/brush", rev = "ee58e24", optional = true }
+brush-ocap-builtins = { git = "https://github.com/hartsock/brush", rev = "ee58e24", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -42,6 +42,13 @@ pub use agent_bridle_tool_shell::ShellTool;
 // `"shell"` name with `ShellTool` (ADR 0019 D3).
 #[cfg(feature = "host-shell")]
 pub use agent_bridle_tool_shell::HostShellTool;
+// The carried brush engine (agent-bridle#20): a bash-in-Rust shell confined
+// in-process by the CommandInterceptor — the only engine that also confines a
+// restricted exec/net grant. Behind the `brush` feature (a git dep on the
+// temporary brush-ocap fork); NOT auto-added to `registry()` — it shares the
+// `"shell"` name with ShellTool (ADR 0005 D2), so the embedder selects it.
+#[cfg(feature = "brush")]
+pub use agent_bridle_tool_shell::BrushShellTool;
 #[cfg(feature = "web")]
 pub use agent_bridle_tool_web::WebFetchTool;
 

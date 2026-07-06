@@ -31,6 +31,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "brush")]
+mod brush_shell;
+#[cfg(feature = "brush")]
+mod caveat_interceptor;
 #[cfg(feature = "host-shell")]
 mod host_shell;
 #[cfg(feature = "shell")]
@@ -48,6 +52,15 @@ pub use shell_tool::ShellTool;
 /// construction-time alternative to [`ShellTool`] behind the ADR 0005 D2 seam.
 #[cfg(feature = "host-shell")]
 pub use host_shell::HostShellTool;
+
+/// The carried **brush** engine (agent-bridle#20 / Track 2): a bash-in-Rust
+/// shell run in-process, confined by the `CommandInterceptor` L2 leash — the
+/// only engine that also confines a *restricted* `exec`/`net` grant, on any
+/// platform. Opt-in via the `brush` feature; a construction-time alternative to
+/// [`ShellTool`] behind the ADR 0005 D2 seam, using the temporary `brush-ocap-*`
+/// fork (reubeno/brush#1184).
+#[cfg(feature = "brush")]
+pub use brush_shell::BrushShellTool;
 
 /// Network egress audit surface (#124, ADR 0016): the loopback proxy records
 /// every proxy-visible connection as a [`NetAuditEvent`] through an [`AuditSink`]
