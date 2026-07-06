@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Gilamonster-Foundation/agent-bridle"
@@ -21,12 +21,12 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 
 [workspace.dependencies]
 # In-workspace crates (lock-step version).
-agent-bridle-core = { version = "0.7.0", path = "agent-bridle-core" }
-agent-bridle-tool-shell = { version = "0.7.0", path = "agent-bridle-tool-shell" }
-agent-bridle-tool-web = { version = "0.7.0", path = "agent-bridle-tool-web" }
+agent-bridle-core = { version = "0.7.1", path = "agent-bridle-core" }
+agent-bridle-tool-shell = { version = "0.7.1", path = "agent-bridle-tool-shell" }
+agent-bridle-tool-web = { version = "0.7.1", path = "agent-bridle-tool-web" }
 # `default-features = false` here so `agent-bridle-mcp` controls the facade's
 # feature set (its own `shell`/`--no-default-features` forward through).
-agent-bridle = { version = "0.7.0", path = "agent-bridle", default-features = false }
+agent-bridle = { version = "0.7.1", path = "agent-bridle", default-features = false }
 
 # The leash. One canonical authority type, shared across the whole agent line.
 agent-mesh-protocol = "0.6"
