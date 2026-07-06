@@ -19,6 +19,15 @@ authors.workspace = true
 name = "bridle-netmon"
 required-features = ["shell"]
 
+# A dispatch-capable host binary for the carried-coreutils integration test
+# (issue #206): its `main` calls `maybe_dispatch()` first, so the brush engine's
+# coreutils shims (which re-exec `<self> --invoke-bundled <name>`) resolve
+# in-process against THIS binary — proving carried `ls`/`cat` work with no host
+# tools. Only built with `carried-coreutils`.
+[[bin]]
+name = "dispatch_host"
+required-features = ["carried-coreutils"]
+
 [features]
 # `shell` is on by default so agent-bridle's registry() includes the tool.
 # It pulls tokio (spawn_blocking + timeout) for confined execution.
@@ -37,6 +46,12 @@ host-shell = ["dep:tokio"]
 # NOT crates.io-publishable — switch to the published `brush-ocap-*` versions
 # before merging to main (agent-bridle#20). Off by default; publish-clean when off.
 brush = ["dep:tokio", "dep:brush-ocap-core", "dep:brush-ocap-builtins"]
+# Carried coreutils (agent-bridle#20 / issue #206): the brush engine registers
+# bundled uu_* coreutils shims that re-exec `<self> --invoke-bundled <name>`, so
+# an embedded shell runs `ls`/`cat`/… with NO host tools — IF the host binary is
+# dispatch-capable (calls `maybe_dispatch()` at the top of `main`). Off by
+# default; carries the fork's coreutils crate (a git dep, like `brush`).
+carried-coreutils = ["brush", "dep:brush-ocap-coreutils-builtins"]
 # Kernel-enforced L3 backstop (Linux). The engine applies the Landlock fs_write
 # ruleset before spawning when fs_write is restricted (agent-bridle#35); off this
 # build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Exec/net axes
@@ -67,6 +82,13 @@ tokio = { workspace = true, optional = true }
 # publish `brush-ocap-*` and swap these to crates.io version deps (agent-bridle#20).
 brush-ocap-core = { git = "https://github.com/hartsock/brush", rev = "ee58e24", optional = true }
 brush-ocap-builtins = { git = "https://github.com/hartsock/brush", rev = "ee58e24", optional = true }
+# A minimal carried coreutils set (ls/cat/echo) — enough to prove the embedded
+# dispatch path (issue #206) without the ~100-crate `coreutils.all` build.
+brush-ocap-coreutils-builtins = { git = "https://github.com/hartsock/brush", rev = "ee58e24", features = [
+    "coreutils.ls",
+    "coreutils.cat",
+    "coreutils.echo",
+], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

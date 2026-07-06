@@ -228,6 +228,16 @@ fn run_in_brush(
                 .await
                 .map_err(|e| ToolError::Exec(brush_io("build shell", &e)))?;
 
+        // Register the carried coreutils shims (issue #206). They re-exec
+        // `<self> --invoke-bundled <name>`, so they resolve in-process ONLY when
+        // the host binary is dispatch-capable (calls `maybe_dispatch()` in main).
+        // The re-exec still funnels through the `before_exec` interceptor.
+        #[cfg(feature = "carried-coreutils")]
+        {
+            crate::coreutils_dispatch::install_default_providers();
+            crate::coreutils_dispatch::register_shims(&mut shell);
+        }
+
         shell
             .env_mut()
             .set_global("PATH", ShellVariable::new(path_value))

@@ -35,6 +35,8 @@
 mod brush_shell;
 #[cfg(feature = "brush")]
 mod caveat_interceptor;
+#[cfg(feature = "carried-coreutils")]
+mod coreutils_dispatch;
 #[cfg(feature = "host-shell")]
 mod host_shell;
 #[cfg(feature = "shell")]
@@ -61,6 +63,15 @@ pub use host_shell::HostShellTool;
 /// fork (reubeno/brush#1184).
 #[cfg(feature = "brush")]
 pub use brush_shell::BrushShellTool;
+
+/// Carried-coreutils dispatch (agent-bridle#20 / issue #206). An embedder's
+/// binary calls [`maybe_dispatch`] at the top of `main` to become
+/// dispatch-capable, so the brush engine's carried `ls`/`cat`/… shims (which
+/// re-exec `<self> --invoke-bundled <name>`) resolve in-process against the host
+/// binary — carried coreutils with no host tools. [`register_shims`] /
+/// [`install_default_providers`] are used by the engine internally.
+#[cfg(feature = "carried-coreutils")]
+pub use coreutils_dispatch::{install_default_providers, maybe_dispatch, register_shims};
 
 /// Network egress audit surface (#124, ADR 0016): the loopback proxy records
 /// every proxy-visible connection as a [`NetAuditEvent`] through an [`AuditSink`]
