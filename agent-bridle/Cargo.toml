@@ -19,6 +19,16 @@ shell = ["dep:agent-bridle-tool-shell"]
 # construction; it is NOT auto-added to `registry()` (it and `ShellTool` share
 # the `"shell"` name). Off by default.
 host-shell = ["dep:agent-bridle-tool-shell", "agent-bridle-tool-shell/host-shell"]
+# The carried brush engine (agent-bridle#20 / Track 2): exposes `BrushShellTool`,
+# a bash-in-Rust shell confined in-process by the CommandInterceptor — the only
+# engine that also confines a restricted exec/net grant. Complementary to `shell`
+# (ADR 0005 D2 seam); the embedder selects it at registry construction. Off by
+# default. Uses the temporary `brush-ocap-*` fork published to crates.io
+# (agent-bridle#20); retire once reubeno/brush#1184 ships upstream.
+brush = ["dep:agent-bridle-tool-shell", "agent-bridle-tool-shell/brush"]
+# Carried coreutils (issue #206): the brush engine carries bundled uu_* coreutils
+# so an embedded shell runs `ls`/`cat`/… with no host tools. Off by default.
+carried-coreutils = ["brush", "agent-bridle-tool-shell/carried-coreutils"]
 # `web` adds the confined `web_fetch` tool (the `net` enforcer). Off by default
 # so the heavy reqwest/readability/DNS deps only enter a build that asks for it.
 web = ["dep:agent-bridle-tool-web"]
