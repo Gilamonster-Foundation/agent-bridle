@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-bridle"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -22,14 +22,14 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-aclaunch"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "agent-bridle-config"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-core"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-jaild"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-bridle-core",
  "libc",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-mcp"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-bridle",
  "anyhow",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-py"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-bridle",
  "agent-mesh-protocol",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-tool-shell"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-tool-web"
-version = "0.1.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
