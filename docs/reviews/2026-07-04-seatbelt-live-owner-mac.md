@@ -47,8 +47,16 @@ matching the CI symptom.
 
 **Suggested fix (one line, matches every sibling):** add
 `let _serial = net_test_lock();` as the test's first statement in
-`agent-bridle-tool-shell/src/net_proxy.rs`. Filed as an issue with this
-evidence; a fix PR is held pending review.
+`agent-bridle-tool-shell/src/net_proxy.rs`. Filed as **#207** (still applicable
+on `main` as of 2026-07-06); a one-line fix PR is a follow-up.
+
+## Follow-up (2026-07-06)
+
+The Seatbelt line was re-verified on this MacBook as part of the **0.7.0-rc.1**
+pre-publication gate (#205): the host-shell Seatbelt keystone, the brush engine's
+in-process confinement, Homebrew PATH parity, carried coreutils under a scrubbed
+env (#206), and a dgx1-inference end-to-end run all pass. This review remains the
+record of the first owner-Mac Seatbelt run; #205 carries the fuller matrix.
 
 ## Environment
 
