@@ -155,6 +155,13 @@ jobs:
       - name: Test the AppContainer backend (core proofs)
         run: cargo test -p agent-bridle-core --features windows-appcontainer
 
+      # Run the shell ENGINES functionally on Windows (#209). The clippy step
+      # above only COMPILES them; this EXERCISES the in-process brush engine and
+      # the carried-coreutils dispatch/re-exec — neither ran on Windows before
+      # 0.7.0-rc.1. HOOK PARITY: mirrored by `just check-windows`.
+      - name: Run the shell engines on Windows (brush + carried coreutils)
+        run: cargo test -p agent-bridle-tool-shell --features brush,carried-coreutils --test brush_real --test carried_coreutils
+
       # The launcher's own unit tests: MSVC CommandLineToArgvW quoting (arg-injection
       # surface) and the flag parser. Windows-only crate — only this job builds it.
       - name: Test the agent-bridle-aclaunch launcher (unit)

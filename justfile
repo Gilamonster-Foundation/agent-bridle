@@ -47,6 +47,9 @@ check-windows:
     set -e
     cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
     cargo test -p agent-bridle-core --features windows-appcontainer
+    # Exercise the shell ENGINES on Windows (#209) — clippy only compiles them.
+    # HOOK PARITY: mirrors the "Run the shell engines on Windows" step in ci.yml.
+    cargo test -p agent-bridle-tool-shell --features brush,carried-coreutils --test brush_real --test carried_coreutils
     cargo test -p agent-bridle-aclaunch --bins
     BRIDLE_REQUIRE_APPCONTAINER=1 cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1
     BRIDLE_REQUIRE_APPCONTAINER=1 cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1
