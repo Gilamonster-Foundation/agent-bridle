@@ -1,0 +1,32 @@
+[package]
+name = "agent-bridle-gateway"
+version = "0.7.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Gilamonster-Foundation/agent-bridle"
+authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
+description = "Browser↔agent-mesh presence gateway + operator web console (MVP: mocked mesh leg)."
+# Not published to crates.io: it is a network service with a heavy async dep
+# tree (axum/tokio), deliberately kept OUT of the lean, publishable core
+# (ADR 0008). It reuses `agent-bridle-core::step_up`; it never forks it.
+publish = false
+
+[[bin]]
+name = "agent-bridle-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# The one true authority/presence surface — reused, never re-implemented.
+agent-bridle-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Gateway-only deps (never enter core or a host's default build).
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+base64 = "0.22"
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

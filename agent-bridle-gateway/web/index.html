@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agent-bridle · presence + traffic</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>agent-bridle <span class="dim">console</span></h1>
+      <div id="banner" class="banner">connecting…</div>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button id="tab-presence" class="tab active" role="tab">Presence</button>
+      <button id="tab-traffic" class="tab" role="tab">Traffic</button>
+    </nav>
+
+    <!-- ── Presence tab ─────────────────────────────────────────────── -->
+    <section id="panel-presence" class="panel active">
+      <div class="card">
+        <h2>1 · Enroll an authenticator</h2>
+        <p class="dim">
+          Registers a passkey / YubiKey / platform fingerprint with this gateway
+          (<code>navigator.credentials.create</code>, user-verification required).
+          This is the credential the work-box gate would pin against (§7.2).
+        </p>
+        <label>Label <input id="enroll-label" type="text" placeholder="my yubikey" /></label>
+        <button id="btn-enroll" class="primary">Enroll credential</button>
+        <div id="enroll-status" class="status"></div>
+        <div class="dim small">Enrolled here: <span id="enrolled-count">0</span></div>
+      </div>
+
+      <div class="card">
+        <h2>2 · Simulate a presence request</h2>
+        <p class="dim">
+          Stands in for the work-doing box asking for a gesture over the mesh.
+          Pick the demanded tier and the action the human will see.
+        </p>
+        <label>Presence
+          <select id="req-presence">
+            <option value="passkey">passkey (hardware gesture)</option>
+            <option value="prompt">prompt (soft affirmation)</option>
+          </select>
+        </label>
+        <label>Action summary
+          <input id="req-summary" type="text" value="git push → github.com/org/prod-api" />
+        </label>
+        <button id="btn-simulate">Request presence</button>
+      </div>
+
+      <div id="approve-card" class="card hidden">
+        <h2>3 · Approve</h2>
+        <div class="request">
+          <div class="req-line">Action: <strong id="ap-summary"></strong></div>
+          <div class="req-line">Requires: <span id="ap-presence" class="pill"></span></div>
+          <div class="req-line dim small">generation <span id="ap-gen"></span> · challenge <code id="ap-chal"></code></div>
+          <div class="warn small">
+            ⚠ The action text above is <em>advisory</em> — it is not yet bound into
+            what your authenticator signs (§8.5). A real deployment must bind it.
+          </div>
+        </div>
+        <div class="approve-actions">
+          <button id="btn-approve" class="primary">Approve with authenticator</button>
+          <button id="btn-deny" class="danger">Deny</button>
+        </div>
+        <div id="approve-status" class="status"></div>
+      </div>
+    </section>
+
+    <!-- ── Traffic tab ──────────────────────────────────────────────── -->
+    <section id="panel-traffic" class="panel">
+      <div class="card">
+        <h2>LLM traffic <span class="dim">(iptraf-for-LLM · demo data)</span></h2>
+        <p class="dim small">
+          Live flow records over the WebSocket. In the real system these come from
+          the flight recorder (P0/P1); here they are mock flows.
+        </p>
+        <div class="table-wrap">
+          <table id="flow-table">
+            <thead>
+              <tr>
+                <th>seq</th><th>provider</th><th>endpoint</th><th>model</th>
+                <th>fidelity</th><th class="num">up</th><th class="num">down</th>
+                <th class="num">tok</th><th class="num">ms</th>
+              </tr>
+            </thead>
+            <tbody id="flow-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
