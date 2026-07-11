@@ -10,6 +10,7 @@ members = [
     "agent-bridle",
     "agent-bridle-mcp",
     "agent-bridle-py",
+    "agent-bridle-gateway",
 ]
 
 [workspace.package]
