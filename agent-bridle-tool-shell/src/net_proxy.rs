@@ -149,6 +149,68 @@ impl Resolver for StdResolver {
     }
 }
 
+// ── I/O seams (#166): the per-connection logic is written against `Conn` +
+// `Connector` traits, not concrete `TcpStream`, so the parse / allow-list /
+// forward / tunnel / audit LOGIC can be unit-tested against an in-memory duplex
+// with NO real socket (deterministic, portable). Production wires the real
+// `TcpStream` / `TcpConnector`; the tests wire scripted in-memory endpoints. ───
+
+/// A bidirectional connection the proxy speaks over. Abstracts the three
+/// `TcpStream`-specific operations the forward/tunnel path needs beyond
+/// `Read`/`Write` — a second owned handle ([`Self::dup`], for the read/write
+/// split and the origin clone), directional [`Self::shutdown`] (how the copy
+/// threads signal EOF), and the per-connection timeouts ([`Self::set_timeouts`]).
+/// `TcpStream` implements it for production; an in-memory scripted stream
+/// implements it for tests.
+pub trait Conn: Read + Write + Send {
+    /// A second owned handle to the SAME underlying stream — for `TcpStream`
+    /// this is `try_clone` (both handles share one socket); the proxy holds one
+    /// half for reading and one for writing, and `splice` needs a third for the
+    /// origin write direction.
+    fn dup(&self) -> io::Result<Box<dyn Conn>>;
+    /// Shut down the read half, write half, or both — how a copy thread signals
+    /// EOF to its peer and how a response closes the client.
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+    /// Apply the per-connection read+write timeouts. A no-op for in-memory
+    /// fakes, which never block on a real socket.
+    fn set_timeouts(&self, dur: Duration) -> io::Result<()>;
+}
+
+impl Conn for TcpStream {
+    fn dup(&self) -> io::Result<Box<dyn Conn>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+    fn set_timeouts(&self, dur: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(dur))?;
+        self.set_write_timeout(Some(dur))?;
+        Ok(())
+    }
+}
+
+/// Dials a resolved origin, returning the connection to forward to. A seam so a
+/// test can hand the proxy a scripted in-memory origin instead of a real TCP
+/// dial — the second half (with [`Conn`]) of what makes the forward path
+/// testable without a socket.
+pub trait Connector: Send + Sync {
+    /// Connect to `addr`, or fail (surfaced to the client as `502 Bad Gateway`).
+    fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn Conn>>;
+}
+
+/// The production connector — a real bounded TCP dial to the resolved origin.
+pub struct TcpConnector;
+
+impl Connector for TcpConnector {
+    fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn Conn>> {
+        let s = TcpStream::connect_timeout(&addr, CONN_TIMEOUT)?;
+        s.set_read_timeout(Some(CONN_TIMEOUT))?;
+        s.set_write_timeout(Some(CONN_TIMEOUT))?;
+        Ok(Box::new(s))
+    }
+}
+
 /// What a client's first request line asked for.
 #[derive(Debug, PartialEq, Eq)]
 enum Target {
@@ -316,6 +378,9 @@ pub fn start(
     let addr = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let policy = HostPolicy::new(allow_hosts);
+    // The production origin dialer — a real TCP connect. Tests bypass `start`
+    // entirely and drive `handle_conn` with a scripted in-memory connector.
+    let connector: Arc<dyn Connector> = Arc::new(TcpConnector);
     // #196: shared refused-host accumulator, populated by each connection thread.
     let refused: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -332,6 +397,7 @@ pub fn start(
                     let Ok(client) = stream else { continue };
                     let policy = policy.clone();
                     let resolver = Arc::clone(&resolver);
+                    let connector = Arc::clone(&connector);
                     let sink = Arc::clone(&sink);
                     let refused = Arc::clone(&refused);
                     // One detached thread per connection; it ends at EOF.
@@ -339,8 +405,9 @@ pub fn start(
                         .name("agent-bridle-egress-conn".to_string())
                         .spawn(move || {
                             let _ = handle_conn(
-                                client,
+                                Box::new(client),
                                 &policy,
+                                connector.as_ref(),
                                 resolver.as_ref(),
                                 sink.as_ref(),
                                 &refused,
@@ -362,21 +429,21 @@ pub fn start(
 /// and either tunnel (`CONNECT`) or forward (`http://`) to the resolved origin.
 /// Every connection with a parsed host is recorded through `sink`.
 fn handle_conn(
-    client: TcpStream,
+    client: Box<dyn Conn>,
     policy: &HostPolicy,
+    connector: &dyn Connector,
     resolver: &dyn Resolver,
     sink: &dyn AuditSink,
     refused: &Mutex<HashSet<String>>,
 ) -> io::Result<()> {
-    client.set_read_timeout(Some(CONN_TIMEOUT))?;
-    client.set_write_timeout(Some(CONN_TIMEOUT))?;
-    let mut reader = BufReader::new(client.try_clone()?);
+    client.set_timeouts(CONN_TIMEOUT)?;
+    let mut reader = BufReader::new(client.dup()?);
     let t0 = Instant::now();
 
     let line = read_line_bounded(&mut reader)?;
     let Some(target) = parse_request_line(&line) else {
         // No host to attribute — a malformed request is not an egress event.
-        return respond(&client, 400, "Bad Request");
+        return respond(client.as_ref(), 400, "Bad Request");
     };
 
     let (host, port, kind) = match &target {
@@ -404,7 +471,7 @@ fn handle_conn(
         if let Ok(mut set) = refused.lock() {
             set.insert(host.clone());
         }
-        return respond(&client, 403, "Forbidden");
+        return respond(client.as_ref(), 403, "Forbidden");
     }
 
     match target {
@@ -415,18 +482,19 @@ fn handle_conn(
             let origin = match resolver
                 .resolve(&host, port)
                 .and_then(guard_target)
-                .and_then(dial)
+                .and_then(|addr| connector.connect(addr))
             {
                 Ok(o) => o,
                 Err(_) => {
                     audit(NetDecision::Error, 0, 0);
-                    return respond(&client, 502, "Bad Gateway");
+                    return respond(client.as_ref(), 502, "Bad Gateway");
                 }
             };
             // A CONNECT success is a *bare* status line — no body, no
             // `Content-Length` — after which the socket is an opaque tunnel. (Do
             // NOT use `respond`, which appends a body that would corrupt it.)
-            (&client).write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+            let mut client = client;
+            client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
             // Forward via `splice_buffered` (not a raw `tunnel`) so any bytes the
             // client already pipelined past the CONNECT header block — buffered in
             // `reader` — reach the origin (a TLS ClientHello sent with the CONNECT;
@@ -449,12 +517,12 @@ fn handle_conn(
             let mut origin = match resolver
                 .resolve(&host, port)
                 .and_then(guard_target)
-                .and_then(dial)
+                .and_then(|addr| connector.connect(addr))
             {
                 Ok(o) => o,
                 Err(_) => {
                     audit(NetDecision::Error, 0, 0);
-                    return respond(&client, 502, "Bad Gateway");
+                    return respond(client.as_ref(), 502, "Bad Gateway");
                 }
             };
             let host_hdr = if port == 80 {
@@ -477,16 +545,10 @@ fn handle_conn(
     }
 }
 
-/// Dial a resolved origin with a bounded connect timeout.
-fn dial(addr: SocketAddr) -> io::Result<TcpStream> {
-    let s = TcpStream::connect_timeout(&addr, CONN_TIMEOUT)?;
-    s.set_read_timeout(Some(CONN_TIMEOUT))?;
-    s.set_write_timeout(Some(CONN_TIMEOUT))?;
-    Ok(s)
-}
-
-/// Read one CRLF-terminated line, bounded to [`MAX_HEAD`].
-fn read_line_bounded(reader: &mut BufReader<TcpStream>) -> io::Result<String> {
+/// Read one CRLF-terminated line, bounded to [`MAX_HEAD`]. Generic over the
+/// buffered reader's source so the same logic drives a real socket or an
+/// in-memory test stream.
+fn read_line_bounded<R: Read>(reader: &mut BufReader<R>) -> io::Result<String> {
     let mut buf = Vec::new();
     reader.take(MAX_HEAD as u64).read_until(b'\n', &mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -494,7 +556,7 @@ fn read_line_bounded(reader: &mut BufReader<TcpStream>) -> io::Result<String> {
 
 /// Read request header lines up to (not including) the terminating blank line,
 /// bounded by [`MAX_HEAD`]. Each returned line keeps its trailing CRLF.
-fn read_headers(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<String>> {
+fn read_headers<R: Read>(reader: &mut BufReader<R>) -> io::Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut total = 0usize;
     loop {
@@ -508,7 +570,7 @@ fn read_headers(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<String>> {
 }
 
 /// Consume request headers up to and including the terminating blank line.
-fn drain_headers(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
+fn drain_headers<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
     let mut total = 0usize;
     loop {
         let line = read_line_bounded(reader)?;
@@ -520,8 +582,8 @@ fn drain_headers(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
 }
 
 /// Write a minimal HTTP/1.1 status response and close.
-fn respond(client: &TcpStream, code: u16, reason: &str) -> io::Result<()> {
-    let mut c = client.try_clone()?;
+fn respond(client: &dyn Conn, code: u16, reason: &str) -> io::Result<()> {
+    let mut c = client.dup()?;
     let body = format!("{code} {reason}\n");
     write!(
         c,
@@ -606,11 +668,11 @@ fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
 /// buffered bytes (the `http://` forward case, after the request line was read).
 /// Returns `(bytes_up, bytes_down)` for the audit.
 fn splice_buffered(
-    mut client_reader: BufReader<TcpStream>,
-    client: TcpStream,
-    origin: TcpStream,
+    mut client_reader: BufReader<Box<dyn Conn>>,
+    client: Box<dyn Conn>,
+    origin: Box<dyn Conn>,
 ) -> io::Result<(u64, u64)> {
-    let mut o_write = origin.try_clone()?;
+    let mut o_write = origin.dup()?;
     let up = thread::spawn(move || {
         let n = copy_counted(&mut client_reader, &mut o_write);
         let _ = o_write.shutdown(Shutdown::Write);
@@ -635,6 +697,7 @@ fn splice_buffered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     /// #138 (SSRF pivot): the proxy must refuse to dial an allow-listed name that
     /// resolves to an internal address (RFC1918 / link-local incl. cloud metadata /
@@ -770,180 +833,322 @@ mod tests {
         }
     }
 
-    /// Serialize the networky proxy tests. Each spins up its own origin + proxy
-    /// accept-loops; running them concurrently under the full-suite `just check`
-    /// contends enough that one connection's **close-time** audit can be starved
-    /// (flaky in the pre-push hook, though each passes instantly in isolation —
-    /// loadavg stays low, so it is interleaving, not CPU). A single shared lock
-    /// runs them one-at-a-time. Poison is ignored so a panicking test does not
-    /// cascade-fail the rest. (The underlying audit-under-contention robustness is
-    /// tracked separately in #138.)
-    fn net_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    // ── In-memory connection fakes (#166) ───────────────────────────────────
+    //
+    // The proxy's forward/tunnel/allow-list/audit LOGIC is driven through the
+    // real `handle_conn` against these scripted endpoints — no sockets, no
+    // accept loops, no timing races. `handle_conn` joins its splice thread
+    // before returning, so every assertion below is fully synchronous and
+    // deterministic (the old socket tests polled/slept up to 30s and still
+    // flaked on constrained runners; #135/#155/#165/#166).
+
+    /// A scripted in-memory [`Conn`]: `read` drains a preset script then returns
+    /// EOF (never blocks); `write` captures bytes for assertions; `dup` shares
+    /// both (as `TcpStream::try_clone` shares one socket). `shutdown`/timeouts
+    /// are no-ops — the fake EOFs on script exhaustion, so nothing can block.
+    #[derive(Clone, Default)]
+    struct ScriptedConn {
+        /// Bytes the proxy reads FROM this endpoint (the client's request, or the
+        /// origin's canned response). Drained by `read`; empty ⇒ EOF.
+        to_read: Arc<Mutex<VecDeque<u8>>>,
+        /// Bytes the proxy WROTE to this endpoint (its client response, or the
+        /// request it forwarded to the origin). Captured for assertions.
+        written: Arc<Mutex<Vec<u8>>>,
     }
 
-    /// A one-shot HTTP origin on loopback that replies 200 with a marker body.
-    fn spawn_origin() -> SocketAddr {
-        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = l.local_addr().unwrap();
-        thread::spawn(move || {
-            for s in l.incoming().flatten() {
-                let mut s = s;
-                let mut b = [0u8; 512];
-                let _ = s.read(&mut b);
-                let _ = s.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin",
-                );
+    impl ScriptedConn {
+        fn with_script(bytes: &[u8]) -> Self {
+            Self {
+                to_read: Arc::new(Mutex::new(bytes.iter().copied().collect())),
+                written: Arc::new(Mutex::new(Vec::new())),
             }
-        });
-        addr
+        }
+        /// The bytes the proxy wrote to this endpoint.
+        fn written(&self) -> Vec<u8> {
+            self.written.lock().unwrap().clone()
+        }
+        /// The bytes the proxy wrote, as a lossy string (for readable asserts).
+        fn written_str(&self) -> String {
+            String::from_utf8_lossy(&self.written()).into_owned()
+        }
     }
 
-    fn http_get_via_proxy(proxy: SocketAddr, url: &str) -> (String, Vec<u8>) {
-        let mut c = TcpStream::connect(proxy).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(
-            c,
-            "GET {url} HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut resp = Vec::new();
-        let _ = c.read_to_end(&mut resp);
-        let status = String::from_utf8_lossy(&resp)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        (status, resp)
+    impl Read for ScriptedConn {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut q = self.to_read.lock().unwrap();
+            let n = buf.len().min(q.len());
+            for slot in buf.iter_mut().take(n) {
+                *slot = q.pop_front().unwrap();
+            }
+            Ok(n) // n == 0 ⇒ script exhausted ⇒ EOF (never blocks)
+        }
+    }
+
+    impl Write for ScriptedConn {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Conn for ScriptedConn {
+        fn dup(&self) -> io::Result<Box<dyn Conn>> {
+            Ok(Box::new(self.clone()))
+        }
+        fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_timeouts(&self, _dur: Duration) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A connector that hands back a scripted in-memory origin (no real dial).
+    struct FakeConnector(ScriptedConn);
+    impl Connector for FakeConnector {
+        fn connect(&self, _addr: SocketAddr) -> io::Result<Box<dyn Conn>> {
+            Ok(Box::new(self.0.clone()))
+        }
+    }
+
+    /// A connector whose dial always fails — for the `502 Bad Gateway` path.
+    struct FailingConnector;
+    impl Connector for FailingConnector {
+        fn connect(&self, _addr: SocketAddr) -> io::Result<Box<dyn Conn>> {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "origin unreachable",
+            ))
+        }
+    }
+
+    /// The outcome of driving one connection through the real `handle_conn`.
+    struct Driven {
+        /// What the proxy sent back to the client (response / forwarded origin bytes).
+        client: ScriptedConn,
+        /// What the proxy forwarded to the origin (empty if it was never dialled).
+        origin: ScriptedConn,
+        /// Hosts refused with 403 (deduped, sorted).
+        refused: Vec<String>,
+        /// Audit events emitted (synchronously, before `handle_conn` returned).
+        audit: Vec<NetAuditEvent>,
+    }
+
+    /// Drive one client `request` through `handle_conn` with `connector` (used
+    /// for the deny / malformed / 502 paths, where the origin is never
+    /// successfully forwarded to — `out.origin` stays empty). Deterministic:
+    /// `handle_conn` joins its splice thread before returning, so all buffers +
+    /// the audit are fully populated on return. For the ALLOWED forward path
+    /// (where you want to inspect the forwarded bytes) use [`drive_forward`].
+    fn drive_with(request: &[u8], allow: &[&str], connector: &dyn Connector) -> Driven {
+        let client = ScriptedConn::with_script(request);
+        let policy = HostPolicy::new(allow.iter().map(|s| s.to_string()));
+        let resolver = FixedResolver("127.0.0.1:9".parse().unwrap());
+        let sink = CapturingSink::default();
+        let refused = Mutex::new(HashSet::new());
+        let _ = handle_conn(
+            Box::new(client.clone()),
+            &policy,
+            connector,
+            &resolver,
+            &sink,
+            &refused,
+        );
+        let mut refused: Vec<String> = refused.into_inner().unwrap().into_iter().collect();
+        refused.sort();
+        Driven {
+            client,
+            origin: ScriptedConn::default(),
+            refused,
+            audit: sink.events(),
+        }
+    }
+
+    /// Convenience: drive an ALLOWED forward/tunnel with an explicit origin
+    /// script, returning the `Driven` outcome (with the origin's captured bytes).
+    fn drive_forward(request: &[u8], allow: &[&str], origin_script: &[u8]) -> Driven {
+        let client = ScriptedConn::with_script(request);
+        let origin = ScriptedConn::with_script(origin_script);
+        let policy = HostPolicy::new(allow.iter().map(|s| s.to_string()));
+        let resolver = FixedResolver("127.0.0.1:9".parse().unwrap());
+        let sink = CapturingSink::default();
+        let refused = Mutex::new(HashSet::new());
+        let connector = FakeConnector(origin.clone());
+        let _ = handle_conn(
+            Box::new(client.clone()),
+            &policy,
+            &connector,
+            &resolver,
+            &sink,
+            &refused,
+        );
+        let mut refused: Vec<String> = refused.into_inner().unwrap().into_iter().collect();
+        refused.sort();
+        Driven {
+            client,
+            origin,
+            refused,
+            audit: sink.events(),
+        }
     }
 
     #[test]
     fn allowed_http_host_is_forwarded_to_origin() {
-        let _serial = net_test_lock();
-        let origin = spawn_origin();
-        let proxy = start_null(
-            ["allowed.test".to_string()],
-            Arc::new(FixedResolver(origin)),
-        )
-        .unwrap();
-        let (status, body) = http_get_via_proxy(proxy.addr(), "http://allowed.test/x");
-        assert!(status.contains("200"), "status={status}");
-        assert!(
-            String::from_utf8_lossy(&body).contains("origin"),
-            "the origin's body must reach the client: {status}"
+        // The allow-listed host is forwarded; the origin's body reaches the client.
+        let out = drive_forward(
+            b"GET http://allowed.test/x HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n",
+            &["allowed.test"],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin",
         );
+        let client_saw = out.client.written_str();
+        assert!(client_saw.contains("200"), "client saw: {client_saw}");
+        assert!(
+            client_saw.contains("origin"),
+            "the origin's body must reach the client: {client_saw}"
+        );
+        // The request reached the origin (proof the forward actually happened).
+        assert!(
+            out.origin.written_str().starts_with("GET /x HTTP/1.1"),
+            "origin must receive the origin-form request: {}",
+            out.origin.written_str()
+        );
+        assert!(out.refused.is_empty(), "an allowed host is not refused");
     }
 
     #[test]
     fn disallowed_http_host_is_refused_403_without_reaching_origin() {
-        let _serial = net_test_lock();
-        // No origin needed — a denied host must never be dialled.
-        let proxy = start_null(
-            ["allowed.test".to_string()],
-            Arc::new(FixedResolver("127.0.0.1:1".parse().unwrap())),
-        )
-        .unwrap();
-        let (status, _) = http_get_via_proxy(proxy.addr(), "http://evil.test/x");
-        assert!(status.contains("403"), "denied host must get 403: {status}");
+        // A denied host must never be dialled: FailingConnector would surface as a
+        // 502 if it were ever called, so a 403 here also proves it was NOT.
+        let out = drive_with(
+            b"GET http://evil.test/x HTTP/1.1\r\nHost: ignored\r\n\r\n",
+            &["allowed.test"],
+            &FailingConnector,
+        );
+        let client_saw = out.client.written_str();
+        assert!(
+            client_saw.contains("403"),
+            "denied host must get 403: {client_saw}"
+        );
+        assert!(
+            !client_saw.contains("502"),
+            "the origin must not be dialled for a denied host: {client_saw}"
+        );
+        assert!(out.origin.written().is_empty(), "origin must see nothing");
     }
 
-    /// #196: the proxy accumulates every CONNECT host it REFUSES and surfaces
-    /// them via `refused_hosts()` (deduped, sorted) — this is what the shell tool
-    /// turns into structured `net` denials. Allowed hosts are never listed.
+    #[test]
+    fn unreachable_allowed_origin_yields_502() {
+        // Allow-listed, but the dial fails → 502 Bad Gateway + an `Error` audit.
+        let out = drive_with(
+            b"GET http://allowed.test/x HTTP/1.1\r\nHost: ignored\r\n\r\n",
+            &["allowed.test"],
+            &FailingConnector,
+        );
+        assert!(
+            out.client.written_str().contains("502"),
+            "an unreachable allowed origin must get 502: {}",
+            out.client.written_str()
+        );
+        let ev = out.audit.iter().find(|e| e.host == "allowed.test").unwrap();
+        assert_eq!(ev.decision, NetDecision::Error);
+    }
+
+    #[test]
+    fn malformed_request_yields_400_and_no_audit() {
+        // A request line the proxy does not speak → 400, and (deliberately) NO
+        // audit event, since there is no host to attribute an egress attempt to.
+        let out = drive_with(
+            b"GET / HTTP/1.1\r\n\r\n",
+            &["allowed.test"],
+            &FailingConnector,
+        );
+        assert!(out.client.written_str().contains("400"));
+        assert!(
+            out.audit.is_empty(),
+            "a malformed request is not an egress event: {:?}",
+            out.audit
+        );
+        assert!(out.refused.is_empty());
+    }
+
+    /// #196: the proxy accumulates every host it REFUSES and surfaces them via
+    /// `refused_hosts()` (deduped, sorted); allowed hosts are never listed.
     #[test]
     fn refused_hosts_surfaces_denied_hosts_deduped_and_omits_allowed() {
-        let _serial = net_test_lock();
-        let origin = spawn_origin();
-        let proxy = start_null(
-            ["allowed.test".to_string()],
-            Arc::new(FixedResolver(origin)),
-        )
-        .unwrap();
-        let _ = http_get_via_proxy(proxy.addr(), "http://allowed.test/x"); // allowed → forwarded
-        let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/y"); // denied → refused
-        let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/z"); // same host → deduped
-                                                                        // Refusals are recorded from detached conn threads (like the audit sink),
-                                                                        // so poll (not a fixed sleep) until the denied host lands.
-        let mut refused = Vec::new();
-        for _ in 0..200 {
-            refused = proxy.refused_hosts();
-            if !refused.is_empty() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
+        // Drive three requests through ONE shared refused-set: allowed (forwarded),
+        // then the same denied host twice (must dedupe to a single entry).
+        let policy = HostPolicy::new(["allowed.test".to_string()]);
+        let resolver = FixedResolver("127.0.0.1:9".parse().unwrap());
+        let sink = NullSink;
+        let refused = Mutex::new(HashSet::new());
+        let origin = ScriptedConn::with_script(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let connector = FakeConnector(origin);
+
+        for (req, conn) in [
+            (
+                &b"GET http://allowed.test/x HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+                &connector as &dyn Connector,
+            ),
+            (
+                &b"GET http://evil.test/y HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+                &FailingConnector,
+            ),
+            (
+                &b"GET http://evil.test/z HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+                &FailingConnector,
+            ),
+        ] {
+            let client = ScriptedConn::with_script(req);
+            let _ = handle_conn(Box::new(client), &policy, conn, &resolver, &sink, &refused);
         }
+
+        let mut got: Vec<String> = refused.into_inner().unwrap().into_iter().collect();
+        got.sort();
         assert_eq!(
-            refused,
+            got,
             vec!["evil.test".to_string()],
-            "only the denied host, deduped; allowed host must NOT appear: {refused:?}"
+            "only the denied host, deduped; the allowed host must NOT appear: {got:?}"
         );
     }
 
     #[test]
     fn audit_records_allowed_with_bytes_and_denied_attempts() {
-        let _serial = net_test_lock();
-        let origin = spawn_origin();
-        let sink = CapturingSink::default();
-        let proxy = start(
-            ["allowed.test".to_string()],
-            Arc::new(FixedResolver(origin)),
-            Arc::new(sink.clone()),
-        )
-        .unwrap();
-        let _ = http_get_via_proxy(proxy.addr(), "http://allowed.test/x");
-        let _ = http_get_via_proxy(proxy.addr(), "http://evil.test/y"); // denied
-
-        // The per-connection audit records are emitted from detached proxy threads
-        // (`handle_conn`), so poll (not a fixed sleep) until both land. The forward
-        // tears down as soon as the origin closes (see `splice_buffered`), so the
-        // records normally appear in milliseconds.
-        //
-        // Skip-on-timeout, NOT fail-on-timeout: on the self-hosted ARC CI runner
-        // (constrained container) this real-TCP round-trip's detached threads can be
-        // starved past any sane deadline — a chronic environment-specific flake
-        // (agent-bridle #135/#155/#165/#166). We keep the test running everywhere
-        // and still assert the event *fields* whenever they land (the valuable
-        // coverage), but degrade to a logged skip rather than a false failure when
-        // the container never schedules them. The proxy's forward/deny behavior is
-        // covered synchronously by the sibling tests; audit serialization by
-        // `jsonl_sink_*`. Run locally for the full end-to-end audit assertion.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let events = loop {
-            let ev = sink.events();
-            let have = |h: &str| ev.iter().any(|e| e.host == h);
-            if have("allowed.test") && have("evil.test") {
-                break ev;
-            }
-            if Instant::now() >= deadline {
-                eprintln!(
-                    "skipping audit assertions: records did not land within the deadline \
-                     (constrained CI runner); got {} event(s)",
-                    ev.len()
-                );
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        let allowed = events
+        // Allowed forward: an `Allowed` Http event on port 80 with response bytes.
+        let allowed = drive_forward(
+            b"GET http://allowed.test/x HTTP/1.1\r\nHost: ignored\r\n\r\n",
+            &["allowed.test"],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin",
+        );
+        let ev = allowed
+            .audit
             .iter()
             .find(|e| e.host == "allowed.test")
             .expect("an allowed event");
-        assert_eq!(allowed.decision, NetDecision::Allowed);
-        assert_eq!(allowed.kind, NetKind::Http);
-        assert_eq!(allowed.port, 80);
+        assert_eq!(ev.decision, NetDecision::Allowed);
+        assert_eq!(ev.kind, NetKind::Http);
+        assert_eq!(ev.port, 80);
         assert!(
-            allowed.bytes_down > 0,
-            "an allowed connection records response bytes: {allowed:?}"
+            ev.bytes_down > 0,
+            "an allowed connection records response bytes: {ev:?}"
         );
 
-        let denied = events
+        // Denied: a `Denied` event (the exfil-attempt signal) with zero bytes.
+        let denied = drive_with(
+            b"GET http://evil.test/y HTTP/1.1\r\nHost: ignored\r\n\r\n",
+            &["allowed.test"],
+            &FailingConnector,
+        );
+        let ev = denied
+            .audit
             .iter()
             .find(|e| e.host == "evil.test")
-            .expect("a denied event (the exfil-attempt signal)");
-        assert_eq!(denied.decision, NetDecision::Denied);
-        assert_eq!(denied.bytes_up, 0);
-        assert_eq!(denied.bytes_down, 0);
+            .expect("a denied event");
+        assert_eq!(ev.decision, NetDecision::Denied);
+        assert_eq!(ev.bytes_up, 0);
+        assert_eq!(ev.bytes_down, 0);
     }
 
     #[test]
@@ -1007,147 +1212,73 @@ mod tests {
         assert_eq!(serde_json::from_str::<NetAuditEvent>(&line).unwrap(), e);
     }
 
-    /// A one-shot raw-TCP echo origin (no HTTP), to prove the `CONNECT` tunnel
-    /// forwards opaque bytes in both directions (as it would TLS records).
-    fn spawn_echo() -> SocketAddr {
-        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = l.local_addr().unwrap();
-        thread::spawn(move || {
-            for s in l.incoming().flatten() {
-                let mut s = s;
-                let mut b = [0u8; 64];
-                if let Ok(n) = s.read(&mut b) {
-                    let _ = s.write_all(&b[..n]);
-                }
-            }
-        });
-        addr
-    }
-
     #[test]
     fn connect_allowed_host_tunnels_opaque_bytes() {
-        let _serial = net_test_lock();
-        let echo = spawn_echo();
-        let proxy =
-            start_null(["allowed.test".to_string()], Arc::new(FixedResolver(echo))).unwrap();
-        let mut c = TcpStream::connect(proxy.addr()).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(
-            c,
-            "CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n"
-        )
-        .unwrap();
-        // The proxy answers a bare 200 status line (ending in the blank line),
-        // then the raw stream is an end-to-end tunnel. Read the header block.
-        let mut status = BufReader::new(c.try_clone().unwrap());
-        let mut head = String::new();
-        loop {
-            let mut l = String::new();
-            status.read_line(&mut l).unwrap();
-            if l == "\r\n" || l.is_empty() {
-                break;
-            }
-            head.push_str(&l);
-        }
-        assert!(
-            head.starts_with("HTTP/1.1 200"),
-            "CONNECT must be accepted with a bare 200: {head:?}"
+        // The client pipelines "PING" right after the CONNECT header block; the
+        // (scripted) origin returns "PING" as its side of the opaque exchange.
+        // Proof of a real bidirectional tunnel: the origin receives the client's
+        // PING (up-copy) and the client receives the origin's PING (down-copy),
+        // after a bare 200 status line — driven through the real splice logic.
+        let out = drive_forward(
+            b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\nPING",
+            &["allowed.test"],
+            b"PING",
         );
-        // Opaque bytes tunnel through to the echo origin and back.
-        c.write_all(b"PING").unwrap();
-        let mut back = [0u8; 4];
-        status.read_exact(&mut back).unwrap();
+        let client_saw = out.client.written_str();
+        assert!(
+            client_saw.starts_with("HTTP/1.1 200"),
+            "CONNECT must be accepted with a bare 200: {client_saw:?}"
+        );
+        assert!(
+            client_saw.contains("PING"),
+            "the origin's bytes must tunnel back to the client: {client_saw:?}"
+        );
         assert_eq!(
-            &back, b"PING",
-            "the tunnel must forward raw bytes both ways"
+            out.origin.written(),
+            b"PING",
+            "the client's pipelined bytes must reach the origin through the tunnel"
         );
     }
 
     #[test]
     fn connect_disallowed_host_is_refused_403() {
-        let _serial = net_test_lock();
-        let proxy = start_null(
-            ["allowed.test".to_string()],
-            Arc::new(FixedResolver("127.0.0.1:1".parse().unwrap())),
-        )
-        .unwrap();
-        let mut c = TcpStream::connect(proxy.addr()).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(c, "CONNECT evil.test:443 HTTP/1.1\r\n\r\n").unwrap();
-        let mut resp = Vec::new();
-        let _ = c.read_to_end(&mut resp);
-        assert!(
-            String::from_utf8_lossy(&resp).contains("403"),
-            "a denied CONNECT must get 403, not a tunnel: {:?}",
-            String::from_utf8_lossy(&resp)
+        let out = drive_with(
+            b"CONNECT evil.test:443 HTTP/1.1\r\n\r\n",
+            &["allowed.test"],
+            &FailingConnector,
         );
-    }
-
-    /// A one-shot origin that echoes back the `Host` header it received.
-    fn spawn_host_echo() -> SocketAddr {
-        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = l.local_addr().unwrap();
-        thread::spawn(move || {
-            for s in l.incoming().flatten() {
-                let mut s = s;
-                let mut reader = BufReader::new(s.try_clone().unwrap());
-                let mut host = String::new();
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    if let Some(v) = line.get(..5).filter(|p| p.eq_ignore_ascii_case("host:")) {
-                        let _ = v;
-                        host = line[5..].trim().to_string();
-                    }
-                }
-                let body = format!("host={host}");
-                let _ = write!(
-                    s,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        addr
+        assert!(
+            out.client.written_str().contains("403"),
+            "a denied CONNECT must get 403, not a tunnel: {}",
+            out.client.written_str()
+        );
     }
 
     #[test]
     fn http_host_header_is_normalized_to_the_validated_authority() {
-        let _serial = net_test_lock();
-        let origin = spawn_host_echo();
-        let proxy = start_null(
-            ["allowed.test".to_string()],
-            Arc::new(FixedResolver(origin)),
-        )
-        .unwrap();
         // The authority (allowed.test) is validated, but the client LIES with a
         // spoofed `Host: evil.test` to domain-front. The origin must see the
-        // validated authority, never the spoof.
-        let mut c = TcpStream::connect(proxy.addr()).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(
-            c,
-            "GET http://allowed.test/ HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut resp = Vec::new();
-        let _ = c.read_to_end(&mut resp);
-        let resp = String::from_utf8_lossy(&resp);
+        // validated authority substituted in, never the spoof.
+        let out = drive_forward(
+            b"GET http://allowed.test/ HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n",
+            &["allowed.test"],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let origin_saw = out.origin.written_str();
         assert!(
-            resp.contains("host=allowed.test"),
-            "origin must receive the validated Host: {resp}"
+            origin_saw.contains("Host: allowed.test\r\n"),
+            "origin must receive the validated Host: {origin_saw:?}"
         );
         assert!(
-            !resp.contains("evil.test"),
-            "the spoofed Host must not reach the origin: {resp}"
+            !origin_saw.contains("evil.test"),
+            "the spoofed Host must not reach the origin: {origin_saw:?}"
         );
     }
 
     #[test]
     fn proxy_env_points_at_the_bound_loopback_addr() {
-        let _serial = net_test_lock();
+        // One of two remaining REAL-socket tests: `proxy_env` is derived from the
+        // actually-bound loopback address, so this exercises the real `bind`.
         let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let env = proxy.proxy_env();
         let url = format!("http://127.0.0.1:{}", proxy.addr().port());
@@ -1156,13 +1287,38 @@ mod tests {
         assert!(env.iter().all(|(_, v)| v.starts_with("http://127.0.0.1:")));
     }
 
+    /// A one-shot HTTP origin on loopback that replies 200 with a marker body —
+    /// used ONLY by the macOS kernel e2e below, which must drive real `curl`
+    /// through the real proxy over a real socket (the in-memory fakes cannot
+    /// exercise a kernel fence). Gated to that test's platform so it is not dead
+    /// code elsewhere.
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    fn spawn_origin() -> SocketAddr {
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = l.local_addr().unwrap();
+        thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut s = s;
+                let mut b = [0u8; 512];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin",
+                );
+            }
+        });
+        addr
+    }
+
     /// End-to-end kernel proof (#124, ADR 0016): a real `curl` child, confined by
     /// the ADR 0015 loopback fence, reaches an ALLOWED host only through the proxy
     /// (200), is refused a DENIED host by the proxy (403), and — crucially —
     /// **cannot bypass** the proxy: a direct off-box connect is kernel-denied. All
     /// hermetic — the resolver maps the allow-listed name to a loopback origin, so
     /// no real network is touched. macOS + `macos-seatbelt` only; self-skips if
-    /// `sandbox-exec`/`curl` are unavailable.
+    /// `sandbox-exec`/`curl` are unavailable. This is the one test that genuinely
+    /// needs the real socket path (the fence is a kernel property); the forward /
+    /// tunnel / allow-list / audit LOGIC is covered deterministically in-memory
+    /// above.
     #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
     #[test]
     fn fenced_child_reaches_allowed_via_proxy_denied_refused_direct_kernel_blocked() {
@@ -1245,9 +1401,12 @@ mod tests {
         drop(proxy);
     }
 
+    /// The second (and only other) REAL-socket test: it must exercise the actual
+    /// `TcpListener` bind + accept loop + `Drop` teardown, which no in-memory
+    /// fake can. Self-contained (its own ephemeral port, no shared origin), so it
+    /// does not need the old cross-test serialization lock.
     #[test]
     fn dropping_the_handle_stops_the_listener() {
-        let _serial = net_test_lock();
         let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let addr = proxy.addr();
         drop(proxy);
