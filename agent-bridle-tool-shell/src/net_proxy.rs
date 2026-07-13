@@ -1326,6 +1326,10 @@ mod tests {
             best_available_sandbox, loopback_fenced_caveats, seatbelt_is_supported, Caveats,
             SandboxPolicy, Scope,
         };
+        // Serialize with sibling loopback tests (issue #207): this is the
+        // heaviest net test (origin + proxy + real curl child) and must not
+        // race siblings on loopback. Held for the whole test via RAII.
+        let _serial = net_test_lock();
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
