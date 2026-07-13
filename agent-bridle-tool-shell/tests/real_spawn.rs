@@ -3,9 +3,19 @@
 //! These exercise the *real* `OsSpawner` with actual processes (and, for
 //! redirections, real files), and are kept out of the unit tests (which mock the
 //! spawner) per the workspace norm: no real subprocesses/fs in unit tests. They
-//! use only universally-present tools (`echo`, `cat`, `sort`, `true`, `false`,
-//! and `touch` for the Linux-only Landlock test).
-#![cfg(feature = "shell")]
+//! use only tools that are universally present *on Unix* (`echo`, `cat`, `sort`,
+//! `true`, `false`, `env`, and `touch` for the Linux-only Landlock test).
+//!
+//! Unix-only (issue #193): every case here spawns a standalone POSIX binary, none
+//! of which ships on stock Windows — `echo`/`true`/`false` are `cmd` builtins, and
+//! `cat`/`sort`/`env` do not exist at all — so `cargo test --workspace` on Windows
+//! fails to spawn them. The Linux/macOS cases below already narrow to their kernel
+//! (`target_os = "linux"`/`"macos"`), and the real Windows kernel boundary is
+//! proven separately by the AppContainer suite in `agent-bridle-aclaunch`
+//! (`kernel_proofs.rs`/`net_proofs.rs`), so gating the whole file to `unix` loses
+//! no Windows coverage. Without this gate the nightly Windows `cargo test
+//! --workspace` runner reports 17 of these as failed.
+#![cfg(all(unix, feature = "shell"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
