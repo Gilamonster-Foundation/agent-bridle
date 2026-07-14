@@ -36,6 +36,7 @@ agent-mesh-protocol = "0.6"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 async-trait = "0.1"
 
 # PyO3 — only the `agent-bridle-py` wheel turns this on (default-feature
