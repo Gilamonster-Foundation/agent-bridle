@@ -31,6 +31,7 @@ mod context;
 mod envelope;
 mod error;
 mod gate;
+pub mod policy;
 mod registry;
 mod report;
 #[cfg(target_os = "linux")]

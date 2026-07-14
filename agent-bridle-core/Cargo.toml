@@ -52,6 +52,7 @@ verifier-webauthn = ["dep:ed25519-dalek", "dep:sha2"]
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 async-trait = { workspace = true }
 agent-mesh-protocol = { workspace = true }
 
