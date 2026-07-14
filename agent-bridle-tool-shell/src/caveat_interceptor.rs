@@ -128,6 +128,19 @@ impl CommandInterceptor for CaveatInterceptor {
     /// reject paths that escape the granted scope via `..` or a symlink — that
     /// logic is the shared one in `agent-bridle-core`, reused here, not copied.
     fn before_open(&self, path: &Path, write: bool) -> OpenDecision {
+        // newt#969: the standard sinks are ALWAYS-permitted write targets.
+        // `2>/dev/null` is the most common idiom in shell training data, and
+        // writing to /dev/null|stdout|stderr is not a filesystem mutation in
+        // any capability sense — no data persists, nothing is created. A
+        // closed 3-item whitelist, not a general redirect grant.
+        if write
+            && matches!(
+                path.to_str(),
+                Some("/dev/null" | "/dev/stdout" | "/dev/stderr")
+            )
+        {
+            return OpenDecision::Allow;
+        }
         let Some(cx) = &self.cx else {
             let reason = "no effective caveats (default interceptor); open denied".to_string();
             self.record(DenialKind::Open, path.to_string_lossy(), &reason);
@@ -264,6 +277,36 @@ mod tests {
             ExecDecision::Allow
         ));
         assert!(drain(&sink).is_empty(), "an Allow must record nothing");
+    }
+
+    #[test]
+    fn dev_null_sinks_are_always_writable() {
+        // newt#969: `cmd 2>/dev/null` must never be a capability denial — the
+        // sinks are not mutations. Even with NO caveats (fail-closed default
+        // interceptor), the three standard sinks stay writable; everything
+        // else keeps failing closed.
+        let i = CaveatInterceptor::default();
+        assert!(matches!(
+            i.before_open(Path::new("/dev/null"), true),
+            OpenDecision::Allow
+        ));
+        assert!(matches!(
+            i.before_open(Path::new("/dev/stdout"), true),
+            OpenDecision::Allow
+        ));
+        assert!(matches!(
+            i.before_open(Path::new("/dev/stderr"), true),
+            OpenDecision::Allow
+        ));
+        // Not a general /dev grant, and reads are unaffected by the whitelist.
+        assert!(matches!(
+            i.before_open(Path::new("/dev/sda"), true),
+            OpenDecision::Deny(_)
+        ));
+        assert!(matches!(
+            i.before_open(Path::new("/etc/passwd"), true),
+            OpenDecision::Deny(_)
+        ));
     }
 
     #[test]

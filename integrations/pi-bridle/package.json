@@ -1,0 +1,17 @@
+{
+	"name": "pi-bridle",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Draft pi extension routing pi's bash tool through the agent-bridle capability leash (experiment, our repo only).",
+	"scripts": {
+		"clean": "echo 'nothing to clean'",
+		"build": "echo 'nothing to build'",
+		"check": "echo 'nothing to check'"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}
