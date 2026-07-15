@@ -1,6 +1,6 @@
 # The Ceremony Contract
 
-**Status:** DRAFT 0.1.1 (2026-07-15) — revised per first review (#229).
+**Status:** DRAFT 0.1.3 (2026-07-15) — revised per review rounds 1–2 (#229).
 Normative once accepted.
 **Scope:** the decision-surface and first-contact contract between agent-*
 libraries (which own decision *semantics*) and harnesses (which own
@@ -172,9 +172,19 @@ conformance (§6.2) — deliberately *not* a law; see §7.
 `escalate` carries **zero authority** (L4): it navigates the human to a
 richer surface; the request remains undecided until a `grant` returns.
 
-A **remote** surface MUST sign its decisions (append `"by": <fingerprint>`,
-`"sig"` over the content-CID) so grant provenance is attributable end to
-end; an in-process surface MAY omit this (§2.1).
+A **remote** surface MUST sign its decisions — and the decision MUST name
+the request it answered:
+
+```json
+{ "v": 1, "request": "cid:…",            // content-CID of the PermissionRequest AS RENDERED
+  "grant": { "verb": "allow", "scope": "once" },
+  "by": "b3:…", "sig": "…" }             // sig over this record's content-CID
+```
+
+The gate accepts a decision only if `request` matches the CID of the
+request it actually issued — binding *what the human saw* to *what was
+granted*, which closes the render-swap MITM (§5.6). An in-process surface
+MAY omit `by`/`sig` (§2.1); the `request` binding is unconditional.
 
 ### 3.4 Introduction
 
@@ -220,7 +230,7 @@ Two CIDs per record: the **content-CID** (canonical form *minus* `sig` —
 what is signed) and the **line-CID** (canonical form *including* `sig` —
 what descendants reference in `parents`). Consequences in §5.1.
 
-### 3.6 AuditRecord
+### 3.6 AuditRecord & RevocationRecord (ceremonies over the store)
 
 An audit is a ceremony whose subject is the chain head: a fingerprint
 witnesses the store's state and signs what it saw.
@@ -237,7 +247,28 @@ witnesses the store's state and signs what it saw.
 
 It is appended to the chain-store like any record (its own content-CID,
 sig, parents), so audits are themselves tamper-evident and auditable. No
-new law — L5 composed with the log; one new record type.
+new law — L5 composed with the log; one new record type. Audits double as
+**freshness checkpoints**: a peer presenting a head must show it extends
+the last head this participant witnessed (rollback resistance, §5.6).
+
+**RevocationRecord** — punting a load-bearing identity is itself a
+ceremony, and per L2 it demands **quorum**:
+
+```json
+{
+  "v": 1,
+  "revoke": "b3:…",                       // the fingerprint being punted
+  "reason": "compromise | rotation | retirement",
+  "succession": "b3:…",                    // optional successor (root rotation)
+  "signers": [ { "by": "b3:…", "sig": "…" }, … ]   // k-of-n per quorum policy
+}
+```
+
+The quorum policy (k, n, eligible signers) is itself a principal-signed
+loosening entry established at setup — defining *who may revoke* is
+authority structure, governed by L2 like any other loosening. Revoking the
+**last** root without a `succession` ends the mesh; implementations MUST
+refuse it unless the record carries an explicit `"tombstone": true`.
 
 ### 3.7 DecisionSurface (the seam)
 
@@ -274,17 +305,27 @@ resolve(R, q) = ⨅ { verdict(r) | r ∈ R, r matches q }
 independent of rule order, file order, and load order. No ordering attack
 exists. **PO-1.**
 
-### L2 — Tamper-monotonicity
+### L2 — Tamper-boundedness
 
-For any mutation `m` of the policy store made **without** the signing key:
+For any mutation `m` made by a party holding **fewer than quorum(target)**
+of the designated keys:
 
 ```
-resolve(m(R), q) ⊑ resolve(R, q)
+resolve(m(R), q) ⊑ resolve(R, q)                    (no widening)
+LoadBearing(R) ⊆ LoadBearing(m(R))                  (no structural narrowing)
 ```
 
-A disk-write attacker can only narrow authority, never widen it. Forged
-restrictive entries are a nuisance; forged loosening entries are dropped at
-load (verification is fail-closed).
+Two directions, one law. **Downward:** a sub-quorum actor can only narrow
+*authority*, never widen it — forged restrictive entries are a nuisance;
+forged loosening entries are dropped at load (verification is
+fail-closed). **Upward:** a sub-quorum actor cannot shrink the
+**load-bearing identity structure** — pinned principals, enrolled devices,
+blessed anchors. Narrowing splits into two species: *reversible* narrowing
+(a spammed deny — the principal can prune it) is nuisance-bounded and
+needs no key; **irreversible narrowing — revoking a load-bearing identity
+— requires quorum**, because a fail-closed system's own failure mode is an
+adversary who can *force* closure. "Reset mesh" must not be a
+denial-of-service surface. Availability is a security property.
 
 **Mechanism honesty:** under flat policy files this law holds for
 **additions only**. *Deleting* a restrictive entry (a durable deny) widens
@@ -298,7 +339,7 @@ the deny row is the threat model.)
 **Hypothesis H1 (append-only-verifiability):** `m` cannot undetectably
 remove a record or reintroduce a previously-signed one. H1 is discharged by
 the chain-store (§5.1), not assumed. **PO-2** (proved under H1; H1's
-discharge is PO-2a).
+discharge is PO-2a; quorum soundness for revocation is PO-2b).
 
 ### L3 — Fail-closed totality
 
@@ -426,8 +467,13 @@ phrase both ways and each side verifies *the attacker's* key. The sound
 construction (per Bluetooth numeric comparison / ZRTP):
 
 1. both devices **commit** to nonces before revealing anything;
-2. both **derive** the SAS from the *entire key-exchange transcript*
-   (commitments, both pubkeys, reveals);
+2. both **derive** the SAS from the *entire key-exchange transcript* —
+   commitments, reveals, **and the long-term public keys being enrolled**.
+   This last inclusion is not optional: an SAS over only the ephemeral
+   session material lets a MITM relay the handshake honestly while
+   substituting the long-term keys — the classic key-substitution hole
+   (§5.6). The SAS must checksum *what is being pinned*, not merely the
+   channel;
 3. **a human compares the SAS on both screens** — the out-of-band channel
    the MITM cannot sit on. The phrase is not a secret to transport; it is
    a checksum of the handshake two screens must agree on.
@@ -449,6 +495,12 @@ channels an attacker must own *simultaneously*. The completed enrollment
 is a `PinRecord` in the chain-store whose payload carries the ceremony
 parameters — auditable later (§3.6).
 
+**Punting ≥ pinning.** Revocation (§3.6) is graded on the same scale:
+removing an identity demands at least the ceremony strength that enrolled
+it — quorum co-signers being the witness axis. Enrollment strength sets a
+floor the revocation ceremony must meet, so the strongest identities are
+exactly the ones an adversary finds hardest to destroy.
+
 ### 5.5 External anchors (corroboration, never the root)
 
 A principal root is **self-sovereign**. Externally published keys —
@@ -459,6 +511,37 @@ human you think it does. Per the floating-identity doctrine, no anchor is
 load-bearing: GitHub corroborates the root; it never *is* the root. A
 user with no GitHub enrolls by ceremony alone (§5.4) with zero degradation
 in the algebra — anchors raise corroboration, never gate participation.
+
+**Anchors are blessed, participating identities.** ANY public-key display
+surface qualifies — *provided the key owner blesses it*: an `AnchorRecord`
+(principal-signed binding of channel + location + displayed key) appended
+to the chain-store. An unblessed anchor is ignored; a blessed one may
+*participate* as a signing/corroboration surface in ceremonies (a
+GitHub-key signature counting as one enrollment witness). Blessings are
+revoked like any load-bearing identity — RevocationRecord, quorum (§3.6)
+— so a captured anchor can be cut loose without ceremony-strength loss:
+corroboration is k-of-n, and n just shrank by one.
+
+### 5.6 The MITM ledger — every channel, every closure
+
+"No MITM hole anywhere" is a claim to *enumerate*, not to feel:
+
+| Channel | Attack | Closure | Residual |
+|---|---|---|---|
+| First contact (stranger) | TOFU key swap | L5 ceremony: SAS or out-of-band fingerprint check; or chain to a common pinned principal | the ceremony itself (below) |
+| Enrollment handshake | relay + **key substitution** | commit-then-reveal; SAS covers the **long-term keys** (§5.4·2); human comparison is the authentic channel | SAS guess ≈ n⁻ᵏ per round; rounds × witnesses shrink it |
+| Post-pin transport | impersonation on any raced path | dial-by-pubkey: QUIC/TLS authenticates the **node key** — a path that answers must hold the private key; paths are hints, never identity | key theft (out of scope: L2 quorum + revocation) |
+| Delegation | rogue "delegated" agent inserted | chains verify to a pinned principal; proof-of-possession at issuance (mesh #39/#40) | principal-root compromise (quorum revocation + succession) |
+| Remote surface | **render-swap**: human approves X, gate runs Y | `Decision.request` = content-CID of the request as rendered; sig covers it; gate matches CIDs (§3.3) | compromised surface *device* → its grants are attributable + revocable |
+| Chain-store sync | forgery in transit | records are self-authenticating (signed + chained); transport can corrupt nothing silently | — |
+| Chain-store sync | **rollback** (stale head hides a revocation) | heads are monotonic (L2 structural clause); AuditRecords are witnessed freshness checkpoints (§3.6) | withholding = visible staleness → treat as degraded, fail closed |
+| Anchor channel | compromised registry vouches a fake root | anchors are blessed, k-of-n, never sufficient alone (§5.5) | k−1 colluding anchors corroborate nothing |
+| The human | prompt fatigue / phishing the ceremony | `attest` for high ceilings; distinct ceremony UI is consumer guidance (newt#1209) | irreducible; parameterized paranoia exists for exactly this |
+
+The pattern behind every row: **the authenticated thing is always the
+key, never the channel** — locations, relays, registries, and rendered
+pixels are candidates and hints; signatures and CIDs are what the gate
+trusts. One doctrine, applied ten times.
 
 ## 6. Conformance
 
@@ -480,8 +563,9 @@ Lean via Aeneas:
 | PO | Law | Statement proved |
 |---|---|---|
 | PO-1 | L1 | ⨅-fold is order-independent (assoc ∘ comm ∘ idem) |
-| PO-2 | L2 | keyless mutation is ⊑-monotone, under H1 |
+| PO-2 | L2 | sub-quorum mutation is ⊑-monotone, under H1 |
 | PO-2a | L2·H1 | chain-store rejects removed and replayed records |
+| PO-2b | L2 | a sub-quorum coalition cannot shrink the load-bearing pin set |
 | PO-3 | L3 | totality + monotone headless degradation |
 | PO-4 | L4 | meet never amplifies (kernel restatement) |
 | PO-5 | L5 | no association without pin; re-key forces re-ceremony |
@@ -511,6 +595,10 @@ without a proof obligation demanding it; everything else is mechanism
 - **Executed (review 1, 2026-07-15):** L6 demoted to WF-1 — completeness
   without escalation is a structural predicate on a wire object, not an
   algebraic invariant of authority. Six laws became five.
+- **Executed (review 2, 2026-07-15):** the revocation-DoS invariant
+  ("reset mesh" must not be an attack surface) was absorbed into L2 as its
+  upward direction — tamper-*monotonicity* became tamper-*boundedness*.
+  Zero count change; PO-2b added.
 - **Next candidate:** L1+L4 are one law ("authority composes by meet") on
   two carriers (verdict lattice, caveat lattice); if the Lean formulation
   unifies them cleanly, five becomes four.
