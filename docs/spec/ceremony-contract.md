@@ -23,6 +23,7 @@ this document deliberately restates none of it.
 | Term | Definition | Already shipped as |
 |---|---|---|
 | **Fingerprint** | `blake3(pubkey)` — a self-certifying identity name | `agent_mesh_protocol::Fingerprint` |
+| **Principal** | the root identity a human (or org) controls; agents and surfaces chain to it | `agent_mesh_protocol::UserKey` |
 | **Caveats** | attenuable authority; forms a meet-semilattice | `agent_mesh_protocol::Caveats` (`meet_never_amplifies` is property-tested) |
 | **Verdict** | durable disposition: `deny ⊏ attest ⊏ ask ⊏ approve`, ordered by restrictiveness | `agent_bridle_core::policy::Verdict` (`precedence()`; code says `Passkey` until #231 lands) |
 | **attest** | allowed only via a presence ceremony — the term follows the trusted-computing literature's *attestation* (Parno et al.); renamed from `passkey`, which remains correct for the *hardware mechanism* only | #231 (coordinated pre-1.0 rename) |
@@ -61,6 +62,32 @@ the laws fail closed (§4 L3).
 └─────────────────────┘Decision│  phone: GUI sheet        │
                                └──────────────────────────┘
 ```
+
+### 2.1 Who has an identity
+
+**Every participant is a fingerprint.** Identity is universal; *roles*
+differ in which wire objects a key signs:
+
+| Role | Holds | Signs |
+|---|---|---|
+| **Principal** | the root keypair (vault/hardware-resident) | issuance of agent & surface certs; durable loosening entries |
+| **Agent** | a keypair chained to a principal | envelopes, requests, delegations |
+| **Surface** | a keypair chained to a principal — possibly *nothing else* (a no-compute device is a keypair + a renderer) | its `Decision`s and `AuditRecord`s |
+| **Gate** | the enforcement identity (usually = its agent) | chain-store appends |
+
+A monolith (newt-agent carrying bridle + mesh in-process) is the
+**degenerate case**: one fingerprint wearing every role. Delegation is the
+roles splitting into separate keypairs — nothing else changes. An
+in-process surface MAY omit signing its `Decision`s (same trust domain as
+the gate); a **remote** surface MUST sign them, so grant provenance in the
+chain-store is attributable end to end.
+
+**Delegation** (agent → agent, e.g. newt to a back-end worker): both
+endpoints present chains to a **common pinned principal** (L5). The
+principal's private key is involved at *issuance*, not per-delegation —
+headless fleets verify chains offline while the root key stays in
+hardware; revocation is a generation bump. Cross-principal delegation is
+two principals pinning each other's roots — L5 again, one level up.
 
 ## 3. Wire objects
 
@@ -144,6 +171,10 @@ conformance (§6.2) — deliberately *not* a law; see §7.
 
 `escalate` carries **zero authority** (L4): it navigates the human to a
 richer surface; the request remains undecided until a `grant` returns.
+
+A **remote** surface MUST sign its decisions (append `"by": <fingerprint>`,
+`"sig"` over the content-CID) so grant provenance is attributable end to
+end; an in-process surface MAY omit this (§2.1).
 
 ### 3.4 Introduction
 
@@ -304,7 +335,21 @@ association(peer) ⇒ pinned(fingerprint(peer))
 fingerprint ⇒ unpinned ⇒ full re-ceremony**. No silent identity swap is
 expressible. A pin is created only by (a) a `Decision::grant` from a bound
 surface, or (b) a pre-pinned policy entry — which is a signed loosening
-entry and therefore governed by L2. **PO-5.**
+entry and therefore governed by L2.
+
+The pinned predicate is **transitive through certification**:
+
+```
+pinned(fp) ⇔ fp ∈ PinSet
+           ∨ ∃ chain: fp →* root,  root ∈ PinSet,
+             proof-of-possession at every link
+```
+
+so pinning a principal admits the agents and surfaces it issues — this is
+delegation (§2.1), and it is already shipped mechanism: mesh `CertChain::
+verify` chains to the user root fail-closed (agent-mesh #39, §9.1) and
+certification requires proof-of-possession (agent-mesh #40, §9.2).
+**PO-5** (now including chain soundness).
 
 ## 5. Mechanism (below the law line)
 
@@ -367,6 +412,53 @@ the pin's `ContentId` (the `DischargeVerifier` seam; PR #214 lineage). This
 upgrades first contact from "someone at a keyboard clicked" to a
 hardware-attested human decision. Optional by law, recommended for pins
 whose caveat ceiling is broad.
+
+### 5.4 Enrollment ceremony (SAS pairing)
+
+How a new device or surface — possibly with no compute beyond key storage
+and a screen — gets its keypair admitted under a principal (L5, applied to
+one's own devices).
+
+The ritual is a **short-authentication-string comparison**, and its shape
+matters: a naive "new device shows a phrase, trusted device sends it back
+encrypted" is MITM-relayable — an attacker owning the channel relays the
+phrase both ways and each side verifies *the attacker's* key. The sound
+construction (per Bluetooth numeric comparison / ZRTP):
+
+1. both devices **commit** to nonces before revealing anything;
+2. both **derive** the SAS from the *entire key-exchange transcript*
+   (commitments, both pubkeys, reveals);
+3. **a human compares the SAS on both screens** — the out-of-band channel
+   the MITM cannot sit on. The phrase is not a secret to transport; it is
+   a checksum of the handshake two screens must agree on.
+
+Commit-before-reveal forces a MITM to *guess* the SAS in advance; one
+round of a `xxx-000`-style SAS ≈ 1-in-46k. Paranoia is then a parameter,
+not a mood:
+
+```
+strength(enrollment) = (SAS entropy × rounds, distinct witnesses, presence)
+```
+
+Policy sets minima **by caveat ceiling**: a broad ceiling demands more
+rounds, witnessing from ≥ 2 previously-secured surfaces, and a hardware
+presence discharge (the `attest` verdict doing enrollment duty —
+thumbprint on the device). Independent witnesses buy more than extra
+rounds: rounds shrink the guess probability; witnesses multiply the
+channels an attacker must own *simultaneously*. The completed enrollment
+is a `PinRecord` in the chain-store whose payload carries the ceremony
+parameters — auditable later (§3.6).
+
+### 5.5 External anchors (corroboration, never the root)
+
+A principal root is **self-sovereign**. Externally published keys —
+GitHub-registered keys (`github.com/<user>.keys`), DNS, an org CA, a
+previously-secured device — are **candidate corroboration channels** for
+it: independent witnesses that the root you are pinning belongs to the
+human you think it does. Per the floating-identity doctrine, no anchor is
+load-bearing: GitHub corroborates the root; it never *is* the root. A
+user with no GitHub enrolls by ceremony alone (§5.4) with zero degradation
+in the algebra — anchors raise corroboration, never gate participation.
 
 ## 6. Conformance
 
