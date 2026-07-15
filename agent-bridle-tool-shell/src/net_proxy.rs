@@ -1275,10 +1275,31 @@ mod tests {
         );
     }
 
+    /// Serialize the tests that touch REAL loopback sockets (#155, #207). They
+    /// share the host's loopback and ephemeral-port space, so concurrent
+    /// siblings can interfere — e.g. a port released by one test can be
+    /// re-bound by a sibling before the first is done probing it, and the
+    /// probe then observes the sibling's live listener. One shared lock
+    /// removes that interference class wholesale; the motivating (never
+    /// locally reproduced) flake was `Empty reply from server` on the
+    /// fenced_child test in PR #195's macOS CI. The in-memory tests above
+    /// (#216) need no lock — only the real-socket tests below take it.
+    /// Process-local, which suffices because `cargo test` runs test binaries
+    /// sequentially; a per-test-process runner (e.g. nextest) would NOT be
+    /// covered, nor would the loopback binds in other crates' test binaries.
+    /// Poison is ignored so a panicking test does not cascade-fail the rest.
+    fn net_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn proxy_env_points_at_the_bound_loopback_addr() {
-        // One of two remaining REAL-socket tests: `proxy_env` is derived from the
-        // actually-bound loopback address, so this exercises the real `bind`.
+        // A REAL-socket test: `proxy_env` is derived from the actually-bound
+        // loopback address, so this exercises the real `bind` — and its live
+        // accept-loop listener must not interleave with the port probes of the
+        // sibling real-socket tests.
+        let _serial = net_test_lock();
         let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let env = proxy.proxy_env();
         let url = format!("http://127.0.0.1:{}", proxy.addr().port());
@@ -1326,6 +1347,10 @@ mod tests {
             best_available_sandbox, loopback_fenced_caveats, seatbelt_is_supported, Caveats,
             SandboxPolicy, Scope,
         };
+        // Serialize with sibling loopback tests (issue #207): this is the
+        // heaviest net test (origin + proxy + real curl child) and must not
+        // race siblings on loopback. Held for the whole test via RAII.
+        let _serial = net_test_lock();
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
@@ -1401,12 +1426,15 @@ mod tests {
         drop(proxy);
     }
 
-    /// The second (and only other) REAL-socket test: it must exercise the actual
+    /// The other always-on REAL-socket test: it must exercise the actual
     /// `TcpListener` bind + accept loop + `Drop` teardown, which no in-memory
-    /// fake can. Self-contained (its own ephemeral port, no shared origin), so it
-    /// does not need the old cross-test serialization lock.
+    /// fake can. It probes a just-released ephemeral port, so it serializes on
+    /// `net_test_lock()` — a concurrent sibling could re-bind that port between
+    /// the drop and the probe, and the probe would then hit the sibling's live
+    /// listener (#207).
     #[test]
     fn dropping_the_handle_stops_the_listener() {
+        let _serial = net_test_lock();
         let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
         let addr = proxy.addr();
         drop(proxy);
