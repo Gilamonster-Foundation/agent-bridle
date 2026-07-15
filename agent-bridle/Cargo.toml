@@ -13,6 +13,10 @@ readme = "../README.md"
 # A host that wants a leaner build can opt out with --no-default-features.
 default = ["shell"]
 shell = ["dep:agent-bridle-tool-shell"]
+# Forward the policy/step-up Ed25519 verifier (#226): lets facade consumers
+# (e.g. newt's signed-approve verify-at-load) enable it without a direct
+# agent-bridle-core dependency. Off by default per ADR 0007.
+verifier-ed25519 = ["agent-bridle-core/verifier-ed25519"]
 # The sandboxed-host engine (ADR 0019 / #194): exposes `HostShellTool` — full
 # shell semantics with the guarantee entirely on L3. Complementary to `shell`,
 # not a replacement (ADR 0019 D3), so the embedder selects it at registry
