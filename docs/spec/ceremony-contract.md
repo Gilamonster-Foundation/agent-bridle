@@ -1,6 +1,6 @@
 # The Ceremony Contract
 
-**Status:** DRAFT 0.1.3 (2026-07-15) — revised per review rounds 1–2 (#229).
+**Status:** DRAFT 0.1.4 (2026-07-16) — revised per review rounds 1–3 (#229).
 Normative once accepted.
 **Scope:** the decision-surface and first-contact contract between agent-*
 libraries (which own decision *semantics*) and harnesses (which own
@@ -22,8 +22,9 @@ this document deliberately restates none of it.
 
 | Term | Definition | Already shipped as |
 |---|---|---|
-| **Fingerprint** | `blake3(pubkey)` — a self-certifying identity name | `agent_mesh_protocol::Fingerprint` |
+| **Fingerprint** | `H(pubkey)` rendered as a **multihash** — a self-describing, self-certifying *name* for the key. The key is the identity; the fingerprint is its name. Algorithms are profile pins (§8), never law: *BLAKE3 is an implementation detail* | `agent_mesh_protocol::Fingerprint` (raw blake3 today; multihash wire format tracked on agent-mesh#66) |
 | **Principal** | the root identity a human (or org) controls; agents and surfaces chain to it | `agent_mesh_protocol::UserKey` |
+| **Memo** | the ancestor discipline (content-addressable-python `data.py`): every value carries its content-id and **reads verify it**. Its Rust heirs: `ContentId` (naming), `MerkleNode` (chaining+sigs), and `Sealed<T>` (§3 preamble — verify at construction, immutable after) | lineage; `Sealed<T>` to build |
 | **Caveats** | attenuable authority; forms a meet-semilattice | `agent_mesh_protocol::Caveats` (`meet_never_amplifies` is property-tested) |
 | **Verdict** | durable disposition: `deny ⊏ attest ⊏ ask ⊏ approve`, ordered by restrictiveness | `agent_bridle_core::policy::Verdict` (`precedence()`; code says `Passkey` until #231 lands) |
 | **attest** | allowed only via a presence ceremony — the term follows the trusted-computing literature's *attestation* (Parno et al.); renamed from `passkey`, which remains correct for the *hardware mechanism* only | #231 (coordinated pre-1.0 rename) |
@@ -33,12 +34,19 @@ this document deliberately restates none of it.
 | **Escalation** | a navigation affordance (e.g. `audit`) — never authority | this spec, §3.2 |
 | **Pin** | a durable, provenance-carrying record that an identity's key was accepted | this spec, §3.5 |
 | **Ceremony** | the interactive resolution of a decision the laws refuse to default | this spec, §4 L5 |
-| **ContentId / MerkleNode** | BLAKE3 CID over canonical DAG-CBOR; parent-linked record | `content-addressable` crate |
+| **ContentId / MerkleNode** | CID (multihash) over canonical DAG-CBOR; parent-linked record; v1 profile hashes with BLAKE3-256 (§8) | `content-addressable` crate |
 
 Encodings: **one schema, three encodings.** JSON for interchange (client
 libs), TOML at rest (#220 policy files), **canonical DAG-CBOR for anything
 hashed or signed**. Signatures and `ContentId`s are computed over canonical
 bytes only.
+
+Identifiers are **self-describing**: fingerprints are multihash, keys and
+signatures are multicodec-tagged, links are CIDv1 (multihash-native).
+Comparison is over the opaque bytes *including* the code — two hash
+algorithms never collide silently. The `b3:` / `ed25519:` / `cid:`
+prefixes in this document's examples render the **v1 profile** (§8); the
+formats themselves are algorithm-agnostic.
 
 Time: per the workspace hard rule, **wall-clock is never a coordination
 primitive**. Validity keys on generation counters
@@ -94,6 +102,26 @@ two principals pinning each other's roots — L5 again, one level up.
 Field names are normative; unknown fields MUST be ignored (forward
 compatibility). All objects carry `"v": 1`.
 
+**The Memo discipline (WF-2).** Every wire object is a Memo-descendant,
+with capabilities attached by *mechanical criteria* — a boundary test, not
+a quota:
+
+- **content-CID: unconditional.** Anything serializable and meaningful
+  beyond this process has canonical bytes and therefore a name.
+- **`by` + `sig`: at trust boundaries.** REQUIRED whenever the object
+  crosses to a different fingerprint (remote surface, delegated agent,
+  another host); MAY be omitted in-process — same trust domain, nothing to
+  assert.
+- **`parents`: for durability.** Anything appended to a chain-store links.
+- **Sealed at load.** Implementations construct wire objects only through
+  verification (CID recomputed; sig checked when present) — verify once at
+  the boundary, immutable thereafter. Nothing enters a kernel unverified.
+
+This is const-correctness for integrity: one unsigned hop breaks the chain
+of custody the way one non-const cast breaks the guarantee. The discipline
+applies to **all of the data layer and none of the resource layer** — the
+same line the pure kernel already draws (§6.2).
+
 ### 3.1 PermissionRequest
 
 What a gate hands a surface when a verdict resolves to interaction.
@@ -105,9 +133,16 @@ What a gate hands a surface when a verdict resolves to interaction.
   "action":  { "class": "exec", "display": "run_command: cd <path>" },
   "violation": "outside-granted-allowlist",
   "matrix":  { … },                       // §3.2
-  "context": { "session": "…", "rationale": "…", "generation": 41 }
+  "context": { "session": "…", "rationale": "…", "generation": 41 },
+  "by": "b3:…", "sig": "…"                // the GATE's signature — required remote (Memo discipline)
 }
 ```
+
+A **remote** surface MUST verify the request's signature and that `by`
+chains to a pinned principal **before rendering** — an unauthenticated
+prompt is a phishing canvas that trains the human on fake ceremonies
+(§5.6), even though its harvested decision is unredeemable (the CID
+binding, §3.3). In-process, `by`/`sig` MAY be omitted.
 
 ### 3.2 DecisionMatrix
 
@@ -197,13 +232,21 @@ First contact: an unpinned identity proposing itself.
   "pubkey": "ed25519:…",
   "channel": "mdns | dial-back | relay | manual | qr",
   "proposed_caveats": [ … ],               // Caveats; the requested ceiling
-  "observed": { "addr_candidates": [ … ] } // candidates, never load-bearing
+  "observed": { "addr_candidates": [ … ] },// candidates, never load-bearing
+  "fresh": "…",                            // transcript-bound challenge/nonce
+  "sig": "…"                               // by the INTRODUCED key, over this record — proof of possession
 }
 ```
 
-On receipt, an implementation MUST verify `fingerprint == blake3(pubkey)`
-and reject on mismatch **before** any surface renders it (self-certification
-is checked by the library, not delegated to the human).
+On receipt, an implementation MUST, **before any surface renders it**:
+
+1. verify the fingerprint is a valid multihash name of `pubkey` —
+   recomputed under the fingerprint's *own* hash code (self-certification
+   is checked by the library, never delegated to the human);
+2. verify `sig` under `pubkey` over this record including `fresh` —
+   **proof of possession**, transcript-bound so a bystander cannot replay
+   *someone else's* introduction as their own (the unknown-key-share
+   closure, §5.6; parity with mesh #40's PoP-to-certify).
 
 ### 3.5 PinRecord / GrantRecord (the chain-store)
 
@@ -372,9 +415,13 @@ re-proves over the kernel. **PO-4.**
 association(peer) ⇒ pinned(fingerprint(peer))
 ```
 
-`fingerprint = blake3(pubkey)` is self-certifying, therefore **re-key ⇒ new
-fingerprint ⇒ unpinned ⇒ full re-ceremony**. No silent identity swap is
-expressible. A pin is created only by (a) a `Decision::grant` from a bound
+`fingerprint = H(pubkey)`, a multihash name, is **self-certifying** for any
+H the profile pins (§8) with two required properties: collision resistance,
+and hardness of finding a key matching a given name. Therefore **re-key ⇒
+new fingerprint ⇒ unpinned ⇒ full re-ceremony**. No silent identity swap is
+expressible. (Rotating H is *re-naming*, not re-keying: the key signs a
+linkage record binding its new name — quorum-free, the identity never
+moved.) A pin is created only by (a) a `Decision::grant` from a bound
 surface, or (b) a pre-pinned policy entry — which is a signed loosening
 entry and therefore governed by L2.
 
@@ -398,8 +445,8 @@ Mechanisms implement or discharge the laws; they add no new ones.
 
 ### 5.1 The chain-store (load-bearing for L2)
 
-Records are `MerkleNode<T>` in the `content-addressable` crate (BLAKE3
-CIDs, canonical DAG-CBOR, parent links), with these conventions:
+Records are `MerkleNode<T>` in the `content-addressable` crate (multihash
+CIDs — §8, canonical DAG-CBOR, parent links), with these conventions:
 
 ```
 c_i = H(canon(record_i ∖ sig))          content-CID   (what is signed)
@@ -529,10 +576,12 @@ corroboration is k-of-n, and n just shrank by one.
 | Channel | Attack | Closure | Residual |
 |---|---|---|---|
 | First contact (stranger) | TOFU key swap | L5 ceremony: SAS or out-of-band fingerprint check; or chain to a common pinned principal | the ceremony itself (below) |
+| First contact | **introduction replay / unknown-key-share** | PoP: the introduced key signs the Introduction over a transcript-bound `fresh` (§3.4) | — |
 | Enrollment handshake | relay + **key substitution** | commit-then-reveal; SAS covers the **long-term keys** (§5.4·2); human comparison is the authentic channel | SAS guess ≈ n⁻ᵏ per round; rounds × witnesses shrink it |
 | Post-pin transport | impersonation on any raced path | dial-by-pubkey: QUIC/TLS authenticates the **node key** — a path that answers must hold the private key; paths are hints, never identity | key theft (out of scope: L2 quorum + revocation) |
 | Delegation | rogue "delegated" agent inserted | chains verify to a pinned principal; proof-of-possession at issuance (mesh #39/#40) | principal-root compromise (quorum revocation + succession) |
 | Remote surface | **render-swap**: human approves X, gate runs Y | `Decision.request` = content-CID of the request as rendered; sig covers it; gate matches CIDs (§3.3) | compromised surface *device* → its grants are attributable + revocable |
+| Remote surface | **phishing canvas**: forged/unsolicited requests train the human | requests are gate-signed; surface verifies chain-to-pinned-principal *before rendering* (§3.1) | compromised gate key → quorum revocation |
 | Chain-store sync | forgery in transit | records are self-authenticating (signed + chained); transport can corrupt nothing silently | — |
 | Chain-store sync | **rollback** (stale head hides a revocation) | heads are monotonic (L2 structural clause); AuditRecords are witnessed freshness checkpoints (§3.6) | withholding = visible staleness → treat as degraded, fail closed |
 | Anchor channel | compromised registry vouches a fake root | anchors are blessed, k-of-n, never sufficient alone (§5.5) | k−1 colluding anchors corroborate nothing |
@@ -570,6 +619,7 @@ Lean via Aeneas:
 | PO-4 | L4 | meet never amplifies (kernel restatement) |
 | PO-5 | L5 | no association without pin; re-key forces re-ceremony |
 | WF-1 | §3.2 | matrix decidable sans escalations (structural predicate, not a law) |
+| WF-2 | §3 | Memo discipline: CID unconditional; sig at trust boundaries; parents for durability; Sealed at load |
 
 Pilot: PO-1 and PO-2.
 
@@ -582,8 +632,10 @@ A conforming harness:
 - [ ] renders `verbs × scopes` completely; MAY render escalations (WF-1, §3.2)
 - [ ] treats `default` as a cursor hint, never an auto-grant
 - [ ] never persists a loosening outcome without a signature (L2)
-- [ ] relies on the library's self-certification check (§3.4) rather than
-      asking the human to compare key bytes
+- [ ] relies on the library's self-certification + proof-of-possession
+      checks (§3.4) rather than asking the human to compare key bytes
+- [ ] (remote) verifies a request's gate signature before rendering (§3.1)
+- [ ] constructs wire objects only through verified load (Sealed; WF-2)
 - [ ] ships no rendering into any agent-* library crate
 
 ## 7. Governance — law minimalism
@@ -599,6 +651,10 @@ without a proof obligation demanding it; everything else is mechanism
   ("reset mesh" must not be an attack surface) was absorbed into L2 as its
   upward direction — tamper-*monotonicity* became tamper-*boundedness*.
   Zero count change; PO-2b added.
+- **Executed (review 3, 2026-07-16):** the Memo discipline and the
+  multihash directive landed as wire discipline (WF-2) and profile (§8) —
+  laws name *properties*; algorithms are pins. L5 de-algorithm'd. Zero
+  count change.
 - **Next candidate:** L1+L4 are one law ("authority composes by meet") on
   two carriers (verdict lattice, caveat lattice); if the Lean formulation
   unifies them cleanly, five becomes four.
@@ -607,7 +663,26 @@ Additions from the same review — the `attest` verb, negative pins, the
 `AuditRecord` — cost **zero** laws: each collapsed into existing structure
 or landed below the line. The algebra decides the count; ambition doesn't.
 
-## 8. Relations
+## 8. Profile v1 (pins, not laws)
+
+Algorithms are **implementation details**; each pin states the *property*
+any replacement must carry. Identifiers are self-describing (multihash /
+multicodec), so profile rotation happens under a running mesh.
+
+| Pin | v1 value | Required property (the law's interest) |
+|---|---|---|
+| Content hash `H` | BLAKE3-256 (multihash `0x1e`) | collision resistance; preimage hardness (L5 self-certification) |
+| Signature | Ed25519 (RFC 8032) | **deterministic** — load-bearing for chain reproducibility (§5.1·1); existential unforgeability |
+| Canonical encoding | DAG-CBOR (codec `0x71`) | injective, canonical serialization (one value ⇒ one byte string) |
+| Links | CIDv1 | multihash-native, codec-tagged |
+
+Rotating `H` is a **re-naming ceremony** (L5): keys sign linkage records
+binding their new names; identity never moves. Rotating the signature
+scheme is heavier — it is a **re-keying** (full L5 re-ceremony per
+identity) because the key *is* the identity. The wire format
+(`agent-mesh#66`) carries the codes either way.
+
+## 9. Relations
 
 - #220 — verdict/policy TOML contract (headless half of this seam)
 - #225 — design directive, strategy, client-lib matrix (umbrella)
@@ -616,6 +691,8 @@ or landed below the line. The algebra decides the count; ambition doesn't.
   for this spec's vocabulary)
 - PR #214 — presence/WebAuthn lineage (§5.3)
 - agent-mesh#65 — `Introduction` struct and mesh decision surfaces
+- agent-mesh#66 — enrollment/delegation protocol; multihash wire format
+  for `Fingerprint`
 - newt-agent#1209 — first consumer: pinning ceremony (HIGH)
 - agent-mesh `docs/decisions/floating_identity.md` — identity doctrine
   (law 5 there = L5 here, seen from the transport)
