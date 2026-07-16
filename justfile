@@ -1,8 +1,13 @@
 # agent-bridle build recipes.
 #
 # PIPELINE PARITY: these recipes mirror .githooks/pre-push and
-# .github/workflows/ci.yml. When editing the lint/format/test steps here,
-# update the push hook AND the CI workflow to match (HOOK PARITY rule).
+# .github/workflows/ci.yml plus formal.yml. When editing the
+# lint/format/test/proof steps here, update the push hook AND the owning CI
+# workflow to match (HOOK PARITY rule).
+
+# `windows-shell` keeps native Windows compatible with just 1.46; newer just
+# versions also accept the `[windows] set shell` spelling.
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 # Default: list recipes.
 default:
@@ -28,6 +33,13 @@ check:
     cargo clippy --workspace --all-targets --no-default-features -- -D warnings
     cargo test --workspace --all-features
     cargo test --workspace --no-default-features
+
+# Lean proof gate. Mirrors `.github/workflows/formal.yml` and is run by the
+# pre-push hook on every platform. Lake reads `formal/lean-toolchain`; the
+# project sets `warningAsError`, so `sorry` / `admit` cannot pass this build.
+[working-directory: 'formal']
+check-formal:
+    lake build
 
 # Windows AppContainer L3 backend checks — the local mirror of the `check-windows`
 # job in .github/workflows/ci.yml (and nightly-windows.yml). The `appcontainer_impl`

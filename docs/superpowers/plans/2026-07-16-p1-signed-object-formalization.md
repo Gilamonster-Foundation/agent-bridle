@@ -391,7 +391,7 @@ Run: `Push-Location formal; lake build; Pop-Location`
 
 Expected: PASS, including `P1Counterexamples`.
 
-- [ ] **Step 6: Commit the verification boundary**
+- [x] **Step 6: Commit the verification boundary**
 
 ```text
 formal(lean): enforce allowlist-before-dispatch
@@ -402,7 +402,7 @@ Co-Authored-By: OpenAI GPT-5 <codex@openai.com>
 ### Task 4: Add cross-platform proof gates and hook parity
 
 **Files:**
-- Modify: `.github/workflows/ci.yml`
+- Create: `.github/workflows/formal.yml`
 - Modify: `justfile`
 - Modify: `.githooks/pre-push`
 - Modify: `docs/TOOLCHAIN.md`
@@ -412,13 +412,13 @@ Co-Authored-By: OpenAI GPT-5 <codex@openai.com>
 - Produces: `just check-formal`, Linux and Windows `lake build` jobs, and a
   pre-push invocation matching the required CI proof gate.
 
-- [ ] **Step 1: Add a failing local gate check**
+- [x] **Step 1: Add a failing local gate check**
 
-Add `check-formal` to `justfile` with `lake build` executed from `formal`, then
-invoke it before installing elan to confirm the command fails clearly when the
-toolchain is absent.
+Invoke the not-yet-defined `just check-formal` first and confirm Just rejects
+the missing recipe. Add `check-formal` with a per-recipe `formal` working
+directory so native Windows elan resolves the nested toolchain pin.
 
-- [ ] **Step 2: Install/resolve the pinned Lean toolchain and verify the gate**
+- [x] **Step 2: Install/resolve the pinned Lean toolchain and verify the gate**
 
 Run: `elan toolchain install leanprover/lean4:v4.31.0`
 
@@ -426,18 +426,20 @@ Run: `just check-formal`
 
 Expected: PASS.
 
-- [ ] **Step 3: Mirror the gate in CI and pre-push**
+- [x] **Step 3: Mirror the gate in CI and pre-push**
 
-Add a `formal` job with an Ubuntu/Windows matrix using `leanprover/lean-action`
-and `lake build`. Add `just check-formal` to `.githooks/pre-push`. Keep parity
-comments adjacent in all three files.
+Add a dedicated formal workflow with an Ubuntu/Windows matrix using
+`leanprover/lean-action@v1` and `lake build`. Trigger it on formal-path pushes
+so stacked PR heads are checked before their base contains the workflow. Add
+`just check-formal` to `.githooks/pre-push`. Keep parity comments adjacent in
+all three files.
 
-- [ ] **Step 4: Update toolchain status accurately**
+- [x] **Step 4: Update toolchain status accurately**
 
 Record native Windows `lake build` as verified only after the local run passes;
 leave native Aeneas/opam explicitly unverified and WSL2-recommended.
 
-- [ ] **Step 5: Run syntax and proof gates**
+- [x] **Step 5: Run syntax and proof gates**
 
 Run: `just check-formal`
 
@@ -447,7 +449,7 @@ Run: `git diff --check`
 
 Expected: all PASS.
 
-- [ ] **Step 6: Commit CI enforcement**
+- [x] **Step 6: Commit CI enforcement**
 
 ```text
 ci(formal): gate P1 proofs on Linux and Windows

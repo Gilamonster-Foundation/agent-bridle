@@ -6,8 +6,10 @@ defaultTargets = ["CeremonyFormal", "CeremonyTests"]
 name = "CeremonyFormal"
 srcDir = "."
 roots = ["Ceremony"]
+moreLeanArgs = ["-DwarningAsError=true"]
 
 [[lean_lib]]
 name = "CeremonyTests"
 srcDir = "."
 roots = ["Tests"]
+moreLeanArgs = ["-DwarningAsError=true"]

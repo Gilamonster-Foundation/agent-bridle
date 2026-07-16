@@ -1,0 +1,43 @@
+# Ceremony Suite formal proof gate.
+#
+# HOOK PARITY: `just check-formal` and `.githooks/pre-push` run the same
+# `lake build` locally. Keep all three in sync when the proof command changes.
+
+name: Formal proofs
+
+on:
+  push:
+    paths:
+      - "formal/**"
+      - ".github/workflows/formal.yml"
+      - ".githooks/pre-push"
+      - "justfile"
+  pull_request:
+    paths:
+      - "formal/**"
+      - ".github/workflows/formal.yml"
+      - ".githooks/pre-push"
+      - "justfile"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  lean:
+    name: Lean (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build P1 proofs and contract tests
+        uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
+          build: true
+          lake-package-directory: formal
+          use-github-cache: false
+          use-mathlib-cache: false
