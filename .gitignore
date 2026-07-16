@@ -3,6 +3,9 @@
 **/target
 Cargo.lock.orig
 
+# Lean / Lake
+**/.lake/
+
 # Coverage
 *.profraw
 /coverage

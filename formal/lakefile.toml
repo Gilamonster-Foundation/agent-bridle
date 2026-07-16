@@ -1,0 +1,13 @@
+name = "ceremony-formal"
+version = "0.1.0"
+defaultTargets = ["CeremonyFormal", "CeremonyTests"]
+
+[[lean_lib]]
+name = "CeremonyFormal"
+srcDir = "."
+roots = ["Ceremony"]
+
+[[lean_lib]]
+name = "CeremonyTests"
+srcDir = "."
+roots = ["Tests"]

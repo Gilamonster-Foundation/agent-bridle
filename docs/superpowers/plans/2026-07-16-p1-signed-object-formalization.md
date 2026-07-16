@@ -126,19 +126,22 @@ default Lake target broken.
 - Consumes: `ByteArray`, `Finset`, and decidable equality from Lean core.
 - Produces: `HashAlgorithm`, `SignatureAlgorithm`, `Codec`, `Profile`,
   `AllowedHash`, `AllowedSignature`, `AllowedCodec`, `CanonicalEncoding`,
-  `VerifiedBytes`, `Sealed`, `seal`, and `sealed_eq_of_same_canonical`.
+  `VerifiedEnvelope`, `Sealed`, `sealValue`, and
+  `sealed_eq_of_same_canonical`.
 
 - [ ] **Step 1: Extend the test with the wished-for sealing API**
 
 ```lean
 def bytesEncoding : CanonicalEncoding ByteArray where
   encode := id
-  injective := fun h => h
+  injective := by
+    intro left right h
+    exact h
 
 example (a b : ByteArray) (h : bytesEncoding.encode a = bytesEncoding.encode b) :
     a = b := bytesEncoding.injective h
 
-example (value : ByteArray) : (seal bytesEncoding value).value = value := rfl
+example (value : ByteArray) : (sealValue bytesEncoding value).value = value := rfl
 ```
 
 - [ ] **Step 2: Run the test and verify RED**
@@ -146,7 +149,7 @@ example (value : ByteArray) : (seal bytesEncoding value).value = value := rfl
 Run: `Push-Location formal; lake build; Pop-Location`
 
 Expected: FAIL with unknown identifiers such as `CanonicalEncoding` and
-`seal`.
+`sealValue`.
 
 - [ ] **Step 3: Implement the minimal P1 model**
 
@@ -206,7 +209,7 @@ structure Sealed {Value : Type} (encoding : CanonicalEncoding Value) where
   canonical : ByteArray
   canonical_eq : canonical = encoding.encode value
 
-def seal (encoding : CanonicalEncoding Value) (value : Value) : Sealed encoding :=
+def sealValue (encoding : CanonicalEncoding Value) (value : Value) : Sealed encoding :=
   { value, canonical := encoding.encode value, canonical_eq := rfl }
 ```
 
