@@ -1,5 +1,9 @@
 # The Ceremony Suite — a dependency-ordered set of provable profiles
 
+> **New to this job? Start with [`PRIMER.md`](PRIMER.md)** — the agent
+> onboarding doc (doctrine, architecture, conventions, current hold, how to
+> contribute). Then this index, then your assigned profile.
+
 **Status:** DRAFT (2026-07-16). This directory replaces the single
 `ceremony-contract.md` monolith with a suite of **loosely-coupled,
 functionally-cohesive** profiles: each names one job, owns its own algebra
