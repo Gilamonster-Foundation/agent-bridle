@@ -682,7 +682,14 @@ pub(crate) mod landlock_impl {
                 handled |= AccessFs::Execute;
             }
 
-            let write_roots = scope_roots(&effective.fs_write);
+            let mut write_roots = scope_roots(&effective.fs_write);
+            // #1220: the device sinks are always write-openable — a confined
+            // git opening `/dev/null` O_RDWR must not be what the jail breaks.
+            // (O_RDWR also needs the read right: ambient when `fs_read` is
+            // `All`; granted via `base_read_paths` — which lists the same
+            // devices — when confined.)
+            write_roots.extend(self.policy.device_sink_paths.resolve());
+            write_roots.retain(|p| std::path::Path::new(p).exists());
             // Build the ruleset: fs axes first (V3 floor), then optionally the
             // net axis (V4+). BestEffort means handle_access silently skips
             // access types the kernel doesn't know — so on pre-6.7 kernels the
@@ -963,7 +970,11 @@ mod seatbelt_impl {
             Ok(vec![
                 SANDBOX_EXEC.to_string(),
                 "-p".to_string(),
-                seatbelt_profile_with(effective, &self.policy.base_read_paths.resolve()),
+                seatbelt_profile_with(
+                    effective,
+                    &self.policy.base_read_paths.resolve(),
+                    &self.policy.device_sink_paths.resolve(),
+                ),
             ])
         }
     }
@@ -985,15 +996,22 @@ mod seatbelt_impl {
     #[cfg(test)]
     #[must_use]
     pub fn seatbelt_profile(effective: &Caveats) -> String {
+        let policy = SandboxPolicy::default();
         seatbelt_profile_with(
             effective,
-            &SandboxPolicy::default().base_read_paths.resolve(),
+            &policy.base_read_paths.resolve(),
+            &policy.device_sink_paths.resolve(),
         )
     }
 
-    /// SBPL profile builder, parameterized on the read base (`base_read`).
+    /// SBPL profile builder, parameterized on the read base (`base_read`) and
+    /// the always-writable device sinks (`sinks`, #1220).
     #[must_use]
-    fn seatbelt_profile_with(effective: &Caveats, base_read: &[String]) -> String {
+    fn seatbelt_profile_with(
+        effective: &Caveats,
+        base_read: &[String],
+        sinks: &[String],
+    ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n");
 
         // fs_write: deny writes, then re-allow the granted roots.
@@ -1004,6 +1022,15 @@ mod seatbelt_impl {
                 p.push_str("(allow file-write*");
                 for r in &roots {
                     p.push_str(&format!(" (subpath {})", sbpl_string(r)));
+                }
+                p.push_str(")\n");
+            }
+            // #1220: device sinks stay write-openable under confinement —
+            // `literal` (not `subpath`): each is a single character device.
+            if !sinks.is_empty() {
+                p.push_str("(allow file-write*");
+                for s in sinks {
+                    p.push_str(&format!(" (literal {})", sbpl_string(s)));
                 }
                 p.push_str(")\n");
             }
@@ -1182,6 +1209,22 @@ mod seatbelt_impl {
     mod unit {
         use super::*;
         use crate::Scope;
+
+        /// #1220: a write-confined profile must re-allow the device sinks as
+        /// literals — git's O_RDWR open of /dev/null dies otherwise.
+        #[test]
+        fn write_confined_profile_allows_the_device_sinks() {
+            let confined = Caveats {
+                fs_write: Scope::only(["/tmp/x".to_string()]),
+                ..Caveats::top()
+            };
+            let profile = seatbelt_profile(&confined);
+            assert!(profile.contains("(deny file-write*)"), "{profile}");
+            assert!(
+                profile.contains("(literal \"/dev/null\")"),
+                "the null sink must stay write-openable: {profile}"
+            );
+        }
 
         #[test]
         fn unrestricted_caveats_make_no_wrapper() {

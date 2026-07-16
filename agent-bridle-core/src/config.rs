@@ -146,6 +146,14 @@ pub struct SandboxPolicy {
     pub base_read_paths: PathList,
     /// Executable dirs read-allowed only when `exec` is ambient (`BIN_READ_PATHS`).
     pub bin_read_paths: PathList,
+    /// Device sinks that are ALWAYS openable read+write inside the jail
+    /// (#1220): discard/zero devices carry no authority, and tools open them
+    /// as plumbing — git opens `/dev/null` O_RDWR and dies inside a confined
+    /// child otherwise. Folded into every write ruleset/profile regardless of
+    /// the granted `fs_write` scope. `#[serde(default)]` so configs written
+    /// before this field existed keep parsing (they get the defaults).
+    #[serde(default = "default_device_sink_paths")]
+    pub device_sink_paths: PathList,
     /// Execute allow-list: the dynamic loader files only (`LOADER_PATHS`).
     pub loader_paths: PathList,
     /// Loopback identifiers for the net axis (`LOOPBACK_HOSTS`).
@@ -154,6 +162,16 @@ pub struct SandboxPolicy {
     pub landlock_abi_floor: u32,
     /// Minimum Landlock ABI for TCP net rules (`NET_ABI_FLOOR`).
     pub landlock_net_abi_floor: u32,
+}
+
+/// The `device_sink_paths` default: the null/zero/full discard devices —
+/// every write to them is a no-op (or ENOSPC by contract, for `/dev/full`),
+/// so granting fresh opens carries no authority. Deliberately excludes
+/// `/dev/tty` (interactive prompts should fail fast inside confinement) and
+/// `/dev/std{out,err}` (inherited fds need no open; the procfs symlinks
+/// resolve to arbitrary files and would widen the grant).
+fn default_device_sink_paths() -> PathList {
+    PathList::from_defaults(&["/dev/null", "/dev/zero", "/dev/full"])
 }
 
 impl Default for SandboxPolicy {
@@ -203,6 +221,7 @@ impl Default for SandboxPolicy {
         Self {
             backends: BackendToggles::default(),
             base_read_paths: PathList::from_defaults(base_read),
+            device_sink_paths: default_device_sink_paths(),
             bin_read_paths: PathList::from_defaults(&[
                 "/usr/bin",
                 "/bin",
