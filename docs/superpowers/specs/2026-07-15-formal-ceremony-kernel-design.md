@@ -1,11 +1,12 @@
 # Formal Ceremony Kernel Design
 
-**Status:** approved for a stacked implementation PR (2026-07-15)
-**Parent:** agent-bridle PR #229, `docs/spec/ceremony-contract.md`
+**Status:** approved for an ordered stack of implementation PRs; reconciled
+with the Ceremony Suite on 2026-07-16
+**Parent:** agent-bridle PR #229, `docs/spec/README.md` and profiles P0-P5
 **Stacked branch:** `feat/formal-ceremony-kernel`
-**Scope:** a hand-written Lean specification, a pure Rust mirror extracted by
-Charon/Aeneas, and bridge proofs that the Rust implementation refines the
-specification.
+**Scope:** profile-ordered hand-written Lean specifications, a pure Rust mirror
+extracted by Charon/Aeneas, and bridge proofs that the Rust implementation
+refines the specifications.
 
 ## 1. Purpose
 
@@ -37,10 +38,12 @@ behind a small verified interface.
 - Make an accepted decision carry evidence that it belongs to the request it
   answers and cannot exceed that request's ceiling.
 - Bind authorization to a canonical structured action, not display text.
-- Make attest and introduction challenges recipient-bound, generation-bound,
-  and single-use.
-- Model rollback protection around a trusted checkpoint outside the
-  attacker-controlled log.
+- Make attest challenges verifier-bound, action-bound, generation-bound, and
+  single-use in the Tier-3 kernel. Enrollment and Introduction freshness are
+  proved separately as a Tier-2 symbolic protocol.
+- Model rollback protection around P2's external anti-rollback anchor, outside
+  the attacker-controlled log and represented as trusted state carried into
+  every verification.
 - Give every quorum signer one canonical unsigned revocation body.
 - Reject unsupported algorithms and unsupported authority-bearing wire data
   before it enters the kernel.
@@ -59,26 +62,32 @@ behind a small verified interface.
   network liveness.
 - Moving serde, IO, crypto implementations, or UI code into the pure kernel.
 - Treating a parent-linked log by itself as rollback-proof.
+- Proving SAS, proof-of-possession Introduction, MITM resistance, or
+  unknown-key-share resistance in Lean. Those are P3 protocol properties and
+  require Tamarin or ProVerif under a Dolev-Yao model.
 
 ## 4. PR And Commit Structure
 
-The implementation is a separate stacked PR:
+Implementation follows the suite dependency DAG. Each proof boundary is a
+separate stacked PR so a reviewer can reject one profile without entangling
+its dependents:
 
-- Base branch: `docs/spec-ceremony-contract` (PR #229)
-- Head branch: `feat/formal-ceremony-kernel`
-- Proposed title: `formal: prove ceremony algebra and protocol safety kernel`
+1. `formal: prove P1 signed-object contracts` -- Lean project, canonical
+   encoding contract, sealed-value boundary, version rejection, and
+   allowlist-before-dispatch.
+2. `formal: prove P2 chain-store monotonicity` -- external-anchor trusted
+   state, DAG extension, rollback/fork rejection, and untrusted-step safety.
+3. `formal: prove P0 authority resolution` -- product lattice, total
+   resolution, matrix/ceiling validation, and non-amplification.
+4. `formal: add the extraction-oriented ceremony kernel` -- pure Rust mirror
+   for the proven P0/P1/P2 slice, with property tests.
+5. `formal: prove Aeneas refinement of the ceremony kernel` -- checked-in
+   extraction and bridge theorems, followed by generated-code freshness gates.
 
-Planned commits:
-
-1. `docs(formal): design the ceremony proof kernel`
-2. `formal(lean): prove the requirement algebra and protocol invariants`
-3. `formal(rust): add the pure extraction-oriented ceremony kernel`
-4. `formal(aeneas): prove the Rust kernel refines the Lean model`
-5. `ci(formal): enforce Lean proofs and generated-code freshness`
-
-The parent PR must be refreshed from `main` before the full verification gate.
-Its current head predates #219, so native Windows `cargo test --workspace`
-runs Unix-only `real_spawn` fixtures and fails before any stacked changes.
+The design PR remains based directly on `docs/spec-ceremony-contract` (PR
+#229). Every implementation branch is based on the preceding formal branch.
+P3 enrollment gets a separate Tier-2 protocol-verification stack after the
+P0/P1/P2 waist is proven; P4 and P5 follow their profile dependencies.
 
 ## 5. Authority Algebra
 
@@ -203,15 +212,15 @@ the request ceiling.
 Escalation is represented separately from `DecisionFor`; it cannot construct
 an effective grant.
 
-## 7. Challenges And Single Use
+## 7. Attestation Challenges And Single Use
 
-Attestation and introduction use the same challenge algebra with different
-domain tags:
+The Tier-3 kernel models attestation challenges. P3 Introduction may reuse the
+wire shape, but its recipient-issued handshake and adversarial-channel claims
+belong to the Tier-2 symbolic model and are not discharged by these theorems:
 
 ```lean
 inductive Purpose
   | attest
-  | introduce
 
 structure Challenge where
   purpose : Purpose
@@ -224,9 +233,6 @@ structure Challenge where
 ```
 
 The signature input is domain-separated by protocol, object kind, and version.
-For introductions, the recipient issues the challenge; a nonce chosen only by
-the introduced party is not fresh evidence.
-
 The trusted state contains issued and consumed challenge identifiers. An
 accepting transition requires the challenge to be issued, unconsumed, valid
 for the current generation, and bound to the expected identities and action.
@@ -236,7 +242,6 @@ Theorems establish:
 
 - an accepted challenge was issued by the expected verifier;
 - an accepted attest challenge names the authorized action;
-- an accepted introduction names both enrolled identities;
 - no sequential execution can accept the same challenge twice;
 - a generation mismatch fails closed.
 
@@ -245,12 +250,12 @@ tested with the existing gate's concurrent single-use regression pattern.
 
 ## 8. Trusted State And Protocol Transitions
 
-The protocol model is an inductive transition relation over a small world:
+The P0/P2 kernel model is an inductive transition relation over a small world:
 
 ```lean
 structure World where
   policy : Policy
-  trustedHead : Checkpoint
+  anchor : ExternalAnchor
   generation : Nat
   issued : Finset ChallengeId
   consumed : Finset ChallengeId
@@ -270,11 +275,11 @@ theorem untrusted_step_safe
   (h : Step .untrusted before event after) :
   effective after <= effective before /\
   after.loadBearing = before.loadBearing /\
-  after.trustedHead = before.trustedHead
+  after.anchor = before.anchor
 ```
 
 An untrusted actor may add a restrictive nuisance entry, but cannot widen
-authority, add or remove trusted identities, or rewrite the trusted checkpoint.
+authority, add or remove trusted identities, or rewrite P2's external anchor.
 Any transition outside that class must carry the corresponding authorization
 witness: principal signature, accepted ceremony, or valid quorum.
 
@@ -290,8 +295,9 @@ make suffix truncation or presentation of an older fork detectable by itself.
 The formal model therefore separates:
 
 - `UntrustedLog`, which may be truncated, reordered, withheld, or replaced;
-- `World.trustedHead`, stored or witnessed outside that attacker's authority;
-- `Extends(candidate, trustedHead)`, a verified ancestry relation.
+- `World.anchor`, the P2 `ExternalAnchor` stored or witnessed outside that
+  attacker's authority;
+- `Extends(candidate, anchor.checkpoint)`, a verified ancestry relation.
 
 A synchronization or reload transition may advance the checkpoint only when
 the candidate extends the existing trusted checkpoint. It may never replace
@@ -416,12 +422,17 @@ formal/
   lakefile.toml
   lean-toolchain
   Ceremony/
-    Algebra.lean
-    Decision.lean
-    Challenge.lean
-    Log.lean
-    Revocation.lean
-    Protocol.lean
+    P1/
+      SignedObject.lean
+    P2/
+      ChainStore.lean
+    P0/
+      Algebra.lean
+      Decision.lean
+      Challenge.lean
+      Protocol.lean
+    P4/
+      Revocation.lean
     CryptoAssumptions.lean
     Refinement.lean
   Generated/
@@ -433,15 +444,16 @@ formal/
 The Lean version is pinned to the Aeneas backend's compatible toolchain.
 Dependencies are pinned in `lake-manifest.json`.
 
-`Counterexamples.lean` records negative examples for the traps found during
-review: suffix rollback without a trusted head, out-of-matrix grants, action
-display substitution, replayed challenges, circular quorum payloads, unknown
-authority fields, and attacker-selected hash algorithms. These examples make
-the missing premise or rejected construction visible to reviewers.
+Counterexample modules live beside the profile that owns the rejected
+construction. They record suffix rollback without an external anchor,
+out-of-matrix grants, action display substitution, replayed attest challenges,
+circular quorum payloads, unknown authority fields, and attacker-selected hash
+algorithms. These examples make the missing premise or rejected construction
+visible to reviewers without mixing profile dependencies.
 
 ## 14. Verification And CI
 
-The stacked PR adds:
+The formal stack adds these gates incrementally as their owning profile lands:
 
 - `lake build` on Ubuntu and native Windows;
 - Rust unit and property tests for the pure mirror;
@@ -454,9 +466,9 @@ Live services, network inference, hardware authenticators, and external peers
 are not used by automated tests. Crypto and storage adapters use deterministic
 mocks at this layer.
 
-Because PR #229 currently predates the Windows test gating in #219, its branch
-must first absorb current `main`; otherwise the unrelated Unix-command fixtures
-fail on native Windows before formal verification runs.
+PR #229 was rebased over #219 before this design was reconciled, and its current
+CI is green on Linux, macOS, and Windows. Each child branch must preserve that
+baseline while adding its profile-specific proof gate.
 
 ## 15. Acceptance Criteria
 
@@ -465,8 +477,9 @@ fail on native Windows before formal verification runs.
 - Resolution is proved permutation-invariant and non-amplifying.
 - A validated decision is proved request-bound, action-bound,
   matrix-contained, and ceiling-bounded.
-- Attest and introduction challenges are proved single-use in the sequential
-  kernel and generation-bound.
+- Attest challenges are proved single-use in the sequential kernel,
+  generation-bound, and action-bound. P3 Introduction claims are absent from
+  the Tier-3 acceptance gate and tracked in the Tier-2 protocol stack.
 - Rollback rejection explicitly depends on an independently trusted
   checkpoint.
 - Quorum validation uses distinct signers over one unsigned body.
