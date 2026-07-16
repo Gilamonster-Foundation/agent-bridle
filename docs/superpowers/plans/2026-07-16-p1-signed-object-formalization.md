@@ -497,7 +497,7 @@ Run: `git log --format=full origin/feat/formal-ceremony-kernel..HEAD`
 Expected: every commit is authored by Shawn Hartsock and contains the OpenAI
 GPT-5 co-author trailer.
 
-- [ ] **Step 4: Push normally and open the PR**
+- [x] **Step 4: Push normally and open the PR**
 
 Attempt a normal push first. If the unchanged parent branch still fails the
 repository hook after all P1-owned gates pass, use only the author's explicit
