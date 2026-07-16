@@ -31,32 +31,35 @@ its dependencies are Proven** — that is the "chain of decisions" made real.
 
 ## The dependency DAG
 
-```
-        ┌─────────────────────────┐
-        │  P1 Signed-Object        │   foundation: content-addressing,
-        │  (CID · canon · Sealed)  │   canonicalization, signatures, allowlist
-        └────────────┬────────────┘
-                     │
-        ┌────────────▼────────────┐
-        │  P2 Chain-Store          │   causal transcript (Merkle DAG),
-        │  (DAG · anchor · rollbk) │   anti-rollback anchor
-        └────────────┬────────────┘
-                     │
-        ┌────────────▼────────────┐
-        │  P0 Ceremony Contract    │   ◄── THE NARROW WAIST
-        │  five laws · lattice ·   │   authority algebra + decision seam
-        │  decision surface · gate │   + gate acceptance
-        └───┬─────────┬────────┬───┘
-            │         │        │
-   ┌────────▼───┐ ┌───▼──────┐ ┌▼─────────────────┐
-   │ P3 Enroll- │ │ P4 Ident-│ │ P5 Rendering     │
-   │ ment       │ │ ity Life-│ │ Security         │
-   │ (SAS·PoP)  │ │ cycle    │ │ (WYSIWYS·transc.)│
-   └────────────┘ └──────────┘ └──────────────────┘
+Corrected 2026-07-16 per an adversarial review (OB-1): the prose had
+back-edges the first diagram hid — P0's attestation and L5 lean on P4, and
+P3/P5 consume P4 records. The fix is **dependency inversion**: P0 depends
+only on *abstract contracts* (`AttestEvidence`, `ValidAssociationProof`)
+that **P4 implements** — so the linear order below is real, not aspirational.
 
-   External fabric: agent-mesh#67 Conversation Graph — the wider causal
-   transcript of which P2's chain-store is the *authority projection*.
 ```
+  P1 Signed-Object      (foundation: CID · canon · Sealed · allowlist)
+        │
+        ▼
+  P2 Chain-Store        (causal transcript DAG · external anti-rollback anchor)
+        │
+        ▼
+  P0 Ceremony Contract  ◄── THE NARROW WAIST
+        │                   five laws · lattice · seam · gate;
+        │                   depends on P4 only via abstract contracts
+        ▼
+  P4 Identity Lifecycle (roles · records · quorum revocation · recovery;
+        │                implements P0's AttestEvidence / association proof)
+        ▼
+  P3 Enrollment         (SAS · PoP; produces P4 PinRecords)
+
+  P5 Rendering  depends on {P0, P1, P4}  (effect binding · gate-signed requests)
+
+  External fabric: agent-mesh#67 Conversation Graph — the wider causal
+  transcript of which P2's chain-store is the *authority projection*.
+```
+
+Build/prove order: **P1 → P2 → P0 → P4 → P3**, with P5 after P0/P1/P4.
 
 ## The profiles
 
@@ -109,7 +112,8 @@ job to satisfy, the kernel's job to assume). This is what lets Aeneas run.
 
 ## Build order (what to prove first)
 
-The DAG dictates it: **P1 → P2 → P0 → {P3, P4, P5}.** The provable MVP is
+The DAG dictates it: **P1 → P2 → P0 → P4 → P3**, P5 after P0/P1/P4 (OB-1).
+The provable MVP is
 **P1 + P2 + P0** — the Signed-Object foundation, the anti-rollback store,
 and the authority kernel with its five laws. That triple is GPT-5's #232
 "formal ceremony kernel" almost exactly; adopt it as the P0/P1/P2 slice and
@@ -139,6 +143,33 @@ may be Accepted against an unproven waist.
 
 The waist stays **five laws**; the ledger just relocates each obligation to
 the profile that owns it.
+
+## Open specification obligations
+
+Tracked from adversarial review round 6 (a fresh GPT pass on the partitioned
+suite, 2026-07-16). The review confirmed the split closed the prior attacks
+and rated architecture / threat-honesty / separation / formal-plan all
+*Strong*; these are the crisp state-machine gaps that remain. **B = blocker
+before implementation-complete; H = high; M = medium.** "choice" = a design
+decision the author owns, not a mechanical fix.
+
+| # | Sev | Profile | Gap | Resolution direction |
+|---|---|---|---|---|
+| OB-1 | B | P0/P4 | declared DAG had back-edges (P0↔P4 cycle) | **dependency inversion** — P0 defines abstract `AttestEvidence` + `ValidAssociationProof`; P4 implements. DAG corrected above. |
+| OB-2 | B (choice) | P2 | branching DAG checkpointed with a scalar `(gen,length,head)`; "two heads @ equal length = equivocation" is false for a DAG | **linear authority spine per causal thread** `(store_id, thread_id, sequence)`, one accepted successor per sequence (conversation branches; authority is a railway). Alt: frontier checkpoint `Set<LineCid>`. |
+| OB-3 | B | P0/P4 | attestation lacks a canonical challenge preimage + an atomic post-append commit; authenticator ≠ DAG verifier | define one challenge preimage (all bound fields); order: verify-checkpoint → presence → construct → append → **CAS-advance anchor** → then mint. Split roles: witness-verifier (DAG) / WebAuthn authenticator (presence) / surface (signs) / gate (appends+advances+activates). |
+| OB-4 | B | P1 | "sign DAG-CBOR + verify received bytes + exchange JSON" is contradictory | **signed-bytes-in-envelope**: `{profile, codec, body: b64(canonical), cid, by, sig}`; JSON/TOML are views, never authority-bearing serializations. |
+| OB-9 | B | P0 | `resolve(∅,q) = ⨅(∅) = ⊤ = approve` — **fail-OPEN**, contradicting L3 | seed the meet with a base: `resolve(R,q) = ⨅({ask} ∪ {matching verdicts})`; empty match → ask → (headless) deny. Define `resolve(∅)` for PO-3 totality. + normalize vocabulary (allow vs approve; is `ask` verdict/state/escalation?). |
+| OB-5 | H | P3 | challenge consumed *before* signature check → burn-DoS | validate-then-consume (reserve→validate→commit); bind the challenge object CID + recipient + role + context. |
+| OB-6 | H | P1/all | domain separation only on the WebAuthn challenge | **universal**: every signature covers (record-type string, `store_id`, thread/principal id, canonical payload). P2 needs a normative, cryptographically-bound `store_id`. |
+| OB-7 | H | P4 | RevocationRecord's `policy` CID not pinned to an epoch → replay an older weaker policy | `policy_cid == ActiveRevocationPolicy(target, observed_checkpoint, generation)`. The strength tuple is not totally ordered → enrollment records the **exact required revocation predicate**, not an informal tuple. |
+| OB-8 | H | P4 | PO-R "never permanently locked out" is unprovable unconditionally | state it **conditionally** (≥1 uncompromised recovery threshold, eventual quorum comms, fair generation advance, no total material destruction). Timelock recovery must handle attacker-owns-a-device-suppresses-veto. |
+| OB-10 | M | P5 | effect-CID binds a call *value*, not the mutable world (symlinks, DNS, container **tags**, repo state, creds) | per-class resource identity in the sealed request (file: path+content-CID/inode; container: image **digest** not tag; repo: commit/tree CID; net: destination+DNS policy). Gate MUST run the exact `Sealed<CallRequest>` whose CID was approved; ambient = named residual, not PO-W. |
+| OB-11 | M | suite | no statement of which profile versions form one compatible suite | a **compatibility manifest**: `suite_version` + per-profile version requires + `conformance_vectors` CID. |
+
+Two of these are the review's sharpest: **OB-9** (a latent fail-open in a
+fail-closed system) and **OB-1** (the clean DAG was prose-cyclic). OB-2 and
+the `attest` factorization remain author's calls.
 
 ## The rule underneath the whole suite
 
