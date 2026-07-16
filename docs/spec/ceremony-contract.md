@@ -1,9 +1,11 @@
 # The Ceremony Contract
 
-**Status:** DRAFT 0.1.5 (2026-07-16) — revised per review rounds 1–4 (#229);
-round 4 = adversarial security review (GPT-5/Codex), findings adjudicated
-against the security-engineering canon (RFC 6962, TUF, Schneier-Kelsey,
-FssAgg, Landrock-Pedersen; see the PR thread). Normative once accepted.
+**Status:** DRAFT 0.1.6 (2026-07-16) — revised per review rounds 1–5 (#229);
+rounds 4–5 = two independent adversarial security reviews (GPT-5/Codex and
+a second LLM), findings adjudicated against the security-engineering canon
+(RFC 6962, TUF, Schneier-Kelsey, FssAgg, Landrock-Pedersen; see the PR
+thread). Two open design forks (§7): the `attest` factorization and whether
+to partition this document into profiles. Normative once accepted.
 **Scope:** the decision-surface and first-contact contract between agent-*
 libraries (which own decision *semantics*) and harnesses (which own
 *rendering*). Companion to the verdict/policy TOML contract (#220) — that
@@ -167,6 +169,17 @@ lossy `display`→effect mapping approves X and executes Y while the CID
 still matches (confused-deputy / TOCTOU). Display and effect are bound
 together under the one signature; a surface that cannot faithfully render
 `effect`'s meaning MUST refuse rather than show a prettier `display`.
+
+**Residual — rendering faithfulness is not cryptographic.** Binding the
+signature to `effect` proves the decision is bound to the *data*; it does
+**not** prove the UI faithfully showed that data to the human. Truncation,
+locale, misleading formatting, hidden arguments, and path abbreviation
+remain human-factors surfaces. This spec therefore requires `display` to
+be derived from `effect` by a profile-defined, deterministic rendering
+function (so display is checkable against effect), and treats a *signed
+render transcript* — the surface attesting the exact bytes it presented —
+as the strengthening path (a Rendering Security Profile, deferred). Named,
+not solved.
 
 A **remote** surface MUST verify the request's signature and that `by`
 chains to a pinned principal **before rendering** — an unauthenticated
@@ -411,6 +424,18 @@ Revoking the **last** root without a `succession` ends the mesh;
 implementations MUST refuse it unless the record carries an explicit
 `"tombstone": true`.
 
+**Break-glass and succession are required, not optional.** A quorum strong
+enough to defeat a hostile revocation is, by the same math, strong enough
+to lock out a legitimate owner who loses `k` keys — availability cuts both
+ways. So enrollment MUST also provision recovery: a pre-enrolled recovery
+factor (offline hardware key / printed share) counted in `n`, plus a
+succession path that transfers a principal root to a new key under quorum
+*or* a time-delayed unilateral recovery (a self-revocation that any single
+device can start but that only takes effect after a published generation
+delay, giving co-signers a window to veto — the "social recovery with
+timelock" pattern). This is a **named required subsystem** (candidate:
+Identity Lifecycle profile), sketched here, not yet fully specified.
+
 ### 3.7 DecisionSurface (the seam)
 
 Language-idiomatic equivalents of:
@@ -579,15 +604,16 @@ anchor of §5.7.** This spec does not claim otherwise.
 
 Two stated assumptions, doing different jobs:
 
-1. **Deterministic signatures.** `H(sig | content, key) = 0` — given the
-   content and the key, the signature carries no fresh entropy. Ed25519
-   provides exactly this (RFC 8032 derives the nonce from key and
-   message), so the whole log is a **pure function** of (genesis, payload
-   sequence, keys). A randomized scheme (ECDSA with random nonce) has
-   `H(sig | content, key) > 0`: two honest signings of identical content
-   yield different line-CIDs, and the chain forks on any re-sign. The
-   entropy identity is the proof obligation that forces a deterministic
-   scheme — it governs *reproducibility*.
+1. **Deterministic signatures.** For Profile v1, signing MUST be
+   deterministic: `Sign(sk, message)` yields one canonical signature
+   encoding for a fixed key and message. Ed25519 provides this (RFC 8032
+   derives the nonce from key and message), so the whole log is a **pure
+   function** of (genesis, payload sequence, keys). A randomized scheme
+   (ECDSA with a random nonce) would produce a different signature — hence
+   a different line-CID — on every re-sign, forking the chain. (The same
+   fact stated information-theoretically: the signature adds no entropy
+   given content and key, `H(sig | content, key) = 0`. The prose rule is
+   normative; the identity is just why.) This governs *reproducibility*.
 2. **Collision resistance of `H`** governs *tamper-evidence*. The two are
    independent: determinism makes the log replayable; collision resistance
    makes it unforgeable.
@@ -634,9 +660,13 @@ construction (per Bluetooth numeric comparison / ZRTP):
    substituting the long-term keys — the classic key-substitution hole
    (§5.6). The SAS must checksum *what is being pinned*, not merely the
    channel;
-3. **a human compares the SAS on both screens** — the out-of-band channel
-   the MITM cannot sit on. The phrase is not a secret to transport; it is
-   a checksum of the handshake two screens must agree on.
+3. **a human compares the SAS on both screens** — a low-bandwidth
+   *authenticated* channel the network MITM is not on. It is not
+   unspoofable: it has a measurable error probability (the SAS entropy)
+   and rests on human-factors assumptions — humans are non-deterministic
+   peripherals who skim. The phrase is not a secret to transport; it is a
+   checksum of the handshake two screens must agree on, and its strength
+   is exactly the guess probability below.
 
 Commit-before-reveal forces a MITM to *guess* the SAS in advance; one
 round of a `xxx-000`-style SAS ≈ 1-in-46k. Paranoia is then a parameter,
@@ -796,7 +826,10 @@ A conforming harness:
       never trusting the surface
 - [ ] (gate) checks a fingerprint's algorithm against the trusted profile
       allowlist *before* dispatch (§3.4, §8)
-- [ ] carries a §5.7 anti-rollback anchor for any shared/persisted store
+- [ ] carries a §5.7 anti-rollback anchor for any shared/persisted store —
+      naming *where* the monotonic head lives (device keystore / TPM or
+      hardware monotonic counter / witness quorum / separately-protected
+      checkpoint); "on disk beside the log" does NOT qualify
 - [ ] ships no rendering into any agent-* library crate
 
 ## 7. Governance — law minimalism
@@ -827,9 +860,37 @@ without a proof obligation demanding it; everything else is mechanism
   honestly split across chain + anchor. **Still five laws.** The review's
   meta-lesson — "prose becomes authority-bearing protocol" — is the case
   for the formal track, not against the design.
+- **Refinements (review 5, 2026-07-16 — second LLM):** confirmed every
+  round-4 fix independently, and sharpened five: deterministic-signature
+  prose over entropy notation (§5.1); human SAS comparison is a
+  measurable-error authenticated channel, *not* "unspoofable" (§5.4);
+  rendering faithfulness named as a residual with a deterministic
+  display-from-effect rule + deferred render transcript (§3.1); break-glass
+  + succession made a required subsystem (§3.6); anti-rollback head
+  location made explicit in conformance (§6.3). No law change.
 - **Next candidate:** L1+L4 are one law ("authority composes by meet") on
   two carriers (verdict lattice, caveat lattice); if the Lean formulation
   unifies them cleanly, five becomes four.
+
+**Open design forks (author's call — not agent-decidable):**
+
+- **The `attest` factorization.** Review 5 argues `attest` is an *assurance
+  condition* (none / presence / hardware-backed), not an *outcome* peer to
+  `allow`/`deny`, and proposes three axes — `effect × assurance × scope` —
+  over one verb axis. Trade-off: three axes are semantically cleaner and
+  future-proof; the single total order is structurally minimal and keeps
+  L1 a plain meet (a product of lattices is still a lattice, so L1 survives
+  either way — the question is factoring, not soundness). Deferred to the
+  author.
+- **Partition into profiles.** Both reviews note this document has grown
+  from a decision-surface contract into a full security constitution
+  (~900 lines: identity, enrollment, revocation, audit, storage, hash
+  agility, rendering). Recommended split — Ceremony Contract (decision
+  semantics) · Signed-Object Profile · Chain-Store Profile · Enrollment
+  Protocol · Identity Lifecycle · Rendering Security Profile — with the
+  five laws as the narrow waist. This is *exactly* the loosely-coupled /
+  functionally-cohesive doctrine applied to the spec itself; strongly
+  recommended, deferred to the author to sequence.
 
 Additions from the same review — the `attest` verb, negative pins, the
 `AuditRecord` — cost **zero** laws: each collapsed into existing structure
