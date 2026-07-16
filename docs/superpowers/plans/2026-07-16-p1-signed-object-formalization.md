@@ -67,7 +67,7 @@ snippets:
 - Produces: Lake library `CeremonyFormal` rooted at `formal/Ceremony` and test
   import `Ceremony.P1.SignedObject`.
 
-- [ ] **Step 1: Add the toolchain and Lake configuration**
+- [x] **Step 1: Add the toolchain and Lake configuration**
 
 ```text
 leanprover/lean4:v4.31.0
@@ -89,7 +89,7 @@ srcDir = "."
 roots = ["Tests"]
 ```
 
-- [ ] **Step 2: Write a test importing the not-yet-created P1 module**
+- [x] **Step 2: Write a test importing the not-yet-created P1 module**
 
 ```lean
 import Ceremony.P1.SignedObject
@@ -104,13 +104,13 @@ example : Not (Profile.v1.allowsHash .sha1) := by decide
 import Tests.SignedObjectContracts
 ```
 
-- [ ] **Step 3: Run the test and verify RED**
+- [x] **Step 3: Run the test and verify RED**
 
 Run: `Push-Location formal; lake build; Pop-Location`
 
 Expected: FAIL because `Ceremony.P1.SignedObject` does not exist.
 
-- [ ] **Step 4: Commit only after Task 2 reaches green**
+- [x] **Step 4: Commit only after Task 2 reaches green**
 
 The scaffold, model, and tests land together in Task 2 so no commit leaves the
 default Lake target broken.
@@ -129,7 +129,7 @@ default Lake target broken.
   `VerifiedEnvelope`, `Sealed`, `sealValue`, and
   `sealed_eq_of_same_canonical`.
 
-- [ ] **Step 1: Extend the test with the wished-for sealing API**
+- [x] **Step 1: Extend the test with the wished-for sealing API**
 
 ```lean
 def bytesEncoding : CanonicalEncoding ByteArray where
@@ -144,14 +144,14 @@ example (a b : ByteArray) (h : bytesEncoding.encode a = bytesEncoding.encode b) 
 example (value : ByteArray) : (sealValue bytesEncoding value).value = value := rfl
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run: `Push-Location formal; lake build; Pop-Location`
 
 Expected: FAIL with unknown identifiers such as `CanonicalEncoding` and
 `sealValue`.
 
-- [ ] **Step 3: Implement the minimal P1 model**
+- [x] **Step 3: Implement the minimal P1 model**
 
 Define finite algorithm enums, a v1 profile containing exactly BLAKE3-256,
 Ed25519, and DAG-CBOR, proof-carrying allowed-algorithm wrappers, an injective
@@ -216,7 +216,7 @@ def sealValue (encoding : CanonicalEncoding Value) (value : Value) : Sealed enco
 Parsing and concrete signature verification remain boundary parameters rather
 than hidden axioms.
 
-- [ ] **Step 4: Prove canonical identity and profile rejection**
+- [x] **Step 4: Prove canonical identity and profile rejection**
 
 Add theorems with these exact signatures:
 
@@ -233,13 +233,13 @@ theorem json_not_allowed : Not (Profile.v1.allowsCodec .json)
 theorem dag_cbor_allowed : Profile.v1.allowsCodec .dagCbor
 ```
 
-- [ ] **Step 5: Run the focused proof build and verify GREEN**
+- [x] **Step 5: Run the focused proof build and verify GREEN**
 
 Run: `Push-Location formal; lake build; Pop-Location`
 
 Expected: PASS with both `CeremonyFormal` and `SignedObjectContracts` built.
 
-- [ ] **Step 6: Commit the P1 model**
+- [x] **Step 6: Commit the P1 model**
 
 ```text
 formal(lean): prove P1 signed-object contracts
@@ -261,7 +261,7 @@ Co-Authored-By: OpenAI GPT-5 <codex@openai.com>
   `verifyEnvelope`, `dispatchHash`, and rejection theorems for unsupported
   versions, critical fields, and algorithms.
 
-- [ ] **Step 1: Write failing tests for hostile inputs**
+- [x] **Step 1: Write failing tests for hostile inputs**
 
 ```lean
 def v1Envelope : RawEnvelope :=
@@ -304,13 +304,13 @@ theorem no_v1_sha1_witness
   exact sha1_not_allowed allowed.allowed
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run: `Push-Location formal; lake build; Pop-Location`
 
 Expected: FAIL because envelope verification and safe dispatch are undefined.
 
-- [ ] **Step 3: Implement staged verification**
+- [x] **Step 3: Implement staged verification**
 
 `verifyEnvelope` checks version, rejects non-empty critical unknown fields,
 checks profile membership, and only then constructs the proof witness passed to
@@ -328,8 +328,7 @@ structure RawEnvelope where
   unknownCritical : List String
   deriving DecidableEq
 
-structure VerifiedEnvelope (profile : Profile) where
-  raw : RawEnvelope
+structure VerifiedEnvelope (profile : Profile) (raw : RawEnvelope) where
   version_eq : raw.version = profile.version
   critical_empty : raw.unknownCritical = []
   allowedHash : AllowedHash profile
@@ -340,13 +339,13 @@ structure VerifiedEnvelope (profile : Profile) where
   codec_eq : allowedCodec.codec = raw.codec
 
 def verifyEnvelope (profile : Profile) (raw : RawEnvelope) :
-    Option (VerifiedEnvelope profile) :=
+    Option (VerifiedEnvelope profile raw) :=
   if hv : raw.version = profile.version then
     if hc : raw.unknownCritical = [] then
       if hh : profile.allowsHash raw.hash then
         if hs : profile.allowsSignature raw.signature then
           if hcodec : profile.allowsCodec raw.codec then
-            some { raw, version_eq := hv, critical_empty := hc,
+            some { version_eq := hv, critical_empty := hc,
               allowedHash := { algorithm := raw.hash, allowed := hh },
               hash_eq := rfl,
               allowedSignature := { algorithm := raw.signature,
@@ -360,7 +359,7 @@ def verifyEnvelope (profile : Profile) (raw : RawEnvelope) :
   else none
 ```
 
-- [ ] **Step 4: Prove fail-closed behavior**
+- [x] **Step 4: Prove fail-closed behavior**
 
 Add theorems with these exact statements:
 
@@ -386,7 +385,7 @@ theorem unknown_critical_rejected
     verifyEnvelope profile raw = none
 ```
 
-- [ ] **Step 5: Run all Lean targets and verify GREEN**
+- [x] **Step 5: Run all Lean targets and verify GREEN**
 
 Run: `Push-Location formal; lake build; Pop-Location`
 

@@ -10,6 +10,15 @@ inductive SignatureAlgorithm
   | ecdsa
   deriving DecidableEq, Repr
 
+def SignatureAlgorithm.isDeterministic : SignatureAlgorithm -> Prop
+  | .ed25519 => True
+  | .ecdsa => False
+
+instance (algorithm : SignatureAlgorithm) :
+    Decidable algorithm.isDeterministic := by
+  cases algorithm <;> unfold SignatureAlgorithm.isDeterministic <;>
+    exact inferInstance
+
 inductive Codec
   | dagCbor
   | json
@@ -104,8 +113,122 @@ theorem ed25519_allowed : Profile.v1.allowsSignature .ed25519 := by decide
 
 theorem ecdsa_not_allowed : Not (Profile.v1.allowsSignature .ecdsa) := by decide
 
+theorem v1_signature_is_deterministic
+    (allowed : AllowedSignature Profile.v1) :
+    allowed.algorithm.isDeterministic := by
+  rcases allowed with ⟨algorithm, algorithmAllowed⟩
+  cases algorithm with
+  | ed25519 => trivial
+  | ecdsa => exact False.elim (ecdsa_not_allowed algorithmAllowed)
+
 theorem dag_cbor_allowed : Profile.v1.allowsCodec .dagCbor := by decide
 
 theorem json_not_allowed : Not (Profile.v1.allowsCodec .json) := by decide
+
+structure RawEnvelope where
+  version : Nat
+  hash : HashAlgorithm
+  signature : SignatureAlgorithm
+  codec : Codec
+  receivedCanonical : ByteArray
+  unknownCritical : List String
+  deriving DecidableEq
+
+structure VerifiedEnvelope (profile : Profile) (raw : RawEnvelope) where
+  version_eq : raw.version = profile.version
+  critical_empty : raw.unknownCritical = []
+  allowedHash : AllowedHash profile
+  hash_eq : allowedHash.algorithm = raw.hash
+  allowedSignature : AllowedSignature profile
+  signature_eq : allowedSignature.algorithm = raw.signature
+  allowedCodec : AllowedCodec profile
+  codec_eq : allowedCodec.codec = raw.codec
+
+def verifyEnvelope (profile : Profile) (raw : RawEnvelope) :
+    Option (VerifiedEnvelope profile raw) :=
+  if versionEq : raw.version = profile.version then
+    if criticalEmpty : raw.unknownCritical = [] then
+      if hashAllowed : profile.allowsHash raw.hash then
+        if signatureAllowed : profile.allowsSignature raw.signature then
+          if codecAllowed : profile.allowsCodec raw.codec then
+            some
+              { version_eq := versionEq
+                critical_empty := criticalEmpty
+                allowedHash :=
+                  { algorithm := raw.hash
+                    allowed := hashAllowed }
+                hash_eq := rfl
+                allowedSignature :=
+                  { algorithm := raw.signature
+                    allowed := signatureAllowed }
+                signature_eq := rfl
+                allowedCodec :=
+                  { codec := raw.codec
+                    allowed := codecAllowed }
+                codec_eq := rfl }
+          else none
+        else none
+      else none
+    else none
+  else none
+
+theorem verified_hash_allowed
+    {profile : Profile} {raw : RawEnvelope}
+    {verified : VerifiedEnvelope profile raw}
+    (_h : verifyEnvelope profile raw = some verified) :
+    profile.allowsHash verified.allowedHash.algorithm :=
+  verified.allowedHash.allowed
+
+theorem verified_signature_allowed
+    {profile : Profile} {raw : RawEnvelope}
+    {verified : VerifiedEnvelope profile raw}
+    (_h : verifyEnvelope profile raw = some verified) :
+    profile.allowsSignature verified.allowedSignature.algorithm :=
+  verified.allowedSignature.allowed
+
+theorem verified_codec_allowed
+    {profile : Profile} {raw : RawEnvelope}
+    {verified : VerifiedEnvelope profile raw}
+    (_h : verifyEnvelope profile raw = some verified) :
+    profile.allowsCodec verified.allowedCodec.codec :=
+  verified.allowedCodec.allowed
+
+theorem unsupported_version_rejected
+    {profile : Profile} {raw : RawEnvelope}
+    (h : Not (raw.version = profile.version)) :
+    verifyEnvelope profile raw = none := by
+  simp [verifyEnvelope, h]
+
+theorem unknown_critical_rejected
+    {profile : Profile} {raw : RawEnvelope}
+    (h : Not (raw.unknownCritical = [])) :
+    verifyEnvelope profile raw = none := by
+  simp [verifyEnvelope, h]
+
+def VerifiedEnvelope.receivedCanonical
+    {profile : Profile} {raw : RawEnvelope}
+    (_verified : VerifiedEnvelope profile raw) : ByteArray :=
+  raw.receivedCanonical
+
+theorem verified_preserves_received
+    {profile : Profile} {raw : RawEnvelope}
+    (verified : VerifiedEnvelope profile raw) :
+    verified.receivedCanonical = raw.receivedCanonical := rfl
+
+inductive HashImplementation
+  | blake3
+  | legacySha1
+  deriving DecidableEq, Repr
+
+def dispatchHash (allowed : AllowedHash profile) : HashImplementation :=
+  match allowed.algorithm with
+  | .blake3_256 => .blake3
+  | .sha1 => .legacySha1
+
+theorem no_v1_sha1_witness (allowed : AllowedHash Profile.v1) :
+    Not (allowed.algorithm = .sha1) := by
+  intro h
+  apply sha1_not_allowed
+  simpa [h] using allowed.allowed
 
 end Ceremony.P1
