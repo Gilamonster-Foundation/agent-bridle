@@ -1,7 +1,9 @@
 # The Ceremony Contract
 
-**Status:** DRAFT 0.1.4 (2026-07-16) — revised per review rounds 1–3 (#229).
-Normative once accepted.
+**Status:** DRAFT 0.1.5 (2026-07-16) — revised per review rounds 1–4 (#229);
+round 4 = adversarial security review (GPT-5/Codex), findings adjudicated
+against the security-engineering canon (RFC 6962, TUF, Schneier-Kelsey,
+FssAgg, Landrock-Pedersen; see the PR thread). Normative once accepted.
 **Scope:** the decision-surface and first-contact contract between agent-*
 libraries (which own decision *semantics*) and harnesses (which own
 *rendering*). Companion to the verdict/policy TOML contract (#220) — that
@@ -99,8 +101,20 @@ two principals pinning each other's roots — L5 again, one level up.
 
 ## 3. Wire objects
 
-Field names are normative; unknown fields MUST be ignored (forward
-compatibility). All objects carry `"v": 1`.
+Field names are normative. All objects carry `"v": <profile-version>`, and
+verification dispatches on it (**version dispatch**, not lenient parsing).
+
+**Signature verification is over the received canonical bytes, never over
+a re-serialization.** Typed deserialization drops unknown fields, so
+reserializing a parsed object cannot reproduce the signed digest — verify
+the bytes as received, then parse (RFC 8785 canonicalization pitfall;
+JWS/COSE practice). **Unknown authority-bearing fields fail closed:** an
+object carrying a field the profile version does not define is *rejected*,
+not ignored — tolerating it is a silent downgrade / version-confusion
+surface (finding #7). Non-authority annotations MAY be preserved verbatim
+only when the profile marks them non-critical (COSE critical-header model).
+Exactly **one** of `grant` / `escalate` is permitted on a Decision;
+zero-or-both is rejected.
 
 **The Memo discipline (WF-2).** Every wire object is a Memo-descendant,
 with capabilities attached by *mechanical criteria* — a boundary test, not
@@ -130,13 +144,29 @@ What a gate hands a surface when a verdict resolves to interaction.
 {
   "v": 1,
   "subject": "b3:9f2c…",                 // Fingerprint — an identity, never a location
-  "action":  { "class": "exec", "display": "run_command: cd <path>" },
+  "action": {
+    "class":   "exec",
+    "display": "run_command: cd <path>",  // human-facing presentation
+    "effect":  "cid:…"                    // content-CID of the CANONICAL resolved call
+  },
   "violation": "outside-granted-allowlist",
   "matrix":  { … },                       // §3.2
   "context": { "session": "…", "rationale": "…", "generation": 41 },
   "by": "b3:…", "sig": "…"                // the GATE's signature — required remote (Memo discipline)
 }
 ```
+
+**`effect` binds the signature to what executes, not to what is shown**
+(finding #2 — *what you see is what you sign*, Landrock-Pedersen 1998).
+`display` is a lossy human rendering; `effect` is the content-CID of the
+canonical, fully-resolved call (arguments *and* resolved resources — the
+`CallRequest` the tool layer already produces). The gate MUST, before
+minting authority, **recompute the canonical effect from the call it is
+about to run and check it equals `action.effect`** — otherwise a stale or
+lossy `display`→effect mapping approves X and executes Y while the CID
+still matches (confused-deputy / TOCTOU). Display and effect are bound
+together under the one signature; a surface that cannot faithfully render
+`effect`'s meaning MUST refuse rather than show a prettier `display`.
 
 A **remote** surface MUST verify the request's signature and that `by`
 chains to a pinned principal **before rendering** — an unauthenticated
@@ -199,31 +229,71 @@ conformance (§6.2) — deliberately *not* a law; see §7.
 ### 3.3 Decision
 
 ```json
-{ "v": 1, "grant": { "verb": "allow", "scope": "session" } }
-{ "v": 1, "grant": { "verb": "attest", "scope": "session" } }   // + presence discharge
-{ "v": 1, "escalate": "audit" }
+{ "v": 1, "request": "cid:…",            // content-CID of the PermissionRequest AS ISSUED
+  "grant": { "verb": "allow", "scope": "once" },
+  "by": "b3:…", "sig": "…" }             // sig over this record's content-CID
+{ "v": 1, "request": "cid:…",
+  "grant": { "verb": "attest", "scope": "session",
+             "discharge": { "challenge": "cid:…", "attempt": "…" } },  // §3.3.1
+  "by": "b3:…", "sig": "…" }
+{ "v": 1, "request": "cid:…", "escalate": "audit", "by": "b3:…", "sig": "…" }
 ```
 
 `escalate` carries **zero authority** (L4): it navigates the human to a
-richer surface; the request remains undecided until a `grant` returns.
+richer surface; the request remains undecided until a `grant` returns. A
+**remote** surface MUST sign its decisions; an in-process surface MAY omit
+`by`/`sig` (§2.1), but the `request` binding is unconditional.
 
-A **remote** surface MUST sign its decisions — and the decision MUST name
-the request it answered:
+**Gate acceptance is a checklist of MUSTs — the client is never trusted**
+(finding #3; never-trust-client authorization / capability monotonicity).
+The gate mints authority only when *all* hold:
 
-```json
-{ "v": 1, "request": "cid:…",            // content-CID of the PermissionRequest AS RENDERED
-  "grant": { "verb": "allow", "scope": "once" },
-  "by": "b3:…", "sig": "…" }             // sig over this record's content-CID
-```
+1. `request` equals the content-CID of the `PermissionRequest` the gate
+   itself issued (render-swap closure, §5.6);
+2. `grant.verb ∈ matrix.verbs` **and** `grant.scope ∈ matrix.scopes` —
+   the answer is a member of the *offered* option-set;
+3. the resulting authority is `⊑` the request's ceiling (L4) — a
+   `once/session` request can never be answered `always`; a surface
+   cannot return more than was asked;
+4. the executable effect recomputes equal to `action.effect` (§3.1);
+5. if `grant.verb == attest`, the discharge verifies (§3.3.1).
 
-The gate accepts a decision only if `request` matches the CID of the
-request it actually issued — binding *what the human saw* to *what was
-granted*, which closes the render-swap MITM (§5.6). An in-process surface
-MAY omit `by`/`sig` (§2.1); the `request` binding is unconditional.
+A buggy or compromised surface that violates any of these is refused at
+the gate, not obeyed — the wire enforces L4, it does not merely state it.
+
+#### 3.3.1 Attest discharge
+
+An `attest` grant is **inert until a presence proof is verified**
+(finding #4 — a verb meaning "prove presence" must carry the proof and a
+normative verify step; WebAuthn/FIDO2 challenge-response). It reuses
+bridle's shipped step-up contract:
+
+- the gate issues a **domain-separated, single-use `Challenge`** (its
+  content-CID is `discharge.challenge`), bound to this request's CID, the
+  subject, and the current generation;
+- the authenticator returns a `DischargeAttempt` (`discharge.attempt`) —
+  a WebAuthn assertion over that challenge;
+- the gate verifies it through `step_up::DischargeVerifier` and marks the
+  challenge consumed **before** the grant takes effect. `attest × session`
+  binds the verified discharge to the generation; a new generation voids
+  it. An unverified or replayed discharge yields **no** authority.
 
 ### 3.4 Introduction
 
-First contact: an unpinned identity proposing itself.
+First contact is a **two-message challenge-response**, because freshness
+comes from the *recipient*, never from the introducer (finding #5 — a
+self-chosen nonce inside a self-signed object is byte-for-byte replayable;
+the party seeking assurance must issue and consume the challenge).
+
+**Message 1 — the recipient issues a challenge** it will remember:
+
+```json
+{ "v": 1, "challenge": "…",              // fresh random, recipient-generated
+  "issued_by": "b3:…",                    // the recipient's fingerprint
+  "for_generation": 41, "expires_at_generation": 42 }
+```
+
+**Message 2 — the introducer answers, binding that challenge:**
 
 ```json
 {
@@ -233,20 +303,28 @@ First contact: an unpinned identity proposing itself.
   "channel": "mdns | dial-back | relay | manual | qr",
   "proposed_caveats": [ … ],               // Caveats; the requested ceiling
   "observed": { "addr_candidates": [ … ] },// candidates, never load-bearing
-  "fresh": "…",                            // transcript-bound challenge/nonce
-  "sig": "…"                               // by the INTRODUCED key, over this record — proof of possession
+  "answers": "…",                          // the recipient's challenge, echoed
+  "transcript": "cid:…",                   // binds both fingerprints + msg 1
+  "sig": "…"                               // by the INTRODUCED key over all of the above
 }
 ```
 
-On receipt, an implementation MUST, **before any surface renders it**:
+On receipt of message 2, an implementation MUST, **before any surface
+renders it**:
 
-1. verify the fingerprint is a valid multihash name of `pubkey` —
-   recomputed under the fingerprint's *own* hash code (self-certification
-   is checked by the library, never delegated to the human);
-2. verify `sig` under `pubkey` over this record including `fresh` —
-   **proof of possession**, transcript-bound so a bystander cannot replay
-   *someone else's* introduction as their own (the unknown-key-share
-   closure, §5.6; parity with mesh #40's PoP-to-certify).
+1. confirm `answers` is a challenge **this recipient issued, still
+   unconsumed and unexpired**, then mark it consumed — replay-state lives
+   with the challenger, so a captured introduction cannot be re-presented
+   (Needham-Schroeder / station-to-station; unknown-key-share closure);
+2. confirm the fingerprint's declared hash algorithm is a **member of the
+   locally-trusted profile allowlist (§8) — checked *before* any hashing**
+   (finding #8; the `alg:none`/algorithm-confusion class — never let the
+   object choose its own verifier), then verify the fingerprint is that
+   algorithm's multihash name of `pubkey` (self-certification checked by
+   the library, never by the human);
+3. verify `sig` under `pubkey` over message 2 including `answers` and
+   `transcript` — **proof of possession**, transcript-bound so a bystander
+   cannot relay someone else's introduction as their own.
 
 ### 3.5 PinRecord / GrantRecord (the chain-store)
 
@@ -290,9 +368,11 @@ witnesses the store's state and signs what it saw.
 
 It is appended to the chain-store like any record (its own content-CID,
 sig, parents), so audits are themselves tamper-evident and auditable. No
-new law — L5 composed with the log; one new record type. Audits double as
-**freshness checkpoints**: a peer presenting a head must show it extends
-the last head this participant witnessed (rollback resistance, §5.6).
+new law — L5 composed with the log; one new record type. An audit's
+`witnessed_head`, once **exported to independently-protected storage**
+(§5.7), becomes an anti-rollback anchor — but an AuditRecord that lives
+*only inside the chain* rolls back with it and anchors nothing (finding
+#1). Anti-rollback is §5.7's job; the AuditRecord is its raw material.
 
 **RevocationRecord** — punting a load-bearing identity is itself a
 ceremony, and per L2 it demands **quorum**:
@@ -300,18 +380,36 @@ ceremony, and per L2 it demands **quorum**:
 ```json
 {
   "v": 1,
-  "revoke": "b3:…",                       // the fingerprint being punted
-  "reason": "compromise | rotation | retirement",
-  "succession": "b3:…",                    // optional successor (root rotation)
-  "signers": [ { "by": "b3:…", "sig": "…" }, … ]   // k-of-n per quorum policy
+  "payload": {                             // the CANONICAL UNSIGNED payload — every signer signs THIS
+    "revoke": "b3:…",                      // the fingerprint being punted
+    "reason": "compromise | rotation | retirement",
+    "succession": "b3:…",                  // optional successor (root rotation)
+    "policy": "cid:…"                      // the quorum policy in force
+  },
+  "signers": [                             // detached; each sig is over content-CID(payload)
+    { "by": "b3:aa…", "sig": "…" },
+    { "by": "b3:cc…", "sig": "…" }         // sorted by `by`, deduplicated
+  ]
 }
 ```
 
-The quorum policy (k, n, eligible signers) is itself a principal-signed
-loosening entry established at setup — defining *who may revoke* is
-authority structure, governed by L2 like any other loosening. Revoking the
-**last** root without a `succession` ends the mesh; implementations MUST
-refuse it unless the record carries an explicit `"tombstone": true`.
+**One payload, many detached signatures** (finding #6 — a signature nested
+in the object it signs is circular; each signer would otherwise sign a
+different, progressively-grown record). Every signer signs
+`content-CID(payload)` — the fixed unsigned inner object — so all
+signatures cover *identical* bytes. `signers` is **sorted by `by` and
+deduplicated** (one identity cannot count twice toward `k`), and the
+signature set is *not* part of what is signed. The chain-append signature
+(`sig` over the whole record's content-CID, WF-2) is separate from the
+quorum signatures and added last.
+
+Acceptance: `|distinct valid signers ∩ eligible| ≥ k` under the named
+`policy`. The quorum policy (k, n, eligible signers) is itself a
+principal-signed loosening entry established at setup — defining *who may
+revoke* is authority structure, governed by L2 like any other loosening.
+Revoking the **last** root without a `succession` ends the mesh;
+implementations MUST refuse it unless the record carries an explicit
+`"tombstone": true`.
 
 ### 3.7 DecisionSurface (the seam)
 
@@ -370,19 +468,27 @@ needs no key; **irreversible narrowing — revoking a load-bearing identity
 adversary who can *force* closure. "Reset mesh" must not be a
 denial-of-service surface. Availability is a security property.
 
-**Mechanism honesty:** under flat policy files this law holds for
-**additions only**. *Deleting* a restrictive entry (a durable deny) widens
-authority, and flat files cannot detect the deletion — signatures guard
-loosening additions, not restrictive removals. Extending L2 to the full
-mutation set {add, delete, reorder} **requires the chain-store** (§5.1);
-the chain is load-bearing for this law, not an optimization. (Surfaced by
-the negative-pins review thread: the teenager with disk access deleting
-the deny row is the threat model.)
+**Mechanism honesty (two layers).** Under flat policy files this law holds
+for **additions only** — deleting a restrictive entry widens authority and
+flat files cannot detect it. The chain-store (§5.1) extends detection to
+{add, delete, reorder} of the log's *interior*. But the chain-store **by
+itself does not detect rollback/truncation of the log's *tail*, nor a
+split-view fork** (finding #1): an attacker who truncates a restrictive
+suffix and its head, or presents an older valid fork, leaves a prefix that
+still verifies — this is the established limit of every hash-chained log
+(Schneier-Kelsey 1999; FssAgg / eprint 2008/185; and the reason
+Certificate Transparency requires gossiped Signed Tree Heads, RFC 6962).
+Closing it requires an **independently-protected monotonic anchor** (§5.7),
+*not* the chain alone. An anti-rollback claim resting on an in-chain
+AuditRecord is circular — it rolls back with the log it certifies.
 
-**Hypothesis H1 (append-only-verifiability):** `m` cannot undetectably
-remove a record or reintroduce a previously-signed one. H1 is discharged by
-the chain-store (§5.1), not assumed. **PO-2** (proved under H1; H1's
-discharge is PO-2a; quorum soundness for revocation is PO-2b).
+**Hypothesis H1 (append-only-verifiability + monotone freshness):** `m`
+cannot undetectably remove/reintroduce an *interior* record (chain-store),
+**nor roll the log back past the last independently-anchored head** (§5.7).
+H1 is *discharged by mechanism*, not assumed: interior integrity by the
+chain (**PO-2a**), tail/fork integrity by the external anchor (**PO-2c**),
+revocation-quorum soundness by §3.6 (**PO-2b**). **PO-2** proves ⊑-monotony
+under H1.
 
 ### L3 — Fail-closed totality
 
@@ -458,11 +564,18 @@ parents(record_{i+1}) ∋ ℓ_i              descendants commit to content AND s
 
 Parents reference the **line-CID** — the full predecessor *including its
 signature* — so stripping or swapping a historical signature breaks the
-chain just as surely as editing content. Removing a record orphans the
-head; replaying a deleted record re-enters with a stale parent set. Both
-verify-fail loudly. This is what discharges H1 and extends L2 to
-deletions, retiring the documented known-limit of flat signed files
-(policy.rs; #226).
+chain just as surely as editing content. Editing or removing an *interior*
+record orphans every descendant's parent link — it verify-fails loudly
+**against a head the verifier already trusts**. This extends interior
+integrity to deletions and retires the flat-file known-limit (policy.rs;
+#226).
+
+**What the chain alone does NOT do (finding #1):** verification is always
+*relative to a head*. Against an attacker who also controls the head —
+truncating the tail, or presenting a wholly older/forked-but-valid log —
+the surviving prefix verifies fine and nothing is orphaned. The chain
+gives interior integrity; **tail and fork integrity require the external
+anchor of §5.7.** This spec does not claim otherwise.
 
 Two stated assumptions, doing different jobs:
 
@@ -583,14 +696,53 @@ corroboration is k-of-n, and n just shrank by one.
 | Remote surface | **render-swap**: human approves X, gate runs Y | `Decision.request` = content-CID of the request as rendered; sig covers it; gate matches CIDs (§3.3) | compromised surface *device* → its grants are attributable + revocable |
 | Remote surface | **phishing canvas**: forged/unsolicited requests train the human | requests are gate-signed; surface verifies chain-to-pinned-principal *before rendering* (§3.1) | compromised gate key → quorum revocation |
 | Chain-store sync | forgery in transit | records are self-authenticating (signed + chained); transport can corrupt nothing silently | — |
-| Chain-store sync | **rollback** (stale head hides a revocation) | heads are monotonic (L2 structural clause); AuditRecords are witnessed freshness checkpoints (§3.6) | withholding = visible staleness → treat as degraded, fail closed |
+| Chain-store sync | **rollback / truncation / fork** (stale-but-valid head hides a revocation) | external anti-rollback anchor (§5.7): independently-stored monotonic head + witness cosigning + fork = proof-of-misbehavior. The chain alone does NOT close this. | withholding = visible staleness vs. a remembered anchor → fail closed |
 | Anchor channel | compromised registry vouches a fake root | anchors are blessed, k-of-n, never sufficient alone (§5.5) | k−1 colluding anchors corroborate nothing |
 | The human | prompt fatigue / phishing the ceremony | `attest` for high ceilings; distinct ceremony UI is consumer guidance (newt#1209) | irreducible; parameterized paranoia exists for exactly this |
 
 The pattern behind every row: **the authenticated thing is always the
 key, never the channel** — locations, relays, registries, and rendered
 pixels are candidates and hints; signatures and CIDs are what the gate
-trusts. One doctrine, applied ten times.
+trusts. One doctrine, applied across every row.
+
+### 5.7 The anti-rollback anchor (external, load-bearing for L2·H1)
+
+A hash-chained log is verified *relative to a head*. Every such log —
+Schneier-Kelsey secure audit logs (1999), the FssAgg truncation analysis
+(eprint 2008/185), Certificate Transparency (RFC 6962) — shares one limit:
+**an attacker who controls the head can truncate the tail or present an
+older/forked-but-internally-valid log, and it still verifies.** The chain
+gives interior integrity only. Closing tail-and-fork requires state the
+attacker does not control. This spec adopts the three canonical layers,
+in ascending assurance:
+
+1. **Independently-protected monotonic head (required).** Each participant
+   remembers, in storage separate from the log, the highest
+   `(generation, length, head-CID)` it has accepted, and **MUST reject any
+   presented head that is not a consistent forward-extension** of it —
+   never a shorter length or lower generation (the TUF rule: *"clients
+   MUST NOT replace metadata with a version number less than the one
+   currently trusted"*, RFC 6962 monotonicity). This alone defeats
+   truncation and rollback *for that participant*.
+2. **Witness cosigning (recommended for shared stores).** The head is
+   periodically countersigned by one or more witnesses whose signatures
+   are the `AuditRecord`s of §3.6 **exported off-chain**. A participant
+   accepts a head only if it carries a witness cosignature no older than
+   its freshness policy (CT gossip / STH; witness-cosigning). This defeats
+   *secret* equivocation: to fool a victim the attacker must fork the
+   witnesses too.
+3. **Fork = proof of misbehavior (required).** Two validly-signed heads of
+   the same store at the same length with different CIDs are incontestable
+   evidence of equivocation (RFC 6962). Implementations MUST treat a
+   detected fork as a security event, halt authority minting from that
+   store, and escalate — never silently pick one.
+
+For a solo user (§5.4's n=2 world) the monotonic head lives on each of
+their own enrolled devices, and each device is the other's witness — the
+same k-of-n substrate as revocation, reused. A quorum/witness set is the
+enterprise instance of the identical mechanism. **Nothing here trusts the
+storage medium**; the anchor is trusted state a participant carries into
+each verification, exactly as `pinned` is.
 
 ## 6. Conformance
 
@@ -613,8 +765,9 @@ Lean via Aeneas:
 |---|---|---|
 | PO-1 | L1 | ⨅-fold is order-independent (assoc ∘ comm ∘ idem) |
 | PO-2 | L2 | sub-quorum mutation is ⊑-monotone, under H1 |
-| PO-2a | L2·H1 | chain-store rejects removed and replayed records |
+| PO-2a | L2·H1 | chain-store rejects removed/replayed *interior* records (vs. a trusted head) |
 | PO-2b | L2 | a sub-quorum coalition cannot shrink the load-bearing pin set |
+| PO-2c | L2·H1 | against the §5.7 anchor, tail truncation and fork are rejected (not merely detected-later) |
 | PO-3 | L3 | totality + monotone headless degradation |
 | PO-4 | L4 | meet never amplifies (kernel restatement) |
 | PO-5 | L5 | no association without pin; re-key forces re-ceremony |
@@ -635,7 +788,15 @@ A conforming harness:
 - [ ] relies on the library's self-certification + proof-of-possession
       checks (§3.4) rather than asking the human to compare key bytes
 - [ ] (remote) verifies a request's gate signature before rendering (§3.1)
-- [ ] constructs wire objects only through verified load (Sealed; WF-2)
+- [ ] constructs wire objects only through verified load (Sealed; WF-2),
+      verifying signatures over received bytes and rejecting unknown
+      authority-bearing fields fail-closed (§3)
+- [ ] (gate) enforces the §3.3 acceptance checklist — request-CID match,
+      matrix membership, ceiling, effect recomputation, attest discharge —
+      never trusting the surface
+- [ ] (gate) checks a fingerprint's algorithm against the trusted profile
+      allowlist *before* dispatch (§3.4, §8)
+- [ ] carries a §5.7 anti-rollback anchor for any shared/persisted store
 - [ ] ships no rendering into any agent-* library crate
 
 ## 7. Governance — law minimalism
@@ -655,6 +816,17 @@ without a proof obligation demanding it; everything else is mechanism
   multihash directive landed as wire discipline (WF-2) and profile (§8) —
   laws name *properties*; algorithms are pins. L5 de-algorithm'd. Zero
   count change.
+- **Executed (review 4, 2026-07-16 — adversarial security review,
+  GPT-5/Codex):** eight true-positive findings, all adjudicated against
+  the canon and closed as *enforcement* (gate MUSTs, §3.3), *mechanism*
+  (external anti-rollback anchor §5.7; recipient-issued challenge §3.4;
+  canonical quorum payload §3.6; effect-CID binding §3.1), and *wire
+  discipline* (fail-closed unknown fields §3; algorithm allowlist §3.4,
+  §8). The one law touched — L2 — was *corrected*, not multiplied: its
+  H1 was over-claimed (chain alone ⇏ rollback resistance) and is now
+  honestly split across chain + anchor. **Still five laws.** The review's
+  meta-lesson — "prose becomes authority-bearing protocol" — is the case
+  for the formal track, not against the design.
 - **Next candidate:** L1+L4 are one law ("authority composes by meet") on
   two carriers (verdict lattice, caveat lattice); if the Lean formulation
   unifies them cleanly, five becomes four.
@@ -668,6 +840,16 @@ or landed below the line. The algebra decides the count; ambition doesn't.
 Algorithms are **implementation details**; each pin states the *property*
 any replacement must carry. Identifiers are self-describing (multihash /
 multicodec), so profile rotation happens under a running mesh.
+
+**Agility needs an allowlist, or it is a downgrade attack** (finding #8).
+Self-describing identifiers let the *object* declare its algorithm — so a
+verifier that dispatches on the declared code alone lets the attacker pick
+a broken hash (the `alg:none` / algorithm-confusion class). Therefore: a
+verifier MUST check the declared code against **this locally-trusted
+profile table before hashing or verifying**, and reject anything outside
+it. Profile *rotation* is a negotiated, principal-signed change to the
+allowlist (a loosening entry, L2), never a per-object choice. Agility
+lives in the profile, not on the wire.
 
 | Pin | v1 value | Required property (the law's interest) |
 |---|---|---|
