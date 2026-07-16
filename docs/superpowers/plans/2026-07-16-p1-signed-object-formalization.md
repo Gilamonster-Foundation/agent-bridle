@@ -9,12 +9,12 @@
 encoding, sealed loading, strict version handling, and algorithm
 allowlist-before-dispatch explicit proof obligations.
 
-**Architecture:** A dependency-free Lean project models only P1. An abstract
-`CanonicalEncoding` interface carries the profile's injectivity premise;
-`VerifiedEnvelope` and `Sealed` make verify-before-parse structural; and the
-algorithm dispatcher can only receive an `AllowedAlgorithm` witness. Negative
-examples demonstrate why raw attacker-selected dispatch and reserialization
-after parsing are not admissible APIs.
+**Architecture:** A dependency-free Lean project models only P1. A signed-byte
+envelope embeds the canonical body and universal signature domain. An abstract
+codec proves every decoded envelope recomposes to the exact received bytes;
+named cryptographic soundness contracts connect executable checks to digest
+binding and signature origin. Verified constructors are private, and algorithm
+dispatch requires the active `TrustedProfile` witness.
 
 **Tech Stack:** Lean 4 `v4.31.0` via elan/lake, Rust workspace checks, GitHub
 Actions on Ubuntu and Windows, PowerShell-compatible local commands.
@@ -30,6 +30,27 @@ Actions on Ubuntu and Windows, PowerShell-compatible local commands.
 - Automated tests are deterministic and use no live services.
 - Every commit is authored as Shawn Hartsock and includes
   `Co-Authored-By: OpenAI GPT-5 <codex@openai.com>`.
+
+## Parent-Reconciliation Amendment
+
+PR #229 added OB-4 and OB-6 after the initial TDD outline below was written.
+These requirements supersede the earlier `RawEnvelope` and public `Sealed`
+snippets:
+
+- Transport is an explicit signed-bytes envelope. JSON/TOML carry an encoded
+  canonical body; authority never depends on their reserialization.
+- The codec contract requires `decode received = some envelope` to imply
+  `encode envelope = received`.
+- Every signature covers record type, store ID, causal thread or principal,
+  profile/version, codec, CID, signer, and canonical body.
+- Executable digest and signature checks carry soundness proofs into named
+  Tier-1 `DigestBinding` and `SignedBy` relations.
+- Verified and parsed-value constructors are private. The only production path
+  is decode, profile/field validation, CID/signature verification, then parse.
+- Cryptographic dispatch requires both an allowlist witness and the active
+  `TrustedProfile`; caller-created profiles cannot reach legacy dispatch.
+- The proof gate scans every Lean source in `formal/`, rejects proof escapes,
+  and rejects modules omitted from the root import graph.
 
 ---
 

@@ -38,6 +38,10 @@ behind a small verified interface.
 - Make an accepted decision carry evidence that it belongs to the request it
   answers and cannot exceed that request's ceiling.
 - Bind authorization to a canonical structured action, not display text.
+- Bind every signed object to an explicit signed-bytes envelope whose canonical
+  body is transported unchanged through JSON/TOML views.
+- Domain-separate every signature by record type, store, causal thread or
+  principal, profile, and version.
 - Make attest challenges verifier-bound, action-bound, generation-bound, and
   single-use in the Tier-3 kernel. Enrollment and Introduction freshness are
   proved separately as a Tier-2 symbolic protocol.
@@ -72,9 +76,9 @@ Implementation follows the suite dependency DAG. Each proof boundary is a
 separate stacked PR so a reviewer can reject one profile without entangling
 its dependents:
 
-1. `formal: prove P1 signed-object contracts` -- Lean project, canonical
-   encoding contract, sealed-value boundary, version rejection, and
-   allowlist-before-dispatch.
+1. `formal: prove P1 signed-object contracts` -- Lean project, exact
+   signed-envelope decoding contract, universal signature domains, private
+   sealed-value boundary, version rejection, and trusted allowlist dispatch.
 2. `formal: prove P2 chain-store monotonicity` -- external-anchor trusted
    state, DAG extension, rollback/fork rejection, and untrusted-step safety.
 3. `formal: prove P0 authority resolution` -- product lattice, total
@@ -356,10 +360,39 @@ cannot produce a revocation transition.
 
 ## 11. Wire And Crypto Boundary
 
-Signed inputs include a domain separator containing protocol, object kind, and
-version. Authority-bearing v1 records reject unknown fields. Future versions
-must be explicitly selected and validated; they are not silently interpreted
-as v1.
+P1 resolves OB-4 with one authority-bearing transport shape. JSON and TOML are
+views over an embedded canonical byte string; they are never signed directly:
+
+```lean
+structure SignatureDomain where
+  recordType : RecordType
+  storeId : StoreId
+  threadOrPrincipal : ScopeId
+
+structure UnsignedEnvelope where
+  profile : ProfileId
+  codec : Codec
+  domain : SignatureDomain
+  body : ByteArray
+  cid : ContentId
+  signer : Fingerprint
+
+structure SignedEnvelope where
+  unsigned : UnsignedEnvelope
+  signatureAlgorithm : SignatureAlgorithm
+  signature : ByteArray
+```
+
+The signature input is the canonical encoding of the entire
+`UnsignedEnvelope`. Thus record type, store, causal thread or principal,
+profile, codec, body CID, and signer are universally domain-bound (OB-6).
+Authority-bearing v1 records reject unknown fields. Future versions must be
+explicitly selected and validated; they are not silently interpreted as v1.
+
+The parser remains outside the kernel, but its Tier-1 contract is exact: if
+`decode received = some envelope`, then `encode envelope = received`. The
+decoder cannot report invented security metadata for unrelated bytes. Shared
+vectors exercise the concrete DAG-CBOR and JSON/TOML envelope adapters.
 
 Opaque extension data is permitted only in fields declared non-authoritative.
 It remains covered by the canonical content digest and must survive a round
@@ -370,22 +403,33 @@ dispatching on a multihash or multicodec code, validation proves that the code
 belongs to the active profile. Profile rotation is an authorized state
 transition.
 
-The Lean boundary exposes assumptions such as:
+The Lean boundary exposes named assumptions such as:
 
 ```lean
-class CryptoAssumptions (Value Key Message Signature : Type) where
+class CryptoAssumptions (Value Key Message Signature Digest : Type) where
   canonicalInjective : forall {x y : Value},
     canonical x = canonical y -> x = y
-  digestBinding : forall {x y : Value},
-    digest x = digest y -> canonical x = canonical y
+  digestSound : forall {value : Value} {claimed : Digest},
+    digestMatches claimed (canonical value) -> claimed = digest (canonical value)
+  digestBinding : forall {left right : ByteArray},
+    digest left = digest right -> left = right
   signatureOrigin : forall {key : Key} {msg : Message} {sig : Signature},
     verifies key msg sig -> signedBy key msg sig
 ```
 
 These are assumptions used by protocol theorems, not claims that Lean proved
-the underlying cryptographic algorithms. `signatureOrigin` proves only which
-key produced a signature. Whether that key is authorized is a separate kernel
-predicate over the active principal, quorum policy, role, and policy epoch.
+the underlying cryptographic algorithms. The executable digest/signature
+predicates must carry proofs into these semantic relations; an arbitrary
+always-true callback is not an admissible boundary implementation.
+`signatureOrigin` proves only which key produced a signature. Whether that key
+is authorized is a separate kernel predicate over the active principal,
+quorum policy, role, and policy epoch.
+
+Verified and sealed types have private constructors. Production code obtains
+them only through the checked decoder/verifier path; the formal API exposes
+read-only evidence projections. Hash and signature dispatch additionally
+requires the active `TrustedProfile` witness, so a caller-created profile cannot
+manufacture a legacy algorithm path.
 
 The concrete checkpoint adapter has a similarly explicit environmental
 obligation: attacker-controlled log writes cannot alter the trusted checkpoint.
@@ -477,6 +521,11 @@ baseline while adding its profile-specific proof gate.
 - Resolution is proved permutation-invariant and non-amplifying.
 - A validated decision is proved request-bound, action-bound,
   matrix-contained, and ceiling-bounded.
+- A decoded signed envelope recomposes to the exact received bytes; its CID is
+  sound for the embedded canonical body and its signature is sound for the
+  universally domain-separated unsigned envelope.
+- Only a trusted active profile can dispatch cryptographic algorithms, and
+  verified/sealed constructors are private.
 - Attest challenges are proved single-use in the sequential kernel,
   generation-bound, and action-bound. P3 Introduction claims are absent from
   the Tier-3 acceptance gate and tracked in the Tier-2 protocol stack.
@@ -498,6 +547,9 @@ Reviewers should reject any change that:
 - moves rendering, serde, IO, or cryptographic implementation into the kernel;
 - treats a CID or parent link as freshness without trusted external state;
 - lets raw wire values bypass validated constructors;
+- accepts transport metadata that is not proved to recompose to the exact
+  received signed envelope;
+- signs a payload without record/store/thread-or-principal domain separation;
 - lets display text identify an executable effect;
 - accepts a decision without checking request, action, matrix, and ceiling;
 - treats a nonce as fresh without issuer and consumption state;
