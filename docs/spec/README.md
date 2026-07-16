@@ -144,32 +144,55 @@ may be Accepted against an unproven waist.
 The waist stays **five laws**; the ledger just relocates each obligation to
 the profile that owns it.
 
-## Open specification obligations
+## Specification obligations — status
 
-Tracked from adversarial review round 6 (a fresh GPT pass on the partitioned
-suite, 2026-07-16). The review confirmed the split closed the prior attacks
-and rated architecture / threat-honesty / separation / formal-plan all
-*Strong*; these are the crisp state-machine gaps that remain. **B = blocker
-before implementation-complete; H = high; M = medium.** "choice" = a design
-decision the author owns, not a mechanical fix.
+From adversarial review round 6 (a fresh GPT pass, 2026-07-16), which
+confirmed the split closed the prior attacks and rated architecture /
+threat-honesty / separation / formal-plan all *Strong*. **All eleven are
+addressed in the v0.3.0 repair cut** below (spec text changed; the *proofs*
+that discharge them are the implementation phase, still held). **B/H/M** =
+original severity.
 
-| # | Sev | Profile | Gap | Resolution direction |
-|---|---|---|---|---|
-| OB-1 | B | P0/P4 | declared DAG had back-edges (P0↔P4 cycle) | **dependency inversion** — P0 defines abstract `AttestEvidence` + `ValidAssociationProof`; P4 implements. DAG corrected above. |
-| OB-2 | B (choice) | P2 | branching DAG checkpointed with a scalar `(gen,length,head)`; "two heads @ equal length = equivocation" is false for a DAG | **linear authority spine per causal thread** `(store_id, thread_id, sequence)`, one accepted successor per sequence (conversation branches; authority is a railway). Alt: frontier checkpoint `Set<LineCid>`. |
-| OB-3 | B | P0/P4 | attestation lacks a canonical challenge preimage + an atomic post-append commit; authenticator ≠ DAG verifier | define one challenge preimage (all bound fields); order: verify-checkpoint → presence → construct → append → **CAS-advance anchor** → then mint. Split roles: witness-verifier (DAG) / WebAuthn authenticator (presence) / surface (signs) / gate (appends+advances+activates). |
-| OB-4 | B | P1 | "sign DAG-CBOR + verify received bytes + exchange JSON" is contradictory | **signed-bytes-in-envelope**: `{profile, codec, body: b64(canonical), cid, by, sig}`; JSON/TOML are views, never authority-bearing serializations. |
-| OB-9 | B | P0 | `resolve(∅,q) = ⨅(∅) = ⊤ = approve` — **fail-OPEN**, contradicting L3 | seed the meet with a base: `resolve(R,q) = ⨅({ask} ∪ {matching verdicts})`; empty match → ask → (headless) deny. Define `resolve(∅)` for PO-3 totality. + normalize vocabulary (allow vs approve; is `ask` verdict/state/escalation?). |
-| OB-5 | H | P3 | challenge consumed *before* signature check → burn-DoS | validate-then-consume (reserve→validate→commit); bind the challenge object CID + recipient + role + context. |
-| OB-6 | H | P1/all | domain separation only on the WebAuthn challenge | **universal**: every signature covers (record-type string, `store_id`, thread/principal id, canonical payload). P2 needs a normative, cryptographically-bound `store_id`. |
-| OB-7 | H | P4 | RevocationRecord's `policy` CID not pinned to an epoch → replay an older weaker policy | `policy_cid == ActiveRevocationPolicy(target, observed_checkpoint, generation)`. The strength tuple is not totally ordered → enrollment records the **exact required revocation predicate**, not an informal tuple. |
-| OB-8 | H | P4 | PO-R "never permanently locked out" is unprovable unconditionally | state it **conditionally** (≥1 uncompromised recovery threshold, eventual quorum comms, fair generation advance, no total material destruction). Timelock recovery must handle attacker-owns-a-device-suppresses-veto. |
-| OB-10 | M | P5 | effect-CID binds a call *value*, not the mutable world (symlinks, DNS, container **tags**, repo state, creds) | per-class resource identity in the sealed request (file: path+content-CID/inode; container: image **digest** not tag; repo: commit/tree CID; net: destination+DNS policy). Gate MUST run the exact `Sealed<CallRequest>` whose CID was approved; ambient = named residual, not PO-W. |
-| OB-11 | M | suite | no statement of which profile versions form one compatible suite | a **compatibility manifest**: `suite_version` + per-profile version requires + `conformance_vectors` CID. |
+| # | Sev | Status | Where fixed |
+|---|---|---|---|
+| OB-1 | B | ✅ resolved | dependency inversion — P0 §3/L5 define abstract `AttestEvidence` + `ValidAssociationProof`; P4 implements. DAG corrected above (P1→P2→P0→P4→P3). |
+| OB-2 | B (choice) | ✅ adopted¹ | **linear authority spine per causal thread** `(store_id, thread_id, sequence)` — P2 §1. Conversation branches; authority is a railway. (Frontier alt rejected as harder to prove.) |
+| OB-3 | B | ✅ resolved | P0 §3 — one canonical challenge preimage; CAS-committed transaction (verify→presence→construct→append→advance-anchor→mint); four separate roles (authenticator ≠ DAG verifier). |
+| OB-4 | B | ✅ resolved | P1 §2 — signed-bytes-in-envelope `{profile, codec, body, cid, by, sig}`; JSON/TOML are views. |
+| OB-9 | B | ✅ resolved | P0 L1 — `resolve(∅,q) = ask` (piecewise, not a seed — a seed would downgrade legitimate `approve`); vocabulary glossary P0 §2.4. |
+| OB-5 | H | ✅ resolved | P3 §1 — reserve→validate→**consume-last**; bind challenge object CID + recipient + role + context. |
+| OB-6 | H | ✅ resolved | P1 §4·5 — universal domain-separation tuple on every signed `body`; normative `store_id` (P2 §1). |
+| OB-7 | H | ✅ resolved | P4 §2 — `policy_cid == ActiveRevocationPolicy(target, observed_checkpoint, generation)`; enrollment records the exact required revocation predicate (tuple isn't totally ordered). |
+| OB-8 | H | ✅ resolved | P4 §3 — PO-R stated **conditionally**; timelock-recovery veto-suppression threat answered (multi-channel ack, fail-closed on silence). |
+| OB-10 | M | ✅ resolved | P5 §1 — per-class sealed resource identities (container **digest** not tag, repo commit/tree CID, …); ambient = named residual. |
+| OB-11 | M | ✅ resolved | `suite.toml` compatibility manifest (below). |
 
-Two of these are the review's sharpest: **OB-9** (a latent fail-open in a
-fail-closed system) and **OB-1** (the clean DAG was prose-cyclic). OB-2 and
-the `attest` factorization remain author's calls.
+¹ OB-2 and the `attest` factorization were the two author's-calls; the
+linear spine is *adopted pending your veto* (it's the reviewer's
+recommendation and the provable option). The factorization stays open — the
+lattice works either way (GPT-5 #232 already leans product-lattice).
+
+The review's own verdict was "approve the split, request-changes on the four
+blockers, list the rest." All four blockers (OB-1/2/3/4) plus the OB-9
+soundness bug are now closed in text.
+
+## Suite compatibility manifest (OB-11)
+
+`suite.toml` names which profile versions form one compatible suite — one
+atomic target for implementers, independent profile evolution preserved:
+
+```toml
+suite = "ceremony-suite"
+suite_version = "0.3.0"
+[requires]
+p0 = "0.2"   # ceremony-contract (waist)
+p1 = "1"     # signed-object
+p2 = "0.2"   # chain-store
+p3 = "0.2"   # enrollment
+p4 = "0.2"   # identity-lifecycle
+p5 = "0.2"   # rendering-security
+conformance_vectors = "cid:…"   # populated with the kernel
+```
 
 ## The rule underneath the whole suite
 

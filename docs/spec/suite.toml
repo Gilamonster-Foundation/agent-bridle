@@ -1,0 +1,18 @@
+# Ceremony Suite — compatibility manifest (OB-11).
+# One atomic target for implementers; profiles still evolve independently.
+# When a profile version bumps, update its pin here and re-run conformance.
+
+suite = "ceremony-suite"
+suite_version = "0.3.0"
+
+[requires]
+p0 = "0.2"   # ceremony-contract  — the narrow waist (five laws)
+p1 = "1"     # signed-object      — CID/canon/Sealed/allowlist/envelope
+p2 = "0.2"   # chain-store        — causal transcript + anti-rollback anchor
+p3 = "0.2"   # enrollment         — SAS/PoP/anchors
+p4 = "0.2"   # identity-lifecycle — roles/revocation/recovery
+p5 = "0.2"   # rendering-security — effect binding + surface attestation
+
+# Cross-language conformance vectors (Rust/Python/Dart/TS must agree).
+# CID is populated once the kernel + vectors exist.
+conformance_vectors = "cid:TBD"

@@ -20,13 +20,39 @@ the algorithm code* — two hash algorithms never collide silently. The key
 is the identity; the fingerprint `H(pubkey)` is its self-certifying *name*.
 *BLAKE3 is an implementation detail, not a law.*
 
-## 2. One schema, three encodings
+## 2. One schema, one signed byte-string, many views (OB-4)
 
-JSON for interchange (client libs), TOML at rest (#220 policy files),
-**canonical DAG-CBOR for anything hashed or signed.** Signatures and
-`ContentId`s are computed over canonical bytes only. Wall-clock is never a
-coordination primitive — validity keys on generation counters; RFC 3339
-timestamps are provenance *data*, never read by a kernel.
+An earlier draft said "JSON for interchange, TOML at rest, DAG-CBOR for
+signing" *and* "verify over received bytes, never reserialize" — which is
+contradictory, because a recipient handed JSON has not received the signed
+DAG-CBOR bytes, and converting JSON → DAG-CBOR *is* a reserialization. The
+resolution: **the canonical DAG-CBOR bytes are carried, not reconstructed.**
+
+Every authority-bearing object travels in a **signed envelope** whose
+`body` is the exact canonical bytes that were hashed and signed:
+```json
+{ "profile": "agent-bridle/permission-request/v1",
+  "codec": "dag-cbor",
+  "body": "<base64url canonical DAG-CBOR bytes>",
+  "cid": "cid:…",              // = H(body)
+  "by": "b3:…", "sig": "…" }   // sig over cid
+```
+Verification is then unambiguous and identical in all four client languages:
+```
+1. allowlist the codec and algorithms (§4·4)  — before touching body
+2. verify cid == H(body)                        — CID over the bytes
+3. verify sig over cid under `by`
+4. decode body → typed value
+5. check schema + critical fields; reject unknown authority-bearing fields
+6. construct Sealed<T>
+```
+**JSON and TOML are views/containers, never independent authority-bearing
+serializations.** A JSON rendering of an object is for humans and
+non-authority interchange; the *authority* lives in `body`. TOML policy
+files (#220) at rest likewise wrap the signed `body`. Signatures and
+`ContentId`s are over `body` only. Wall-clock is never a coordination
+primitive — validity keys on generation counters; RFC 3339 timestamps are
+provenance *data*, never read by a kernel.
 
 ## 3. The Memo discipline (WF-2)
 
@@ -70,6 +96,20 @@ the data layer, none of the resource layer.**
    declared code against the locally-trusted profile table (§6) **before
    hashing or verifying**, and reject anything outside it. Agility lives in
    the profile, never on the wire.
+5. **Universal domain separation + context binding (OB-6).** *Every* signed
+   `body` MUST begin with a domain-separation tuple, not just the WebAuthn
+   challenge:
+   ```
+   ("agent-bridle/<profile>/<record-type>/<version>",
+    store_id, thread_id_or_principal_id, generation, <payload…>)
+   ```
+   A signature is valid only for its exact `(record-type, store, thread/
+   principal, version)` context. Without this, a validly-signed payload can
+   be replayed **across stores, principals, causal threads, structurally-
+   compatible record types, and profile versions.** `store_id` is a
+   normative, cryptographically-bound identifier (P2 §) — "same store" is a
+   value the signature covers, not prose. Verifiers reject a signature whose
+   domain tuple does not match the context in which it is being used.
 
 ## 5. Deterministic signatures (why Ed25519 is pinned)
 

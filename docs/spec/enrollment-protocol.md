@@ -25,16 +25,25 @@ nonce in a self-signed object is byte-for-byte replayable.
   "proposed_caveats": [ … ], "observed": { "addr_candidates": [ … ] },
   "answers": "…", "transcript": "cid:…", "sig": "…" }
 ```
-On receipt of message 2, **before any surface renders it**:
-1. `answers` MUST be a challenge *this recipient issued, unconsumed,
-   unexpired* — then mark it consumed. Replay-state lives with the
-   challenger (unknown-key-share closure; station-to-station).
+On receipt of message 2, **before any surface renders it**, validate
+*first* and **consume last** — an early consume lets an unauthenticated
+attacker submit garbage referencing a live challenge and *burn it* before
+the signature is checked (OB-5). The order is `reserve → validate →
+commit-consume`:
+1. `answers` MUST reference a challenge *this recipient issued, unconsumed,
+   unexpired*, and bind the **challenge object CID** (not merely a nonce),
+   its intended recipient, protocol role, and store/principal context —
+   **reserve** it (do not yet consume);
 2. the fingerprint's hash algorithm MUST be in the P1 allowlist **before
    hashing**, then the fingerprint MUST equal that algorithm's multihash
    name of `pubkey` (self-certification, checked by the library not the
-   human).
+   human);
 3. `sig` MUST verify under `pubkey` over message 2 incl. `answers` and
-   `transcript` — **proof of possession**, transcript-bound.
+   `transcript` — **proof of possession**, transcript-bound;
+4. **only now consume** the challenge (commit). A failed step 2/3 releases
+   the reservation, so a forged message cannot burn a live challenge.
+Replay-state lives with the challenger (unknown-key-share closure;
+station-to-station).
 
 ## 2. SAS pairing (enrolling your own devices/surfaces)
 

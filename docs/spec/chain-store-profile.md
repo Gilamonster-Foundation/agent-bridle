@@ -8,16 +8,58 @@
 **Owns:** durable, tamper-evident, **rollback-resistant** history — and the
 honest statement of what the hash chain does and does not buy.
 
-## 1. The store is a causal transcript, not a ledger
+## 1. Conversation is a jungle; authority is a railway (OB-2)
 
-Records are `MerkleNode<T>` (P1). `parents` is a **set** — branches
-(parallel agents) and merges (accepted synthesis) are first-class, so the
-store is a **Merkle DAG**. "Extends" means *reachable-ancestor*; the
-forward-only checks below are over this partial order, **not** an integer
-index. This chain-store is the **authority projection** of the wider
-Conversation Graph (agent-mesh#67) — same structure, payload `T` =
-authority records here, conversation records there. Deliberately *not* a
-blockchain: no mining, tokens, leader election, or global total order.
+Records are `MerkleNode<T>` (P1). The wider **Conversation Graph**
+(agent-mesh#67) is a genuine Merkle DAG — branches (parallel agents) and
+merges (accepted synthesis) are first-class. But a branching DAG **cannot**
+be checkpointed by a scalar `(length, head)`: two heads at equal depth can
+be *legitimate* concurrent descendants, so "different heads at the same
+length ⇒ equivocation" is false for a DAG.
+
+The resolution: **the authority projection is a linear spine per causal
+thread.** The conversation may branch and merge freely; branches must
+**merge before producing the next authority record**, so the sequence of
+authority records along one thread is totally ordered.
+
+```rust
+struct AuthorityCheckpoint {   // the protected anchor state (P2 §4)
+    store_id:   StoreId,       // normative, cryptographically bound (OB-6)
+    thread_id:  ThreadId,      // one causal authority thread
+    sequence:   u64,           // dense per (store_id, thread_id)
+    head:       LineCid,
+}
+```
+
+Normative definitions:
+- **`store_id`** — a content-addressed identifier of the store's genesis
+  (its root record's CID); every signed record's domain tuple binds it
+  (P1 §4·5), so a record cannot be replayed into a different store.
+- **`thread_id`** — the identifier of one authority thread within a store; a
+  causal thread is the totally-ordered sequence of authority records a
+  single principal-scope advances. A thread MAY be forked (declared) and
+  merged (a record naming multiple thread parents), but **within a thread,
+  `sequence n` has exactly one accepted successor at `n+1`.**
+- **`length`/`sequence`** — the dense per-thread record count, *not*
+  longest-path depth.
+
+**Equivocation, now well-defined:** two validly-signed records for the same
+`(store_id, thread_id, sequence)` with different CIDs are incontestable
+proof of misbehavior (§4). This is the branching-safe restatement of the CT
+fork rule.
+
+"Extends" for the ratchet means: the presented head's thread reaches the
+protected `(thread_id, sequence, head)` as a strict-ancestor prefix — a
+*forward extension of the same spine*, never a sibling. This chain-store is
+the authority projection of the Conversation Graph — same `MerkleNode<T>`
+structure, payload `T` = authority records here, conversation records there.
+Deliberately *not* a blockchain: no mining, tokens, leader election, or
+global total order.
+
+*(Alternative considered and rejected as harder to reason about: a
+frontier-based checkpoint `{store_id, frontier: Set<LineCid>}`. The linear
+spine is chosen for provability; revisit only if genuine concurrent
+authority within one thread becomes a requirement.)*
 
 ## 2. Two CIDs per record
 
@@ -63,8 +105,10 @@ canonical layers, ascending assurance:
 
 1. **Independently-protected monotonic head (REQUIRED).** Each participant
    remembers — in storage *separate from the log* — the highest
-   `(generation, length, head-CID)` it has accepted, and MUST reject any
-   presented head that is not a consistent forward-extension of it (TUF:
+   `AuthorityCheckpoint` `(store_id, thread_id, sequence, head)` it has
+   accepted per thread (§1), and MUST reject any presented head that is not
+   a forward extension of the *same spine* — never a lower `sequence`, a
+   different store, or a sibling (TUF:
    *"clients MUST NOT replace metadata with a version less than the one
    currently trusted"*; RFC 6962 monotonicity). Defeats truncation and
    rollback for that participant. **Where it lives is normative** (§6):
@@ -77,10 +121,13 @@ canonical layers, ascending assurance:
    cosignature no older than its freshness policy (CT gossip / STH). Defeats
    *secret* equivocation: to fool a victim the attacker must fork the
    witnesses too.
-3. **Fork = proof of misbehavior (REQUIRED).** Two validly-signed heads of
-   the same store at the same length with different CIDs are incontestable
-   evidence of equivocation (RFC 6962). Implementations MUST halt authority
-   minting from that store and escalate — never silently pick one.
+3. **Fork = proof of misbehavior (REQUIRED).** Two validly-signed records
+   for the same `(store_id, thread_id, sequence)` with different CIDs are
+   incontestable evidence of equivocation (§1; the branching-safe restatement
+   of RFC 6962). Implementations MUST halt authority minting from that store
+   and escalate — never silently pick one. (Legitimate concurrent
+   *conversation* branches are not equivocation; they merge before the next
+   authority record, so they never collide on a `sequence`.)
 
 For a solo user (P3's n=2 world) the monotonic head lives on each enrolled
 device and each device is the other's witness — the same k-of-n substrate

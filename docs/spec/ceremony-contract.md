@@ -1,12 +1,15 @@
 # P0 — The Ceremony Contract (the narrow waist)
 
-**Status:** DRAFT 0.2.0 (2026-07-16) — partitioned from the v0.1.x
-monolith into the [Ceremony Suite](README.md). This document is now the
-**waist**: the five laws, the authority algebra, and the decision seam.
-Everything mechanical it used to contain moved to a profile (P1–P5); this
-doc *references* them and states the invariants they must satisfy.
-**Depends on:** P1 (Signed-Object), P2 (Chain-Store).
-**Depended on by:** P3, P4, P5.
+**Status:** DRAFT 0.2.1 (2026-07-16) — partitioned from the v0.1.x
+monolith into the [Ceremony Suite](README.md), then repaired against review
+round 6 (all eleven obligations closed in text — see README). This document
+is the **waist**: the five laws, the authority algebra, and the decision
+seam. Everything mechanical moved to a profile (P1–P5); this doc *references*
+them and states the invariants they must satisfy.
+**Depends on:** P1 (Signed-Object), P2 (Chain-Store); P4 only via the
+abstract contracts it defines (`AttestEvidence`, `ValidAssociationProof`) —
+no back-edge (OB-1).
+**Depended on by:** P4, P3, P5.
 **Teeth:** Lean proof of the lattice laws + resolution, refined to the pure
 Rust kernel by Aeneas (Tier 3). See the review history and adjudications on
 [#229](https://github.com/Gilamonster-Foundation/agent-bridle/pull/229);
@@ -103,28 +106,78 @@ trusted:**
 A surface violating any is refused at the gate — the wire *enforces* L4, it
 does not merely state it.
 
+### 2.4 Vocabulary (one word, one job — OB-9)
+
+Three registers were drifting; they are pinned here:
+
+| Term | Register | Meaning |
+|---|---|---|
+| `allow` / `attest` / `deny` | **matrix verb** — what a surface *offers* the human | `allow` maps to verdict `approve`; `attest` to `attest`; `deny` to `deny` |
+| `deny ⊏ attest ⊏ ask ⊏ approve` | **verdict** — resolution's codomain | the durable disposition `resolve` yields |
+| `ask` | **verdict only** (never a matrix verb) | "no durable rule → interact"; the `resolve(∅)` default (L1); fail-closed via L3 |
+| `escalate` | **Decision action** (never a verdict) | navigation to a richer surface; `authority(escalate) = ⊥` |
+
+So `allow` (offer) and `approve` (verdict) are the same disposition seen
+from the two sides of the seam; `ask` is a verdict, not an offer; `escalate`
+is neither.
+
 ## 3. Attest discharge + the forward-only ratchet
 
-An `attest` grant is **inert until a presence proof is verified** (WebAuthn/
-FIDO2 challenge-response via the shipped `step_up::DischargeVerifier`): the
-gate issues a domain-separated, single-use `Challenge` bound to the request
-CID, subject, and generation; the authenticator returns a
-`DischargeAttempt`; the gate verifies and consumes it **before** the grant
-takes effect.
+An `attest` grant is **inert until a presence proof is verified**, and the
+proof *also witnesses a non-regressing history*: the same finger-press
+attests "I approved R" **and** "the world had not regressed when I did."
 
-**A presence proof also witnesses a non-regressing history.** The challenge
-commits to a **checkpoint**; the signer refuses unless the store it is
-shown *extends* the store it last witnessed. This yields an
-`AttestationRecord` (P4) carrying two distinct statements under one
-signature — **authorization** ("I approved R") and **history witness** ("I
-verified `observed_head` descends from `previous_witnessed_head`"). The
-signer's `previous_witnessed_head` MUST live in its **P2 §4 anti-rollback
-anchor**, not the store it validates. Rollback *or* fork → `CHAIN HISTORY
-REGRESSION` → halt + escalate. Checked **per causal thread**, so concurrent
-threads never false-trip. Generation (total order) and DAG ancestry
-(partial order) must *both* advance. Payoff: **every ordinary approval is a
-free freshness checkpoint.** Not a new law — L2·H1's anchor at ceremony
-time.
+**Four roles, deliberately separate (OB-3).** The WebAuthn authenticator
+does not understand a Merkle DAG — it signs over a client-data hash. So do
+not say "the hardware witnessed the chain." The roles are:
+
+| Role | Does |
+|---|---|
+| **Witness-verifier** | holds the P2 §4 protected checkpoint; verifies DAG extension; **constructs the challenge preimage** |
+| **Authenticator** (WebAuthn/FIDO2) | proves user presence/verification over that challenge — nothing more |
+| **Surface identity** | signs the resulting `AttestEvidence` record |
+| **Gate** | appends, advances the anchor, then activates authority |
+
+**One canonical challenge preimage** — every field the attestation binds,
+domain-separated (P1 §), so nothing is left to prose:
+```
+challenge = H("agent-bridle/attest/v1",
+              store_id, thread_id, request_cid, decision_cid,
+              previous_checkpoint, observed_checkpoint, generation, nonce)
+```
+
+**The commit is transactional (compare-and-swap, OB-3).** A crash or
+rollback must never leave "authority active but attestation not durable" or
+"attestation appended but anchor not advanced":
+```
+1. witness-verifier: observed_checkpoint Extends protected_checkpoint  (else HALT)
+2. authenticator: presence proof over the canonical challenge
+3. surface: construct AttestEvidence
+4. append it → post_attestation_head
+5. CAS-advance the protected anchor: protected := post_attestation_head
+6. only now mint/activate authority
+```
+Steps 4–6 are one atomic transition (CAS on the anchor); a recoverable
+two-phase form is permitted. Rollback *or* fork at step 1 → `CHAIN HISTORY
+REGRESSION` → halt + escalate (a fork is P2 proof-of-misbehavior, never a
+branch to silently adopt). Checked **per causal thread** (P2 `thread_id`),
+so concurrent threads never false-trip; generation (total order) and DAG
+ancestry (partial order) must *both* advance.
+
+**P0 depends only on an abstract evidence contract (OB-1)** — not on P4's
+concrete record — so the waist has no back-edge into P4:
+```rust
+trait AttestEvidence {
+    fn request(&self) -> ContentId;
+    fn decision(&self) -> ContentId;
+    fn previous_checkpoint(&self) -> Checkpoint;
+    fn observed_checkpoint(&self) -> Checkpoint;
+    fn presence_proof(&self) -> PresenceProof;
+}
+```
+P4 supplies `AttestationRecord` as the concrete implementation. Payoff of
+the whole ratchet: **every ordinary approval is a free freshness
+checkpoint.** Not a new law — L2·H1's anchor applied at ceremony time.
 
 ## 4. The Laws (normative — the whole waist)
 
@@ -132,13 +185,24 @@ Five laws. Nothing enters this section without a proof obligation (§5);
 everything else is mechanism (a profile) or well-formedness.
 
 ### L1 — Resolution is a meet
-Verdicts are ordered by restrictiveness (`deny ⊏ attest ⊏ ask ⊏ approve`).
-`resolve(R, q) = ⨅ { verdict(r) | r ∈ R, r matches q }`. ⨅ is associative,
-commutative, idempotent ⇒ resolution is independent of rule/file/load order.
-No ordering attack exists. **PO-1.** *(The `attest`-factorization fork —
-one verb axis vs. `effect × assurance × scope` — is a lattice-shape choice;
-L1 survives either, since a product of lattices is a lattice. Author's call;
-see README.)*
+Verdicts are ordered by restrictiveness (`deny ⊏ attest ⊏ ask ⊏ approve`);
+`deny` is ⊥, `approve` is ⊤. Resolution is the meet of the matching
+verdicts, **with the no-match case defined explicitly** so it is total *and*
+fail-closed (OB-9):
+```
+resolve(R, q) = ⨅ { verdict(r) | r ∈ R, r matches q }   if some rule matches q
+              = ask                                       if none matches q
+```
+The explicit `ask` default is load-bearing: the empty meet's mathematical
+identity is `⊤ = approve`, so *without this clause an unmatched request
+would fail OPEN* — the defect L3 forbids. `ask` (→ prompt; headless → deny,
+L3) is the deliberate "unknown ⇒ interactive, never granted" default. ⨅ is
+associative, commutative, idempotent ⇒ resolution is independent of
+rule/file/load order; no ordering attack exists. **PO-1** (now includes
+`resolve(∅,q) = ask`, i.e. no fail-open). *(The `attest`-factorization fork
+— one verb axis vs. `effect × assurance × scope` — is a lattice-shape
+choice; L1 survives either, since a product of lattices is a lattice.
+Author's call; see README.)*
 
 ### L2 — Tamper-boundedness
 For any mutation `m` by a party holding **fewer than quorum(target)** keys:
@@ -173,13 +237,15 @@ bottom is `ask`; absent a bound surface, `ask ↦ deny`, `attest ↦ deny`
 `association(peer) ⇒ pinned(fingerprint(peer))`. `fingerprint = H(pubkey)`
 is self-certifying (P1) — re-key ⇒ new fingerprint ⇒ unpinned ⇒ full
 re-ceremony; no silent identity swap is expressible. Pinned is **transitive
-through certification**:
+through certification** — but the waist states this over an **abstract
+predicate** (OB-1), not P4's concrete cert-chain, so L5 has no back-edge:
 ```
-pinned(fp) ⇔ fp ∈ PinSet ∨ ∃ chain: fp →* root ∈ PinSet, PoP at every link
+pinned(fp) ⇔ fp ∈ PinSet ∨ ValidAssociationProof(fp, PinSet)
 ```
-so pinning a principal admits the agents/surfaces it issues (delegation, P4;
-shipped as mesh `CertChain::verify` + PoP, #39/#40). **PO-5** (incl. chain
-soundness).
+`ValidAssociationProof` is an abstract contract (there exists a
+PoP-at-every-link chain `fp →* root ∈ PinSet`); **P4 proves its cert-chains
+implement it** (shipped as mesh `CertChain::verify` + PoP, #39/#40). **PO-5**
+(incl. chain soundness) is proved by P4 against this predicate.
 
 ## 5. Proof-obligation ledger (owned here; full suite in README)
 
