@@ -171,14 +171,45 @@ original severity.
 | OB-10 | M | ✅ resolved | P5 §1 — per-class sealed resource identities (container **digest** not tag, repo commit/tree CID, …); ambient = named residual. |
 | OB-11 | M | ✅ resolved | `suite.toml` compatibility manifest (below). |
 
-¹ OB-2 and the `attest` factorization were the two author's-calls; the
-linear spine is *adopted pending your veto* (it's the reviewer's
-recommendation and the provable option). The factorization stays open — the
-lattice works either way (GPT-5 #232 already leans product-lattice).
+¹ OB-2's linear spine and the `attest` factorization were the two
+author's-calls — **both now decided** (see OB-12/OB-15 below).
 
-The review's own verdict was "approve the split, request-changes on the four
-blockers, list the rest." All four blockers (OB-1/2/3/4) plus the OB-9
-soundness bug are now closed in text.
+### Review 7 — the v0.3.1 PROTOCOL FREEZE (2026-07-16)
+
+A protocol-freeze review named seven places implementers would otherwise
+diverge. All closed in text; the *proofs / conformance vectors* that discharge
+them are the (still-held) implementation phase.
+
+| # | Sev | Status | Where fixed |
+|---|---|---|---|
+| OB-12 | B | ✅ **type frozen** | P0 §2.0 — `Authority = Effect × Assurance × Scope` (componentwise meet); `ask`→`NeedsDecision` (control-flow, not authority); `deny`=⊥; **explicit signed `ceiling`**; scope is a profile-declared closed order. Resolves the `attest` factorization (4-way converged). |
+| OB-13 | B | ✅ resolved | P1 §2 — ONE signed-object constructor; `sig` covers a canonical **protected tuple** (profile, codec, cid, signer, domain-sep), not bare cid; body domain tuple must equal the envelope. |
+| OB-14 | B | ✅ resolved | P1 §2 / P2 §1 — genesis `STORE_ID_SELF` sentinel breaks the `store_id = CID(genesis)` fixed point. |
+| OB-15 | B | ✅ **CAS frozen** | P2 §1.1 — compare-and-swap on expected head; **concurrent candidates + CAS-losers are NOT equivocation**. Roadmap: CAS → **Byzantine Vertical Paxos** (below). |
+| OB-16 | B | ✅ **law corrected** | P0 L2 — upward direction is now `TrustedStructure(m(R)) = TrustedStructure(R)` (equality), not `⊆`: sub-quorum actors can't *add* a trusted issuer either (closes time-delayed privilege escalation). |
+| OB-17 | H | ✅ resolved | P3/P4 — dropped "punting ≥ pinning" scalar (tuple isn't totally ordered); revocation is P4's exact policy-CID predicate; P3 now depends on P4. |
+| OB-18 | H | ✅ resolved | P5 — token downgraded to attention-aid; faithfulness = **byte-compare vs a gate-produced canonical render**; **raw secrets forbidden** in any signed record (use secret-version refs / one-shot caps / keyed commitments). |
+
+**Exit gate (v0.3.1) status:** factorization + `ask` ✅ · ceiling + scope
+order ✅ · signed-envelope grammar ✅ · genesis non-circular ✅ · append/CAS
+normative ✅ · L2 forbids latent additions ✅ · P3/P4 agree ✅ · P5 token +
+secrets ✅ · **conformance vectors (positive + negative) — the one
+implementation-phase item, tracked with the kernel (`suite.toml`
+`conformance_vectors`).**
+
+### Store roadmap (adopted): CAS → Byzantine Vertical Paxos
+
+The frozen CAS append is the **threshold-1 steady-state case** of a
+vertically-reconfigurable store. **Sequencing (author-adopted):** prove the
+`P1 → P2 → P0` waist on CAS first; then evolve P2 to separate a lean
+steady-state protocol from a stronger **reconfiguration** mechanism (the
+*wedge*: fence config → capture safe closing state → certify next config),
+giving 2-full-node deployments safe failover (`f+1` steady / `2f+1`
+reconfiguration) and an operation-sensitive partition-authority ceiling on the
+§2.0 lattice. **Reference implementation: (Byzantine) Vertical Paxos —
+Abraham & Malkhi (IBM Zurich DCCL); VP orig. Lamport-Malkhi-Zhou, PODC 2009.**
+The wedge/closing-state correctness gets its own ADR + TLA+/Lean model before
+it is normative; it is **not** part of the v0.3.1 freeze.
 
 ## Suite compatibility manifest (OB-11)
 

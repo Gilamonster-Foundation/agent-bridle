@@ -41,13 +41,22 @@ are sealed:
 | `container` | image **digest**, never a mutable tag |
 | `repo` | repository identity **+** commit/tree CID |
 | `network` | destination policy **+** an explicit DNS-resolution policy |
-| `env`/`creds` | the resolved values, or a named residual (below) |
+| `env`/`creds` | an immutable **secret-*version* reference** / one-shot capability / keyed commitment — **NEVER raw secret material** (OB-18) |
 
 Anything left ambient at approval time — symlink targets, DNS answers,
 mutable files, env vars, container tags, credentials resolved *after*
 approval — is a **named residual**, never silently folded into PO-W. If a
 class cannot freeze a resource, it says so; it does not pretend the
 signature covered it.
+
+**Never put raw secret material in a signed record (OB-18/#7).** The record
+is content-addressed, permanently retained, replicated, and offline-guessable
+against its CID — so a raw credential in the `body` is a permanent disclosure
+(and lands in logs). An authority record MAY reference a secret only as an
+immutable **secret-version id**, a **one-shot capability**, or a **keyed
+commitment** the gate later redeems; the material itself resolves at
+execution time, outside the record. A verifier rejects a body carrying an
+apparent raw secret in a credential field.
 
 ## 2. Gate-signed requests (the phishing-canvas closure)
 
@@ -83,17 +92,24 @@ different measurement and fails the check. This is remote attestation
 (Parno et al.); its primitives are a Tier-1 assumption, its handshake a
 Tier-2 (protocol) obligation.
 
-**4.2 Rendering attestation — what the surface DID.** A **signed render
-transcript**: the surface signs the exact bytes it presented, bound to
-`request_cid` and the deterministic `display`-from-`effect` output (§1). The
-faithfulness *ceremony* injects a challenge a faithful renderer passes and
-an unfaithful one cannot: the gate derives a **witness token** from
-`(effect, nonce)` that MUST appear verbatim in the canonical `display` the
-human confirms. A surface that truncated, reformatted, localized-away, or
-hid part of the effect cannot produce a `display` containing the correct
-token — so the token is absent or wrong, the human sees the mismatch, and
-the presence discharge (which covers the token) fails. "Did the surface show
-the whole truth?" becomes checkable rather than assumed.
+**4.2 Rendering attestation — what the surface DID (corrected, OB-18/#7).**
+The mechanism is a **byte-comparison against a gate-produced canonical
+render**, *not* a token that "proves" faithful display. Because `display` is
+a deterministic function of `effect` (§1), **the gate produces the canonical
+render bytes itself**; the surface's signed render transcript commits to the
+bytes it presented; the verifier **byte-compares** the committed render
+against the gate's canonical render. Equal ⇒ the surface emitted the right
+bytes.
+
+The **witness token** (a value derived from `(effect, nonce)` that must
+appear in `display`) is retained only as an **attention-binding aid** — it
+nudges the human to look — and is explicitly *not* proof of faithful
+rendering: a malicious renderer can print a misleading partial summary *and*
+include the correct token. So the token proves *possession of effect-derived
+information*, never *that the human saw the whole effect*. Even the
+byte-comparison proves only *what bytes were emitted*, not *what pixels a
+possibly-hostile display painted or what the human understood* — §5's
+irreducible residual.
 
 Both compose with the existing gate checklist: high-ceiling actions MAY
 require a blessed measurement (4.1) **and** a token-bearing render transcript
@@ -128,7 +144,7 @@ authority-bearing protocol" failure the security reviews caught.
 | PO-RES | each action class seals resource *identities*, not mutable handles (OB-10) | 3 + vectors |
 | — | render-swap / phishing-canvas closures | 3 (with P0 gate checklist) |
 | PO-SB | binary attestation: a decision above ceiling C is honoured only from a blessed surface measurement | 2 (protocol) |
-| PO-SR | rendering attestation: the witness token is present in `display` ⇒ the surface showed the whole effect | 2 (protocol) |
+| PO-SR | rendering attestation: committed render bytes == gate's canonical render (byte-compare) ⇒ correct bytes emitted (NOT faithful pixels; token is only an attention aid) | 2 (protocol) |
 | residual | display-faithfulness on a hostile display | *shrunk by §4, not eliminated — stated* |
 
 ## Relations

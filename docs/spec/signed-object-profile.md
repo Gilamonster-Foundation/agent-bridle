@@ -28,31 +28,58 @@ contradictory, because a recipient handed JSON has not received the signed
 DAG-CBOR bytes, and converting JSON → DAG-CBOR *is* a reserialization. The
 resolution: **the canonical DAG-CBOR bytes are carried, not reconstructed.**
 
-Every authority-bearing object travels in a **signed envelope** whose
-`body` is the exact canonical bytes that were hashed and signed:
+**The signed-object grammar is ONE normative constructor (OB-13/#2).** A
+naive envelope that signs only `cid = H(body)` leaves the interpretation-
+bearing fields (`profile`, `codec`, `signer`) *outside* the signature — an
+attacker could re-tag the codec or profile without breaking the sig. So the
+signature covers a canonical **protected tuple**, not the bare CID:
+
 ```json
-{ "profile": "agent-bridle/permission-request/v1",
-  "codec": "dag-cbor",
+{ "profile": "agent-bridle/permission-request/v1",   // protected
+  "codec": "dag-cbor",                                // protected
+  "cid": "cid:…",                                     // = H(body); protected
+  "signer": "b3:…",                                   // protected
   "body": "<base64url canonical DAG-CBOR bytes>",
-  "cid": "cid:…",              // = H(body)
-  "by": "b3:…", "sig": "…" }   // sig over cid
+  "sig": "…" }
 ```
-Verification is then unambiguous and identical in all four client languages:
 ```
-1. allowlist the codec and algorithms (§4·4)  — before touching body
-2. verify cid == H(body)                        — CID over the bytes
-3. verify sig over cid under `by`
-4. decode body → typed value
-5. check schema + critical fields; reject unknown authority-bearing fields
-6. construct Sealed<T>
+protected = canon( "agent-bridle/signed-object/v1",   // domain separation
+                   profile, codec, cid, signer )
+sig       = Sign(signer, protected)
 ```
+
+Normative bindings (no implementer choice left):
+- **`sig` covers `protected`** — profile, codec, cid, signer are all
+  authenticated; changing any breaks the signature.
+- **the body's own domain tuple** (§4·5) MUST equal `(profile, codec)` of the
+  envelope, and its `signer`/`by` MUST equal the envelope `signer` — an
+  implementation rejects any mismatch (no split identity across the boundary).
+- `signer` is the one canonical location for the key id; `by` in inner-record
+  examples (P0/P4) is the *same* value surfaced logically, never a second
+  authority.
+- verification (identical in all four languages):
+  ```
+  1. allowlist codec + algorithms (§4·4)         — before touching body
+  2. recompute protected; verify sig over it under signer
+  3. verify cid == H(body)
+  4. decode body; check body domain tuple == (profile, codec, signer)
+  5. schema + critical fields; reject unknown authority-bearing fields
+  6. construct Sealed<T>
+  ```
+
+**Genesis is non-circular (OB-14/#3).** P2 defines `store_id = H(genesis
+record)`, but every body must bind `store_id` (§4·5) — a fixed point at
+genesis. Resolution (normative): **the genesis body carries the reserved
+sentinel `store_id = 0x00` (`STORE_ID_SELF`); its resulting `cid` becomes the
+store's `store_id`**, and every *subsequent* record binds that value. A
+verifier resolves `STORE_ID_SELF` to "this record's own cid." The first
+ordinary record can therefore be canonically encoded.
+
 **JSON and TOML are views/containers, never independent authority-bearing
-serializations.** A JSON rendering of an object is for humans and
-non-authority interchange; the *authority* lives in `body`. TOML policy
-files (#220) at rest likewise wrap the signed `body`. Signatures and
-`ContentId`s are over `body` only. Wall-clock is never a coordination
-primitive — validity keys on generation counters; RFC 3339 timestamps are
-provenance *data*, never read by a kernel.
+serializations.** A JSON rendering is for humans/non-authority interchange;
+the *authority* lives in `body` + `protected`. TOML policy files (#220) wrap
+the signed object. Wall-clock is never a coordination primitive — validity
+keys on generation counters; RFC 3339 timestamps are provenance *data*.
 
 ## 3. The Memo discipline (WF-2)
 

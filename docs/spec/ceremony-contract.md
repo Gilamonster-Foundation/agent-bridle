@@ -1,6 +1,8 @@
 # P0 — The Ceremony Contract (the narrow waist)
 
-**Status:** DRAFT 0.2.1 (2026-07-16) — partitioned from the v0.1.x
+**Status:** DRAFT 0.3.1 — PROTOCOL FREEZE (2026-07-16). Authority type frozen
+(`Effect × Assurance × Scope`; `ask`→`NeedsDecision`; explicit ceiling — the
+`attest` factorization, decided). Partitioned from the v0.1.x
 monolith into the [Ceremony Suite](README.md), then repaired against review
 round 6 (all eleven obligations closed in text — see README). This document
 is the **waist**: the five laws, the authority algebra, and the decision
@@ -52,6 +54,42 @@ All are Memo-descendants (P1 §3). Full field-level definitions of the
 identity/enrollment/store records live in their owning profiles; the three
 objects the *seam* itself trades are here.
 
+### 2.0 The Authority type (FROZEN — OB-12)
+
+Authority is a **product meet-lattice of three independent axes**, with
+componentwise attenuation:
+
+```
+Authority = Effect × Assurance × Scope
+  Effect    : deny ⊏ allow                        (deny = ⊥)
+  Assurance : none ⊏ presence ⊏ hardware          (the old `attest` lives here)
+  Scope     : once ⊏ session ⊏ durable            (open-EXTENSIBLE, but see below)
+  (e₁,a₁,s₁) ⊓ (e₂,a₂,s₂) = (e₁⊓e₂, a₁⊓a₂, s₁⊓s₂)
+  ⊥ = (deny, none, once)     ⊤ = (allow, hardware, durable)
+```
+
+`deny` is the bottom of `Effect`; there is exactly one denied authority
+(`⊥`), never several semantically-equal "denied authorities". The former
+`attest` disposition is **`Assurance = presence`** (or `hardware`); it is no
+longer a verb, so it composes with any Effect/Scope.
+
+**`ask` is NOT an authority level — it is a control-flow result (OB-1/#1):**
+
+```
+Resolution = NeedsDecision                 (was `ask`: must interact)
+           | Decided(Authority)
+```
+
+`NeedsDecision` means "no rule settled this; a surface must decide." It has
+no place in the lattice; the gate never *grants* `NeedsDecision`. Headless,
+it degrades to `deny` (L3).
+
+**Scope is a *declared, closed-per-profile* order, not arbitrary strings
+(#1).** A profile MUST publish its scope set and their total order + meet
+(v1: `once ⊏ session ⊏ durable`); an implementation rejects a scope outside
+its profile. "Open vocabulary" means *a profile may extend the set*, never
+*any string compares somehow*.
+
 ### 2.1 PermissionRequest
 
 ```json
@@ -59,73 +97,81 @@ objects the *seam* itself trades are here.
   "action": { "class": "exec", "display": "run_command: cd <path>",
               "effect": "cid:…" },       // canonical resolved call — P5
   "violation": "outside-granted-allowlist",
+  "ceiling": { "effect": "allow", "assurance": "presence", "scope": "session" },
   "matrix": { … }, "context": { "session": "…", "generation": 41 },
   "by": "b3:…", "sig": "…" }             // gate signature — required remote (P5)
 ```
 
-`action.effect` binds the signature to *what executes*, not what is shown
-(P5 owns effect-binding and the rendering residual).
+**`ceiling` is an explicit, signed field (#1)** — the maximum Authority this
+request may resolve to. No grant may exceed it (L4). It is set by the gate
+from policy at issue time; the gate re-derives and re-checks it before
+minting (never trusts a surface-supplied ceiling). `action.effect` binds the
+signature to *what executes* (P5).
 
 ### 2.2 DecisionMatrix
 
 ```json
-{ "verbs": ["allow", "attest", "deny"], "scopes": ["once", "session"],
-  "default": ["allow", "once"], "escalations": ["audit"] }
+{ "effects": ["allow", "deny"],
+  "assurances": ["none", "presence"],
+  "scopes": ["once", "session"],
+  "default": { "effect": "allow", "assurance": "none", "scope": "once" },
+  "escalations": ["audit"] }
 ```
 
-The decision *space*; nothing encodes layout. `attest` is the
-presence-required disposition (`attest × once` = ceremony every action;
-`attest × session` = one discharge per generation). `default` is the
-administrator/packager **opinion surface** (`rm -rf` ships `["deny",
-"session"]`), never an auto-grant. Scope vocabulary is open; a durable
-scope materializes as a signed loosening entry (L2, via P2).
+The decision *space* over the three axes; nothing encodes layout. A surface
+offers points of `effects × assurances × scopes` bounded by `ceiling`.
+Presence-required is `assurance ∈ {presence, hardware}` (§3). `default` is
+the administrator/packager **opinion surface** (`rm -rf` ships
+`{deny, none, once}`), never an auto-grant. Scopes are drawn from the
+profile's declared set (§2.0).
 
 **WF-1 (well-formedness, not a law):** every matrix MUST be decidable with
-all escalations unrendered — `verbs × scopes` non-empty and sufficient (a
-harness with no audit surface renders a complete chooser by omission).
+all escalations unrendered — the axis products are non-empty and sufficient.
 
 ### 2.3 Decision + gate acceptance
 
 ```json
-{ "v": 1, "request": "cid:…", "grant": { "verb": "allow", "scope": "once" },
+{ "v": 1, "request": "cid:…",
+  "grant": { "effect": "allow", "assurance": "presence", "scope": "once",
+             "discharge": { "challenge": "cid:…", "attempt": "…" } },  // if assurance>none
   "by": "b3:…", "sig": "…" }
+{ "v": 1, "request": "cid:…", "escalate": "audit", "by": "b3:…", "sig": "…" }
 ```
 
-`escalate` carries **zero authority** (L4); exactly one of `grant`/
-`escalate`. **Gate acceptance is a checklist of MUSTs — the client is never
-trusted:**
+`escalate` carries **⊥ authority** (L4); exactly one of `grant`/`escalate`.
+A `grant` is a point in the Authority lattice. **Gate acceptance is a
+checklist of MUSTs — the client is never trusted:**
 
 1. `request` = the content-CID of the request the gate itself issued;
-2. `grant.verb ∈ matrix.verbs` and `grant.scope ∈ matrix.scopes`;
-3. the result is `⊑` the request ceiling (L4) — never answer `once` with
-   `always`;
+2. each axis of `grant` is a member of the matrix's declared axis sets;
+3. `grant ⊑ ceiling` (L4, componentwise) — no axis exceeds the request ceiling;
 4. the executable effect recomputes equal to `action.effect` (P5);
-5. if `verb == attest`, the discharge verifies **and** its history witness
-   passes the forward-only ratchet (§3).
+5. if `grant.assurance > none`, the discharge verifies **and** its history
+   witness passes the forward-only ratchet (§3).
 
-A surface violating any is refused at the gate — the wire *enforces* L4, it
-does not merely state it.
+A surface violating any is refused — the wire *enforces* L4.
 
-### 2.4 Vocabulary (one word, one job — OB-9)
-
-Three registers were drifting; they are pinned here:
+### 2.4 Vocabulary (one word, one job — OB-9/OB-12)
 
 | Term | Register | Meaning |
 |---|---|---|
-| `allow` / `attest` / `deny` | **matrix verb** — what a surface *offers* the human | `allow` maps to verdict `approve`; `attest` to `attest`; `deny` to `deny` |
-| `deny ⊏ attest ⊏ ask ⊏ approve` | **verdict** — resolution's codomain | the durable disposition `resolve` yields |
-| `ask` | **verdict only** (never a matrix verb) | "no durable rule → interact"; the `resolve(∅)` default (L1); fail-closed via L3 |
-| `escalate` | **Decision action** (never a verdict) | navigation to a richer surface; `authority(escalate) = ⊥` |
+| `Effect` (`deny`/`allow`) | authority axis | *what* is permitted; `deny = ⊥` |
+| `Assurance` (`none`/`presence`/`hardware`) | authority axis | *how strongly proven present*; the old `attest` = `presence` |
+| `Scope` (`once`/`session`/`durable`) | authority axis | *how long* the grant covers (profile-declared order) |
+| `NeedsDecision` | **control-flow result**, not authority | "no rule settled it → interact"; headless ↦ `deny` (L3); never granted |
+| `escalate` | **Decision action**, not authority | navigation to a richer surface; `authority(escalate) = ⊥` |
 
-So `allow` (offer) and `approve` (verdict) are the same disposition seen
-from the two sides of the seam; `ask` is a verdict, not an offer; `escalate`
-is neither.
+There is no `ask` verdict and no `attest` verb any more: `ask` became the
+control-flow `NeedsDecision`; `attest` became `Assurance = presence`.
 
-## 3. Attest discharge + the forward-only ratchet
+## 3. Presence discharge + the forward-only ratchet
 
-An `attest` grant is **inert until a presence proof is verified**, and the
-proof *also witnesses a non-regressing history*: the same finger-press
-attests "I approved R" **and** "the world had not regressed when I did."
+A grant with **`Assurance > none`** (formerly "attest") is **inert until a
+presence proof is verified**, and the proof *also witnesses a non-regressing
+history*: the same finger-press attests "I approved R" **and** "the world had
+not regressed when I did." (`presence` = a WebAuthn/FIDO2 user-presence
+discharge; `hardware` additionally requires a bound hardware/measurement
+attestation, P5 §4.1.)
 
 **Four roles, deliberately separate (OB-3).** The WebAuthn authenticator
 does not understand a Merkle DAG — it signs over a client-data hash. So do
@@ -185,38 +231,43 @@ Five laws. Nothing enters this section without a proof obligation (§5);
 everything else is mechanism (a profile) or well-formedness.
 
 ### L1 — Resolution is a meet
-Verdicts are ordered by restrictiveness (`deny ⊏ attest ⊏ ask ⊏ approve`);
-`deny` is ⊥, `approve` is ⊤. Resolution is the meet of the matching
-verdicts, **with the no-match case defined explicitly** so it is total *and*
-fail-closed (OB-9):
+Authority is the **product meet-lattice** `Effect × Assurance × Scope` (§2.0);
+`⊓` is componentwise; `⊥ = (deny,none,once)`. Resolution meets the matching
+rules, **with the no-match case an explicit control-flow result** so it is
+total *and* fail-closed (OB-9):
 ```
-resolve(R, q) = ⨅ { verdict(r) | r ∈ R, r matches q }   if some rule matches q
-              = ask                                       if none matches q
+resolve(R, q) = Decided( ⨅ { authority(r) | r ∈ R, r matches q } )  if some rule matches
+              = NeedsDecision                                        if none matches
 ```
-The explicit `ask` default is load-bearing: the empty meet's mathematical
-identity is `⊤ = approve`, so *without this clause an unmatched request
-would fail OPEN* — the defect L3 forbids. `ask` (→ prompt; headless → deny,
-L3) is the deliberate "unknown ⇒ interactive, never granted" default. ⨅ is
+The explicit `NeedsDecision` default is load-bearing: the empty meet's
+identity is `⊤ = (allow,hardware,durable)`, so *without this clause an
+unmatched request would fail OPEN*. `NeedsDecision` is not an authority — it
+routes to a surface (headless ↦ `deny`, L3). Componentwise `⊓` is
 associative, commutative, idempotent ⇒ resolution is independent of
-rule/file/load order; no ordering attack exists. **PO-1** (now includes
-`resolve(∅,q) = ask`, i.e. no fail-open). *(The `attest`-factorization fork
-— one verb axis vs. `effect × assurance × scope` — is a lattice-shape
-choice; L1 survives either, since a product of lattices is a lattice.
-Author's call; see README.)*
+rule/file/load order; no ordering attack. **PO-1** (includes
+`resolve(∅,q) = NeedsDecision`, i.e. no fail-open; product-of-lattices is a
+lattice, so the meet laws lift componentwise).
 
 ### L2 — Tamper-boundedness
 For any mutation `m` by a party holding **fewer than quorum(target)** keys:
 ```
-resolve(m(R), q) ⊑ resolve(R, q)          (no widening)
-LoadBearing(R) ⊆ LoadBearing(m(R))        (no structural narrowing)
+resolve(m(R), q) ⊑ resolve(R, q)                     (no widening, any query)
+TrustedStructure(m(R)) = TrustedStructure(R)         (no authority-generating change)
 ```
 Two directions, one law. **Downward:** sub-quorum actors only narrow
-authority; forged loosening entries drop at load (fail-closed). **Upward:**
-sub-quorum actors cannot shrink the load-bearing identity structure —
-reversible narrowing (deny-spam) is a nuisance; **irreversible narrowing
-(revoking an identity) requires quorum** (P4), because a fail-closed
-system's failure mode is an adversary who can *force* closure. Availability
-is a security property.
+authority; forged loosening entries drop at load (fail-closed). **Structural
+(strengthened, OB-16/#5):** the *authority-generating structure* — pinned
+principals, enrolled devices, trusted issuers, blessed anchors, delegation
+edges — must be **unchanged**, not merely un-shrunk. The old `⊆` only forbade
+*removal*; it permitted a sub-quorum actor to *add* a trusted issuer that
+widens no query today but **issues authority later** — a time-delayed
+privilege escalation that passes the per-query monotonicity test. Equality
+closes it: any add *or* remove of authority-generating structure is a
+quorum-gated operation (P4). Reversible authority *narrowing* (deny-spam)
+stays a nuisance; **irreversible narrowing (revoking an identity) and any
+structural change require quorum**, because a fail-closed system's failure
+mode is an adversary who can *force* closure. Availability is a security
+property.
 **H1 (append-only-verifiability + monotone freshness)** is discharged *by
 mechanism*, split across P2: interior integrity by the chain (**PO-2a**),
 tail/fork by the external anchor (**PO-2c**), revocation-quorum by P4
@@ -224,14 +275,16 @@ tail/fork by the external anchor (**PO-2c**), revocation-quorum by P4
 over-claimed in v0.1.x and corrected — see README teeth Tier 3.)
 
 ### L3 — Fail-closed totality
-`resolve` is total; no input reaches "undefined permission." Interactive
-bottom is `ask`; absent a bound surface, `ask ↦ deny`, `attest ↦ deny`
-(degradation is ⊑-monotone). **PO-3.**
+`resolve` is total; no input reaches "undefined permission." The
+non-authority result is `NeedsDecision`; absent a bound surface it degrades
+to `deny` (`⊥`-Effect), and any un-discharged `Assurance > none` grant also
+degrades to `deny` (degradation is ⊑-monotone). **PO-3.**
 
 ### L4 — Attenuation
-`effective = granted ⊓ required`; `granted = requested ⊓ ceiling`;
-`authority(escalate) = ⊥`. Authority composes by meet, never amplifies
-(property-tested upstream as `meet_never_amplifies`). **PO-4.**
+`effective = granted ⊓ required`; `granted ⊑ ceiling` (componentwise, §2.0);
+`authority(escalate) = ⊥`. Authority composes by componentwise meet, never
+amplifies on any axis (property-tested upstream as `meet_never_amplifies`,
+lifted to the product). **PO-4.**
 
 ### L5 — The ceremony gate
 `association(peer) ⇒ pinned(fingerprint(peer))`. `fingerprint = H(pubkey)`
@@ -288,11 +341,16 @@ without a proof obligation; everything else is a profile or a
 well-formedness predicate.** The count history: six → five (L6 → WF-1);
 then held at five through the revocation-DoS absorption (L2 upward), the
 Memo/multihash discipline (WF-2/P1), two adversarial security reviews
-(rounds 4–5, eight findings closed as enforcement/mechanism/wire-discipline
-— L2's H1 *corrected*, not multiplied), and the forward-only ratchet.
+(rounds 4–5), the forward-only ratchet, and the **v0.3.1 protocol freeze**
+(review 7): seven findings closed as *type freeze* (OB-12: `Effect ×
+Assurance × Scope`, `ask`→control-flow, explicit ceiling), *law correction*
+(OB-16: L2 upward now **equality** over authority-generating structure, not
+`⊆` — closing latent-injection escalation), and *mechanism/wire discipline*
+(OB-13 signed grammar, OB-14 genesis, OB-15 CAS append, OB-17 P3/P4
+revocation, OB-18 P5 token+secrets). **Still five laws** — the frozen product
+authority type is a *carrier* change, not a new law; L1/L4 lift componentwise.
 **Next candidate:** L1+L4 unify as one "authority composes by meet" law on
-two carriers (verdict + caveat lattices) — five → four if the Lean
-formulation collapses them cleanly.
+the product carrier — five → four if the Lean formulation collapses them.
 
 The algebra decides the count; ambition doesn't.
 

@@ -3,10 +3,10 @@
 # When a profile version bumps, update its pin here and re-run conformance.
 
 suite = "ceremony-suite"
-suite_version = "0.3.0"
+suite_version = "0.3.1"   # PROTOCOL FREEZE — authority type + wire grammar frozen
 
 [requires]
-p0 = "0.2"   # ceremony-contract  — the narrow waist (five laws)
+p0 = "0.3"   # ceremony-contract  — the narrow waist (five laws; Authority = Effect×Assurance×Scope)
 p1 = "1"     # signed-object      — CID/canon/Sealed/allowlist/envelope
 p2 = "0.2"   # chain-store        — causal transcript + anti-rollback anchor
 p3 = "0.2"   # enrollment         — SAS/PoP/anchors

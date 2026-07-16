@@ -1,6 +1,7 @@
 # P3 — Enrollment Protocol
 
-**Layer:** 2. **Depends on:** P0 (L5), P1, P2.
+**Layer:** 2. **Depends on:** P0 (L5), P1, P2, **P4** (it produces P4
+`PinRecord`s and its revocation predicate is P4's — OB-17).
 **Status:** DRAFT. **Teeth:** this profile is a **protocol**, not an
 algebra — its correctness is *symbolic protocol analysis* (Tamarin /
 ProVerif under Dolev-Yao), **Tier 2**, not Lean/Aeneas. A flawless lattice
@@ -76,8 +77,15 @@ guess probability; independent witnesses multiply the channels an attacker
 must own *simultaneously*. The completed enrollment is a `PinRecord` (P4)
 whose payload carries the ceremony parameters.
 
-**Punting ≥ pinning:** revocation (P4) is graded on the same scale —
-removing an identity demands at least the strength that enrolled it.
+**Revocation is an exact predicate, not a scale (OB-17/#6).** An earlier
+draft said "punting ≥ pinning" — revocation graded on the enrollment-strength
+scale. That contradicts P4, and rightly: the strength tuple `(SAS entropy ×
+rounds, witnesses, presence)` is **not totally ordered**, so "≥" is
+undefined. The normative rule is P4's: **each `PinRecord` names, at enrollment
+time, the exact `RevocationPolicy` CID required to later punt that identity**,
+and revocation compares against *that* recorded predicate. Enrollment's job
+here is only to *record* the required policy CID in the pin; P4 owns its
+evaluation.
 
 ## 3. External anchors (corroboration, never the root)
 

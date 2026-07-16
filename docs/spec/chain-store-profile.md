@@ -34,7 +34,10 @@ struct AuthorityCheckpoint {   // the protected anchor state (P2 §4)
 Normative definitions:
 - **`store_id`** — a content-addressed identifier of the store's genesis
   (its root record's CID); every signed record's domain tuple binds it
-  (P1 §4·5), so a record cannot be replayed into a different store.
+  (P1 §4·5), so a record cannot be replayed into a different store. Genesis
+  is non-circular via the `STORE_ID_SELF` sentinel (P1 §2, OB-14): the
+  genesis body binds `0x00`, and its own cid *becomes* the `store_id` every
+  later record binds.
 - **`thread_id`** — the identifier of one authority thread within a store; a
   causal thread is the totally-ordered sequence of authority records a
   single principal-scope advances. A thread MAY be forked (declared) and
@@ -43,23 +46,44 @@ Normative definitions:
 - **`length`/`sequence`** — the dense per-thread record count, *not*
   longest-path depth.
 
-**Equivocation, now well-defined:** two validly-signed records for the same
-`(store_id, thread_id, sequence)` with different CIDs are incontestable
-proof of misbehavior (§4). This is the branching-safe restatement of the CT
-fork rule.
+This chain-store is the authority projection of the Conversation Graph —
+same `MerkleNode<T>` structure, payload `T` = authority records here,
+conversation records there. Deliberately *not* a blockchain: no mining,
+tokens, leader election, or global total order.
 
-"Extends" for the ratchet means: the presented head's thread reaches the
-protected `(thread_id, sequence, head)` as a strict-ancestor prefix — a
-*forward extension of the same spine*, never a sibling. This chain-store is
-the authority projection of the Conversation Graph — same `MerkleNode<T>`
-structure, payload `T` = authority records here, conversation records there.
-Deliberately *not* a blockchain: no mining, tokens, leader election, or
-global total order.
+## 1.1 Append arbitration (OB-15/#4)
 
-*(Alternative considered and rejected as harder to reason about: a
-frontier-based checkpoint `{store_id, frontier: Set<LineCid>}`. The linear
-spine is chosen for provability; revisit only if genuine concurrent
-authority within one thread becomes a requirement.)*
+**FROZEN for v0.3.1 — compare-and-swap on the expected head** (author's
+decision). `Append(expected_head, next)` commits `next` iff the thread's head
+still equals `expected_head`; a loser **retries**. Single-writer/optimistic;
+the simplest model that closes the honest-race hole the review flagged.
+
+**Refined equivocation (this part is load-bearing regardless of the append
+model):** a concurrent **candidate** record is NORMAL, and a **CAS-loser**
+(one that lost the race to commit a parent) is **benign** — never evidence of
+misbehavior. Equivocation is *two records both **committed** at the same
+`(store_id, thread_id, sequence)` with different CIDs* — a genuine
+double-commit / fork, not a race a writer lost. An honest device that reads a
+head, proposes a successor, and loses the CAS is retrying, not attacking.
+
+> **Roadmap: CAS now → Byzantine Vertical Paxos next (adopted sequencing).**
+> CAS is the threshold-1 steady-state case of a **vertically-reconfigurable**
+> store: after the P1/P2/P0 waist is proven on CAS, P2 evolves to separate a
+> lean *steady-state* protocol from a stronger *reconfiguration* mechanism —
+> the **wedge**: fence the active configuration, capture a safe *closing
+> state* (preserving acknowledged-but-partial commands), certify the next
+> configuration, resume. This makes concurrent candidates normal, gives a
+> 2-full-node deployment safe failover via a reconfiguration participant
+> (`f+1` steady / `2f+1` reconfiguration), and makes the partition-authority
+> ceiling operation-sensitive on the §2.0 lattice. Key-custody stays a
+> *separate* threshold. **Reference implementation: (Byzantine) Vertical
+> Paxos — Abraham & Malkhi, IBM Zurich DCCL; VP orig. Lamport-Malkhi-Zhou,
+> PODC 2009.** The wedge/closing-state correctness gets its own ADR + TLA+/Lean
+> model before it is normative — it is *not* part of the v0.3.1 freeze.
+
+The forward-only ratchet's "extends" means: the presented committed head is a
+forward extension of the protected one on the same `(store_id, thread_id)`
+spine, `sequence` strictly greater — never a sibling.
 
 ## 2. Two CIDs per record
 
@@ -121,13 +145,13 @@ canonical layers, ascending assurance:
    cosignature no older than its freshness policy (CT gossip / STH). Defeats
    *secret* equivocation: to fool a victim the attacker must fork the
    witnesses too.
-3. **Fork = proof of misbehavior (REQUIRED).** Two validly-signed records
-   for the same `(store_id, thread_id, sequence)` with different CIDs are
-   incontestable evidence of equivocation (§1; the branching-safe restatement
-   of RFC 6962). Implementations MUST halt authority minting from that store
-   and escalate — never silently pick one. (Legitimate concurrent
-   *conversation* branches are not equivocation; they merge before the next
-   authority record, so they never collide on a `sequence`.)
+3. **Fork = proof of misbehavior (REQUIRED) — at the CERTIFIED layer only
+   (OB-15).** Two conflicting *quorum-certified* heads for the same
+   `(store_id, thread_id, config_epoch)`, or one voter's conflicting
+   certification votes, are incontestable evidence (§1.1; branching-safe
+   restatement of RFC 6962). Implementations MUST halt authority minting and
+   escalate — never silently pick one. **Concurrent Candidates and
+   CAS-losers are NOT forks** — only the certified frontier can equivocate.
 
 For a solo user (P3's n=2 world) the monotonic head lives on each enrolled
 device and each device is the other's witness — the same k-of-n substrate
