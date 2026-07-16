@@ -44,4 +44,6 @@ jobs:
           use-mathlib-cache: false
       - name: Reject proof escapes and omitted modules
         working-directory: formal
-        run: lake exe formalGate
+        shell: bash
+        run: |
+          "$HOME/.elan/bin/lake" exe formalGate
