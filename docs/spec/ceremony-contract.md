@@ -1,11 +1,12 @@
 # The Ceremony Contract
 
-**Status:** DRAFT 0.1.6 (2026-07-16) — revised per review rounds 1–5 (#229);
-rounds 4–5 = two independent adversarial security reviews (GPT-5/Codex and
-a second LLM), findings adjudicated against the security-engineering canon
-(RFC 6962, TUF, Schneier-Kelsey, FssAgg, Landrock-Pedersen; see the PR
-thread). Two open design forks (§7): the `attest` factorization and whether
-to partition this document into profiles. Normative once accepted.
+**Status:** DRAFT 0.1.7 (2026-07-16) — revised per review rounds 1–5 (#229)
+plus the author's forward-only-ratchet / causal-transcript direction.
+Rounds 4–5 = two independent adversarial security reviews (GPT-5/Codex and
+a second LLM), adjudicated against the security-engineering canon (RFC 6962,
+TUF, Schneier-Kelsey, FssAgg, Landrock-Pedersen; see the PR thread). Two
+open design forks (§7): the `attest` factorization and whether to partition
+this document into profiles. Normative once accepted.
 **Scope:** the decision-surface and first-contact contract between agent-*
 libraries (which own decision *semantics*) and harnesses (which own
 *rendering*). Companion to the verdict/policy TOML contract (#220) — that
@@ -291,6 +292,44 @@ bridle's shipped step-up contract:
   binds the verified discharge to the generation; a new generation voids
   it. An unverified or replayed discharge yields **no** authority.
 
+**The forward-only ratchet: a presence proof also witnesses a
+non-regressing history.** A presence-backed signer MUST NOT authorize
+against a view of the world that has moved *backward*. So the challenge
+the authenticator signs commits not only to `request`/`decision` but to a
+**checkpoint** — and the signer refuses if the store it is shown does not
+extend the store it last witnessed. This produces an `AttestationRecord`
+(§3.6) carrying *two distinct statements in one signature*:
+
+- **authorization** — "I was present and approved this `request` /
+  `decision`" (`request_cid`, `decision_cid`);
+- **history witness** — "I verified the presented head `observed_head`
+  descends from `previous_witnessed_head`, the last head I remember"
+  (`observed_head`, `previous_witnessed_head`).
+
+The signer's `previous_witnessed_head` MUST live in its **§5.7
+anti-rollback anchor** (device keystore / hardware counter / witness
+quorum) — *not* in the same store it is validating, or an attacker rolls
+back the chain and the memory of it together and everything verifies. On
+success the signer advances the anchor to `observed_head`. The check is
+run **per causal thread** (per conversation / subject), so concurrent
+threads never false-trip regression.
+
+Ratchet failures are refused loudly, never silently accepted:
+
+- `previous_witnessed_head` is **not an ancestor** of `observed_head` →
+  either a rollback (regressed head) or a **fork** (a sibling branch that
+  omits the witnessed head). Both are `CHAIN HISTORY REGRESSION` — halt
+  and escalate; a fork is proof-of-misbehavior (§5.7), never a branch to
+  silently adopt.
+- generation has regressed → refuse.
+
+Two monotonicities compose here: the **generation** counter (a coarse
+total order per subject) and **DAG ancestry** (the fine causal order,
+§3.6). An attestation is valid only when *both* advance. This is not a new
+law — it is L2·H1's §5.7 anchor applied at the instant of the ceremony;
+its payoff is that **every ordinary presence approval becomes a free
+freshness checkpoint**, nailing a timestamp-free piton into the history.
+
 ### 3.4 Introduction
 
 First contact is a **two-message challenge-response**, because freshness
@@ -364,10 +403,18 @@ Two CIDs per record: the **content-CID** (canonical form *minus* `sig` —
 what is signed) and the **line-CID** (canonical form *including* `sig` —
 what descendants reference in `parents`). Consequences in §5.1.
 
-### 3.6 AuditRecord & RevocationRecord (ceremonies over the store)
+### 3.6 Attestation, Audit & Revocation records (ceremonies over the store)
 
-An audit is a ceremony whose subject is the chain head: a fingerprint
-witnesses the store's state and signs what it saw.
+The store is a **causal transcript** — a Merkle DAG of content-addressed
+records, not a linear ledger. `parents` is a *set* (branches and merges
+are first-class); "extends" means *reachable-ancestor*, and the
+forward-only checks below are over this partial order, not an integer
+index. (The chain-store here is the **authority projection** of the wider
+Conversation Graph — same `MerkleNode<T>` structure, different payload
+`T`; agent-mesh#67.)
+
+An **AuditRecord** is a ceremony whose subject is the chain head: a
+fingerprint witnesses the store's state and signs what it saw.
 
 ```json
 {
@@ -378,6 +425,31 @@ witnesses the store's state and signs what it saw.
   "decision": { "grant": { "verb": "attest", "scope": "once" } }
 }
 ```
+
+An **AttestationRecord** (§3.3.1) is the AuditRecord's authorization-bearing
+sibling: one presence signature carrying both an approval and a history
+witness. Authorization and witnessing are *distinct fields*, never
+conflated — the same finger-press proves "I approved R" and "the world had
+not regressed when I did."
+
+```json
+{
+  "v": 1,
+  "request_cid": "cid:…",                  // WHAT was approved (§3.1 effect-bound)
+  "decision_cid": "cid:…",                 // the Decision answering it
+  "observed_head": "cid:…",                // history the approval was made against
+  "previous_witnessed_head": "cid:…",      // last head this signer remembers (§5.7 anchor)
+  "generation": 41,
+  "nonce": "…",                            // the gate-issued single-use challenge (§3.3.1)
+  "signer": "b3:…",
+  "presence": { "kind": "passkey", "discharge": "…" },
+  "sig": "…"                               // over content-CID of all of the above
+}
+```
+
+Acceptance requires `previous_witnessed_head` to be a reachable ancestor of
+`observed_head` (else `CHAIN HISTORY REGRESSION`, §3.3.1) — *no
+authorization floats free of the exact history that gave it meaning.*
 
 It is appended to the chain-store like any record (its own content-CID,
 sig, parents), so audits are themselves tamper-evident and auditable. No
@@ -868,6 +940,13 @@ without a proof obligation demanding it; everything else is mechanism
   display-from-effect rule + deferred render transcript (§3.1); break-glass
   + succession made a required subsystem (§3.6); anti-rollback head
   location made explicit in conformance (§6.3). No law change.
+- **Extension (author, 2026-07-16 — forward-only ratchet):** a presence
+  attestation now also witnesses a non-regressing history head (§3.3.1,
+  `AttestationRecord` §3.6). This is *not* a sixth law — it is L2·H1's §5.7
+  anchor applied at ceremony time, so every approval doubles as a freshness
+  checkpoint. The store is restated as a **causal transcript** (Merkle DAG,
+  authority projection of the Conversation Graph, agent-mesh#67). Still
+  five laws.
 - **Next candidate:** L1+L4 are one law ("authority composes by meet") on
   two carriers (verdict lattice, caveat lattice); if the Lean formulation
   unifies them cleanly, five becomes four.
@@ -936,8 +1015,11 @@ identity) because the key *is* the identity. The wire format
 - agent-mesh#65 — `Introduction` struct and mesh decision surfaces
 - agent-mesh#66 — enrollment/delegation protocol; multihash wire format
   for `Fingerprint`
+- agent-mesh#67 — the **Conversation Graph** (distributed content-addressed
+  causal transcript); the chain-store is its authority projection
 - newt-agent#1209 — first consumer: pinning ceremony (HIGH)
 - agent-mesh `docs/decisions/floating_identity.md` — identity doctrine
-  (law 5 there = L5 here, seen from the transport)
+  (law 5 there = L5 here; law 4 "conversations outlive locations" is what
+  the Conversation Graph makes concrete)
 - `content-addressable` crate — `ContentId`, canonical DAG-CBOR,
   `MerkleNode` (§5.1)
