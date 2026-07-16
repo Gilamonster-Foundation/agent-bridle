@@ -35,11 +35,12 @@ check:
     cargo test --workspace --no-default-features
 
 # Lean proof gate. Mirrors `.github/workflows/formal.yml` and is run by the
-# pre-push hook on every platform. Lake reads `formal/lean-toolchain`; the
-# project sets `warningAsError`, so `sorry` / `admit` cannot pass this build.
+# pre-push hook on every platform. Lake reads `formal/lean-toolchain`;
+# warning-as-error and `formalGate` reject proof escapes and omitted modules.
 [working-directory: 'formal']
 check-formal:
     lake build
+    lake exe formalGate
 
 # Windows AppContainer L3 backend checks — the local mirror of the `check-windows`
 # job in .github/workflows/ci.yml (and nightly-windows.yml). The `appcontainer_impl`

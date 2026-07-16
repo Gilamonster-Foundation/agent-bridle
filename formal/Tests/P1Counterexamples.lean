@@ -13,5 +13,6 @@ example (allowed : AllowedHash Profile.v1) :
   no_v1_sha1_witness allowed
 
 example : dispatchHash
+    TrustedProfile.v1
     ({ algorithm := .blake3_256, allowed := blake3_allowed } :
       AllowedHash Profile.v1) = .blake3 := rfl

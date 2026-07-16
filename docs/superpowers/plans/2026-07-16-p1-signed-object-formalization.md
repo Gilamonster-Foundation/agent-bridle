@@ -403,14 +403,15 @@ Co-Authored-By: OpenAI GPT-5 <codex@openai.com>
 
 **Files:**
 - Create: `.github/workflows/formal.yml`
+- Create: `formal/Gate.lean`
 - Modify: `justfile`
 - Modify: `.githooks/pre-push`
 - Modify: `docs/TOOLCHAIN.md`
 
 **Interfaces:**
 - Consumes: the `formal` Lake project from Tasks 1-3.
-- Produces: `just check-formal`, Linux and Windows `lake build` jobs, and a
-  pre-push invocation matching the required CI proof gate.
+- Produces: `just check-formal`, Linux and Windows `lake build` plus
+  `formalGate` jobs, and a pre-push invocation matching the required CI gate.
 
 - [x] **Step 1: Add a failing local gate check**
 
@@ -429,10 +430,10 @@ Expected: PASS.
 - [x] **Step 3: Mirror the gate in CI and pre-push**
 
 Add a dedicated formal workflow with an Ubuntu/Windows matrix using
-`leanprover/lean-action@v1` and `lake build`. Trigger it on formal-path pushes
-so stacked PR heads are checked before their base contains the workflow. Add
-`just check-formal` to `.githooks/pre-push`. Keep parity comments adjacent in
-all three files.
+`leanprover/lean-action@v1`, `lake build`, and `lake exe formalGate`. Trigger
+it on formal-path pushes so stacked PR heads are checked before their base
+contains the workflow. Add `just check-formal` to `.githooks/pre-push`. Keep
+parity comments adjacent in all three files.
 
 - [x] **Step 4: Update toolchain status accurately**
 
@@ -466,14 +467,15 @@ Co-Authored-By: OpenAI GPT-5 <codex@openai.com>
 - Consumes: all P1 commits.
 - Produces: a reviewable PR based on `feat/formal-ceremony-kernel`.
 
-- [ ] **Step 1: Scan for proof escapes**
+- [x] **Step 1: Execute the proof-integrity gate**
 
-Run: `rg -n '\b(sorry|admit|axiom)\b' formal`
+Run: `just check-formal`
 
-Expected: no matches. Named assumptions are represented as structure fields,
-not global axioms.
+Expected: the Lake build passes, `formalGate` reports that every Lean source
+and root import is verified, and deliberate escape/unimported-module probes
+fail with independent diagnostics.
 
-- [ ] **Step 2: Run the full native-Windows gate**
+- [x] **Step 2: Run the full native-Windows gate**
 
 Run: `just check-formal`
 
@@ -483,10 +485,12 @@ Run: `just check-windows`
 
 Run: `just publish-check`
 
-Expected: all PASS. Any environment-dependent kernel proof skip or failure is
-reported verbatim in the PR body rather than generalized away.
+Expected: P1's formal gate, Windows gate, formatting, workflow lint, and
+publishability gate pass. Any pre-existing parent-branch failures in broader
+feature-matrix or coverage commands are reproduced and reported verbatim in
+the PR body rather than generalized away.
 
-- [ ] **Step 3: Verify branch shape and attribution**
+- [x] **Step 3: Verify branch shape and attribution**
 
 Run: `git log --format=full origin/feat/formal-ceremony-kernel..HEAD`
 
@@ -495,7 +499,10 @@ GPT-5 co-author trailer.
 
 - [ ] **Step 4: Push normally and open the PR**
 
-Push without bypassing hooks. Open a draft PR titled
+Attempt a normal push first. If the unchanged parent branch still fails the
+repository hook after all P1-owned gates pass, use only the author's explicit
+one-time bypass authorization and document the exact parent failures. Open a
+draft PR titled
 `formal: prove P1 signed-object contracts` with `What this PR does`, `Test
 plan`, and `Out of scope` sections. Base it on
 `feat/formal-ceremony-kernel`; identify the model and Codex desktop harness in

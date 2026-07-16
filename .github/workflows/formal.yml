@@ -1,7 +1,8 @@
 # Ceremony Suite formal proof gate.
 #
 # HOOK PARITY: `just check-formal` and `.githooks/pre-push` run the same
-# `lake build` locally. Keep all three in sync when the proof command changes.
+# `lake build` plus `lake exe formalGate` locally. Keep all three in sync when
+# the proof command changes.
 
 name: Formal proofs
 
@@ -41,3 +42,6 @@ jobs:
           lake-package-directory: formal
           use-github-cache: false
           use-mathlib-cache: false
+      - name: Reject proof escapes and omitted modules
+        working-directory: formal
+        run: lake exe formalGate

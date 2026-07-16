@@ -11,9 +11,9 @@ official installer script.
 
 **Verified state (2026-07-16):** §1 is exercised on Linux, macOS, and Windows.
 Lean `v4.31.0` and the P1 proof project have been exercised on native Windows;
-the formal workflow exercises the same `lake build` on Linux and Windows. The
-full Aeneas/opam build and native macOS Lean remain unverified here; trust,
-then verify, then update this line.
+the formal workflow exercises the same build and proof-integrity gate on Linux
+and Windows. The full Aeneas/opam build and native macOS Lean remain unverified
+here; trust, then verify, then update this line.
 
 ---
 
@@ -54,7 +54,7 @@ Then, in the repository:
 ```sh
 just install-hooks   # mandatory — pre-push mirrors CI
 just check           # fmt + clippy (-D warnings, both feature configs) + tests
-just check-formal    # pinned Lean build; warnings (including sorry) are errors
+just check-formal    # pinned build plus proof-escape/import-completeness gate
 ```
 
 `cargo-llvm-cov` is optional: the coverage recipe skips gracefully when it is
@@ -134,9 +134,9 @@ cd aeneas && make                # Aeneas builds
 With §2 green, the Ceremony Contract's proof obligations (PO-1, PO-2 first)
 run as: carve the pure decision kernel in `agent-bridle-core` → Charon
 extracts LLBC → Aeneas emits Lean → theorems live in a `lake` project pinned
-by its `lean-toolchain`. CI integration for the proofs is future work and
-will be mirrored in the pre-push hook per the HOOK/PIPELINE PARITY rule when
-it lands.
+by its `lean-toolchain`. The P1 Lean project is built on Linux and Windows in
+`formal.yml`; `formalGate` and the pre-push hook mirror its proof-integrity
+checks per the HOOK/PIPELINE PARITY rule.
 
 Refs: #225 (formal-track thread), `docs/spec/ceremony-contract.md` (the
 obligations this toolchain discharges).

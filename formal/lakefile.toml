@@ -13,3 +13,9 @@ name = "CeremonyTests"
 srcDir = "."
 roots = ["Tests"]
 moreLeanArgs = ["-DwarningAsError=true"]
+
+[[lean_exe]]
+name = "formalGate"
+srcDir = "."
+root = "Gate"
+moreLeanArgs = ["-DwarningAsError=true"]

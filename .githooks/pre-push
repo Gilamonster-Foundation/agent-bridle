@@ -15,7 +15,7 @@ set -euo pipefail
 echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, full matrix)"
 just check
 
-echo "[pre-push] running 'just check-formal' (Lean proofs, pinned toolchain)"
+echo "[pre-push] running 'just check-formal' (Lean proofs + integrity gate)"
 just check-formal
 
 echo "[pre-push] running 'just check-windows' (AppContainer backend + kernel proofs; skips off Windows)"
