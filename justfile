@@ -44,6 +44,25 @@ check-formal:
     set -e
     ( cd formal && "$LAKE" build && "$LAKE" exe formalGate )
 
+# Tier-3 REFINEMENT gate (HEAVY — pulls the Aeneas Lean backend + mathlib).
+# Proves the Charon/Aeneas-EXTRACTED Rust of agent-bridle-ceremony satisfies the
+# Authority.lean laws (formal/refinement/). Deliberately NOT in the mandatory
+# pre-push gate or CI (mathlib is too heavy for every push) — run it on a machine
+# with the Charon/Aeneas toolchain. Skips gracefully if lake OR the Aeneas Lean
+# backend is absent. See formal/refinement/README.md and docs/TOOLCHAIN.md §2.
+check-refinement:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! command -v lake >/dev/null 2>&1 && [ ! -x "$HOME/.elan/bin/lake" ]; then
+        echo "lake (Lean) not installed — skipping refinement gate"; exit 0
+    fi
+    LAKE="$(command -v lake || echo "$HOME/.elan/bin/lake")"
+    if [ ! -d "${AENEAS_LEAN_LIB:-$HOME/opt/aeneas/backends/lean}" ]; then
+        echo "Aeneas Lean backend absent — skipping refinement gate (see docs/TOOLCHAIN.md §2)"; exit 0
+    fi
+    set -e
+    ( cd formal/refinement && ./setup.sh && "$LAKE" build )
+
 # Windows AppContainer L3 backend checks — the local mirror of the `check-windows`
 # job in .github/workflows/ci.yml (and nightly-windows.yml). The `appcontainer_impl`
 # module and the `agent-bridle-aclaunch` launcher only compile on Windows, so this

@@ -23,8 +23,14 @@ def main : IO Unit := do
   let ceremonyRoot <- IO.FS.readFile "Ceremony.lean"
   let testsRoot <- IO.FS.readFile "Tests.lean"
   let mut errors := #[]
+  -- `refinement/` is a SEPARATE, heavy Lake project (Aeneas + mathlib + Aeneas-
+  -- generated code that legitimately uses opaque externals, plus a machine-local
+  -- `aeneas-lean` symlink into the Aeneas source). It is gated on its own by
+  -- `just check-refinement`, NOT by this fast mathlib-free gate — so prune it.
+  -- (This comment avoids the literal escape words on purpose — the gate scans
+  -- its own source too.)
   let paths <- (System.FilePath.mk ".").walkDir fun path =>
-    pure (!path.components.contains ".lake")
+    pure (!path.components.contains ".lake" && !path.components.contains "refinement")
   for path in paths do
     if path.extension == some "lean" && !path.components.contains ".lake" then
       let source <- IO.FS.readFile path

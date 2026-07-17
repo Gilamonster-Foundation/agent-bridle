@@ -34,7 +34,7 @@ Tamarin/ProVerif, Tier-1 assumed crypto).
 | 0.3 | **Lean P0 authority model** — `formal/Ceremony/P0/Authority.lean`, 25 theorems, 0 `sorry` | ✅ |
 | 0.4 | **TLA+ store model** — `formal/tla/CeremonyStore.tla` (CAS + anti-rollback invariants) | ✅ |
 | 0.5 | **Lean P1 signed-object contracts** + Lake project + `formalGate` proof-escape gate + CI (`formal.yml`) + `just check-formal` | ✅ (harvested from PR #233 / GPT-5, integrated with P0) |
-| 0.6 | Aeneas/Charon toolchain green on gnuc (opam/OCaml leg) | pending (`../TOOLCHAIN.md`) |
+| 0.6 | Aeneas/Charon toolchain green on gnuc (opam/OCaml leg) | ✅ built on gnuc; `agent-bridle-ceremony` extracts Rust→LLBC→Lean and the first refinement proofs pass (`formal/refinement/`) |
 
 **Exit:** ADRs merged; the unified Lean project (P0 + P1) builds under CI + the
 pre-push gate; TLA+ store model in place; only the opam leg remains before
@@ -57,6 +57,11 @@ formal proof → conformance vectors.
   precedence + the gate-acceptance checklist. **Charon extracts the Rust
   kernel; Aeneas proves it refines `Authority.lean`.** *Gate:* PO-1/3/4/5
   + the refinement bridge theorem; CI blocks any kernel that fails it.
+  - *Started:* `agent-bridle-ceremony` (`authority.rs` + `boundary.rs`) is the
+    pure kernel; `formal/refinement/` proves the `meet`/`attenuate` laws on the
+    Charon/Aeneas-extracted code. **Remaining:** rewrite `resolve` from an
+    iterator-`fold` (Aeneas axiomatizes slice iterators, so it won't reduce) to
+    explicit recursion, then extend the refinement proof to cover it.
 - **1d Conformance vectors.** `tests/vectors/*.json` — positive **and
   negative** — the cross-language behavioral contract. *This unblocks the
   "held" wire freeze.*
