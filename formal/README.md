@@ -21,7 +21,7 @@ it builds in seconds.
 | `Ceremony/P1/SignedObject.lean` | **P1 signed-object contracts** — profile/algorithm allowlist (`TrustedProfile`), canonical encoding injectivity, the universal `SignaturePreimage` binding profile/codec/domain/store/thread/body/cid/signer (OB-13), genesis. | PR #233 (GPT-5/Codex) |
 | `Gate.lean` + `formalGate` exe | the proof-escape gate: rejects `sorry` / omitted modules. | PR #233 |
 | `Tests/P1Counterexamples.lean`, `Tests/SignedObjectContracts.lean` | negative + contract tests (Lean-level conformance). | PR #233 |
-| `tla/CeremonyStore.tla` | **P2 store** — CAS append + anti-rollback state machine; invariants map to PO-2/2a/2c + OB-15/16. Check with TLC. | P2 (this suite) |
+| `tla/CeremonyStore.tla` (+ `.cfg`) | **P2 store** — CAS append + anti-rollback state machine; invariants map to PO-2/2a/2c + OB-15/16. **TLC-checked green** (547 distinct states: `Inv` = TypeOK ∧ SpineFunctional ∧ NoRollback, plus `CheckpointMono`/`LenMono`). Run: `java -cp tla2tools.jar tlc2.TLC -config CeremonyStore.cfg CeremonyStore.tla`. | P2 (this suite) |
 | `tla/EnforcementGate.tla` | **the L3-gate under a fence that DROPS over time** — temporal half of `Boundary.lean`. `NoAdvisoryDynamicExec` holds iff the fence is re-checked at exec (I4). TLC PASSES with `CheckAtExec=TRUE`, exhibits the TOCTOU trace with `FALSE` (two `.cfg`s next to it). | P0 (this suite) |
 
 ## Why this shape
