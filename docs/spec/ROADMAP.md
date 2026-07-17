@@ -31,12 +31,14 @@ Tamarin/ProVerif, Tier-1 assumed crypto).
 |---|---|---|
 | 0.1 | Merge the spec suite to `main` | ✅ PR #229 |
 | 0.2 | ADRs 0020 (authority type) · 0021 (append CAS→BVP) · 0022 (signed grammar) · 0023 (proof discipline) | this cut |
-| 0.3 | **Lean authority model** — `formal/lean/Authority.lean`, 25 theorems, 0 `sorry`, compiles | ✅ this cut |
-| 0.4 | **TLA+ store model** — `formal/tla/CeremonyStore.tla` (CAS + anti-rollback invariants) | this cut |
-| 0.5 | Aeneas/Charon toolchain green on gnuc (opam/OCaml leg) | pending (`../TOOLCHAIN.md`) |
+| 0.3 | **Lean P0 authority model** — `formal/Ceremony/P0/Authority.lean`, 25 theorems, 0 `sorry` | ✅ |
+| 0.4 | **TLA+ store model** — `formal/tla/CeremonyStore.tla` (CAS + anti-rollback invariants) | ✅ |
+| 0.5 | **Lean P1 signed-object contracts** + Lake project + `formalGate` proof-escape gate + CI (`formal.yml`) + `just check-formal` | ✅ (harvested from PR #233 / GPT-5, integrated with P0) |
+| 0.6 | Aeneas/Charon toolchain green on gnuc (opam/OCaml leg) | pending (`../TOOLCHAIN.md`) |
 
-**Exit:** ADRs merged; both formal models under `formal/`; toolchain ready to
-extract Rust→Lean.
+**Exit:** ADRs merged; the unified Lean project (P0 + P1) builds under CI + the
+pre-push gate; TLA+ store model in place; only the opam leg remains before
+Rust→Lean extraction.
 
 ## Phase 1 — Prove the waist  *(P1 → P2 → P0)*  — the MVP
 

@@ -15,7 +15,7 @@
 
   The append/rollback state machine (P2, PO-2*) is modeled separately in TLA+.
 -/
-namespace Ceremony
+namespace Ceremony.P0
 
 /-! ### Axes — finite chains; `deny/none/once` is ⊥ -/
 inductive Effect | deny | allow deriving DecidableEq, Repr
@@ -123,4 +123,4 @@ theorem resolve_swap (x y : Authority) (xs : List Authority) :
     resolve (x :: y :: xs) = resolve (y :: x :: xs) := by
   simp only [resolve, List.foldl, meet_comm x y]
 
-end Ceremony
+end Ceremony.P0

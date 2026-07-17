@@ -1,0 +1,21 @@
+name = "ceremony-formal"
+version = "0.1.0"
+defaultTargets = ["CeremonyFormal", "CeremonyTests"]
+
+[[lean_lib]]
+name = "CeremonyFormal"
+srcDir = "."
+roots = ["Ceremony"]
+moreLeanArgs = ["-DwarningAsError=true"]
+
+[[lean_lib]]
+name = "CeremonyTests"
+srcDir = "."
+roots = ["Tests"]
+moreLeanArgs = ["-DwarningAsError=true"]
+
+[[lean_exe]]
+name = "formalGate"
+srcDir = "."
+root = "Gate"
+moreLeanArgs = ["-DwarningAsError=true"]
