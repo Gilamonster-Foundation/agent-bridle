@@ -165,10 +165,28 @@ pub enum Resolution {
 /// the empty meet `⊤` — the no-fail-open clause (OB-9 / OB-12): the piecewise
 /// definition never seeds the fold with `⊤`, which would both fail open on no
 /// match *and* silently downgrade a legitimate `Allow`.
+///
+/// Uses explicit index recursion ([`meet_from`]) rather than `iter().fold`: the
+/// iterator/closure form extracts to Aeneas's *opaque* slice-iterator axioms and
+/// cannot be reduced in a refinement proof, whereas this extracts to a real
+/// recursive function (see `formal/refinement/`).
 pub fn resolve(candidates: &[Authority]) -> Resolution {
-    match candidates.split_first() {
-        None => Resolution::NeedsDecision,
-        Some((first, rest)) => Resolution::Decided(rest.iter().fold(*first, |acc, &a| acc.meet(a))),
+    if candidates.is_empty() {
+        Resolution::NeedsDecision
+    } else {
+        Resolution::Decided(meet_from(candidates, 1, candidates[0]))
+    }
+}
+
+/// Fold the meet over `candidates[start..]`, accumulating into `acc`. Explicit
+/// tail recursion — no iterator, no closure — so it extracts to a genuine
+/// recursive function for the Aeneas refinement. The recursion decreases
+/// `candidates.len() - start`, so it terminates.
+fn meet_from(candidates: &[Authority], start: usize, acc: Authority) -> Authority {
+    if start >= candidates.len() {
+        acc
+    } else {
+        meet_from(candidates, start + 1, acc.meet(candidates[start]))
     }
 }
 
