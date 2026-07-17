@@ -1,0 +1,5 @@
+# TLC model-checker run artifacts (scratch)
+states/
+*_TTrace_*.tla
+*_TTrace_*.bin
+*.st
