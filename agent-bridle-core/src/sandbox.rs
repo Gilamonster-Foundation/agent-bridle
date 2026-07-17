@@ -1422,8 +1422,14 @@ mod seatbelt_impl {
             let prof = seatbelt_profile(&cav);
             assert!(prof.contains("(deny file-write*)"));
             assert!(
-                !prof.contains("(allow file-write*"),
+                !prof.contains("(subpath"),
                 "an empty scope must grant no write roots: {prof}"
+            );
+            // #1220: the device sinks stay write-openable even with an empty
+            // write scope — that re-allow is a `literal`, not a `subpath` root.
+            assert!(
+                prof.contains("(literal \"/dev/null\")"),
+                "device sinks must still be re-allowed: {prof}"
             );
         }
 
@@ -1468,9 +1474,14 @@ mod seatbelt_impl {
                 ..Caveats::top()
             };
             let prof = seatbelt_profile(&cav);
+            // Every other structural term is a plain, non-crafted literal (the
+            // #1220 device sinks); the crafted root contributes exactly one
+            // structural (subpath "…") term — 2 unescaped quotes — on top of
+            // those.
+            let sinks = SandboxPolicy::default().device_sink_paths.resolve();
             assert_eq!(
                 unescaped_quotes(&prof),
-                2,
+                2 + 2 * sinks.len(),
                 "exactly one structural (subpath \"…\") term — no breakout: {prof}"
             );
             assert!(
