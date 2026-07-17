@@ -30,5 +30,10 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+mod boundary;
 
 pub use authority::{resolve, Assurance, Authority, Effect, Resolution, Scope};
+pub use boundary::{
+    boundary_ceiling, boundary_verdict, brush_honest, enforceable_ceiling, minted_grant,
+    safe_subset, Fence, Request,
+};
