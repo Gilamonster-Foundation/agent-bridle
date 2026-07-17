@@ -15,7 +15,6 @@
 //! builtin that spawns outside the `before_exec` funnel — a proven bypass).
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use agent_bridle_core::{
@@ -31,6 +30,7 @@ use brush_core::variables::ShellVariable;
 use brush_core::{Shell, ShellFd};
 
 use crate::caveat_interceptor::{CaveatInterceptor, DenialSink};
+use crate::output_observer::{drain_capped, output_session, OutputEmitter};
 
 /// The engine identity stamped on the disclosure (ADR 0005 D2 / ADR 0019 D4).
 const ENGINE_NAME: &str = "brush";
@@ -71,6 +71,7 @@ static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
 pub struct BrushShellTool {
     max_output: usize,
     schema: Arc<serde_json::Value>,
+    output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
 }
 
 impl std::fmt::Debug for BrushShellTool {
@@ -92,7 +93,20 @@ impl BrushShellTool {
         Self {
             max_output: DEFAULT_MAX_OUTPUT,
             schema: DEFAULT_SCHEMA.clone(),
+            output_observer: None,
         }
+    }
+
+    /// Attach a presentation-only observer for bounded stdout/stderr chunks.
+    ///
+    /// The observer receives only output captured by an admitted invocation and
+    /// cannot change the interceptor, authority, or final result envelope.
+    /// Delivery may finish asynchronously after the invocation returns;
+    /// `on_finish` marks the queue-drained boundary.
+    #[must_use]
+    pub fn with_output_observer(mut self, observer: Arc<dyn crate::ShellOutputObserver>) -> Self {
+        self.output_observer = Some(observer);
+        self
     }
 
     /// Override the tool's input schema (three-Cs: Configuration).
@@ -149,11 +163,12 @@ impl Tool for BrushShellTool {
         let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
         let interceptor = CaveatInterceptor::new(cx.clone(), Arc::clone(&sink));
         let max_output = self.max_output;
+        let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
 
         // brush's shell API is async and blocks on a per-invocation current-thread
         // runtime; run it off the async runtime on a blocking worker.
         let captured = tokio::task::spawn_blocking(move || {
-            run_in_brush(cmd, cwd, path_value, interceptor, max_output)
+            run_in_brush(cmd, cwd, path_value, interceptor, max_output, output)
         })
         .await
         .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
@@ -161,14 +176,16 @@ impl Tool for BrushShellTool {
         // Any denial the interceptor recorded lifts the envelope to `denied:true`.
         let denials: Vec<Denial> = sink.lock().map(|g| g.clone()).unwrap_or_default();
 
-        Ok(ToolEnvelope::new(SandboxKind::None)
+        let envelope = ToolEnvelope::new(SandboxKind::None)
             .with_disclosure(self.disclosure())
             .with_exit_code(captured.exit_code)
             .with_stdout(captured.stdout)
             .with_stderr(captured.stderr)
             .with_timed_out(false)
             .with_denials(denials)
-            .into_json())
+            .into_json();
+        output_guard.finish();
+        Ok(envelope)
     }
 }
 
@@ -192,6 +209,7 @@ fn run_in_brush(
     path_value: String,
     interceptor: CaveatInterceptor,
     max_output: usize,
+    output: OutputEmitter,
 ) -> ToolResult<Captured> {
     let (out_reader, out_writer) =
         std::io::pipe().map_err(|e| ToolError::Exec(brush_io("create stdout pipe", &e)))?;
@@ -200,8 +218,23 @@ fn run_in_brush(
 
     // Drain the read ends on background threads so a chatty command cannot
     // deadlock by filling the pipe buffer before the shell exits.
-    let out_handle = std::thread::spawn(move || drain(out_reader, max_output));
-    let err_handle = std::thread::spawn(move || drain(err_reader, max_output));
+    let stdout_output = output.clone();
+    let out_handle = std::thread::spawn(move || {
+        drain(
+            out_reader,
+            max_output,
+            &stdout_output,
+            crate::ShellOutputStream::Stdout,
+        )
+    });
+    let err_handle = std::thread::spawn(move || {
+        drain(
+            err_reader,
+            max_output,
+            &output,
+            crate::ShellOutputStream::Stderr,
+        )
+    });
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -301,14 +334,14 @@ fn confined_builtins() -> HashMap<String, Registration<LeashedExtensions>> {
 }
 
 /// Read a pipe to EOF (capped at `max` bytes), returning lossy UTF-8.
-fn drain(mut reader: std::io::PipeReader, max: usize) -> ToolResult<String> {
-    let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
+fn drain(
+    reader: std::io::PipeReader,
+    max: usize,
+    output: &OutputEmitter,
+    stream: crate::ShellOutputStream,
+) -> ToolResult<String> {
+    let (buf, _truncated) = drain_capped(reader, max, output, stream)
         .map_err(|e| ToolError::Exec(brush_io("drain pipe", &e)))?;
-    if buf.len() > max {
-        buf.truncate(max);
-    }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 

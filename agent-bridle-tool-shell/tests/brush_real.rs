@@ -10,9 +10,58 @@
 #![cfg(feature = "brush")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use agent_bridle_core::{Caveats, Gate, Scope, Tool, ToolContext};
-use agent_bridle_tool_shell::BrushShellTool;
+use agent_bridle_tool_shell::{
+    BrushShellTool, ShellInvocationId, ShellOutputObserver, ShellOutputStream,
+};
+
+#[cfg(unix)]
+const OUTPUT_CAP: usize = 64 * 1024;
+
+#[derive(Default)]
+struct OutputRecorder {
+    chunks: Mutex<Vec<(ShellOutputStream, Vec<u8>)>>,
+    finished: Mutex<bool>,
+    finished_cv: Condvar,
+}
+
+impl ShellOutputObserver for OutputRecorder {
+    fn on_output(&self, _invocation: ShellInvocationId, stream: ShellOutputStream, chunk: &[u8]) {
+        self.chunks
+            .lock()
+            .expect("output recorder lock")
+            .push((stream, chunk.to_vec()));
+    }
+
+    fn on_finish(&self, _invocation: ShellInvocationId) {
+        *self.finished.lock().expect("finished lock") = true;
+        self.finished_cv.notify_all();
+    }
+}
+
+impl OutputRecorder {
+    fn bytes(&self, stream: ShellOutputStream) -> Vec<u8> {
+        self.chunks
+            .lock()
+            .expect("output recorder lock")
+            .iter()
+            .filter(|(seen, _)| *seen == stream)
+            .flat_map(|(_, chunk)| chunk.iter().copied())
+            .collect()
+    }
+
+    fn wait_finished(&self) {
+        let finished = self.finished.lock().expect("finished lock");
+        let (finished, _) = self
+            .finished_cv
+            .wait_timeout_while(finished, Duration::from_secs(2), |finished| !*finished)
+            .expect("finished condition variable");
+        assert!(*finished, "timed out waiting for observer finish");
+    }
+}
 
 /// Mint a [`ToolContext`] carrying `granted` — the public-API path an embedder
 /// uses (mirrors `host_shell_real.rs`).
@@ -30,6 +79,49 @@ fn unique_temp(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+#[tokio::test]
+async fn output_observer_matches_the_brush_envelope() {
+    let observer = Arc::new(OutputRecorder::default());
+    let out = BrushShellTool::new()
+        .with_output_observer(observer.clone())
+        .invoke(
+            serde_json::json!({ "cmd": "printf brush-out; printf brush-err >&2" }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    observer.wait_finished();
+    assert_eq!(observer.bytes(ShellOutputStream::Stdout), b"brush-out");
+    assert_eq!(observer.bytes(ShellOutputStream::Stderr), b"brush-err");
+    assert_eq!(out["stdout"], "brush-out");
+    assert_eq!(out["stderr"], "brush-err");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stderr_observer_and_brush_envelope_apply_the_output_cap() {
+    let observer = Arc::new(OutputRecorder::default());
+    let out = BrushShellTool::new()
+        .with_output_observer(observer.clone())
+        .invoke(
+            serde_json::json!({
+                "cmd": format!("yes b | head -c {} >&2", OUTPUT_CAP + 4),
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke chatty brush shell");
+
+    observer.wait_finished();
+    let observed = observer.bytes(ShellOutputStream::Stderr);
+    assert_eq!(observed.len(), OUTPUT_CAP);
+    assert_eq!(
+        out["stderr"].as_str().expect("stderr string").as_bytes(),
+        observed
+    );
 }
 
 /// Full-access: a `$(...)` command substitution — refused by the safe-subset

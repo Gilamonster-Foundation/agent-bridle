@@ -41,11 +41,13 @@ mod coreutils_dispatch;
 mod host_shell;
 #[cfg(feature = "shell")]
 mod net_proxy;
+mod output_observer;
 #[cfg(feature = "shell")]
 mod parse;
 #[cfg(feature = "shell")]
 mod shell_tool;
 
+pub use output_observer::{ShellInvocationId, ShellOutputObserver, ShellOutputStream};
 #[cfg(feature = "shell")]
 pub use shell_tool::ShellTool;
 

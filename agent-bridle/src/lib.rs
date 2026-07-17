@@ -35,6 +35,8 @@ pub use agent_bridle_core::*;
 // keeps the linker from DCE-ing a tool module under strip+lto.
 #[cfg(feature = "shell")]
 pub use agent_bridle_tool_shell::ShellTool;
+#[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
+pub use agent_bridle_tool_shell::{ShellInvocationId, ShellOutputObserver, ShellOutputStream};
 // The sandboxed-host engine (ADR 0019 / #194). Anchored here so a host can
 // construct its own registry with it (`Registry::builder().tool(Arc::new(
 // HostShellTool::new()))`); it is deliberately NOT added to `registry()` — it
