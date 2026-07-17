@@ -66,7 +66,11 @@ AdvanceCheckpoint ==
 \* it as a no-op (candidate records live off the committed spine).
 UntrustedStep == UNCHANGED vars
 
-Next == (\E e \in Nat, r \in RecordIds : Append(e, r))
+\* `expected` ranges over the plausible (possibly stale) head-reads `0..len`;
+\* Append only fires on `expected = len`, so any `e > len` is a disabled
+\* transition — restricting to `0..len` keeps the relation faithful AND finite
+\* (TLC cannot enumerate `Nat`). A stale read `e < len` is the benign CAS loser.
+Next == (\E e \in 0..len, r \in RecordIds : Append(e, r))
         \/ AdvanceCheckpoint
         \/ UntrustedStep
 
@@ -84,6 +88,10 @@ NoRollback == len >= checkpoint
 Inv == TypeOK /\ SpineFunctional /\ NoRollback
 
 THEOREM Spec => []Inv
+
+\* Finite-state bound for TLC (the spine/len are otherwise unbounded). See
+\* CeremonyStore.cfg: RecordIds is a small model-value set and len is capped.
+StateBound == len =< 4
 
 ------------------------------------------------------------------------------
 \* Action properties (checked with a state constraint like len =< 4)
