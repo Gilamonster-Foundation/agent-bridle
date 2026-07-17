@@ -45,7 +45,7 @@ jobs:
   # over the axes that actually vary on Linux.
   powerset-linux:
     name: feature-powerset — Linux (Landlock)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
