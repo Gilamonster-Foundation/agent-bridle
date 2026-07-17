@@ -17,10 +17,12 @@ it builds in seconds.
 | Path | Covers | Origin |
 |---|---|---|
 | `Ceremony/P0/Authority.lean` | **P0 authority algebra** — the product meet-lattice `Effect × Assurance × Scope`, attenuation (L4), no-fail-open (OB-9/OB-12), order-independence (L1). 25 theorems, 0 `sorry`. | P0 (this suite) |
+| `Ceremony/P0/Boundary.lean` | **the OCAP two-stream sequencing, mechanized** — the L3-gated brush default proven to be an `Effect` attenuation in the frozen algebra (no new law/axis); safe-subset fallback *forced* by I9; enforcement = meet-homomorphic image of authority (streams converge). Confirms the [DECIDED board note](../../../knowledge/board/2026-07-16_ocap-two-streams-sequencing-DECIDED.md). | P0 (this suite) |
 | `Ceremony/P1/SignedObject.lean` | **P1 signed-object contracts** — profile/algorithm allowlist (`TrustedProfile`), canonical encoding injectivity, the universal `SignaturePreimage` binding profile/codec/domain/store/thread/body/cid/signer (OB-13), genesis. | PR #233 (GPT-5/Codex) |
 | `Gate.lean` + `formalGate` exe | the proof-escape gate: rejects `sorry` / omitted modules. | PR #233 |
 | `Tests/P1Counterexamples.lean`, `Tests/SignedObjectContracts.lean` | negative + contract tests (Lean-level conformance). | PR #233 |
 | `tla/CeremonyStore.tla` | **P2 store** — CAS append + anti-rollback state machine; invariants map to PO-2/2a/2c + OB-15/16. Check with TLC. | P2 (this suite) |
+| `tla/EnforcementGate.tla` | **the L3-gate under a fence that DROPS over time** — temporal half of `Boundary.lean`. `NoAdvisoryDynamicExec` holds iff the fence is re-checked at exec (I4). TLC PASSES with `CheckAtExec=TRUE`, exhibits the TOCTOU trace with `FALSE` (two `.cfg`s next to it). | P0 (this suite) |
 
 ## Why this shape
 
