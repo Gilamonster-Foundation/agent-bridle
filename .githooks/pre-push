@@ -26,4 +26,7 @@ just publish-check
 echo "[pre-push] running Python wheel + pytest (skips gracefully if maturin absent)"
 just py-test
 
+echo "[pre-push] running Tier-3 formal proof gate (Lean; skips gracefully if lake absent)"
+just check-formal
+
 echo "[pre-push] OK"

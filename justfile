@@ -29,6 +29,21 @@ check:
     cargo test --workspace --all-features
     cargo test --workspace --no-default-features
 
+# Tier-3 formal proof gate: build the Lean project (P0 authority algebra +
+# P1 signed-object contracts + counterexample tests) and reject proof escapes
+# (sorry/omitted modules) via `lake exe formalGate`. Skips gracefully if Lean
+# (`lake`) is not installed, like cov-ci/py-test.
+# HOOK PARITY: run by .githooks/pre-push and mirrored by .github/workflows/formal.yml.
+check-formal:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! command -v lake >/dev/null 2>&1 && [ ! -x "$HOME/.elan/bin/lake" ]; then
+        echo "lake (Lean) not installed — skipping formal proof gate (install: see docs/TOOLCHAIN.md)"; exit 0
+    fi
+    LAKE="$(command -v lake || echo "$HOME/.elan/bin/lake")"
+    set -e
+    ( cd formal && "$LAKE" build && "$LAKE" exe formalGate )
+
 # Windows AppContainer L3 backend checks — the local mirror of the `check-windows`
 # job in .github/workflows/ci.yml (and nightly-windows.yml). The `appcontainer_impl`
 # module and the `agent-bridle-aclaunch` launcher only compile on Windows, so this

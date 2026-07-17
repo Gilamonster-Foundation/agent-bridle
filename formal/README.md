@@ -1,50 +1,40 @@
 # formal/ — mechanized models of the Ceremony Suite
 
-Tier-3 (algebra + state machine) formal artifacts for `docs/spec/`. These are
-the "solid and defensible" backbone: the spec's laws are not just prose, they
-type-check / model-check.
-
-## `lean/Authority.lean` — the authority algebra (P0 §2.0, laws L1/L4)
-
-Mathlib-free Lean 4. The authority type `Effect × Assurance × Scope` is finite,
-so axis laws are `decide`-checked and the product laws follow componentwise.
+Tier-3 (algebra + state machine) verification for `docs/spec/`. The spec's laws
+are not just prose — they type-check. One Lake project builds the whole thing.
 
 ```sh
-lean formal/lean/Authority.lean      # type-checks in seconds; exit 0 = proved
+just check-formal        # lake build (all proofs) + lake exe formalGate (no proof escapes)
+#  or, in formal/:  lake build && lake exe formalGate
 ```
 
-Proves (25 theorems, **0 `sorry`**):
-- axis + product meet laws (commutative, associative, idempotent);
-- **attenuation** `a ⊓ c ≤ a` and `≤ c` — authority never amplifies (L4 / PO-4);
-- `attenuate_compose` — sequential ceilings collapse to one meet (order of
-  independent ceilings is irrelevant);
-- **no fail-open** `resolve [] = NeedsDecision`, never ⊤/approve (OB-9/OB-12);
-- **order-independence** `resolve (x::y::xs) = resolve (y::x::xs)` — the
-  generating step of any permutation (L1 / PO-1).
+Gated in CI by `.github/workflows/formal.yml` and locally by `.githooks/pre-push`
+(HOOK PARITY). Toolchain pinned in `lean-toolchain` (Lean 4.31); no Mathlib, so
+it builds in seconds.
 
-The Aeneas track (Phase 1c) extracts the Rust `resolve` kernel with Charon and
-proves it *refines* this model — so the implementation inherits these theorems.
+## Layout
 
-## `tla/CeremonyStore.tla` — the store state machine (P2, PO-2*)
+| Path | Covers | Origin |
+|---|---|---|
+| `Ceremony/P0/Authority.lean` | **P0 authority algebra** — the product meet-lattice `Effect × Assurance × Scope`, attenuation (L4), no-fail-open (OB-9/OB-12), order-independence (L1). 25 theorems, 0 `sorry`. | P0 (this suite) |
+| `Ceremony/P1/SignedObject.lean` | **P1 signed-object contracts** — profile/algorithm allowlist (`TrustedProfile`), canonical encoding injectivity, the universal `SignaturePreimage` binding profile/codec/domain/store/thread/body/cid/signer (OB-13), genesis. | PR #233 (GPT-5/Codex) |
+| `Gate.lean` + `formalGate` exe | the proof-escape gate: rejects `sorry` / omitted modules. | PR #233 |
+| `Tests/P1Counterexamples.lean`, `Tests/SignedObjectContracts.lean` | negative + contract tests (Lean-level conformance). | PR #233 |
+| `tla/CeremonyStore.tla` | **P2 store** — CAS append + anti-rollback state machine; invariants map to PO-2/2a/2c + OB-15/16. Check with TLC. | P2 (this suite) |
 
-TLA+ model of the CAS append + the anti-rollback trusted-state machine:
-concurrent candidates and CAS-losers are benign; the externally-protected
-checkpoint is monotone; no rollback past it; equivocation is two *committed*
-records at one `(store,thread,sequence)`. Check with TLC:
+## Why this shape
 
-```sh
-# tlc CeremonyStore.tla   (TLA+ Toolbox / tla2tools.jar; add a model with small bounds)
-```
+Two tools for two kinds of claim (ADR 0023): the **algebra** (pure functions
+over a lattice) is Lean+Aeneas territory — it refines to Rust; the **store
+state machine** (concurrency, an attacker transition, temporal invariants) is
+TLA+ territory. Enrollment **ceremonies** (P3) get **Tier-2** symbolic proofs
+(Tamarin/ProVerif) in Phase 2 — a third tool for a third kind of claim.
+Conflating them is the failure the reviews punished.
 
-Maps invariants to PO-2 / PO-2a / PO-2c and OB-15 / OB-16.
+## Where this goes (Phase 1)
 
-## Why two tools
-
-The **algebra** (a pure function over a lattice) is Lean+Aeneas territory —
-it refines to Rust. The **protocol/state machine** (concurrency, an attacker
-transition, temporal invariants) is TLA+ territory. Confusing the two is the
-"prose becomes authority-bearing protocol" failure the reviews punished; the
-proof tiers keep them apart (see `docs/spec/README.md` → "The teeth").
-
-Enrollment ceremonies (P3) get **Tier-2** symbolic proofs (Tamarin/ProVerif)
-in Phase 2 — a third tool for a third kind of claim.
+The Lean models are the **refinement targets**: the pure Rust kernel (`resolve`,
+gate acceptance, the signed-object verifier) will be extracted with Charon and
+proven by Aeneas to *refine* these files, so the implementation inherits the
+theorems. See `docs/spec/ROADMAP.md` (Phase 1c). Needs the OCaml/opam leg of
+`docs/TOOLCHAIN.md`.
