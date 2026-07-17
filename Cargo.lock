@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-bridle-ceremony"
+version = "0.7.5"
+
+[[package]]
 name = "agent-bridle-config"
 version = "0.7.5"
 dependencies = [
