@@ -872,3 +872,50 @@ async fn real_seatbelt_denies_egress_when_net_is_empty() {
         "egress under net:none must be denied at the socket (curl exit 7): {out}"
     );
 }
+
+// #1220 regression: a write-confined child must still be able to OPEN the
+// device sinks — git opens `/dev/null` O_RDWR as plumbing and died with
+// "could not open '/dev/null' for reading and writing: Permission denied"
+// before the fix (the sinks were absent from the Landlock write ruleset;
+// #969 had only fixed the L2 interceptor). `dd of=/dev/null` performs the
+// same fresh write-open inside the jail. RED before the fix, GREEN after.
+// Linux + `linux-landlock` only; self-skips if the kernel lacks Landlock.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+#[tokio::test]
+async fn real_landlock_write_confined_child_can_open_dev_null() {
+    use agent_bridle_core::landlock_is_supported;
+
+    if !landlock_is_supported() {
+        eprintln!("skipping: kernel lacks Landlock");
+        return;
+    }
+
+    let allowed = unique_temp("ll-devnull-allowed");
+    std::fs::create_dir_all(&allowed).unwrap();
+
+    // fs_write confined to `allowed` — /dev/null is NOT in the granted scope;
+    // only the #1220 device-sink fold makes its open succeed.
+    let caveats = Caveats {
+        exec: Scope::only(["dd".to_string()]),
+        fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+
+    let inside = ShellTool::new()
+        .invoke(
+            serde_json::json!({"cmd": "dd if=/dev/zero of=/dev/null count=1"}),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(
+        inside["exit_code"], 0,
+        "a fresh write-open of /dev/null must succeed inside the jail: {inside}"
+    );
+    assert_eq!(
+        inside["sandbox_kind"], "landlock",
+        "must report kernel enforcement: {inside}"
+    );
+
+    let _ = std::fs::remove_dir_all(&allowed);
+}
