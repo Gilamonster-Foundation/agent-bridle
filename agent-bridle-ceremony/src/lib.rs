@@ -31,9 +31,17 @@
 
 mod authority;
 mod boundary;
+mod signed_object;
 
 pub use authority::{resolve, Assurance, Authority, Effect, Resolution, Scope};
 pub use boundary::{
     boundary_ceiling, boundary_verdict, brush_honest, enforceable_ceiling, minted_grant,
     safe_subset, Fence, Request,
+};
+pub use signed_object::{
+    load_envelope, parse_verified, resolve_store_id, verify_envelope, AllowedCodec, AllowedHash,
+    AllowedSignature, CanonicalEncoding, CanonicalPayloadDecoder, Codec, CryptoBoundary,
+    DomainBinding, HashAlgorithm, Profile, Sealed, SignatureAlgorithm, SignatureDomain,
+    SignaturePreimage, SignedEnvelopeCodec, TrustedProfile, VerifiedEnvelope, VerifyRejection,
+    SIGNED_OBJECT_DOMAIN, STORE_ID_SELF,
 };
