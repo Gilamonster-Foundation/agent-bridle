@@ -79,4 +79,23 @@ theorem resolve_singleton (a : authority.Authority) :
 -- meet_from-induction proof left as follow-up. The *safety* law (no fail-open)
 -- is fully proven above.
 
+-- ══ P1 signed-object: extraction VERIFIED; allowlist proof is a follow-up ══
+-- The P1 kernel (signed_object.rs) now extracts through Charon/Aeneas — the
+-- profile allowlist (`Profile.v1`, `allows_*`, `Allowed{Hash,Signature,Codec}.admit`)
+-- and the trait-generic verify logic come through (the abstract crypto/encoding
+-- land as opaque type-externals in `AgentBridleCeremony/TypesExternal.lean`,
+-- exactly as HELD intends). This file's extraction is regenerated to include it.
+--
+-- The closed-allowlist LAW (v1 admits exactly its member per axis, rejects all
+-- else — PO-8 / law §4·4) is NOT yet proven here: the extracted `admit` threads
+-- `allows_* = core.slice.Slice.contains(profile.axis, algo)` = `List.anyM (eq …)`
+-- over an Aeneas `Vec`. That is *closed and computable*, but neither `rfl`/`simp`
+-- (needs the `contains`/`anyM`/`into_vec`/`deref` reduction lemmas) nor
+-- `native_decide` (needs `DecidableEq (Result …)`, which Aeneas's `Result`+`Error`
+-- do not derive out of the box) discharges it cheaply — unlike the pure-enum P0
+-- algebra. FOLLOW-UP: either supply the Aeneas-Std Vec/`contains` simp set, or a
+-- `DecidableEq` for `Result`, then the allowlist closure proves by evaluation.
+-- (The property is already exhaustively covered by the Rust unit tests in
+-- `signed_object.rs`: `allowlist_admits_exactly_v1_algorithms_and_codec`.)
+
 end CeremonyRefinement

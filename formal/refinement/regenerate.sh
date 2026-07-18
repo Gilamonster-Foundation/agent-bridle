@@ -22,5 +22,11 @@ OUT="$(mktemp -d)"
 cp "$OUT/lean/Types.lean" "$OUT/lean/Funs.lean" AgentBridleCeremony/
 # FunsExternal is the (opaque) external axioms; regenerated as a *_Template.
 cp "$OUT/lean/FunsExternal_Template.lean" AgentBridleCeremony/FunsExternal.lean
+# TypesExternal holds the opaque TYPE externals (P1's abstract trait associated
+# types — the concrete Envelope/Unsigned etc. are HELD). Present only once the
+# crate has trait-generic code; copy the template as-is when Aeneas emits it.
+if [ -f "$OUT/lean/TypesExternal_Template.lean" ]; then
+  cp "$OUT/lean/TypesExternal_Template.lean" AgentBridleCeremony/TypesExternal.lean
+fi
 cp "$OUT/lean/AgentBridleCeremony.lean" .
 echo "Regenerated. Review 'git diff' before committing."

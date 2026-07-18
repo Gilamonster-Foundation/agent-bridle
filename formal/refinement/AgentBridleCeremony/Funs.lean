@@ -19,6 +19,68 @@ noncomputable section
 
 namespace agent_bridle_ceremony
 
+/-- Trait implementation: [core::option::{impl core::fmt::Debug for core::option::Option<T>}]
+    Source: '/rustc/library/core/src/option.rs', lines 591:15-591:20
+    Name pattern: [core::fmt::Debug<core::option::Option<@T>>] -/
+@[reducible, rust_trait_impl "core::fmt::Debug<core::option::Option<@T>>"]
+def core.option.Option.Insts.CoreFmtDebug {T : Type} (fmtDebugInst :
+  core.fmt.Debug T) : core.fmt.Debug (Option T) := {
+  fmt := core.option.Option.Insts.CoreFmtDebug.fmt fmtDebugInst
+}
+
+/-- Trait implementation: [core::option::{impl core::cmp::PartialEq<core::option::Option<T>> for core::option::Option<T>}]
+    Source: '/rustc/library/core/src/option.rs', lines 2438:0-2438:56
+    Name pattern: [core::cmp::PartialEq<core::option::Option<@T>, core::option::Option<@T>>] -/
+@[reducible, rust_trait_impl
+  "core::cmp::PartialEq<core::option::Option<@T>, core::option::Option<@T>>"]
+impl_def core.option.Option.Insts.CoreCmpPartialEqOption {T : Type}
+  (cmpPartialEqInst : core.cmp.PartialEq T T) : core.cmp.PartialEq (Option T)
+  (Option T) := {
+  eq := core.option.Option.Insts.CoreCmpPartialEqOption.eq cmpPartialEqInst
+  ne := core.cmp.PartialEq.ne.trait_default
+    (core.option.Option.Insts.CoreCmpPartialEqOption cmpPartialEqInst)
+}
+
+/-- Trait implementation: [core::slice::cmp::{impl core::cmp::PartialEq<[U]> for [T]}]
+    Source: '/rustc/library/core/src/slice/cmp.rs', lines 14:0-16:28
+    Name pattern: [core::cmp::PartialEq<[@T], [@U]>] -/
+@[reducible, rust_trait_impl "core::cmp::PartialEq<[@T], [@U]>"]
+impl_def Slice.Insts.CoreCmpPartialEqSlice {T : Type} {U : Type}
+  (cmpPartialEqInst : core.cmp.PartialEq T U) : core.cmp.PartialEq (Slice T)
+  (Slice U) := {
+  eq := core.slice.cmp.PartialEqSlice.eq cmpPartialEqInst
+  ne := core.cmp.PartialEq.ne.trait_default (Slice.Insts.CoreCmpPartialEqSlice
+    cmpPartialEqInst)
+}
+
+/-- Trait implementation: [alloc::string::{impl core::cmp::PartialEq<alloc::string::String> for alloc::string::String}]
+    Source: '/rustc/library/alloc/src/string.rs', lines 350:9-350:18
+    Name pattern: [core::cmp::PartialEq<alloc::string::String, alloc::string::String>] -/
+@[reducible, rust_trait_impl
+  "core::cmp::PartialEq<alloc::string::String, alloc::string::String>"]
+impl_def alloc.string.String.Insts.CoreCmpPartialEqString : core.cmp.PartialEq
+  String String := {
+  eq := alloc.string.String.Insts.CoreCmpPartialEqString.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    alloc.string.String.Insts.CoreCmpPartialEqString
+}
+
+/-- Trait implementation: [alloc::string::{impl core::clone::Clone for alloc::string::String}]
+    Source: '/rustc/library/alloc/src/string.rs', lines 2363:0-2363:21
+    Name pattern: [core::clone::Clone<alloc::string::String>] -/
+@[reducible, rust_trait_impl "core::clone::Clone<alloc::string::String>"]
+def alloc.string.String.Insts.CoreCloneClone : core.clone.Clone String := {
+  clone := alloc.string.String.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [alloc::string::{impl core::fmt::Debug for alloc::string::String}]
+    Source: '/rustc/library/alloc/src/string.rs', lines 2730:0-2730:26
+    Name pattern: [core::fmt::Debug<alloc::string::String>] -/
+@[reducible, rust_trait_impl "core::fmt::Debug<alloc::string::String>"]
+def alloc.string.String.Insts.CoreFmtDebug : core.fmt.Debug String := {
+  fmt := alloc.string.String.Insts.CoreFmtDebug.fmt
+}
+
 /-- [agent_bridle_ceremony::authority::{impl core::clone::Clone for agent_bridle_ceremony::authority::Effect}::clone]:
     Source: 'agent-bridle-ceremony/src/authority.rs', lines 18:9-18:14
     Visibility: public -/
@@ -79,9 +141,11 @@ def authority.Effect.Insts.CoreCmpPartialEqEffect.eq
 /-- Trait implementation: [agent_bridle_ceremony::authority::{impl core::cmp::PartialEq<agent_bridle_ceremony::authority::Effect> for agent_bridle_ceremony::authority::Effect}]
     Source: 'agent-bridle-ceremony/src/authority.rs', lines 18:29-18:38 -/
 @[reducible]
-def authority.Effect.Insts.CoreCmpPartialEqEffect : core.cmp.PartialEq
+impl_def authority.Effect.Insts.CoreCmpPartialEqEffect : core.cmp.PartialEq
   authority.Effect authority.Effect := {
   eq := authority.Effect.Insts.CoreCmpPartialEqEffect.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    authority.Effect.Insts.CoreCmpPartialEqEffect
 }
 
 /-- [agent_bridle_ceremony::authority::{impl core::cmp::Eq for agent_bridle_ceremony::authority::Effect}::assert_fields_are_eq]:
@@ -184,9 +248,11 @@ def authority.Assurance.Insts.CoreCmpPartialEqAssurance.eq
 /-- Trait implementation: [agent_bridle_ceremony::authority::{impl core::cmp::PartialEq<agent_bridle_ceremony::authority::Assurance> for agent_bridle_ceremony::authority::Assurance}]
     Source: 'agent-bridle-ceremony/src/authority.rs', lines 27:29-27:38 -/
 @[reducible]
-def authority.Assurance.Insts.CoreCmpPartialEqAssurance : core.cmp.PartialEq
-  authority.Assurance authority.Assurance := {
+impl_def authority.Assurance.Insts.CoreCmpPartialEqAssurance :
+  core.cmp.PartialEq authority.Assurance authority.Assurance := {
   eq := authority.Assurance.Insts.CoreCmpPartialEqAssurance.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    authority.Assurance.Insts.CoreCmpPartialEqAssurance
 }
 
 /-- [agent_bridle_ceremony::authority::{impl core::cmp::Eq for agent_bridle_ceremony::authority::Assurance}::assert_fields_are_eq]:
@@ -286,9 +352,11 @@ def authority.Scope.Insts.CoreCmpPartialEqScope.eq
 /-- Trait implementation: [agent_bridle_ceremony::authority::{impl core::cmp::PartialEq<agent_bridle_ceremony::authority::Scope> for agent_bridle_ceremony::authority::Scope}]
     Source: 'agent-bridle-ceremony/src/authority.rs', lines 36:29-36:38 -/
 @[reducible]
-def authority.Scope.Insts.CoreCmpPartialEqScope : core.cmp.PartialEq
+impl_def authority.Scope.Insts.CoreCmpPartialEqScope : core.cmp.PartialEq
   authority.Scope authority.Scope := {
   eq := authority.Scope.Insts.CoreCmpPartialEqScope.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    authority.Scope.Insts.CoreCmpPartialEqScope
 }
 
 /-- [agent_bridle_ceremony::authority::{impl core::cmp::Eq for agent_bridle_ceremony::authority::Scope}::assert_fields_are_eq]:
@@ -491,9 +559,11 @@ def authority.Authority.Insts.CoreCmpPartialEqAuthority.eq
 /-- Trait implementation: [agent_bridle_ceremony::authority::{impl core::cmp::PartialEq<agent_bridle_ceremony::authority::Authority> for agent_bridle_ceremony::authority::Authority}]
     Source: 'agent-bridle-ceremony/src/authority.rs', lines 106:29-106:38 -/
 @[reducible]
-def authority.Authority.Insts.CoreCmpPartialEqAuthority : core.cmp.PartialEq
-  authority.Authority authority.Authority := {
+impl_def authority.Authority.Insts.CoreCmpPartialEqAuthority :
+  core.cmp.PartialEq authority.Authority authority.Authority := {
   eq := authority.Authority.Insts.CoreCmpPartialEqAuthority.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    authority.Authority.Insts.CoreCmpPartialEqAuthority
 }
 
 /-- [agent_bridle_ceremony::authority::{impl core::cmp::Eq for agent_bridle_ceremony::authority::Authority}::assert_fields_are_eq]:
@@ -672,9 +742,11 @@ def authority.Resolution.Insts.CoreCmpPartialEqResolution.eq
 /-- Trait implementation: [agent_bridle_ceremony::authority::{impl core::cmp::PartialEq<agent_bridle_ceremony::authority::Resolution> for agent_bridle_ceremony::authority::Resolution}]
     Source: 'agent-bridle-ceremony/src/authority.rs', lines 157:29-157:38 -/
 @[reducible]
-def authority.Resolution.Insts.CoreCmpPartialEqResolution : core.cmp.PartialEq
-  authority.Resolution authority.Resolution := {
+impl_def authority.Resolution.Insts.CoreCmpPartialEqResolution :
+  core.cmp.PartialEq authority.Resolution authority.Resolution := {
   eq := authority.Resolution.Insts.CoreCmpPartialEqResolution.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    authority.Resolution.Insts.CoreCmpPartialEqResolution
 }
 
 /-- [agent_bridle_ceremony::authority::{impl core::cmp::Eq for agent_bridle_ceremony::authority::Resolution}::assert_fields_are_eq]:
@@ -808,9 +880,11 @@ def boundary.Fence.Insts.CoreCmpPartialEqFence.eq
 /-- Trait implementation: [agent_bridle_ceremony::boundary::{impl core::cmp::PartialEq<agent_bridle_ceremony::boundary::Fence> for agent_bridle_ceremony::boundary::Fence}]
     Source: 'agent-bridle-ceremony/src/boundary.rs', lines 25:29-25:38 -/
 @[reducible]
-def boundary.Fence.Insts.CoreCmpPartialEqFence : core.cmp.PartialEq
+impl_def boundary.Fence.Insts.CoreCmpPartialEqFence : core.cmp.PartialEq
   boundary.Fence boundary.Fence := {
   eq := boundary.Fence.Insts.CoreCmpPartialEqFence.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    boundary.Fence.Insts.CoreCmpPartialEqFence
 }
 
 /-- [agent_bridle_ceremony::boundary::{impl core::cmp::Eq for agent_bridle_ceremony::boundary::Fence}::assert_fields_are_eq]:
@@ -912,9 +986,11 @@ def boundary.Request.Insts.CoreCmpPartialEqRequest.eq
 /-- Trait implementation: [agent_bridle_ceremony::boundary::{impl core::cmp::PartialEq<agent_bridle_ceremony::boundary::Request> for agent_bridle_ceremony::boundary::Request}]
     Source: 'agent-bridle-ceremony/src/boundary.rs', lines 38:29-38:38 -/
 @[reducible]
-def boundary.Request.Insts.CoreCmpPartialEqRequest : core.cmp.PartialEq
+impl_def boundary.Request.Insts.CoreCmpPartialEqRequest : core.cmp.PartialEq
   boundary.Request boundary.Request := {
   eq := boundary.Request.Insts.CoreCmpPartialEqRequest.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    boundary.Request.Insts.CoreCmpPartialEqRequest
 }
 
 /-- [agent_bridle_ceremony::boundary::{impl core::cmp::Eq for agent_bridle_ceremony::boundary::Request}::assert_fields_are_eq]:
@@ -1021,5 +1097,3177 @@ def boundary.minted_grant
   := do
   let a ← boundary.boundary_ceiling f q
   authority.Authority.attenuate req a
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::StoreId}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:9-66:14
+    Visibility: public -/
+def chain_store.StoreId.Insts.CoreCloneClone.clone
+  (self : chain_store.StoreId) : Result chain_store.StoreId := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::StoreId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:9-66:14 -/
+@[reducible]
+def chain_store.StoreId.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.StoreId := {
+  clone := chain_store.StoreId.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::Copy for agent_bridle_ceremony::chain_store::StoreId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:16-66:20 -/
+@[reducible]
+def chain_store.StoreId.Insts.CoreMarkerCopy : core.marker.Copy
+  chain_store.StoreId := {
+  cloneInst := chain_store.StoreId.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::StoreId}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:22-66:27
+    Visibility: public -/
+def chain_store.StoreId.Insts.CoreFmtDebug.fmt
+  (self : chain_store.StoreId) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self
+  core.fmt.Formatter.debug_tuple_field1_finish f (toStr "StoreId") dyn
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::StoreId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:22-66:27 -/
+@[reducible]
+def chain_store.StoreId.Insts.CoreFmtDebug : core.fmt.Debug chain_store.StoreId
+  := {
+  fmt := chain_store.StoreId.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::StoreId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:29-66:38 -/
+@[reducible]
+def chain_store.StoreId.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.StoreId := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::StoreId> for agent_bridle_ceremony::chain_store::StoreId}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:29-66:38
+    Visibility: public -/
+def chain_store.StoreId.Insts.CoreCmpPartialEqStoreId.eq
+  (self : chain_store.StoreId) (other : chain_store.StoreId) :
+  Result Bool
+  := do
+  ok (self = other)
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::StoreId> for agent_bridle_ceremony::chain_store::StoreId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:29-66:38 -/
+@[reducible]
+impl_def chain_store.StoreId.Insts.CoreCmpPartialEqStoreId : core.cmp.PartialEq
+  chain_store.StoreId chain_store.StoreId := {
+  eq := chain_store.StoreId.Insts.CoreCmpPartialEqStoreId.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.StoreId.Insts.CoreCmpPartialEqStoreId
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::StoreId}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:40-66:42
+    Visibility: public -/
+def chain_store.StoreId.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.StoreId) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::StoreId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:40-66:42 -/
+@[reducible]
+def chain_store.StoreId.Insts.CoreCmpEq : core.cmp.Eq chain_store.StoreId := {
+  partialEqInst := chain_store.StoreId.Insts.CoreCmpPartialEqStoreId
+  assert_fields_are_eq :=
+    chain_store.StoreId.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::StoreId}::hash]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:44-66:48
+    Visibility: public -/
+def chain_store.StoreId.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : chain_store.StoreId) (state : __H) :
+  Result __H
+  := do
+  U64.Insts.CoreHashHash.hash corehashHasherInst self state
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::StoreId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 66:44-66:48 -/
+@[reducible]
+def chain_store.StoreId.Insts.CoreHashHash : core.hash.Hash chain_store.StoreId
+  := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    chain_store.StoreId.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::ThreadId}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:9-71:14
+    Visibility: public -/
+def chain_store.ThreadId.Insts.CoreCloneClone.clone
+  (self : chain_store.ThreadId) : Result chain_store.ThreadId := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::ThreadId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:9-71:14 -/
+@[reducible]
+def chain_store.ThreadId.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.ThreadId := {
+  clone := chain_store.ThreadId.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::Copy for agent_bridle_ceremony::chain_store::ThreadId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:16-71:20 -/
+@[reducible]
+def chain_store.ThreadId.Insts.CoreMarkerCopy : core.marker.Copy
+  chain_store.ThreadId := {
+  cloneInst := chain_store.ThreadId.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::ThreadId}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:22-71:27
+    Visibility: public -/
+def chain_store.ThreadId.Insts.CoreFmtDebug.fmt
+  (self : chain_store.ThreadId) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self
+  core.fmt.Formatter.debug_tuple_field1_finish f (toStr "ThreadId") dyn
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::ThreadId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:22-71:27 -/
+@[reducible]
+def chain_store.ThreadId.Insts.CoreFmtDebug : core.fmt.Debug
+  chain_store.ThreadId := {
+  fmt := chain_store.ThreadId.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::ThreadId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:29-71:38 -/
+@[reducible]
+def chain_store.ThreadId.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.ThreadId := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::ThreadId> for agent_bridle_ceremony::chain_store::ThreadId}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:29-71:38
+    Visibility: public -/
+def chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId.eq
+  (self : chain_store.ThreadId) (other : chain_store.ThreadId) :
+  Result Bool
+  := do
+  ok (self = other)
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::ThreadId> for agent_bridle_ceremony::chain_store::ThreadId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:29-71:38 -/
+@[reducible]
+impl_def chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId :
+  core.cmp.PartialEq chain_store.ThreadId chain_store.ThreadId := {
+  eq := chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::ThreadId}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:40-71:42
+    Visibility: public -/
+def chain_store.ThreadId.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.ThreadId) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::ThreadId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:40-71:42 -/
+@[reducible]
+def chain_store.ThreadId.Insts.CoreCmpEq : core.cmp.Eq chain_store.ThreadId
+  := {
+  partialEqInst := chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId
+  assert_fields_are_eq :=
+    chain_store.ThreadId.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::ThreadId}::hash]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:44-71:48
+    Visibility: public -/
+def chain_store.ThreadId.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : chain_store.ThreadId) (state : __H) :
+  Result __H
+  := do
+  U64.Insts.CoreHashHash.hash corehashHasherInst self state
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::ThreadId}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 71:44-71:48 -/
+@[reducible]
+def chain_store.ThreadId.Insts.CoreHashHash : core.hash.Hash
+  chain_store.ThreadId := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    chain_store.ThreadId.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::LineCid}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:9-80:14
+    Visibility: public -/
+def chain_store.LineCid.Insts.CoreCloneClone.clone
+  (self : chain_store.LineCid) : Result chain_store.LineCid := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::LineCid}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:9-80:14 -/
+@[reducible]
+def chain_store.LineCid.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.LineCid := {
+  clone := chain_store.LineCid.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::Copy for agent_bridle_ceremony::chain_store::LineCid}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:16-80:20 -/
+@[reducible]
+def chain_store.LineCid.Insts.CoreMarkerCopy : core.marker.Copy
+  chain_store.LineCid := {
+  cloneInst := chain_store.LineCid.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::LineCid}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:22-80:27
+    Visibility: public -/
+def chain_store.LineCid.Insts.CoreFmtDebug.fmt
+  (self : chain_store.LineCid) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self
+  core.fmt.Formatter.debug_tuple_field1_finish f (toStr "LineCid") dyn
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::LineCid}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:22-80:27 -/
+@[reducible]
+def chain_store.LineCid.Insts.CoreFmtDebug : core.fmt.Debug chain_store.LineCid
+  := {
+  fmt := chain_store.LineCid.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::LineCid}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:29-80:38 -/
+@[reducible]
+def chain_store.LineCid.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.LineCid := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::LineCid> for agent_bridle_ceremony::chain_store::LineCid}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:29-80:38
+    Visibility: public -/
+def chain_store.LineCid.Insts.CoreCmpPartialEqLineCid.eq
+  (self : chain_store.LineCid) (other : chain_store.LineCid) :
+  Result Bool
+  := do
+  ok (self = other)
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::LineCid> for agent_bridle_ceremony::chain_store::LineCid}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:29-80:38 -/
+@[reducible]
+impl_def chain_store.LineCid.Insts.CoreCmpPartialEqLineCid : core.cmp.PartialEq
+  chain_store.LineCid chain_store.LineCid := {
+  eq := chain_store.LineCid.Insts.CoreCmpPartialEqLineCid.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.LineCid.Insts.CoreCmpPartialEqLineCid
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::LineCid}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:40-80:42
+    Visibility: public -/
+def chain_store.LineCid.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.LineCid) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::LineCid}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:40-80:42 -/
+@[reducible]
+def chain_store.LineCid.Insts.CoreCmpEq : core.cmp.Eq chain_store.LineCid := {
+  partialEqInst := chain_store.LineCid.Insts.CoreCmpPartialEqLineCid
+  assert_fields_are_eq :=
+    chain_store.LineCid.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::LineCid}::hash]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:44-80:48
+    Visibility: public -/
+def chain_store.LineCid.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : chain_store.LineCid) (state : __H) :
+  Result __H
+  := do
+  U64.Insts.CoreHashHash.hash corehashHasherInst self state
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::LineCid}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 80:44-80:48 -/
+@[reducible]
+def chain_store.LineCid.Insts.CoreHashHash : core.hash.Hash chain_store.LineCid
+  := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    chain_store.LineCid.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::StoreId}::from_model]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 88:4-90:5
+    Visibility: public -/
+def chain_store.StoreId.from_model
+  (token : Std.U64) : Result chain_store.StoreId := do
+  ok token
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ThreadId}::from_model]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 95:4-97:5
+    Visibility: public -/
+def chain_store.ThreadId.from_model
+  (token : Std.U64) : Result chain_store.ThreadId := do
+  ok token
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::LineCid}::from_model]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 103:4-105:5
+    Visibility: public -/
+def chain_store.LineCid.from_model
+  (token : Std.U64) : Result chain_store.LineCid := do
+  ok token
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:9-112:14
+    Visibility: public -/
+def chain_store.AuthorityCheckpoint.Insts.CoreCloneClone.clone
+  (self : chain_store.AuthorityCheckpoint) :
+  Result chain_store.AuthorityCheckpoint
+  := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:9-112:14 -/
+@[reducible]
+def chain_store.AuthorityCheckpoint.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.AuthorityCheckpoint := {
+  clone := chain_store.AuthorityCheckpoint.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::Copy for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:16-112:20 -/
+@[reducible]
+def chain_store.AuthorityCheckpoint.Insts.CoreMarkerCopy : core.marker.Copy
+  chain_store.AuthorityCheckpoint := {
+  cloneInst := chain_store.AuthorityCheckpoint.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:22-112:27
+    Visibility: public -/
+def chain_store.AuthorityCheckpoint.Insts.CoreFmtDebug.fmt
+  (self : chain_store.AuthorityCheckpoint) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ chain_store.StoreId.Insts.CoreFmtDebug self.store_id
+  let dyn1 := Dyn.mk _ chain_store.ThreadId.Insts.CoreFmtDebug self.thread_id
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.sequence
+  let dyn3 :=
+    Dyn.mk _ (core.fmt.DebugShared chain_store.LineCid.Insts.CoreFmtDebug)
+      self.head
+  core.fmt.Formatter.debug_struct_field4_finish f (toStr "AuthorityCheckpoint")
+    (toStr "store_id") dyn (toStr "thread_id") dyn1 (toStr "sequence") dyn2
+    (toStr "head") dyn3
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:22-112:27 -/
+@[reducible]
+def chain_store.AuthorityCheckpoint.Insts.CoreFmtDebug : core.fmt.Debug
+  chain_store.AuthorityCheckpoint := {
+  fmt := chain_store.AuthorityCheckpoint.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:29-112:38 -/
+@[reducible]
+def chain_store.AuthorityCheckpoint.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.AuthorityCheckpoint := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::AuthorityCheckpoint> for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:29-112:38
+    Visibility: public -/
+def
+  chain_store.AuthorityCheckpoint.Insts.CoreCmpPartialEqAuthorityCheckpoint.eq
+  (self : chain_store.AuthorityCheckpoint)
+  (other : chain_store.AuthorityCheckpoint) :
+  Result Bool
+  := do
+  if self.sequence = other.sequence
+  then
+    let b ←
+      chain_store.StoreId.Insts.CoreCmpPartialEqStoreId.eq self.store_id
+        other.store_id
+    if b
+    then
+      let b1 ←
+        chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId.eq self.thread_id
+          other.thread_id
+      if b1
+      then
+        chain_store.LineCid.Insts.CoreCmpPartialEqLineCid.eq self.head
+          other.head
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::AuthorityCheckpoint> for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:29-112:38 -/
+@[reducible]
+impl_def
+  chain_store.AuthorityCheckpoint.Insts.CoreCmpPartialEqAuthorityCheckpoint :
+  core.cmp.PartialEq chain_store.AuthorityCheckpoint
+  chain_store.AuthorityCheckpoint := {
+  eq :=
+    chain_store.AuthorityCheckpoint.Insts.CoreCmpPartialEqAuthorityCheckpoint.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.AuthorityCheckpoint.Insts.CoreCmpPartialEqAuthorityCheckpoint
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:40-112:42
+    Visibility: public -/
+def chain_store.AuthorityCheckpoint.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.AuthorityCheckpoint) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:40-112:42 -/
+@[reducible]
+def chain_store.AuthorityCheckpoint.Insts.CoreCmpEq : core.cmp.Eq
+  chain_store.AuthorityCheckpoint := {
+  partialEqInst :=
+    chain_store.AuthorityCheckpoint.Insts.CoreCmpPartialEqAuthorityCheckpoint
+  assert_fields_are_eq :=
+    chain_store.AuthorityCheckpoint.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}::hash]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:44-112:48
+    Visibility: public -/
+def chain_store.AuthorityCheckpoint.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : chain_store.AuthorityCheckpoint) (state : __H) :
+  Result __H
+  := do
+  let state1 ←
+    chain_store.StoreId.Insts.CoreHashHash.hash corehashHasherInst
+      self.store_id state
+  let state2 ←
+    chain_store.ThreadId.Insts.CoreHashHash.hash corehashHasherInst
+      self.thread_id state1
+  let state3 ←
+    U64.Insts.CoreHashHash.hash corehashHasherInst self.sequence state2
+  chain_store.LineCid.Insts.CoreHashHash.hash corehashHasherInst self.head
+    state3
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::AuthorityCheckpoint}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 112:44-112:48 -/
+@[reducible]
+def chain_store.AuthorityCheckpoint.Insts.CoreHashHash : core.hash.Hash
+  chain_store.AuthorityCheckpoint := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    chain_store.AuthorityCheckpoint.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::AppendOutcome}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:9-126:14
+    Visibility: public -/
+def chain_store.AppendOutcome.Insts.CoreCloneClone.clone
+  (self : chain_store.AppendOutcome) : Result chain_store.AppendOutcome := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::AppendOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:9-126:14 -/
+@[reducible]
+def chain_store.AppendOutcome.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.AppendOutcome := {
+  clone := chain_store.AppendOutcome.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::Copy for agent_bridle_ceremony::chain_store::AppendOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:16-126:20 -/
+@[reducible]
+def chain_store.AppendOutcome.Insts.CoreMarkerCopy : core.marker.Copy
+  chain_store.AppendOutcome := {
+  cloneInst := chain_store.AppendOutcome.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::AppendOutcome}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:22-126:27
+    Visibility: public -/
+def chain_store.AppendOutcome.Insts.CoreFmtDebug.fmt
+  (self : chain_store.AppendOutcome) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | chain_store.AppendOutcome.Committed __self_0 __self_1 =>
+    let __self_01 := Dyn.mk _ core.fmt.DebugU64 __self_0
+    let __self_11 :=
+      Dyn.mk _ (core.fmt.DebugShared chain_store.LineCid.Insts.CoreFmtDebug)
+        __self_1
+    core.fmt.Formatter.debug_struct_field2_finish f (toStr "Committed") (toStr
+      "sequence") __self_01 (toStr "head") __self_11
+  | chain_store.AppendOutcome.CasLost __self_0 =>
+    let __self_01 :=
+      Dyn.mk _ (core.fmt.DebugShared (core.option.Option.Insts.CoreFmtDebug
+        chain_store.LineCid.Insts.CoreFmtDebug)) __self_0
+    core.fmt.Formatter.debug_struct_field1_finish f (toStr "CasLost") (toStr
+      "current") __self_01
+  | chain_store.AppendOutcome.Rejected __self_0 =>
+    let __self_01 :=
+      Dyn.mk _ (core.fmt.DebugShared (core.option.Option.Insts.CoreFmtDebug
+        chain_store.LineCid.Insts.CoreFmtDebug)) __self_0
+    core.fmt.Formatter.debug_struct_field1_finish f (toStr "Rejected") (toStr
+      "current") __self_01
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::AppendOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:22-126:27 -/
+@[reducible]
+def chain_store.AppendOutcome.Insts.CoreFmtDebug : core.fmt.Debug
+  chain_store.AppendOutcome := {
+  fmt := chain_store.AppendOutcome.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::AppendOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:29-126:38 -/
+@[reducible]
+def chain_store.AppendOutcome.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.AppendOutcome := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::AppendOutcome> for agent_bridle_ceremony::chain_store::AppendOutcome}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:29-126:38
+    Visibility: public -/
+def chain_store.AppendOutcome.Insts.CoreCmpPartialEqAppendOutcome.eq
+  (self : chain_store.AppendOutcome) (other : chain_store.AppendOutcome) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  if self1 = other1
+  then
+    match self with
+    | chain_store.AppendOutcome.Committed __self_0 __self_1 =>
+      match other with
+      | chain_store.AppendOutcome.Committed __arg1_0 __arg1_1 =>
+        let b ← lift (core.cmp.impls.PartialEqU64.eq __self_0 __arg1_0)
+        if b
+        then
+          chain_store.LineCid.Insts.CoreCmpPartialEqLineCid.eq __self_1
+            __arg1_1
+        else ok false
+      | chain_store.AppendOutcome.CasLost _ => fail panic
+      | chain_store.AppendOutcome.Rejected _ => fail panic
+    | chain_store.AppendOutcome.CasLost __self_0 =>
+      match other with
+      | chain_store.AppendOutcome.Committed _ _ => fail panic
+      | chain_store.AppendOutcome.CasLost __arg1_0 =>
+        core.option.Option.Insts.CoreCmpPartialEqOption.eq
+          chain_store.LineCid.Insts.CoreCmpPartialEqLineCid __self_0 __arg1_0
+      | chain_store.AppendOutcome.Rejected _ => fail panic
+    | chain_store.AppendOutcome.Rejected __self_0 =>
+      match other with
+      | chain_store.AppendOutcome.Committed _ _ => fail panic
+      | chain_store.AppendOutcome.CasLost _ => fail panic
+      | chain_store.AppendOutcome.Rejected __arg1_0 =>
+        core.option.Option.Insts.CoreCmpPartialEqOption.eq
+          chain_store.LineCid.Insts.CoreCmpPartialEqLineCid __self_0 __arg1_0
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::AppendOutcome> for agent_bridle_ceremony::chain_store::AppendOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:29-126:38 -/
+@[reducible]
+impl_def chain_store.AppendOutcome.Insts.CoreCmpPartialEqAppendOutcome :
+  core.cmp.PartialEq chain_store.AppendOutcome chain_store.AppendOutcome := {
+  eq := chain_store.AppendOutcome.Insts.CoreCmpPartialEqAppendOutcome.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.AppendOutcome.Insts.CoreCmpPartialEqAppendOutcome
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::AppendOutcome}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:40-126:42
+    Visibility: public -/
+def chain_store.AppendOutcome.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.AppendOutcome) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::AppendOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:40-126:42 -/
+@[reducible]
+def chain_store.AppendOutcome.Insts.CoreCmpEq : core.cmp.Eq
+  chain_store.AppendOutcome := {
+  partialEqInst :=
+    chain_store.AppendOutcome.Insts.CoreCmpPartialEqAppendOutcome
+  assert_fields_are_eq :=
+    chain_store.AppendOutcome.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::AppendOutcome}::hash]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:44-126:48
+    Visibility: public -/
+def chain_store.AppendOutcome.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : chain_store.AppendOutcome) (state : __H) :
+  Result __H
+  := do
+  let self1 := read_discriminant self
+  let state1 ← Isize.Insts.CoreHashHash.hash corehashHasherInst self1 state
+  match self with
+  | chain_store.AppendOutcome.Committed __self_0 __self_1 =>
+    let state2 ←
+      U64.Insts.CoreHashHash.hash corehashHasherInst __self_0 state1
+    chain_store.LineCid.Insts.CoreHashHash.hash corehashHasherInst __self_1
+      state2
+  | chain_store.AppendOutcome.CasLost __self_0 =>
+    core.option.Option.Insts.CoreHashHash.hash
+      chain_store.LineCid.Insts.CoreHashHash corehashHasherInst __self_0 state1
+  | chain_store.AppendOutcome.Rejected __self_0 =>
+    core.option.Option.Insts.CoreHashHash.hash
+      chain_store.LineCid.Insts.CoreHashHash corehashHasherInst __self_0 state1
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::AppendOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 126:44-126:48 -/
+@[reducible]
+def chain_store.AppendOutcome.Insts.CoreHashHash : core.hash.Hash
+  chain_store.AppendOutcome := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    chain_store.AppendOutcome.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::AcceptOutcome}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:9-146:14
+    Visibility: public -/
+def chain_store.AcceptOutcome.Insts.CoreCloneClone.clone
+  (self : chain_store.AcceptOutcome) : Result chain_store.AcceptOutcome := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::AcceptOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:9-146:14 -/
+@[reducible]
+def chain_store.AcceptOutcome.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.AcceptOutcome := {
+  clone := chain_store.AcceptOutcome.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::Copy for agent_bridle_ceremony::chain_store::AcceptOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:16-146:20 -/
+@[reducible]
+def chain_store.AcceptOutcome.Insts.CoreMarkerCopy : core.marker.Copy
+  chain_store.AcceptOutcome := {
+  cloneInst := chain_store.AcceptOutcome.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::Rejection}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:22-157:27
+    Visibility: public -/
+def chain_store.Rejection.Insts.CoreFmtDebug.fmt
+  (self : chain_store.Rejection) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | chain_store.Rejection.DifferentStore =>
+    core.fmt.Formatter.write_str f (toStr "DifferentStore")
+  | chain_store.Rejection.DifferentThread =>
+    core.fmt.Formatter.write_str f (toStr "DifferentThread")
+  | chain_store.Rejection.NotForward =>
+    core.fmt.Formatter.write_str f (toStr "NotForward")
+  | chain_store.Rejection.Sibling =>
+    core.fmt.Formatter.write_str f (toStr "Sibling")
+  | chain_store.Rejection.BeyondSpine =>
+    core.fmt.Formatter.write_str f (toStr "BeyondSpine")
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::Rejection}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:22-157:27 -/
+@[reducible]
+def chain_store.Rejection.Insts.CoreFmtDebug : core.fmt.Debug
+  chain_store.Rejection := {
+  fmt := chain_store.Rejection.Insts.CoreFmtDebug.fmt
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::AcceptOutcome}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:22-146:27
+    Visibility: public -/
+def chain_store.AcceptOutcome.Insts.CoreFmtDebug.fmt
+  (self : chain_store.AcceptOutcome) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | chain_store.AcceptOutcome.Accepted __self_0 =>
+    let __self_01 := Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) __self_0
+    core.fmt.Formatter.debug_struct_field1_finish f (toStr "Accepted") (toStr
+      "sequence") __self_01
+  | chain_store.AcceptOutcome.Rejected __self_0 =>
+    let __self_01 :=
+      Dyn.mk _ (core.fmt.DebugShared chain_store.Rejection.Insts.CoreFmtDebug)
+        __self_0
+    core.fmt.Formatter.debug_tuple_field1_finish f (toStr "Rejected") __self_01
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::AcceptOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:22-146:27 -/
+@[reducible]
+def chain_store.AcceptOutcome.Insts.CoreFmtDebug : core.fmt.Debug
+  chain_store.AcceptOutcome := {
+  fmt := chain_store.AcceptOutcome.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::AcceptOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:29-146:38 -/
+@[reducible]
+def chain_store.AcceptOutcome.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.AcceptOutcome := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::Rejection> for agent_bridle_ceremony::chain_store::Rejection}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:29-157:38
+    Visibility: public -/
+def chain_store.Rejection.Insts.CoreCmpPartialEqRejection.eq
+  (self : chain_store.Rejection) (other : chain_store.Rejection) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::Rejection> for agent_bridle_ceremony::chain_store::Rejection}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:29-157:38 -/
+@[reducible]
+impl_def chain_store.Rejection.Insts.CoreCmpPartialEqRejection :
+  core.cmp.PartialEq chain_store.Rejection chain_store.Rejection := {
+  eq := chain_store.Rejection.Insts.CoreCmpPartialEqRejection.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.Rejection.Insts.CoreCmpPartialEqRejection
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::AcceptOutcome> for agent_bridle_ceremony::chain_store::AcceptOutcome}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:29-146:38
+    Visibility: public -/
+def chain_store.AcceptOutcome.Insts.CoreCmpPartialEqAcceptOutcome.eq
+  (self : chain_store.AcceptOutcome) (other : chain_store.AcceptOutcome) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  if self1 = other1
+  then
+    match self with
+    | chain_store.AcceptOutcome.Accepted __self_0 =>
+      match other with
+      | chain_store.AcceptOutcome.Accepted __arg1_0 =>
+        lift (core.cmp.impls.PartialEqU64.eq __self_0 __arg1_0)
+      | chain_store.AcceptOutcome.Rejected _ => fail panic
+    | chain_store.AcceptOutcome.Rejected __self_0 =>
+      match other with
+      | chain_store.AcceptOutcome.Accepted _ => fail panic
+      | chain_store.AcceptOutcome.Rejected __arg1_0 =>
+        chain_store.Rejection.Insts.CoreCmpPartialEqRejection.eq __self_0
+          __arg1_0
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::AcceptOutcome> for agent_bridle_ceremony::chain_store::AcceptOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:29-146:38 -/
+@[reducible]
+impl_def chain_store.AcceptOutcome.Insts.CoreCmpPartialEqAcceptOutcome :
+  core.cmp.PartialEq chain_store.AcceptOutcome chain_store.AcceptOutcome := {
+  eq := chain_store.AcceptOutcome.Insts.CoreCmpPartialEqAcceptOutcome.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.AcceptOutcome.Insts.CoreCmpPartialEqAcceptOutcome
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::AcceptOutcome}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:40-146:42
+    Visibility: public -/
+def chain_store.AcceptOutcome.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.AcceptOutcome) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::AcceptOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:40-146:42 -/
+@[reducible]
+def chain_store.AcceptOutcome.Insts.CoreCmpEq : core.cmp.Eq
+  chain_store.AcceptOutcome := {
+  partialEqInst :=
+    chain_store.AcceptOutcome.Insts.CoreCmpPartialEqAcceptOutcome
+  assert_fields_are_eq :=
+    chain_store.AcceptOutcome.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::Rejection}::hash]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:44-157:48
+    Visibility: public -/
+def chain_store.Rejection.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : chain_store.Rejection) (state : __H) :
+  Result __H
+  := do
+  let self1 := read_discriminant self
+  Isize.Insts.CoreHashHash.hash corehashHasherInst self1 state
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::AcceptOutcome}::hash]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:44-146:48
+    Visibility: public -/
+def chain_store.AcceptOutcome.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : chain_store.AcceptOutcome) (state : __H) :
+  Result __H
+  := do
+  let self1 := read_discriminant self
+  let state1 ← Isize.Insts.CoreHashHash.hash corehashHasherInst self1 state
+  match self with
+  | chain_store.AcceptOutcome.Accepted __self_0 =>
+    U64.Insts.CoreHashHash.hash corehashHasherInst __self_0 state1
+  | chain_store.AcceptOutcome.Rejected __self_0 =>
+    chain_store.Rejection.Insts.CoreHashHash.hash corehashHasherInst __self_0
+      state1
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::AcceptOutcome}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 146:44-146:48 -/
+@[reducible]
+def chain_store.AcceptOutcome.Insts.CoreHashHash : core.hash.Hash
+  chain_store.AcceptOutcome := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    chain_store.AcceptOutcome.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::Rejection}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:9-157:14
+    Visibility: public -/
+def chain_store.Rejection.Insts.CoreCloneClone.clone
+  (self : chain_store.Rejection) : Result chain_store.Rejection := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::Rejection}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:9-157:14 -/
+@[reducible]
+def chain_store.Rejection.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.Rejection := {
+  clone := chain_store.Rejection.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::Copy for agent_bridle_ceremony::chain_store::Rejection}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:16-157:20 -/
+@[reducible]
+def chain_store.Rejection.Insts.CoreMarkerCopy : core.marker.Copy
+  chain_store.Rejection := {
+  cloneInst := chain_store.Rejection.Insts.CoreCloneClone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::Rejection}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:29-157:38 -/
+@[reducible]
+def chain_store.Rejection.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.Rejection := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::Rejection}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:40-157:42
+    Visibility: public -/
+def chain_store.Rejection.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.Rejection) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::Rejection}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:40-157:42 -/
+@[reducible]
+def chain_store.Rejection.Insts.CoreCmpEq : core.cmp.Eq chain_store.Rejection
+  := {
+  partialEqInst := chain_store.Rejection.Insts.CoreCmpPartialEqRejection
+  assert_fields_are_eq :=
+    chain_store.Rejection.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::hash::Hash for agent_bridle_ceremony::chain_store::Rejection}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 157:44-157:48 -/
+@[reducible]
+def chain_store.Rejection.Insts.CoreHashHash : core.hash.Hash
+  chain_store.Rejection := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    chain_store.Rejection.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::ChainStore}::clone]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:9-181:14
+    Visibility: public -/
+def chain_store.ChainStore.Insts.CoreCloneClone.clone
+  (self : chain_store.ChainStore) : Result chain_store.ChainStore := do
+  let si ← chain_store.StoreId.Insts.CoreCloneClone.clone self.store_id
+  let ti ← chain_store.ThreadId.Insts.CoreCloneClone.clone self.thread_id
+  let v ←
+    alloc.vec.CloneVec.clone chain_store.LineCid.Insts.CoreCloneClone
+      self.spine
+  let i ← lift (core.clone.impls.CloneU64.clone self.checkpoint)
+  ok { store_id := si, thread_id := ti, spine := v, checkpoint := i }
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::clone::Clone for agent_bridle_ceremony::chain_store::ChainStore}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:9-181:14 -/
+@[reducible]
+def chain_store.ChainStore.Insts.CoreCloneClone : core.clone.Clone
+  chain_store.ChainStore := {
+  clone := chain_store.ChainStore.Insts.CoreCloneClone.clone
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::ChainStore}::fmt]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:16-181:21
+    Visibility: public -/
+def chain_store.ChainStore.Insts.CoreFmtDebug.fmt
+  (self : chain_store.ChainStore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ chain_store.StoreId.Insts.CoreFmtDebug self.store_id
+  let dyn1 := Dyn.mk _ chain_store.ThreadId.Insts.CoreFmtDebug self.thread_id
+  let dyn2 :=
+    Dyn.mk _ (core.fmt.DebugVec chain_store.LineCid.Insts.CoreFmtDebug)
+      self.spine
+  let dyn3 := Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.checkpoint
+  core.fmt.Formatter.debug_struct_field4_finish f (toStr "ChainStore") (toStr
+    "store_id") dyn (toStr "thread_id") dyn1 (toStr "spine") dyn2 (toStr
+    "checkpoint") dyn3
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::fmt::Debug for agent_bridle_ceremony::chain_store::ChainStore}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:16-181:21 -/
+@[reducible]
+def chain_store.ChainStore.Insts.CoreFmtDebug : core.fmt.Debug
+  chain_store.ChainStore := {
+  fmt := chain_store.ChainStore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::chain_store::ChainStore}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:23-181:32 -/
+@[reducible]
+def chain_store.ChainStore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq chain_store.ChainStore := {
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::ChainStore> for agent_bridle_ceremony::chain_store::ChainStore}::eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:23-181:32
+    Visibility: public -/
+def chain_store.ChainStore.Insts.CoreCmpPartialEqChainStore.eq
+  (self : chain_store.ChainStore) (other : chain_store.ChainStore) :
+  Result Bool
+  := do
+  if self.checkpoint = other.checkpoint
+  then
+    let b ←
+      chain_store.StoreId.Insts.CoreCmpPartialEqStoreId.eq self.store_id
+        other.store_id
+    if b
+    then
+      let b1 ←
+        chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId.eq self.thread_id
+          other.thread_id
+      if b1
+      then
+        alloc.vec.partial_eq.PartialEqVec.eq
+          chain_store.LineCid.Insts.CoreCmpPartialEqLineCid self.spine
+          other.spine
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::PartialEq<agent_bridle_ceremony::chain_store::ChainStore> for agent_bridle_ceremony::chain_store::ChainStore}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:23-181:32 -/
+@[reducible]
+impl_def chain_store.ChainStore.Insts.CoreCmpPartialEqChainStore :
+  core.cmp.PartialEq chain_store.ChainStore chain_store.ChainStore := {
+  eq := chain_store.ChainStore.Insts.CoreCmpPartialEqChainStore.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    chain_store.ChainStore.Insts.CoreCmpPartialEqChainStore
+}
+
+/-- [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::ChainStore}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:34-181:36
+    Visibility: public -/
+def chain_store.ChainStore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : chain_store.ChainStore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::chain_store::{impl core::cmp::Eq for agent_bridle_ceremony::chain_store::ChainStore}]
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 181:34-181:36 -/
+@[reducible]
+def chain_store.ChainStore.Insts.CoreCmpEq : core.cmp.Eq chain_store.ChainStore
+  := {
+  partialEqInst := chain_store.ChainStore.Insts.CoreCmpPartialEqChainStore
+  assert_fields_are_eq :=
+    chain_store.ChainStore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::new]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 196:4-203:5
+    Visibility: public -/
+def chain_store.ChainStore.new
+  (store_id : chain_store.StoreId) (thread_id : chain_store.ThreadId) :
+  Result chain_store.ChainStore
+  := do
+  ok
+    {
+      store_id,
+      thread_id,
+      spine := (alloc.vec.Vec.new chain_store.LineCid),
+      checkpoint := 0#u64
+    }
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::store_id]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 206:4-208:5
+    Visibility: public -/
+def chain_store.ChainStore.impl.store_id
+  (self : chain_store.ChainStore) : Result chain_store.StoreId := do
+  ok self.store_id
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::thread_id]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 211:4-213:5
+    Visibility: public -/
+def chain_store.ChainStore.impl.thread_id
+  (self : chain_store.ChainStore) : Result chain_store.ThreadId := do
+  ok self.thread_id
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::len]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 216:4-218:5
+    Visibility: public -/
+def chain_store.ChainStore.len
+  (self : chain_store.ChainStore) : Result Std.U64 := do
+  let i := alloc.vec.Vec.len self.spine
+  ok (UScalar.cast .U64 i)
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::is_empty]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 221:4-223:5
+    Visibility: public -/
+def chain_store.ChainStore.is_empty
+  (self : chain_store.ChainStore) : Result Bool := do
+  alloc.vec.Vec.is_empty Global self.spine
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::head]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 226:4-228:5
+    Visibility: public -/
+def chain_store.ChainStore.head
+  (self : chain_store.ChainStore) : Result (Option chain_store.LineCid) := do
+  let s := alloc.vec.Vec.deref self.spine
+  let o ← core.slice.Slice.last s
+  core.option.OptionShared0T.copied chain_store.LineCid.Insts.CoreMarkerCopy o
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::checkpoint]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 231:4-233:5
+    Visibility: public -/
+def chain_store.ChainStore.impl.checkpoint
+  (self : chain_store.ChainStore) : Result Std.U64 := do
+  ok self.checkpoint
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::committed_head_at]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 249:4-254:5 -/
+def chain_store.ChainStore.committed_head_at
+  (self : chain_store.ChainStore) (sequence : Std.U64) :
+  Result (Option chain_store.LineCid)
+  := do
+  if sequence = 0#u64
+  then ok none
+  else
+    let s := alloc.vec.Vec.deref self.spine
+    let i ← sequence - 1#u64
+    let i1 ← lift (UScalar.cast .Usize i)
+    let o ←
+      core.slice.Slice.get (core.slice.index.SliceIndexUsizeSlice
+        chain_store.LineCid) s i1
+    core.option.OptionShared0T.copied chain_store.LineCid.Insts.CoreMarkerCopy
+      o
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::protected_checkpoint]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 237:4-245:5
+    Visibility: public -/
+def chain_store.ChainStore.protected_checkpoint
+  (self : chain_store.ChainStore) :
+  Result (Option chain_store.AuthorityCheckpoint)
+  := do
+  let o ← chain_store.ChainStore.committed_head_at self self.checkpoint
+  let cf ← core.option.Option.Insts.CoreOpsTry_traitTry.branch o
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue val =>
+    ok (some
+      {
+        store_id := self.store_id,
+        thread_id := self.thread_id,
+        sequence := self.checkpoint,
+        head := val
+      })
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.option.Option.Insts.CoreOpsTry_traitFromResidualOptionInfallible.from_residual
+      chain_store.AuthorityCheckpoint residual
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::is_prior_head]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 261:4-267:5 -/
+def chain_store.ChainStore.is_prior_head
+  (self : chain_store.ChainStore) (expected : Option chain_store.LineCid) :
+  Result Bool
+  := do
+  match expected with
+  | none => let b ← alloc.vec.Vec.is_empty Global self.spine
+            ok (¬ b)
+  | some cid =>
+    let s := alloc.vec.Vec.deref self.spine
+    core.slice.Slice.contains chain_store.LineCid.Insts.CoreCmpPartialEqLineCid
+      s cid
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::append_cas]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 278:4-296:5
+    Visibility: public -/
+def chain_store.ChainStore.append_cas
+  (self : chain_store.ChainStore) (expected : Option chain_store.LineCid)
+  (next : chain_store.LineCid) :
+  Result (chain_store.AppendOutcome × chain_store.ChainStore)
+  := do
+  let current ← chain_store.ChainStore.head self
+  let b ←
+    core.option.Option.Insts.CoreCmpPartialEqOption.eq
+      chain_store.LineCid.Insts.CoreCmpPartialEqLineCid expected current
+  if b
+  then
+    let v ← alloc.vec.Vec.push self.spine next
+    let i ← chain_store.ChainStore.len { self with spine := v }
+    ok (chain_store.AppendOutcome.Committed i next, { self with spine := v })
+  else
+    let b1 ← chain_store.ChainStore.is_prior_head self expected
+    if b1
+    then ok (chain_store.AppendOutcome.CasLost current, self)
+    else ok (chain_store.AppendOutcome.Rejected current, self)
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::advance_checkpoint]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 303:4-310:5
+    Visibility: public -/
+def chain_store.ChainStore.advance_checkpoint
+  (self : chain_store.ChainStore) :
+  Result (Bool × chain_store.ChainStore)
+  := do
+  let i ← chain_store.ChainStore.len self
+  if self.checkpoint < i
+  then ok (true, { self with checkpoint := i })
+  else ok (false, self)
+
+/-- [agent_bridle_ceremony::chain_store::{agent_bridle_ceremony::chain_store::ChainStore}::accept_head]:
+    Source: 'agent-bridle-ceremony/src/chain_store.rs', lines 321:4-345:5
+    Visibility: public -/
+def chain_store.ChainStore.accept_head
+  (self : chain_store.ChainStore) (presented : chain_store.AuthorityCheckpoint)
+  :
+  Result (chain_store.AcceptOutcome × chain_store.ChainStore)
+  := do
+  let b ←
+    core.cmp.PartialEq.ne.trait_default
+      chain_store.StoreId.Insts.CoreCmpPartialEqStoreId presented.store_id
+      self.store_id
+  if b
+  then
+    ok (chain_store.AcceptOutcome.Rejected
+      chain_store.Rejection.DifferentStore, self)
+  else
+    let b1 ←
+      core.cmp.PartialEq.ne.trait_default
+        chain_store.ThreadId.Insts.CoreCmpPartialEqThreadId presented.thread_id
+        self.thread_id
+    if b1
+    then
+      ok (chain_store.AcceptOutcome.Rejected
+        chain_store.Rejection.DifferentThread, self)
+    else
+      if presented.sequence <= self.checkpoint
+      then
+        ok (chain_store.AcceptOutcome.Rejected
+          chain_store.Rejection.NotForward, self)
+      else
+        let o ←
+          chain_store.ChainStore.committed_head_at self presented.sequence
+        match o with
+        | none =>
+          ok (chain_store.AcceptOutcome.Rejected
+            chain_store.Rejection.BeyondSpine, self)
+        | some cid =>
+          let b2 ←
+            chain_store.LineCid.Insts.CoreCmpPartialEqLineCid.eq cid
+              presented.head
+          if b2
+          then
+            ok (chain_store.AcceptOutcome.Accepted presented.sequence,
+              { self with checkpoint := presented.sequence })
+          else
+            ok (chain_store.AcceptOutcome.Rejected
+              chain_store.Rejection.Sibling, self)
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::HashAlgorithm}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:9-64:14
+    Visibility: public -/
+def signed_object.HashAlgorithm.Insts.CoreCloneClone.clone
+  (self : signed_object.HashAlgorithm) :
+  Result signed_object.HashAlgorithm
+  := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::HashAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:9-64:14 -/
+@[reducible]
+def signed_object.HashAlgorithm.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.HashAlgorithm := {
+  clone := signed_object.HashAlgorithm.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::Copy for agent_bridle_ceremony::signed_object::HashAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:16-64:20 -/
+@[reducible]
+def signed_object.HashAlgorithm.Insts.CoreMarkerCopy : core.marker.Copy
+  signed_object.HashAlgorithm := {
+  cloneInst := signed_object.HashAlgorithm.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::HashAlgorithm}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:22-64:27
+    Visibility: public -/
+def signed_object.HashAlgorithm.Insts.CoreFmtDebug.fmt
+  (self : signed_object.HashAlgorithm) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | signed_object.HashAlgorithm.Blake3_256 =>
+    core.fmt.Formatter.write_str f (toStr "Blake3_256")
+  | signed_object.HashAlgorithm.Sha1 =>
+    core.fmt.Formatter.write_str f (toStr "Sha1")
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::HashAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:22-64:27 -/
+@[reducible]
+def signed_object.HashAlgorithm.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.HashAlgorithm := {
+  fmt := signed_object.HashAlgorithm.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::HashAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:29-64:38 -/
+@[reducible]
+def signed_object.HashAlgorithm.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.HashAlgorithm := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::HashAlgorithm> for agent_bridle_ceremony::signed_object::HashAlgorithm}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:29-64:38
+    Visibility: public -/
+def signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm.eq
+  (self : signed_object.HashAlgorithm) (other : signed_object.HashAlgorithm) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::HashAlgorithm> for agent_bridle_ceremony::signed_object::HashAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:29-64:38 -/
+@[reducible]
+impl_def signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm :
+  core.cmp.PartialEq signed_object.HashAlgorithm signed_object.HashAlgorithm
+  := {
+  eq := signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::HashAlgorithm}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:40-64:42
+    Visibility: public -/
+def signed_object.HashAlgorithm.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.HashAlgorithm) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::HashAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:40-64:42 -/
+@[reducible]
+def signed_object.HashAlgorithm.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.HashAlgorithm := {
+  partialEqInst :=
+    signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm
+  assert_fields_are_eq :=
+    signed_object.HashAlgorithm.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::hash::Hash for agent_bridle_ceremony::signed_object::HashAlgorithm}::hash]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:44-64:48
+    Visibility: public -/
+def signed_object.HashAlgorithm.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : signed_object.HashAlgorithm) (state : __H) :
+  Result __H
+  := do
+  let self1 := read_discriminant self
+  Isize.Insts.CoreHashHash.hash corehashHasherInst self1 state
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::hash::Hash for agent_bridle_ceremony::signed_object::HashAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 64:44-64:48 -/
+@[reducible]
+def signed_object.HashAlgorithm.Insts.CoreHashHash : core.hash.Hash
+  signed_object.HashAlgorithm := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    signed_object.HashAlgorithm.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::HashAlgorithm}::ALL]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 77:4-77:89
+    Visibility: public -/
+@[global_simps, irreducible]
+def signed_object.HashAlgorithm.ALL
+  : Array signed_object.HashAlgorithm 2#usize :=
+  Array.make 2#usize [
+    signed_object.HashAlgorithm.Blake3_256, signed_object.HashAlgorithm.Sha1
+    ]
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::SignatureAlgorithm}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:9-81:14
+    Visibility: public -/
+def signed_object.SignatureAlgorithm.Insts.CoreCloneClone.clone
+  (self : signed_object.SignatureAlgorithm) :
+  Result signed_object.SignatureAlgorithm
+  := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::SignatureAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:9-81:14 -/
+@[reducible]
+def signed_object.SignatureAlgorithm.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.SignatureAlgorithm := {
+  clone := signed_object.SignatureAlgorithm.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::Copy for agent_bridle_ceremony::signed_object::SignatureAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:16-81:20 -/
+@[reducible]
+def signed_object.SignatureAlgorithm.Insts.CoreMarkerCopy : core.marker.Copy
+  signed_object.SignatureAlgorithm := {
+  cloneInst := signed_object.SignatureAlgorithm.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::SignatureAlgorithm}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:22-81:27
+    Visibility: public -/
+def signed_object.SignatureAlgorithm.Insts.CoreFmtDebug.fmt
+  (self : signed_object.SignatureAlgorithm) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | signed_object.SignatureAlgorithm.Ed25519 =>
+    core.fmt.Formatter.write_str f (toStr "Ed25519")
+  | signed_object.SignatureAlgorithm.Ecdsa =>
+    core.fmt.Formatter.write_str f (toStr "Ecdsa")
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::SignatureAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:22-81:27 -/
+@[reducible]
+def signed_object.SignatureAlgorithm.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.SignatureAlgorithm := {
+  fmt := signed_object.SignatureAlgorithm.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::SignatureAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:29-81:38 -/
+@[reducible]
+def signed_object.SignatureAlgorithm.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.SignatureAlgorithm := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::SignatureAlgorithm> for agent_bridle_ceremony::signed_object::SignatureAlgorithm}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:29-81:38
+    Visibility: public -/
+def
+  signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm.eq
+  (self : signed_object.SignatureAlgorithm)
+  (other : signed_object.SignatureAlgorithm) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::SignatureAlgorithm> for agent_bridle_ceremony::signed_object::SignatureAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:29-81:38 -/
+@[reducible]
+impl_def
+  signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm :
+  core.cmp.PartialEq signed_object.SignatureAlgorithm
+  signed_object.SignatureAlgorithm := {
+  eq :=
+    signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::SignatureAlgorithm}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:40-81:42
+    Visibility: public -/
+def signed_object.SignatureAlgorithm.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.SignatureAlgorithm) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::SignatureAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:40-81:42 -/
+@[reducible]
+def signed_object.SignatureAlgorithm.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.SignatureAlgorithm := {
+  partialEqInst :=
+    signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm
+  assert_fields_are_eq :=
+    signed_object.SignatureAlgorithm.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::hash::Hash for agent_bridle_ceremony::signed_object::SignatureAlgorithm}::hash]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:44-81:48
+    Visibility: public -/
+def signed_object.SignatureAlgorithm.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : signed_object.SignatureAlgorithm) (state : __H) :
+  Result __H
+  := do
+  let self1 := read_discriminant self
+  Isize.Insts.CoreHashHash.hash corehashHasherInst self1 state
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::hash::Hash for agent_bridle_ceremony::signed_object::SignatureAlgorithm}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 81:44-81:48 -/
+@[reducible]
+def signed_object.SignatureAlgorithm.Insts.CoreHashHash : core.hash.Hash
+  signed_object.SignatureAlgorithm := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    signed_object.SignatureAlgorithm.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::SignatureAlgorithm}::ALL]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 93:4-94:65
+    Visibility: public -/
+@[global_simps, irreducible]
+def signed_object.SignatureAlgorithm.ALL
+  : Array signed_object.SignatureAlgorithm 2#usize :=
+  Array.make 2#usize [
+    signed_object.SignatureAlgorithm.Ed25519,
+    signed_object.SignatureAlgorithm.Ecdsa
+    ]
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::SignatureAlgorithm}::is_deterministic]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 99:4-104:5
+    Visibility: public -/
+def signed_object.SignatureAlgorithm.is_deterministic
+  (self : signed_object.SignatureAlgorithm) : Result Bool := do
+  match self with
+  | signed_object.SignatureAlgorithm.Ed25519 => ok true
+  | signed_object.SignatureAlgorithm.Ecdsa => ok false
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::Codec}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:9-108:14
+    Visibility: public -/
+def signed_object.Codec.Insts.CoreCloneClone.clone
+  (self : signed_object.Codec) : Result signed_object.Codec := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::Codec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:9-108:14 -/
+@[reducible]
+def signed_object.Codec.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.Codec := {
+  clone := signed_object.Codec.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::Copy for agent_bridle_ceremony::signed_object::Codec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:16-108:20 -/
+@[reducible]
+def signed_object.Codec.Insts.CoreMarkerCopy : core.marker.Copy
+  signed_object.Codec := {
+  cloneInst := signed_object.Codec.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::Codec}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:22-108:27
+    Visibility: public -/
+def signed_object.Codec.Insts.CoreFmtDebug.fmt
+  (self : signed_object.Codec) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | signed_object.Codec.DagCbor =>
+    core.fmt.Formatter.write_str f (toStr "DagCbor")
+  | signed_object.Codec.Json => core.fmt.Formatter.write_str f (toStr "Json")
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::Codec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:22-108:27 -/
+@[reducible]
+def signed_object.Codec.Insts.CoreFmtDebug : core.fmt.Debug signed_object.Codec
+  := {
+  fmt := signed_object.Codec.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::Codec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:29-108:38 -/
+@[reducible]
+def signed_object.Codec.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.Codec := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::Codec> for agent_bridle_ceremony::signed_object::Codec}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:29-108:38
+    Visibility: public -/
+def signed_object.Codec.Insts.CoreCmpPartialEqCodec.eq
+  (self : signed_object.Codec) (other : signed_object.Codec) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::Codec> for agent_bridle_ceremony::signed_object::Codec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:29-108:38 -/
+@[reducible]
+impl_def signed_object.Codec.Insts.CoreCmpPartialEqCodec : core.cmp.PartialEq
+  signed_object.Codec signed_object.Codec := {
+  eq := signed_object.Codec.Insts.CoreCmpPartialEqCodec.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.Codec.Insts.CoreCmpPartialEqCodec
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::Codec}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:40-108:42
+    Visibility: public -/
+def signed_object.Codec.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.Codec) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::Codec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:40-108:42 -/
+@[reducible]
+def signed_object.Codec.Insts.CoreCmpEq : core.cmp.Eq signed_object.Codec := {
+  partialEqInst := signed_object.Codec.Insts.CoreCmpPartialEqCodec
+  assert_fields_are_eq :=
+    signed_object.Codec.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::hash::Hash for agent_bridle_ceremony::signed_object::Codec}::hash]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:44-108:48
+    Visibility: public -/
+def signed_object.Codec.Insts.CoreHashHash.hash
+  {__H : Type} (corehashHasherInst : core.hash.Hasher __H)
+  (self : signed_object.Codec) (state : __H) :
+  Result __H
+  := do
+  let self1 := read_discriminant self
+  Isize.Insts.CoreHashHash.hash corehashHasherInst self1 state
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::hash::Hash for agent_bridle_ceremony::signed_object::Codec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 108:44-108:48 -/
+@[reducible]
+def signed_object.Codec.Insts.CoreHashHash : core.hash.Hash signed_object.Codec
+  := {
+  hash := fun {H : Type} (corehashHasherInst : core.hash.Hasher H) =>
+    signed_object.Codec.Insts.CoreHashHash.hash corehashHasherInst
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Codec}::ALL]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 119:4-119:62
+    Visibility: public -/
+@[global_simps, irreducible]
+def signed_object.Codec.ALL : Array signed_object.Codec 2#usize :=
+  Array.make 2#usize [ signed_object.Codec.DagCbor, signed_object.Codec.Json ]
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::Profile}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:9-129:14
+    Visibility: public -/
+def signed_object.Profile.Insts.CoreCloneClone.clone
+  (self : signed_object.Profile) : Result signed_object.Profile := do
+  let i ← lift (core.clone.impls.CloneU64.clone self.version)
+  let v ←
+    alloc.vec.CloneVec.clone signed_object.HashAlgorithm.Insts.CoreCloneClone
+      self.hashes
+  let v1 ←
+    alloc.vec.CloneVec.clone
+      signed_object.SignatureAlgorithm.Insts.CoreCloneClone self.signatures
+  let v2 ←
+    alloc.vec.CloneVec.clone signed_object.Codec.Insts.CoreCloneClone
+      self.codecs
+  ok { version := i, hashes := v, signatures := v1, codecs := v2 }
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::Profile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:9-129:14 -/
+@[reducible]
+def signed_object.Profile.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.Profile := {
+  clone := signed_object.Profile.Insts.CoreCloneClone.clone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::Profile}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:16-129:21
+    Visibility: public -/
+def signed_object.Profile.Insts.CoreFmtDebug.fmt
+  (self : signed_object.Profile) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.version
+  let dyn1 :=
+    Dyn.mk _ (core.fmt.DebugVec signed_object.HashAlgorithm.Insts.CoreFmtDebug)
+      self.hashes
+  let dyn2 :=
+    Dyn.mk _ (core.fmt.DebugVec
+      signed_object.SignatureAlgorithm.Insts.CoreFmtDebug) self.signatures
+  let dyn3 :=
+    Dyn.mk _ (core.fmt.DebugShared (core.fmt.DebugVec
+      signed_object.Codec.Insts.CoreFmtDebug)) self.codecs
+  core.fmt.Formatter.debug_struct_field4_finish f (toStr "Profile") (toStr
+    "version") dyn (toStr "hashes") dyn1 (toStr "signatures") dyn2 (toStr
+    "codecs") dyn3
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::Profile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:16-129:21 -/
+@[reducible]
+def signed_object.Profile.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.Profile := {
+  fmt := signed_object.Profile.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::Profile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:23-129:32 -/
+@[reducible]
+def signed_object.Profile.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.Profile := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::Profile> for agent_bridle_ceremony::signed_object::Profile}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:23-129:32
+    Visibility: public -/
+def signed_object.Profile.Insts.CoreCmpPartialEqProfile.eq
+  (self : signed_object.Profile) (other : signed_object.Profile) :
+  Result Bool
+  := do
+  if self.version = other.version
+  then
+    let b ←
+      alloc.vec.partial_eq.PartialEqVec.eq
+        signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm
+        self.hashes other.hashes
+    if b
+    then
+      let b1 ←
+        alloc.vec.partial_eq.PartialEqVec.eq
+          signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm
+          self.signatures other.signatures
+      if b1
+      then
+        alloc.vec.partial_eq.PartialEqVec.eq
+          signed_object.Codec.Insts.CoreCmpPartialEqCodec self.codecs
+          other.codecs
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::Profile> for agent_bridle_ceremony::signed_object::Profile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:23-129:32 -/
+@[reducible]
+impl_def signed_object.Profile.Insts.CoreCmpPartialEqProfile :
+  core.cmp.PartialEq signed_object.Profile signed_object.Profile := {
+  eq := signed_object.Profile.Insts.CoreCmpPartialEqProfile.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.Profile.Insts.CoreCmpPartialEqProfile
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::Profile}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:34-129:36
+    Visibility: public -/
+def signed_object.Profile.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.Profile) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::Profile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 129:34-129:36 -/
+@[reducible]
+def signed_object.Profile.Insts.CoreCmpEq : core.cmp.Eq signed_object.Profile
+  := {
+  partialEqInst := signed_object.Profile.Insts.CoreCmpPartialEqProfile
+  assert_fields_are_eq :=
+    signed_object.Profile.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Profile}::v1]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 141:4-148:5
+    Visibility: public -/
+def signed_object.Profile.v1 : Result signed_object.Profile := do
+  let y ←
+    lift (Std.Array.to_slice
+      (Array.make 1#usize [ signed_object.HashAlgorithm.Blake3_256 ] : Array
+      signed_object.HashAlgorithm 1#usize))
+  let ret := alloc.slice.Slice.into_vec y
+  let y1 ←
+    lift (Std.Array.to_slice
+      (Array.make 1#usize [ signed_object.SignatureAlgorithm.Ed25519 ] : Array
+      signed_object.SignatureAlgorithm 1#usize))
+  let ret1 := alloc.slice.Slice.into_vec y1
+  let y2 ←
+    lift (Std.Array.to_slice
+      (Array.make 1#usize [ signed_object.Codec.DagCbor ] : Array
+      signed_object.Codec 1#usize))
+  let ret2 := alloc.slice.Slice.into_vec y2
+  ok { version := 1#u64, hashes := ret, signatures := ret1, codecs := ret2 }
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Profile}::allows_hash]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 151:4-153:5
+    Visibility: public -/
+def signed_object.Profile.allows_hash
+  (self : signed_object.Profile) (algorithm : signed_object.HashAlgorithm) :
+  Result Bool
+  := do
+  let s := alloc.vec.Vec.deref self.hashes
+  core.slice.Slice.contains
+    signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm s algorithm
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Profile}::allows_signature]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 156:4-158:5
+    Visibility: public -/
+def signed_object.Profile.allows_signature
+  (self : signed_object.Profile) (algorithm : signed_object.SignatureAlgorithm)
+  :
+  Result Bool
+  := do
+  let s := alloc.vec.Vec.deref self.signatures
+  core.slice.Slice.contains
+    signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm s
+    algorithm
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Profile}::allows_codec]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 161:4-163:5
+    Visibility: public -/
+def signed_object.Profile.allows_codec
+  (self : signed_object.Profile) (codec : signed_object.Codec) :
+  Result Bool
+  := do
+  let s := alloc.vec.Vec.deref self.codecs
+  core.slice.Slice.contains signed_object.Codec.Insts.CoreCmpPartialEqCodec s
+    codec
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::TrustedProfile}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:9-172:14
+    Visibility: public -/
+def signed_object.TrustedProfile.Insts.CoreCloneClone.clone
+  (self : signed_object.TrustedProfile) :
+  Result signed_object.TrustedProfile
+  := do
+  let p ← signed_object.Profile.Insts.CoreCloneClone.clone self.profile
+  ok { profile := p }
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::TrustedProfile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:9-172:14 -/
+@[reducible]
+def signed_object.TrustedProfile.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.TrustedProfile := {
+  clone := signed_object.TrustedProfile.Insts.CoreCloneClone.clone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::TrustedProfile}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:16-172:21
+    Visibility: public -/
+def signed_object.TrustedProfile.Insts.CoreFmtDebug.fmt
+  (self : signed_object.TrustedProfile) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn :=
+    Dyn.mk _ (core.fmt.DebugShared signed_object.Profile.Insts.CoreFmtDebug)
+      self.profile
+  core.fmt.Formatter.debug_struct_field1_finish f (toStr "TrustedProfile")
+    (toStr "profile") dyn
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::TrustedProfile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:16-172:21 -/
+@[reducible]
+def signed_object.TrustedProfile.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.TrustedProfile := {
+  fmt := signed_object.TrustedProfile.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::TrustedProfile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:23-172:32 -/
+@[reducible]
+def signed_object.TrustedProfile.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.TrustedProfile := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::TrustedProfile> for agent_bridle_ceremony::signed_object::TrustedProfile}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:23-172:32
+    Visibility: public -/
+def signed_object.TrustedProfile.Insts.CoreCmpPartialEqTrustedProfile.eq
+  (self : signed_object.TrustedProfile) (other : signed_object.TrustedProfile)
+  :
+  Result Bool
+  := do
+  signed_object.Profile.Insts.CoreCmpPartialEqProfile.eq self.profile
+    other.profile
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::TrustedProfile> for agent_bridle_ceremony::signed_object::TrustedProfile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:23-172:32 -/
+@[reducible]
+impl_def signed_object.TrustedProfile.Insts.CoreCmpPartialEqTrustedProfile :
+  core.cmp.PartialEq signed_object.TrustedProfile signed_object.TrustedProfile
+  := {
+  eq := signed_object.TrustedProfile.Insts.CoreCmpPartialEqTrustedProfile.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.TrustedProfile.Insts.CoreCmpPartialEqTrustedProfile
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::TrustedProfile}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:34-172:36
+    Visibility: public -/
+def signed_object.TrustedProfile.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.TrustedProfile) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::TrustedProfile}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 172:34-172:36 -/
+@[reducible]
+def signed_object.TrustedProfile.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.TrustedProfile := {
+  partialEqInst :=
+    signed_object.TrustedProfile.Insts.CoreCmpPartialEqTrustedProfile
+  assert_fields_are_eq :=
+    signed_object.TrustedProfile.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::TrustedProfile}::v1]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 179:4-183:5
+    Visibility: public -/
+def signed_object.TrustedProfile.v1 : Result signed_object.TrustedProfile := do
+  let p ← signed_object.Profile.v1
+  ok { profile := p }
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::TrustedProfile}::admit]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 188:4-194:5
+    Visibility: public -/
+def signed_object.TrustedProfile.admit
+  (profile : signed_object.Profile) :
+  Result (Option signed_object.TrustedProfile)
+  := do
+  let p ← signed_object.Profile.v1
+  let b ← signed_object.Profile.Insts.CoreCmpPartialEqProfile.eq profile p
+  if b
+  then ok (some { profile })
+  else ok none
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::TrustedProfile}::profile]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 198:4-200:5
+    Visibility: public -/
+def signed_object.TrustedProfile.impl.profile
+  (self : signed_object.TrustedProfile) : Result signed_object.Profile := do
+  ok self.profile
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::AllowedHash}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:9-214:14
+    Visibility: public -/
+def signed_object.AllowedHash.Insts.CoreCloneClone.clone
+  (self : signed_object.AllowedHash) : Result signed_object.AllowedHash := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::AllowedHash}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:9-214:14 -/
+@[reducible]
+def signed_object.AllowedHash.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.AllowedHash := {
+  clone := signed_object.AllowedHash.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::Copy for agent_bridle_ceremony::signed_object::AllowedHash}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:16-214:20 -/
+@[reducible]
+def signed_object.AllowedHash.Insts.CoreMarkerCopy : core.marker.Copy
+  signed_object.AllowedHash := {
+  cloneInst := signed_object.AllowedHash.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::AllowedHash}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:22-214:27
+    Visibility: public -/
+def signed_object.AllowedHash.Insts.CoreFmtDebug.fmt
+  (self : signed_object.AllowedHash) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn :=
+    Dyn.mk _ (core.fmt.DebugShared
+      signed_object.HashAlgorithm.Insts.CoreFmtDebug) self.algorithm
+  core.fmt.Formatter.debug_struct_field1_finish f (toStr "AllowedHash") (toStr
+    "algorithm") dyn
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::AllowedHash}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:22-214:27 -/
+@[reducible]
+def signed_object.AllowedHash.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.AllowedHash := {
+  fmt := signed_object.AllowedHash.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::AllowedHash}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:29-214:38 -/
+@[reducible]
+def signed_object.AllowedHash.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.AllowedHash := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::AllowedHash> for agent_bridle_ceremony::signed_object::AllowedHash}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:29-214:38
+    Visibility: public -/
+def signed_object.AllowedHash.Insts.CoreCmpPartialEqAllowedHash.eq
+  (self : signed_object.AllowedHash) (other : signed_object.AllowedHash) :
+  Result Bool
+  := do
+  signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm.eq
+    self.algorithm other.algorithm
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::AllowedHash> for agent_bridle_ceremony::signed_object::AllowedHash}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:29-214:38 -/
+@[reducible]
+impl_def signed_object.AllowedHash.Insts.CoreCmpPartialEqAllowedHash :
+  core.cmp.PartialEq signed_object.AllowedHash signed_object.AllowedHash := {
+  eq := signed_object.AllowedHash.Insts.CoreCmpPartialEqAllowedHash.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.AllowedHash.Insts.CoreCmpPartialEqAllowedHash
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::AllowedHash}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:40-214:42
+    Visibility: public -/
+def signed_object.AllowedHash.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.AllowedHash) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::AllowedHash}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 214:40-214:42 -/
+@[reducible]
+def signed_object.AllowedHash.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.AllowedHash := {
+  partialEqInst := signed_object.AllowedHash.Insts.CoreCmpPartialEqAllowedHash
+  assert_fields_are_eq :=
+    signed_object.AllowedHash.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::AllowedHash}::admit]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 221:4-227:5
+    Visibility: public -/
+def signed_object.AllowedHash.admit
+  (profile : signed_object.Profile) (algorithm : signed_object.HashAlgorithm) :
+  Result (Option signed_object.AllowedHash)
+  := do
+  let b ← signed_object.Profile.allows_hash profile algorithm
+  if b
+  then ok (some { algorithm })
+  else ok none
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::AllowedHash}::algorithm]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 229:4-231:5
+    Visibility: public -/
+def signed_object.AllowedHash.impl.algorithm
+  (self : signed_object.AllowedHash) : Result signed_object.HashAlgorithm := do
+  ok self.algorithm
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::AllowedSignature}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:9-235:14
+    Visibility: public -/
+def signed_object.AllowedSignature.Insts.CoreCloneClone.clone
+  (self : signed_object.AllowedSignature) :
+  Result signed_object.AllowedSignature
+  := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::AllowedSignature}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:9-235:14 -/
+@[reducible]
+def signed_object.AllowedSignature.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.AllowedSignature := {
+  clone := signed_object.AllowedSignature.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::Copy for agent_bridle_ceremony::signed_object::AllowedSignature}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:16-235:20 -/
+@[reducible]
+def signed_object.AllowedSignature.Insts.CoreMarkerCopy : core.marker.Copy
+  signed_object.AllowedSignature := {
+  cloneInst := signed_object.AllowedSignature.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::AllowedSignature}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:22-235:27
+    Visibility: public -/
+def signed_object.AllowedSignature.Insts.CoreFmtDebug.fmt
+  (self : signed_object.AllowedSignature) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn :=
+    Dyn.mk _ (core.fmt.DebugShared
+      signed_object.SignatureAlgorithm.Insts.CoreFmtDebug) self.algorithm
+  core.fmt.Formatter.debug_struct_field1_finish f (toStr "AllowedSignature")
+    (toStr "algorithm") dyn
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::AllowedSignature}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:22-235:27 -/
+@[reducible]
+def signed_object.AllowedSignature.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.AllowedSignature := {
+  fmt := signed_object.AllowedSignature.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::AllowedSignature}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:29-235:38 -/
+@[reducible]
+def signed_object.AllowedSignature.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.AllowedSignature := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::AllowedSignature> for agent_bridle_ceremony::signed_object::AllowedSignature}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:29-235:38
+    Visibility: public -/
+def signed_object.AllowedSignature.Insts.CoreCmpPartialEqAllowedSignature.eq
+  (self : signed_object.AllowedSignature)
+  (other : signed_object.AllowedSignature) :
+  Result Bool
+  := do
+  signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm.eq
+    self.algorithm other.algorithm
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::AllowedSignature> for agent_bridle_ceremony::signed_object::AllowedSignature}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:29-235:38 -/
+@[reducible]
+impl_def signed_object.AllowedSignature.Insts.CoreCmpPartialEqAllowedSignature
+  : core.cmp.PartialEq signed_object.AllowedSignature
+  signed_object.AllowedSignature := {
+  eq :=
+    signed_object.AllowedSignature.Insts.CoreCmpPartialEqAllowedSignature.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.AllowedSignature.Insts.CoreCmpPartialEqAllowedSignature
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::AllowedSignature}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:40-235:42
+    Visibility: public -/
+def signed_object.AllowedSignature.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.AllowedSignature) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::AllowedSignature}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 235:40-235:42 -/
+@[reducible]
+def signed_object.AllowedSignature.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.AllowedSignature := {
+  partialEqInst :=
+    signed_object.AllowedSignature.Insts.CoreCmpPartialEqAllowedSignature
+  assert_fields_are_eq :=
+    signed_object.AllowedSignature.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::AllowedSignature}::admit]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 241:4-247:5
+    Visibility: public -/
+def signed_object.AllowedSignature.admit
+  (profile : signed_object.Profile)
+  (algorithm : signed_object.SignatureAlgorithm) :
+  Result (Option signed_object.AllowedSignature)
+  := do
+  let b ← signed_object.Profile.allows_signature profile algorithm
+  if b
+  then ok (some { algorithm })
+  else ok none
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::AllowedSignature}::algorithm]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 249:4-251:5
+    Visibility: public -/
+def signed_object.AllowedSignature.impl.algorithm
+  (self : signed_object.AllowedSignature) :
+  Result signed_object.SignatureAlgorithm
+  := do
+  ok self.algorithm
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::AllowedCodec}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:9-255:14
+    Visibility: public -/
+def signed_object.AllowedCodec.Insts.CoreCloneClone.clone
+  (self : signed_object.AllowedCodec) : Result signed_object.AllowedCodec := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::AllowedCodec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:9-255:14 -/
+@[reducible]
+def signed_object.AllowedCodec.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.AllowedCodec := {
+  clone := signed_object.AllowedCodec.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::Copy for agent_bridle_ceremony::signed_object::AllowedCodec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:16-255:20 -/
+@[reducible]
+def signed_object.AllowedCodec.Insts.CoreMarkerCopy : core.marker.Copy
+  signed_object.AllowedCodec := {
+  cloneInst := signed_object.AllowedCodec.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::AllowedCodec}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:22-255:27
+    Visibility: public -/
+def signed_object.AllowedCodec.Insts.CoreFmtDebug.fmt
+  (self : signed_object.AllowedCodec) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn :=
+    Dyn.mk _ (core.fmt.DebugShared signed_object.Codec.Insts.CoreFmtDebug)
+      self.codec
+  core.fmt.Formatter.debug_struct_field1_finish f (toStr "AllowedCodec") (toStr
+    "codec") dyn
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::AllowedCodec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:22-255:27 -/
+@[reducible]
+def signed_object.AllowedCodec.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.AllowedCodec := {
+  fmt := signed_object.AllowedCodec.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::AllowedCodec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:29-255:38 -/
+@[reducible]
+def signed_object.AllowedCodec.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.AllowedCodec := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::AllowedCodec> for agent_bridle_ceremony::signed_object::AllowedCodec}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:29-255:38
+    Visibility: public -/
+def signed_object.AllowedCodec.Insts.CoreCmpPartialEqAllowedCodec.eq
+  (self : signed_object.AllowedCodec) (other : signed_object.AllowedCodec) :
+  Result Bool
+  := do
+  signed_object.Codec.Insts.CoreCmpPartialEqCodec.eq self.codec other.codec
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::AllowedCodec> for agent_bridle_ceremony::signed_object::AllowedCodec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:29-255:38 -/
+@[reducible]
+impl_def signed_object.AllowedCodec.Insts.CoreCmpPartialEqAllowedCodec :
+  core.cmp.PartialEq signed_object.AllowedCodec signed_object.AllowedCodec := {
+  eq := signed_object.AllowedCodec.Insts.CoreCmpPartialEqAllowedCodec.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.AllowedCodec.Insts.CoreCmpPartialEqAllowedCodec
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::AllowedCodec}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:40-255:42
+    Visibility: public -/
+def signed_object.AllowedCodec.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.AllowedCodec) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::AllowedCodec}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 255:40-255:42 -/
+@[reducible]
+def signed_object.AllowedCodec.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.AllowedCodec := {
+  partialEqInst :=
+    signed_object.AllowedCodec.Insts.CoreCmpPartialEqAllowedCodec
+  assert_fields_are_eq :=
+    signed_object.AllowedCodec.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::AllowedCodec}::admit]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 261:4-267:5
+    Visibility: public -/
+def signed_object.AllowedCodec.admit
+  (profile : signed_object.Profile) (codec : signed_object.Codec) :
+  Result (Option signed_object.AllowedCodec)
+  := do
+  let b ← signed_object.Profile.allows_codec profile codec
+  if b
+  then ok (some { codec })
+  else ok none
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::AllowedCodec}::codec]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 269:4-271:5
+    Visibility: public -/
+def signed_object.AllowedCodec.impl.codec
+  (self : signed_object.AllowedCodec) : Result signed_object.Codec := do
+  ok self.codec
+
+/-- [agent_bridle_ceremony::signed_object::SIGNED_OBJECT_DOMAIN]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 283:0-283:71
+    Visibility: public -/
+@[global_simps, irreducible]
+def signed_object.SIGNED_OBJECT_DOMAIN : Str :=
+  toStr "agent-bridle/signed-object/v1"
+
+/-- [agent_bridle_ceremony::signed_object::STORE_ID_SELF]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 289:0-289:41
+    Visibility: public -/
+@[global_simps, irreducible]
+def signed_object.STORE_ID_SELF : Slice Std.U8 :=
+  Array.to_slice (Array.make 1#usize [ 0#u8 ])
+
+/-- [agent_bridle_ceremony::signed_object::resolve_store_id]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 295:0-301:1
+    Visibility: public -/
+def signed_object.resolve_store_id
+  (declared_store_id : Slice Std.U8) (own_cid : Slice Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let b ←
+    core.slice.cmp.PartialEqSlice.eq core.cmp.PartialEqU8 declared_store_id
+      signed_object.STORE_ID_SELF
+  if b
+  then alloc.slice.Slice.to_vec core.clone.CloneU8 own_cid
+  else alloc.slice.Slice.to_vec core.clone.CloneU8 declared_store_id
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::SignatureDomain}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:9-309:14
+    Visibility: public -/
+def signed_object.SignatureDomain.Insts.CoreCloneClone.clone
+  (self : signed_object.SignatureDomain) :
+  Result signed_object.SignatureDomain
+  := do
+  let s ← alloc.string.String.Insts.CoreCloneClone.clone self.record_type
+  let v ← alloc.vec.CloneVec.clone core.clone.CloneU8 self.store_id
+  let v1 ←
+    alloc.vec.CloneVec.clone core.clone.CloneU8 self.thread_or_principal
+  ok { record_type := s, store_id := v, thread_or_principal := v1 }
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::SignatureDomain}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:9-309:14 -/
+@[reducible]
+def signed_object.SignatureDomain.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.SignatureDomain := {
+  clone := signed_object.SignatureDomain.Insts.CoreCloneClone.clone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::SignatureDomain}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:16-309:21
+    Visibility: public -/
+def signed_object.SignatureDomain.Insts.CoreFmtDebug.fmt
+  (self : signed_object.SignatureDomain) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ alloc.string.String.Insts.CoreFmtDebug self.record_type
+  let dyn1 := Dyn.mk _ (core.fmt.DebugVec core.fmt.DebugU8) self.store_id
+  let dyn2 :=
+    Dyn.mk _ (core.fmt.DebugShared (core.fmt.DebugVec core.fmt.DebugU8))
+      self.thread_or_principal
+  core.fmt.Formatter.debug_struct_field3_finish f (toStr "SignatureDomain")
+    (toStr "record_type") dyn (toStr "store_id") dyn1 (toStr
+    "thread_or_principal") dyn2
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::SignatureDomain}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:16-309:21 -/
+@[reducible]
+def signed_object.SignatureDomain.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.SignatureDomain := {
+  fmt := signed_object.SignatureDomain.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::SignatureDomain}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:23-309:32 -/
+@[reducible]
+def signed_object.SignatureDomain.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.SignatureDomain := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::SignatureDomain> for agent_bridle_ceremony::signed_object::SignatureDomain}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:23-309:32
+    Visibility: public -/
+def signed_object.SignatureDomain.Insts.CoreCmpPartialEqSignatureDomain.eq
+  (self : signed_object.SignatureDomain)
+  (other : signed_object.SignatureDomain) :
+  Result Bool
+  := do
+  let b ←
+    alloc.string.String.Insts.CoreCmpPartialEqString.eq self.record_type
+      other.record_type
+  if b
+  then
+    let b1 ←
+      alloc.vec.partial_eq.PartialEqVec.eq core.cmp.PartialEqU8 self.store_id
+        other.store_id
+    if b1
+    then
+      alloc.vec.partial_eq.PartialEqVec.eq core.cmp.PartialEqU8
+        self.thread_or_principal other.thread_or_principal
+    else ok false
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::SignatureDomain> for agent_bridle_ceremony::signed_object::SignatureDomain}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:23-309:32 -/
+@[reducible]
+impl_def signed_object.SignatureDomain.Insts.CoreCmpPartialEqSignatureDomain :
+  core.cmp.PartialEq signed_object.SignatureDomain
+  signed_object.SignatureDomain := {
+  eq := signed_object.SignatureDomain.Insts.CoreCmpPartialEqSignatureDomain.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.SignatureDomain.Insts.CoreCmpPartialEqSignatureDomain
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::SignatureDomain}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:34-309:36
+    Visibility: public -/
+def signed_object.SignatureDomain.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.SignatureDomain) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::SignatureDomain}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 309:34-309:36 -/
+@[reducible]
+def signed_object.SignatureDomain.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.SignatureDomain := {
+  partialEqInst :=
+    signed_object.SignatureDomain.Insts.CoreCmpPartialEqSignatureDomain
+  assert_fields_are_eq :=
+    signed_object.SignatureDomain.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::DomainBinding}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:9-321:14
+    Visibility: public -/
+def signed_object.DomainBinding.Insts.CoreCloneClone.clone
+  (self : signed_object.DomainBinding) :
+  Result signed_object.DomainBinding
+  := do
+  let i ← lift (core.clone.impls.CloneU64.clone self.profile_version)
+  let c ← signed_object.Codec.Insts.CoreCloneClone.clone self.codec
+  let v ← alloc.vec.CloneVec.clone core.clone.CloneU8 self.signer
+  ok { profile_version := i, codec := c, signer := v }
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::DomainBinding}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:9-321:14 -/
+@[reducible]
+def signed_object.DomainBinding.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.DomainBinding := {
+  clone := signed_object.DomainBinding.Insts.CoreCloneClone.clone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::DomainBinding}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:16-321:21
+    Visibility: public -/
+def signed_object.DomainBinding.Insts.CoreFmtDebug.fmt
+  (self : signed_object.DomainBinding) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.profile_version
+  let dyn1 := Dyn.mk _ signed_object.Codec.Insts.CoreFmtDebug self.codec
+  let dyn2 :=
+    Dyn.mk _ (core.fmt.DebugShared (core.fmt.DebugVec core.fmt.DebugU8))
+      self.signer
+  core.fmt.Formatter.debug_struct_field3_finish f (toStr "DomainBinding")
+    (toStr "profile_version") dyn (toStr "codec") dyn1 (toStr "signer") dyn2
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::DomainBinding}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:16-321:21 -/
+@[reducible]
+def signed_object.DomainBinding.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.DomainBinding := {
+  fmt := signed_object.DomainBinding.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::DomainBinding}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:23-321:32 -/
+@[reducible]
+def signed_object.DomainBinding.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.DomainBinding := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::DomainBinding> for agent_bridle_ceremony::signed_object::DomainBinding}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:23-321:32
+    Visibility: public -/
+def signed_object.DomainBinding.Insts.CoreCmpPartialEqDomainBinding.eq
+  (self : signed_object.DomainBinding) (other : signed_object.DomainBinding) :
+  Result Bool
+  := do
+  if self.profile_version = other.profile_version
+  then
+    let b ←
+      signed_object.Codec.Insts.CoreCmpPartialEqCodec.eq self.codec other.codec
+    if b
+    then
+      alloc.vec.partial_eq.PartialEqVec.eq core.cmp.PartialEqU8 self.signer
+        other.signer
+    else ok false
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::DomainBinding> for agent_bridle_ceremony::signed_object::DomainBinding}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:23-321:32 -/
+@[reducible]
+impl_def signed_object.DomainBinding.Insts.CoreCmpPartialEqDomainBinding :
+  core.cmp.PartialEq signed_object.DomainBinding signed_object.DomainBinding
+  := {
+  eq := signed_object.DomainBinding.Insts.CoreCmpPartialEqDomainBinding.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.DomainBinding.Insts.CoreCmpPartialEqDomainBinding
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::DomainBinding}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:34-321:36
+    Visibility: public -/
+def signed_object.DomainBinding.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.DomainBinding) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::DomainBinding}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 321:34-321:36 -/
+@[reducible]
+def signed_object.DomainBinding.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.DomainBinding := {
+  partialEqInst :=
+    signed_object.DomainBinding.Insts.CoreCmpPartialEqDomainBinding
+  assert_fields_are_eq :=
+    signed_object.DomainBinding.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::SignaturePreimage}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:9-342:14
+    Visibility: public -/
+def signed_object.SignaturePreimage.Insts.CoreCloneClone.clone
+  (self : signed_object.SignaturePreimage) :
+  Result signed_object.SignaturePreimage
+  := do
+  let v ← alloc.vec.CloneVec.clone core.clone.CloneU8 self.canonical_unsigned
+  let i ← lift (core.clone.impls.CloneU64.clone self.profile_version)
+  let ha ←
+    signed_object.HashAlgorithm.Insts.CoreCloneClone.clone self.hash_algorithm
+  let sa ←
+    signed_object.SignatureAlgorithm.Insts.CoreCloneClone.clone
+      self.signature_algorithm
+  let c ← signed_object.Codec.Insts.CoreCloneClone.clone self.codec
+  let sd ←
+    signed_object.SignatureDomain.Insts.CoreCloneClone.clone self.domain
+  let v1 ← alloc.vec.CloneVec.clone core.clone.CloneU8 self.body
+  let v2 ← alloc.vec.CloneVec.clone core.clone.CloneU8 self.claimed_cid
+  let v3 ← alloc.vec.CloneVec.clone core.clone.CloneU8 self.signer
+  let v4 ←
+    alloc.vec.CloneVec.clone alloc.string.String.Insts.CoreCloneClone
+      self.unknown_critical
+  ok
+    {
+      canonical_unsigned := v,
+      profile_version := i,
+      hash_algorithm := ha,
+      signature_algorithm := sa,
+      codec := c,
+      domain := sd,
+      body := v1,
+      claimed_cid := v2,
+      signer := v3,
+      unknown_critical := v4
+    }
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::SignaturePreimage}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:9-342:14 -/
+@[reducible]
+def signed_object.SignaturePreimage.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.SignaturePreimage := {
+  clone := signed_object.SignaturePreimage.Insts.CoreCloneClone.clone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::SignaturePreimage}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:16-342:21
+    Visibility: public -/
+def signed_object.SignaturePreimage.Insts.CoreFmtDebug.fmt
+  (self : signed_object.SignaturePreimage) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn :=
+    Dyn.mk _ (core.fmt.DebugVec core.fmt.DebugU8) self.canonical_unsigned
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.profile_version
+  let dyn2 :=
+    Dyn.mk _ signed_object.HashAlgorithm.Insts.CoreFmtDebug self.hash_algorithm
+  let dyn3 :=
+    Dyn.mk _ signed_object.SignatureAlgorithm.Insts.CoreFmtDebug
+      self.signature_algorithm
+  let dyn4 := Dyn.mk _ signed_object.Codec.Insts.CoreFmtDebug self.codec
+  let dyn5 :=
+    Dyn.mk _ signed_object.SignatureDomain.Insts.CoreFmtDebug self.domain
+  let dyn6 := Dyn.mk _ (core.fmt.DebugVec core.fmt.DebugU8) self.body
+  let dyn7 := Dyn.mk _ (core.fmt.DebugVec core.fmt.DebugU8) self.claimed_cid
+  let dyn8 := Dyn.mk _ (core.fmt.DebugVec core.fmt.DebugU8) self.signer
+  let dyn9 :=
+    Dyn.mk _ (core.fmt.DebugShared (core.fmt.DebugVec
+      alloc.string.String.Insts.CoreFmtDebug)) self.unknown_critical
+  let values :=
+    Array.to_slice
+      (Array.make 10#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9
+        ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 10#usize [
+        toStr "canonical_unsigned", toStr "profile_version", toStr
+        "hash_algorithm", toStr "signature_algorithm", toStr "codec", toStr
+        "domain", toStr "body", toStr "claimed_cid", toStr "signer", toStr
+        "unknown_critical"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr "SignaturePreimage") s
+    values
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::SignaturePreimage}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:16-342:21 -/
+@[reducible]
+def signed_object.SignaturePreimage.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.SignaturePreimage := {
+  fmt := signed_object.SignaturePreimage.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::SignaturePreimage}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:23-342:32 -/
+@[reducible]
+def signed_object.SignaturePreimage.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.SignaturePreimage := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::SignaturePreimage> for agent_bridle_ceremony::signed_object::SignaturePreimage}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:23-342:32
+    Visibility: public -/
+def signed_object.SignaturePreimage.Insts.CoreCmpPartialEqSignaturePreimage.eq
+  (self : signed_object.SignaturePreimage)
+  (other : signed_object.SignaturePreimage) :
+  Result Bool
+  := do
+  if self.profile_version = other.profile_version
+  then
+    let b ←
+      alloc.vec.partial_eq.PartialEqVec.eq core.cmp.PartialEqU8
+        self.canonical_unsigned other.canonical_unsigned
+    if b
+    then
+      let b1 ←
+        signed_object.HashAlgorithm.Insts.CoreCmpPartialEqHashAlgorithm.eq
+          self.hash_algorithm other.hash_algorithm
+      if b1
+      then
+        let b2 ←
+          signed_object.SignatureAlgorithm.Insts.CoreCmpPartialEqSignatureAlgorithm.eq
+            self.signature_algorithm other.signature_algorithm
+        if b2
+        then
+          let b3 ←
+            signed_object.Codec.Insts.CoreCmpPartialEqCodec.eq self.codec
+              other.codec
+          if b3
+          then
+            let b4 ←
+              signed_object.SignatureDomain.Insts.CoreCmpPartialEqSignatureDomain.eq
+                self.domain other.domain
+            if b4
+            then
+              let b5 ←
+                alloc.vec.partial_eq.PartialEqVec.eq core.cmp.PartialEqU8
+                  self.body other.body
+              if b5
+              then
+                let b6 ←
+                  alloc.vec.partial_eq.PartialEqVec.eq core.cmp.PartialEqU8
+                    self.claimed_cid other.claimed_cid
+                if b6
+                then
+                  let b7 ←
+                    alloc.vec.partial_eq.PartialEqVec.eq core.cmp.PartialEqU8
+                      self.signer other.signer
+                  if b7
+                  then
+                    alloc.vec.partial_eq.PartialEqVec.eq
+                      alloc.string.String.Insts.CoreCmpPartialEqString
+                      self.unknown_critical other.unknown_critical
+                  else ok false
+                else ok false
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::SignaturePreimage> for agent_bridle_ceremony::signed_object::SignaturePreimage}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:23-342:32 -/
+@[reducible]
+impl_def
+  signed_object.SignaturePreimage.Insts.CoreCmpPartialEqSignaturePreimage :
+  core.cmp.PartialEq signed_object.SignaturePreimage
+  signed_object.SignaturePreimage := {
+  eq :=
+    signed_object.SignaturePreimage.Insts.CoreCmpPartialEqSignaturePreimage.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.SignaturePreimage.Insts.CoreCmpPartialEqSignaturePreimage
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::SignaturePreimage}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:34-342:36
+    Visibility: public -/
+def signed_object.SignaturePreimage.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.SignaturePreimage) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::SignaturePreimage}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 342:34-342:36 -/
+@[reducible]
+def signed_object.SignaturePreimage.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.SignaturePreimage := {
+  partialEqInst :=
+    signed_object.SignaturePreimage.Insts.CoreCmpPartialEqSignaturePreimage
+  assert_fields_are_eq :=
+    signed_object.SignaturePreimage.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::SignedEnvelopeCodec::signature_preimage]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 461:4-474:5
+    Visibility: public -/
+@[trait_default]
+def signed_object.SignedEnvelopeCodec.signature_preimage.default
+  {Self : Type} {Clause0_Envelope : Type} {Clause0_Unsigned : Type}
+  (SignedEnvelopeCodecInst : signed_object.SignedEnvelopeCodec Self
+  Clause0_Envelope Clause0_Unsigned) (self : Self)
+  (unsigned : Clause0_Unsigned) :
+  Result signed_object.SignaturePreimage
+  := do
+  let v ← SignedEnvelopeCodecInst.encode_unsigned self unsigned
+  let i ← SignedEnvelopeCodecInst.profile_version self unsigned
+  let ha ← SignedEnvelopeCodecInst.hash_algorithm self unsigned
+  let sa ← SignedEnvelopeCodecInst.signature_algorithm self unsigned
+  let c ← SignedEnvelopeCodecInst.codec self unsigned
+  let sd ← SignedEnvelopeCodecInst.domain self unsigned
+  let v1 ← SignedEnvelopeCodecInst.body self unsigned
+  let v2 ← SignedEnvelopeCodecInst.claimed_cid self unsigned
+  let v3 ← SignedEnvelopeCodecInst.signer self unsigned
+  let v4 ← SignedEnvelopeCodecInst.unknown_critical self unsigned
+  ok
+    {
+      canonical_unsigned := v,
+      profile_version := i,
+      hash_algorithm := ha,
+      signature_algorithm := sa,
+      codec := c,
+      domain := sd,
+      body := v1,
+      claimed_cid := v2,
+      signer := v3,
+      unknown_critical := v4
+    }
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::VerifyRejection}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:9-514:14
+    Visibility: public -/
+def signed_object.VerifyRejection.Insts.CoreCloneClone.clone
+  (self : signed_object.VerifyRejection) :
+  Result signed_object.VerifyRejection
+  := do
+  ok self
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::VerifyRejection}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:9-514:14 -/
+@[reducible]
+def signed_object.VerifyRejection.Insts.CoreCloneClone : core.clone.Clone
+  signed_object.VerifyRejection := {
+  clone := signed_object.VerifyRejection.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::Copy for agent_bridle_ceremony::signed_object::VerifyRejection}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:16-514:20 -/
+@[reducible]
+def signed_object.VerifyRejection.Insts.CoreMarkerCopy : core.marker.Copy
+  signed_object.VerifyRejection := {
+  cloneInst := signed_object.VerifyRejection.Insts.CoreCloneClone
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::VerifyRejection}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:22-514:27
+    Visibility: public -/
+def signed_object.VerifyRejection.Insts.CoreFmtDebug.fmt
+  (self : signed_object.VerifyRejection) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | signed_object.VerifyRejection.Undecodable =>
+    core.fmt.Formatter.write_str f (toStr "Undecodable")
+  | signed_object.VerifyRejection.VersionMismatch =>
+    core.fmt.Formatter.write_str f (toStr "VersionMismatch")
+  | signed_object.VerifyRejection.HashNotAllowed =>
+    core.fmt.Formatter.write_str f (toStr "HashNotAllowed")
+  | signed_object.VerifyRejection.SignatureAlgNotAllowed =>
+    core.fmt.Formatter.write_str f (toStr "SignatureAlgNotAllowed")
+  | signed_object.VerifyRejection.CodecNotAllowed =>
+    core.fmt.Formatter.write_str f (toStr "CodecNotAllowed")
+  | signed_object.VerifyRejection.SignatureInvalid =>
+    core.fmt.Formatter.write_str f (toStr "SignatureInvalid")
+  | signed_object.VerifyRejection.CidMismatch =>
+    core.fmt.Formatter.write_str f (toStr "CidMismatch")
+  | signed_object.VerifyRejection.BodyDomainMismatch =>
+    core.fmt.Formatter.write_str f (toStr "BodyDomainMismatch")
+  | signed_object.VerifyRejection.UnknownCriticalField =>
+    core.fmt.Formatter.write_str f (toStr "UnknownCriticalField")
+  | signed_object.VerifyRejection.NonCanonicalBody =>
+    core.fmt.Formatter.write_str f (toStr "NonCanonicalBody")
+  | signed_object.VerifyRejection.NonCanonicalEnvelope =>
+    core.fmt.Formatter.write_str f (toStr "NonCanonicalEnvelope")
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::VerifyRejection}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:22-514:27 -/
+@[reducible]
+def signed_object.VerifyRejection.Insts.CoreFmtDebug : core.fmt.Debug
+  signed_object.VerifyRejection := {
+  fmt := signed_object.VerifyRejection.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::marker::StructuralPartialEq for agent_bridle_ceremony::signed_object::VerifyRejection}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:29-514:38 -/
+@[reducible]
+def signed_object.VerifyRejection.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq signed_object.VerifyRejection := {
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::VerifyRejection> for agent_bridle_ceremony::signed_object::VerifyRejection}::eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:29-514:38
+    Visibility: public -/
+def signed_object.VerifyRejection.Insts.CoreCmpPartialEqVerifyRejection.eq
+  (self : signed_object.VerifyRejection)
+  (other : signed_object.VerifyRejection) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::PartialEq<agent_bridle_ceremony::signed_object::VerifyRejection> for agent_bridle_ceremony::signed_object::VerifyRejection}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:29-514:38 -/
+@[reducible]
+impl_def signed_object.VerifyRejection.Insts.CoreCmpPartialEqVerifyRejection :
+  core.cmp.PartialEq signed_object.VerifyRejection
+  signed_object.VerifyRejection := {
+  eq := signed_object.VerifyRejection.Insts.CoreCmpPartialEqVerifyRejection.eq
+  ne := core.cmp.PartialEq.ne.trait_default
+    signed_object.VerifyRejection.Insts.CoreCmpPartialEqVerifyRejection
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::VerifyRejection}::assert_fields_are_eq]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:40-514:42
+    Visibility: public -/
+def signed_object.VerifyRejection.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : signed_object.VerifyRejection) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::cmp::Eq for agent_bridle_ceremony::signed_object::VerifyRejection}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 514:40-514:42 -/
+@[reducible]
+def signed_object.VerifyRejection.Insts.CoreCmpEq : core.cmp.Eq
+  signed_object.VerifyRejection := {
+  partialEqInst :=
+    signed_object.VerifyRejection.Insts.CoreCmpPartialEqVerifyRejection
+  assert_fields_are_eq :=
+    signed_object.VerifyRejection.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 551:9-551:14
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.Insts.CoreCloneClone.clone
+  {E : Type} (corecloneCloneInst : core.clone.Clone E)
+  (self : signed_object.VerifiedEnvelope E) :
+  Result (signed_object.VerifiedEnvelope E)
+  := do
+  let t ← corecloneCloneInst.clone self.envelope
+  let p ← signed_object.Profile.Insts.CoreCloneClone.clone self.profile
+  let ah ←
+    signed_object.AllowedHash.Insts.CoreCloneClone.clone self.allowed_hash
+  let as1 ←
+    signed_object.AllowedSignature.Insts.CoreCloneClone.clone
+      self.allowed_signature
+  let ac ←
+    signed_object.AllowedCodec.Insts.CoreCloneClone.clone self.allowed_codec
+  let sp ←
+    signed_object.SignaturePreimage.Insts.CoreCloneClone.clone self.preimage
+  ok
+    {
+      envelope := t,
+      profile := p,
+      allowed_hash := ah,
+      allowed_signature := as1,
+      allowed_codec := ac,
+      preimage := sp
+    }
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 551:9-551:14 -/
+@[reducible]
+def signed_object.VerifiedEnvelope.Insts.CoreCloneClone {E : Type}
+  (corecloneCloneInst : core.clone.Clone E) : core.clone.Clone
+  (signed_object.VerifiedEnvelope E) := {
+  clone := signed_object.VerifiedEnvelope.Insts.CoreCloneClone.clone
+    corecloneCloneInst
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 551:16-551:21
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.Insts.CoreFmtDebug.fmt
+  {E : Type} (corefmtDebugInst : core.fmt.Debug E)
+  (self : signed_object.VerifiedEnvelope E) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ corefmtDebugInst self.envelope
+  let dyn1 := Dyn.mk _ signed_object.Profile.Insts.CoreFmtDebug self.profile
+  let dyn2 :=
+    Dyn.mk _ signed_object.AllowedHash.Insts.CoreFmtDebug self.allowed_hash
+  let dyn3 :=
+    Dyn.mk _ signed_object.AllowedSignature.Insts.CoreFmtDebug
+      self.allowed_signature
+  let dyn4 :=
+    Dyn.mk _ signed_object.AllowedCodec.Insts.CoreFmtDebug self.allowed_codec
+  let dyn5 :=
+    Dyn.mk _ (core.fmt.DebugShared
+      signed_object.SignaturePreimage.Insts.CoreFmtDebug) self.preimage
+  let values :=
+    Array.to_slice (Array.make 6#usize [ dyn, dyn1, dyn2, dyn3, dyn4, dyn5 ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 6#usize [
+        toStr "envelope", toStr "profile", toStr "allowed_hash", toStr
+        "allowed_signature", toStr "allowed_codec", toStr "preimage"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr "VerifiedEnvelope") s
+    values
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 551:16-551:21 -/
+@[reducible]
+def signed_object.VerifiedEnvelope.Insts.CoreFmtDebug {E : Type}
+  (corefmtDebugInst : core.fmt.Debug E) : core.fmt.Debug
+  (signed_object.VerifiedEnvelope E) := {
+  fmt := signed_object.VerifiedEnvelope.Insts.CoreFmtDebug.fmt corefmtDebugInst
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::envelope]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 565:4-567:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.impl.envelope
+  {E : Type} (self : signed_object.VerifiedEnvelope E) : Result E := do
+  ok self.envelope
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::profile]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 570:4-572:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.impl.profile
+  {E : Type} (self : signed_object.VerifiedEnvelope E) :
+  Result signed_object.Profile
+  := do
+  ok self.profile
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::allowed_hash]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 575:4-577:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.impl.allowed_hash
+  {E : Type} (self : signed_object.VerifiedEnvelope E) :
+  Result signed_object.AllowedHash
+  := do
+  ok self.allowed_hash
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::allowed_signature]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 580:4-582:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.impl.allowed_signature
+  {E : Type} (self : signed_object.VerifiedEnvelope E) :
+  Result signed_object.AllowedSignature
+  := do
+  ok self.allowed_signature
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::allowed_codec]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 585:4-587:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.impl.allowed_codec
+  {E : Type} (self : signed_object.VerifiedEnvelope E) :
+  Result signed_object.AllowedCodec
+  := do
+  ok self.allowed_codec
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::preimage]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 590:4-592:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.impl.preimage
+  {E : Type} (self : signed_object.VerifiedEnvelope E) :
+  Result signed_object.SignaturePreimage
+  := do
+  ok self.preimage
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::cid]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 595:4-597:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.cid
+  {E : Type} (self : signed_object.VerifiedEnvelope E) :
+  Result (Slice Std.U8)
+  := do
+  ok (alloc.vec.Vec.deref self.preimage.claimed_cid)
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::VerifiedEnvelope<E>}::effective_store_id]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 603:4-605:5
+    Visibility: public -/
+def signed_object.VerifiedEnvelope.effective_store_id
+  {E : Type} (self : signed_object.VerifiedEnvelope E) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let s := alloc.vec.Vec.deref self.preimage.domain.store_id
+  let s1 := alloc.vec.Vec.deref self.preimage.claimed_cid
+  signed_object.resolve_store_id s s1
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::Sealed<V, E>}::clone]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 613:9-613:14
+    Visibility: public -/
+def signed_object.Sealed.Insts.CoreCloneClone.clone
+  {V : Type} {E : Type} (corecloneCloneInst : core.clone.Clone V)
+  (corecloneCloneInst1 : core.clone.Clone E) (self : signed_object.Sealed V E)
+  :
+  Result (signed_object.Sealed V E)
+  := do
+  let ve ←
+    signed_object.VerifiedEnvelope.Insts.CoreCloneClone.clone
+      corecloneCloneInst1 self.verified
+  let t ← corecloneCloneInst.clone self.value
+  ok { verified := ve, value := t }
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::clone::Clone for agent_bridle_ceremony::signed_object::Sealed<V, E>}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 613:9-613:14 -/
+@[reducible]
+def signed_object.Sealed.Insts.CoreCloneClone {V : Type} {E : Type}
+  (corecloneCloneInst : core.clone.Clone V) (corecloneCloneInst1 :
+  core.clone.Clone E) : core.clone.Clone (signed_object.Sealed V E) := {
+  clone := signed_object.Sealed.Insts.CoreCloneClone.clone corecloneCloneInst
+    corecloneCloneInst1
+}
+
+/-- [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::Sealed<V, E>}::fmt]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 613:16-613:21
+    Visibility: public -/
+def signed_object.Sealed.Insts.CoreFmtDebug.fmt
+  {V : Type} {E : Type} (corefmtDebugInst : core.fmt.Debug V)
+  (corefmtDebugInst1 : core.fmt.Debug E) (self : signed_object.Sealed V E)
+  (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn :=
+    Dyn.mk _ (signed_object.VerifiedEnvelope.Insts.CoreFmtDebug
+      corefmtDebugInst1) self.verified
+  let dyn1 := Dyn.mk _ (core.fmt.DebugShared corefmtDebugInst) self.value
+  core.fmt.Formatter.debug_struct_field2_finish f (toStr "Sealed") (toStr
+    "verified") dyn (toStr "value") dyn1
+
+/-- Trait implementation: [agent_bridle_ceremony::signed_object::{impl core::fmt::Debug for agent_bridle_ceremony::signed_object::Sealed<V, E>}]
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 613:16-613:21 -/
+@[reducible]
+def signed_object.Sealed.Insts.CoreFmtDebug {V : Type} {E : Type}
+  (corefmtDebugInst : core.fmt.Debug V) (corefmtDebugInst1 : core.fmt.Debug E)
+  : core.fmt.Debug (signed_object.Sealed V E) := {
+  fmt := signed_object.Sealed.Insts.CoreFmtDebug.fmt corefmtDebugInst
+    corefmtDebugInst1
+}
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Sealed<V, E>}::verified]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 621:4-623:5
+    Visibility: public -/
+def signed_object.Sealed.impl.verified
+  {V : Type} {E : Type} (self : signed_object.Sealed V E) :
+  Result (signed_object.VerifiedEnvelope E)
+  := do
+  ok self.verified
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Sealed<V, E>}::value]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 626:4-628:5
+    Visibility: public -/
+def signed_object.Sealed.impl.value
+  {V : Type} {E : Type} (self : signed_object.Sealed V E) : Result V := do
+  ok self.value
+
+/-- [agent_bridle_ceremony::signed_object::{agent_bridle_ceremony::signed_object::Sealed<V, E>}::into_value]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 631:4-633:5
+    Visibility: public -/
+def signed_object.Sealed.into_value
+  {V : Type} {E : Type} (self : signed_object.Sealed V E) : Result V := do
+  ok self.value
+
+/-- [agent_bridle_ceremony::signed_object::verify_envelope]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 650:0-726:1
+    Visibility: public -/
+def signed_object.verify_envelope
+  {C : Type} {K : Type} {Clause0_Envelope : Type} {Clause0_Unsigned : Type}
+  (SignedEnvelopeCodecInst : signed_object.SignedEnvelopeCodec C
+  Clause0_Envelope Clause0_Unsigned) (CryptoBoundaryInst :
+  signed_object.CryptoBoundary K) (trusted : signed_object.TrustedProfile)
+  (envelope_codec : C) (crypto : K) (received : Slice Std.U8) :
+  Result (core.result.Result (signed_object.VerifiedEnvelope Clause0_Envelope)
+    signed_object.VerifyRejection)
+  := do
+  let profile ← signed_object.TrustedProfile.impl.profile trusted
+  let o ← SignedEnvelopeCodecInst.decode envelope_codec received
+  let r ←
+    core.option.Option.ok_or o signed_object.VerifyRejection.Undecodable
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue val =>
+    let v ← SignedEnvelopeCodecInst.encode envelope_codec val
+    let b ←
+      alloc.vec.Vec.Insts.CoreCmpPartialEqShared0Slice.ne Global
+        core.cmp.PartialEqU8 v received
+    if b
+    then
+      ok (core.result.Result.Err
+        signed_object.VerifyRejection.NonCanonicalEnvelope)
+    else
+      let unsigned ← SignedEnvelopeCodecInst.unsigned envelope_codec val
+      let i ← SignedEnvelopeCodecInst.profile_version envelope_codec unsigned
+      if i != profile.version
+      then
+        ok (core.result.Result.Err
+          signed_object.VerifyRejection.VersionMismatch)
+      else
+        let ha ←
+          SignedEnvelopeCodecInst.hash_algorithm envelope_codec unsigned
+        let o1 ← signed_object.AllowedHash.admit profile ha
+        let r1 ←
+          core.option.Option.ok_or o1
+            signed_object.VerifyRejection.HashNotAllowed
+        let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+        match cf1 with
+        | core.ops.control_flow.ControlFlow.Continue val1 =>
+          let sa ←
+            SignedEnvelopeCodecInst.signature_algorithm envelope_codec unsigned
+          let o2 ← signed_object.AllowedSignature.admit profile sa
+          let r2 ←
+            core.option.Option.ok_or o2
+              signed_object.VerifyRejection.SignatureAlgNotAllowed
+          let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+          match cf2 with
+          | core.ops.control_flow.ControlFlow.Continue val2 =>
+            let c ← SignedEnvelopeCodecInst.codec envelope_codec unsigned
+            let o3 ← signed_object.AllowedCodec.admit profile c
+            let r3 ←
+              core.option.Option.ok_or o3
+                signed_object.VerifyRejection.CodecNotAllowed
+            let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+            match cf3 with
+            | core.ops.control_flow.ControlFlow.Continue val3 =>
+              let preimage ←
+                SignedEnvelopeCodecInst.signature_preimage envelope_codec
+                  unsigned
+              let signature ←
+                SignedEnvelopeCodecInst.signature_bytes envelope_codec val
+              let s := alloc.vec.Vec.deref signature
+              let b1 ←
+                CryptoBoundaryInst.signature_matches crypto val2 preimage s
+              if b1
+              then
+                let v1 ← SignedEnvelopeCodecInst.body envelope_codec unsigned
+                let s1 := alloc.vec.Vec.deref v1
+                let recomputed_cid ← CryptoBoundaryInst.digest crypto val1 s1
+                let v2 ←
+                  SignedEnvelopeCodecInst.claimed_cid envelope_codec unsigned
+                let b2 ←
+                  alloc.vec.partial_eq.PartialEqVec.ne core.cmp.PartialEqU8 v2
+                    recomputed_cid
+                if b2
+                then
+                  ok (core.result.Result.Err
+                    signed_object.VerifyRejection.CidMismatch)
+                else
+                  let v3 ←
+                    SignedEnvelopeCodecInst.signer envelope_codec unsigned
+                  let db ←
+                    SignedEnvelopeCodecInst.body_binding envelope_codec
+                      unsigned
+                  let b3 ←
+                    core.cmp.PartialEq.ne.trait_default
+                      signed_object.DomainBinding.Insts.CoreCmpPartialEqDomainBinding
+                      db { profile_version := i, codec := c, signer := v3 }
+                  if b3
+                  then
+                    ok (core.result.Result.Err
+                      signed_object.VerifyRejection.BodyDomainMismatch)
+                  else
+                    let v4 ←
+                      SignedEnvelopeCodecInst.unknown_critical envelope_codec
+                        unsigned
+                    let b4 ← alloc.vec.Vec.is_empty Global v4
+                    if b4
+                    then
+                      let p ←
+                        signed_object.Profile.Insts.CoreCloneClone.clone
+                          profile
+                      ok (core.result.Result.Ok
+                        {
+                          envelope := val,
+                          profile := p,
+                          allowed_hash := val1,
+                          allowed_signature := val2,
+                          allowed_codec := val3,
+                          preimage
+                        })
+                    else
+                      ok (core.result.Result.Err
+                        signed_object.VerifyRejection.UnknownCriticalField)
+              else
+                ok (core.result.Result.Err
+                  signed_object.VerifyRejection.SignatureInvalid)
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                (signed_object.VerifiedEnvelope Clause0_Envelope)
+                (core.convert.FromSame signed_object.VerifyRejection) residual
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              (signed_object.VerifiedEnvelope Clause0_Envelope)
+              (core.convert.FromSame signed_object.VerifyRejection) residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            (signed_object.VerifiedEnvelope Clause0_Envelope)
+            (core.convert.FromSame signed_object.VerifyRejection) residual
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      (signed_object.VerifiedEnvelope Clause0_Envelope) (core.convert.FromSame
+      signed_object.VerifyRejection) residual
+
+/-- [agent_bridle_ceremony::signed_object::parse_verified]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 733:0-748:1
+    Visibility: public -/
+def signed_object.parse_verified
+  {D : Type} {E : Type} {Clause0_Clause0_Value : Type}
+  (CanonicalPayloadDecoderInst : signed_object.CanonicalPayloadDecoder D
+  Clause0_Clause0_Value) (decoder : D)
+  (verified : signed_object.VerifiedEnvelope E) :
+  Result (core.result.Result (signed_object.Sealed Clause0_Clause0_Value E)
+    signed_object.VerifyRejection)
+  := do
+  let body ←
+    alloc.vec.CloneVec.clone core.clone.CloneU8 verified.preimage.body
+  let s := alloc.vec.Vec.deref body
+  let o ← CanonicalPayloadDecoderInst.parse decoder s
+  let r ←
+    core.option.Option.ok_or o signed_object.VerifyRejection.NonCanonicalBody
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue val =>
+    let v ←
+      CanonicalPayloadDecoderInst.CanonicalEncodingInst.encode decoder val
+    let b ← alloc.vec.partial_eq.PartialEqVec.ne core.cmp.PartialEqU8 v body
+    if b
+    then
+      ok (core.result.Result.Err
+        signed_object.VerifyRejection.NonCanonicalBody)
+    else ok (core.result.Result.Ok { verified, value := val })
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      (signed_object.Sealed Clause0_Clause0_Value E) (core.convert.FromSame
+      signed_object.VerifyRejection) residual
+
+/-- [agent_bridle_ceremony::signed_object::load_envelope]:
+    Source: 'agent-bridle-ceremony/src/signed_object.rs', lines 752:0-766:1
+    Visibility: public -/
+def signed_object.load_envelope
+  {C : Type} {K : Type} {D : Type} {Clause0_Envelope : Type} {Clause0_Unsigned
+  : Type} {Clause2_Clause0_Value : Type} (SignedEnvelopeCodecInst :
+  signed_object.SignedEnvelopeCodec C Clause0_Envelope Clause0_Unsigned)
+  (CryptoBoundaryInst : signed_object.CryptoBoundary K)
+  (CanonicalPayloadDecoderInst : signed_object.CanonicalPayloadDecoder D
+  Clause2_Clause0_Value) (trusted : signed_object.TrustedProfile)
+  (envelope_codec : C) (crypto : K) (decoder : D) (received : Slice Std.U8) :
+  Result (core.result.Result (signed_object.Sealed Clause2_Clause0_Value
+    Clause0_Envelope) signed_object.VerifyRejection)
+  := do
+  let r ←
+    signed_object.verify_envelope SignedEnvelopeCodecInst CryptoBoundaryInst
+      trusted envelope_codec crypto received
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue val =>
+    signed_object.parse_verified CanonicalPayloadDecoderInst decoder val
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      (signed_object.Sealed Clause2_Clause0_Value Clause0_Envelope)
+      (core.convert.FromSame signed_object.VerifyRejection) residual
 
 end agent_bridle_ceremony

@@ -23,6 +23,14 @@ open agent_bridle_ceremony
 axiom Isize.Insts.CoreHashHash.hash
   {H : Type} (HasherInst : core.hash.Hasher H) : Std.Isize → H → Result H
 
+/-- [core::hash::impls::{impl core::hash::Hash for u64}::hash]:
+    Source: '/rustc/library/core/src/hash/mod.rs', lines 812:16-812:56
+    Name pattern: [core::hash::impls::{core::hash::Hash<u64>}::hash]
+    Visibility: public -/
+@[rust_fun "core::hash::impls::{core::hash::Hash<u64>}::hash"]
+axiom U64.Insts.CoreHashHash.hash
+  {H : Type} (HasherInst : core.hash.Hasher H) : Std.U64 → H → Result H
+
 /-- [core::hash::impls::{impl core::hash::Hash for bool}::hash]:
     Source: '/rustc/library/core/src/hash/mod.rs', lines 848:8-848:48
     Name pattern: [core::hash::impls::{core::hash::Hash<bool>}::hash]
@@ -30,4 +38,124 @@ axiom Isize.Insts.CoreHashHash.hash
 @[rust_fun "core::hash::impls::{core::hash::Hash<bool>}::hash"]
 axiom Bool.Insts.CoreHashHash.hash
   {H : Type} (HasherInst : core.hash.Hasher H) : Bool → H → Result H
+
+/-- [core::option::{impl core::fmt::Debug for core::option::Option<T>}::fmt]:
+    Source: '/rustc/library/core/src/option.rs', lines 591:15-591:20
+    Name pattern: [core::option::{core::fmt::Debug<core::option::Option<@T>>}::fmt]
+    Visibility: public -/
+@[rust_fun "core::option::{core::fmt::Debug<core::option::Option<@T>>}::fmt"]
+axiom core.option.Option.Insts.CoreFmtDebug.fmt
+  {T : Type} (fmtDebugInst : core.fmt.Debug T) :
+  Option T → core.fmt.Formatter → Result ((core.result.Result Unit
+    core.fmt.Error) × core.fmt.Formatter)
+
+/-- [core::option::{impl core::hash::Hash for core::option::Option<T>}::hash]:
+    Source: '/rustc/library/core/src/option.rs', lines 591:22-591:26
+    Name pattern: [core::option::{core::hash::Hash<core::option::Option<@T>>}::hash]
+    Visibility: public -/
+@[rust_fun "core::option::{core::hash::Hash<core::option::Option<@T>>}::hash"]
+axiom core.option.Option.Insts.CoreHashHash.hash
+  {T : Type} {__H : Type} (hashHashInst : core.hash.Hash T) (hashHasherInst :
+  core.hash.Hasher __H) :
+  Option T → __H → Result __H
+
+/-- [core::option::{core::option::Option<T>}::ok_or]:
+    Source: '/rustc/library/core/src/option.rs', lines 1334:4-1334:73
+    Name pattern: [core::option::{core::option::Option<@T>}::ok_or]
+    Visibility: public -/
+@[rust_fun "core::option::{core::option::Option<@T>}::ok_or"]
+axiom core.option.Option.ok_or
+  {T : Type} {E : Type} : Option T → E → Result (core.result.Result T E)
+
+/-- [core::option::{core::option::Option<&'_0 T>}::copied]:
+    Source: '/rustc/library/core/src/option.rs', lines 2135:4-2137:16
+    Name pattern: [core::option::{core::option::Option<&'0 @T>}::copied]
+    Visibility: public -/
+@[rust_fun "core::option::{core::option::Option<&'0 @T>}::copied"]
+axiom core.option.OptionShared0T.copied
+  {T : Type} (markerCopyInst : core.marker.Copy T) :
+  Option T → Result (Option T)
+
+/-- [core::option::{impl core::cmp::PartialEq<core::option::Option<T>> for core::option::Option<T>}::eq]:
+    Source: '/rustc/library/core/src/option.rs', lines 2440:4-2440:38
+    Name pattern: [core::option::{core::cmp::PartialEq<core::option::Option<@T>, core::option::Option<@T>>}::eq]
+    Visibility: public -/
+@[rust_fun
+  "core::option::{core::cmp::PartialEq<core::option::Option<@T>, core::option::Option<@T>>}::eq"]
+axiom core.option.Option.Insts.CoreCmpPartialEqOption.eq
+  {T : Type} (cmpPartialEqInst : core.cmp.PartialEq T T) :
+  Option T → Option T → Result Bool
+
+/-- [core::option::{impl core::ops::try_trait::Try for core::option::Option<T>}::branch]:
+    Source: '/rustc/library/core/src/option.rs', lines 2779:4-2779:64
+    Name pattern: [core::option::{core::ops::try_trait::Try<core::option::Option<@T>>}::branch]
+    Visibility: public -/
+@[rust_fun
+  "core::option::{core::ops::try_trait::Try<core::option::Option<@T>>}::branch"]
+axiom core.option.Option.Insts.CoreOpsTry_traitTry.branch
+  {T : Type} :
+  Option T → Result (core.ops.control_flow.ControlFlow (Option
+    core.convert.Infallible) T)
+
+/-- [core::option::{impl core::ops::try_trait::FromResidual<core::option::Option<core::convert::Infallible>> for core::option::Option<T>}::from_residual]:
+    Source: '/rustc/library/core/src/option.rs', lines 2793:4-2793:67
+    Name pattern: [core::option::{core::ops::try_trait::FromResidual<core::option::Option<@T>, core::option::Option<core::convert::Infallible>>}::from_residual]
+    Visibility: public -/
+@[rust_fun
+  "core::option::{core::ops::try_trait::FromResidual<core::option::Option<@T>, core::option::Option<core::convert::Infallible>>}::from_residual"]
+axiom
+  core.option.Option.Insts.CoreOpsTry_traitFromResidualOptionInfallible.from_residual
+  (T : Type) : Option core.convert.Infallible → Result (Option T)
+
+/-- [core::slice::{[T]}::last]:
+    Source: '/rustc/library/core/src/slice/mod.rs', lines 281:4-281:42
+    Name pattern: [core::slice::{[@T]}::last]
+    Visibility: public -/
+@[rust_fun "core::slice::{[@T]}::last"]
+axiom core.slice.Slice.last {T : Type} : Slice T → Result (Option T)
+
+/-- [alloc::string::{impl core::cmp::PartialEq<alloc::string::String> for alloc::string::String}::eq]:
+    Source: '/rustc/library/alloc/src/string.rs', lines 350:9-350:18
+    Name pattern: [alloc::string::{core::cmp::PartialEq<alloc::string::String, alloc::string::String>}::eq]
+    Visibility: public -/
+@[rust_fun
+  "alloc::string::{core::cmp::PartialEq<alloc::string::String, alloc::string::String>}::eq"]
+axiom alloc.string.String.Insts.CoreCmpPartialEqString.eq
+  : String → String → Result Bool
+
+/-- [alloc::string::{impl core::clone::Clone for alloc::string::String}::clone]:
+    Source: '/rustc/library/alloc/src/string.rs', lines 2364:4-2364:27
+    Name pattern: [alloc::string::{core::clone::Clone<alloc::string::String>}::clone]
+    Visibility: public -/
+@[rust_fun "alloc::string::{core::clone::Clone<alloc::string::String>}::clone"]
+axiom alloc.string.String.Insts.CoreCloneClone.clone : String → Result String
+
+/-- [alloc::string::{impl core::fmt::Debug for alloc::string::String}::fmt]:
+    Source: '/rustc/library/alloc/src/string.rs', lines 2732:4-2732:60
+    Name pattern: [alloc::string::{core::fmt::Debug<alloc::string::String>}::fmt]
+    Visibility: public -/
+@[rust_fun "alloc::string::{core::fmt::Debug<alloc::string::String>}::fmt"]
+axiom alloc.string.String.Insts.CoreFmtDebug.fmt
+  :
+  String → core.fmt.Formatter → Result ((core.result.Result Unit
+    core.fmt.Error) × core.fmt.Formatter)
+
+/-- [alloc::vec::{alloc::vec::Vec<T>}::is_empty]:
+    Source: '/rustc/library/alloc/src/vec/mod.rs', lines 3085:4-3085:40
+    Name pattern: [alloc::vec::{alloc::vec::Vec<@T>}::is_empty]
+    Visibility: public -/
+@[rust_fun "alloc::vec::{alloc::vec::Vec<@T>}::is_empty"]
+axiom alloc.vec.Vec.is_empty
+  {T : Type} (A : Type) : alloc.vec.Vec T → Result Bool
+
+/-- [alloc::vec::partial_eq::{impl core::cmp::PartialEq<&'_0 [U]> for alloc::vec::Vec<T>}::ne]:
+    Source: '/rustc/library/alloc/src/vec/partial_eq.rs', lines 17:12-17:46
+    Name pattern: [alloc::vec::partial_eq::{core::cmp::PartialEq<alloc::vec::Vec<@T>, &'0 [@U]>}::ne]
+    Visibility: public -/
+@[rust_fun
+  "alloc::vec::partial_eq::{core::cmp::PartialEq<alloc::vec::Vec<@T>, &'0 [@U]>}::ne"]
+axiom alloc.vec.Vec.Insts.CoreCmpPartialEqShared0Slice.ne
+  {T : Type} {U : Type} (A : Type) (corecmpPartialEqInst : core.cmp.PartialEq T
+  U) :
+  alloc.vec.Vec T → Slice U → Result Bool
 
