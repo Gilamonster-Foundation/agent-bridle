@@ -14,6 +14,19 @@ import AgentBridleCeremony.Funs
 open Aeneas Aeneas.Std Result
 open agent_bridle_ceremony
 
+-- `native_decide` on the (computable) P1 allowlist needs `DecidableEq` for the
+-- goal's `Result (Option Allowed…)`. Aeneas's `Error`/`Result` and the extracted
+-- signed-object enums/witnesses only `deriving BEq`, so derive the `DecidableEq`
+-- chain here (all are plain inductives / single-field structs).
+deriving instance DecidableEq for Aeneas.Std.Error
+deriving instance DecidableEq for Aeneas.Std.Result
+deriving instance DecidableEq for signed_object.HashAlgorithm
+deriving instance DecidableEq for signed_object.SignatureAlgorithm
+deriving instance DecidableEq for signed_object.Codec
+deriving instance DecidableEq for signed_object.AllowedHash
+deriving instance DecidableEq for signed_object.AllowedSignature
+deriving instance DecidableEq for signed_object.AllowedCodec
+
 namespace CeremonyRefinement
 
 -- ── axis meet: commutative, idempotent ──
@@ -79,23 +92,33 @@ theorem resolve_singleton (a : authority.Authority) :
 -- meet_from-induction proof left as follow-up. The *safety* law (no fail-open)
 -- is fully proven above.
 
--- ══ P1 signed-object: extraction VERIFIED; allowlist proof is a follow-up ══
--- The P1 kernel (signed_object.rs) now extracts through Charon/Aeneas — the
--- profile allowlist (`Profile.v1`, `allows_*`, `Allowed{Hash,Signature,Codec}.admit`)
--- and the trait-generic verify logic come through (the abstract crypto/encoding
--- land as opaque type-externals in `AgentBridleCeremony/TypesExternal.lean`,
--- exactly as HELD intends). This file's extraction is regenerated to include it.
---
--- The closed-allowlist LAW (v1 admits exactly its member per axis, rejects all
--- else — PO-8 / law §4·4) is NOT yet proven here: the extracted `admit` threads
--- `allows_* = core.slice.Slice.contains(profile.axis, algo)` = `List.anyM (eq …)`
--- over an Aeneas `Vec`. That is *closed and computable*, but neither `rfl`/`simp`
--- (needs the `contains`/`anyM`/`into_vec`/`deref` reduction lemmas) nor
--- `native_decide` (needs `DecidableEq (Result …)`, which Aeneas's `Result`+`Error`
--- do not derive out of the box) discharges it cheaply — unlike the pure-enum P0
--- algebra. FOLLOW-UP: either supply the Aeneas-Std Vec/`contains` simp set, or a
--- `DecidableEq` for `Result`, then the allowlist closure proves by evaluation.
--- (The property is already exhaustively covered by the Rust unit tests in
--- `signed_object.rs`: `allowlist_admits_exactly_v1_algorithms_and_codec`.)
+-- ══ P1 signed-object: the allowlist is a CLOSED gate (PO-8, law §4·4) ══
+-- The extracted `admit` threads `allows_* = core.slice.Slice.contains(profile.axis,
+-- algo) = List.anyM (eq …)` over the `v1` Vec — closed and computable. The v1
+-- profile admits EXACTLY its member on each axis and rejects every other value,
+-- the Rust image of SignedObject.lean's `allows_*` + `TrustedProfile` (v1-only).
+-- Discharged on the extracted code by `native_decide` (via the DecidableEq chain
+-- above), the Aeneas analogue of Lean's `by decide` over the finite domain.
+
+open signed_object in
+theorem admit_hash_v1_admits_blake3_rejects_sha1 :
+    ((do let p ← Profile.v1; AllowedHash.admit p HashAlgorithm.Blake3_256)
+      = ok (some { algorithm := HashAlgorithm.Blake3_256 }))
+    ∧ ((do let p ← Profile.v1; AllowedHash.admit p HashAlgorithm.Sha1) = ok none) := by
+  native_decide
+
+open signed_object in
+theorem admit_signature_v1_admits_ed25519_rejects_ecdsa :
+    ((do let p ← Profile.v1; AllowedSignature.admit p SignatureAlgorithm.Ed25519)
+      = ok (some { algorithm := SignatureAlgorithm.Ed25519 }))
+    ∧ ((do let p ← Profile.v1; AllowedSignature.admit p SignatureAlgorithm.Ecdsa) = ok none) := by
+  native_decide
+
+open signed_object in
+theorem admit_codec_v1_admits_dagcbor_rejects_json :
+    ((do let p ← Profile.v1; AllowedCodec.admit p Codec.DagCbor)
+      = ok (some { codec := Codec.DagCbor }))
+    ∧ ((do let p ← Profile.v1; AllowedCodec.admit p Codec.Json) = ok none) := by
+  native_decide
 
 end CeremonyRefinement
