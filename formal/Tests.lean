@@ -1,2 +1,3 @@
 import Tests.SignedObjectContracts
 import Tests.P1Counterexamples
+import Tests.PreimageCodecContracts
