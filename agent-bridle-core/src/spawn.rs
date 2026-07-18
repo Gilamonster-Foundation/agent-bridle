@@ -714,7 +714,7 @@ mod tokio_spawn_tests {
         let cx = ctx(caveats);
         // curl honors the lowercase `https_proxy` the proxy env grant sets; the
         // off-list CONNECT is refused at the allow-list (403) before any dial.
-        let mut child = ConfinedCommand::new(curl)
+        let child = ConfinedCommand::new(curl)
             .arg("-s")
             .arg("-m")
             .arg("5")
