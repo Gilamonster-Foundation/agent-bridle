@@ -40,9 +40,9 @@ use std::time::Duration;
 
 use agent_bridle_core::{
     best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
-    human_gate, is_unbridled, loopback_fenced_caveats, net_egress_proxy_hosts, Caveats, Denial,
-    DenialKind, Disclosure, EnforcementReport, LimitsPolicy, SandboxKind, SandboxPolicy, Tool,
-    ToolContext, ToolEnvelope, ToolError, ToolResult,
+    human_gate, is_unbridled, Caveats, Denial, DenialKind, Disclosure, EnforcementReport,
+    LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope, ToolError,
+    ToolResult,
 };
 use async_trait::async_trait;
 
@@ -160,23 +160,16 @@ impl Spawner for OsSpawner {
 }
 
 /// The egress-proxy plan for `caveats`, or `None` to fall through to the ordinary
-/// confinement paths (#124, ADR 0016). `Some((allow_hosts, fenced))` **iff** the
-/// grant is a general remote-host `net` allow-list ([`net_egress_proxy_hosts`])
-/// *and* the loopback fence it needs is actually emittable on this host — i.e.
-/// [`loopback_fenced_caveats`] engages a real backend
-/// ([`intended_sandbox_kind`] ≠ `None`; today only macOS Seatbelt). This one
-/// helper feeds BOTH the spawn routing ([`OsSpawner::run`]) and the reported
-/// `sandbox_kind` ([`ShellTool::invoke`]), so check and routing cannot disagree.
+/// confinement paths (#124, ADR 0016). Since #257 this is the SHARED core
+/// decision ([`agent_bridle_core::egress_proxy_plan`]) — the same one
+/// `ConfinedCommand::spawn_tokio` routes through — kept as a thin local alias so
+/// the spawn routing ([`OsSpawner::run`]) and the reported `sandbox_kind`
+/// ([`ShellTool::invoke`]) keep one call-shape and cannot disagree.
 fn egress_proxy_plan(
     caveats: &Caveats,
     sandbox: &Arc<SandboxPolicy>,
 ) -> Option<(Vec<String>, Caveats)> {
-    let allow_hosts = net_egress_proxy_hosts(caveats)?;
-    let fenced = loopback_fenced_caveats(caveats);
-    if intended_sandbox_kind(&fenced, sandbox) == SandboxKind::None {
-        return None; // no loopback fence available → not enforceable; fall through
-    }
-    Some((allow_hosts, fenced))
+    agent_bridle_core::egress_proxy_plan(caveats, sandbox)
 }
 
 /// Run the pipeline under the loopback egress proxy (#124, ADR 0016). Mirrors

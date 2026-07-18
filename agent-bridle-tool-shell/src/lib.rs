@@ -39,8 +39,12 @@ mod caveat_interceptor;
 mod coreutils_dispatch;
 #[cfg(feature = "host-shell")]
 mod host_shell;
+// #257: the loopback egress proxy moved to agent-bridle-core (shared with
+// `ConfinedCommand::spawn_tokio` and external no-subprocess callers). This
+// alias keeps every `crate::net_proxy::…` path — and the audit re-exports
+// below — resolving unchanged, now to the single core implementation.
 #[cfg(feature = "shell")]
-mod net_proxy;
+pub(crate) use agent_bridle_core::net_proxy;
 mod output_observer;
 #[cfg(feature = "shell")]
 mod parse;

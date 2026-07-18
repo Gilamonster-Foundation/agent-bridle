@@ -253,6 +253,30 @@ pub fn loopback_fenced_caveats(caveats: &Caveats) -> Caveats {
     }
 }
 
+/// The egress-proxy plan for `caveats` (#124/#257, ADR 0016), or `None` to fall
+/// through to the ordinary confinement paths. `Some((allow_hosts, fenced))`
+/// **iff** the grant is a general remote-host `net` allow-list
+/// ([`net_egress_proxy_hosts`]) *and* the loopback fence it needs is actually
+/// emittable on this host — [`loopback_fenced_caveats`] engages a real backend
+/// under `policy`. A proxy a rogue child can walk around is not confinement, so
+/// fence-less hosts stay inert (the ADR 0015 honest posture).
+///
+/// The ONE decision both consumers route through — the shell engine's
+/// proxied-pipeline path and `ConfinedCommand::spawn_tokio` (#257) — so the
+/// check and the spawn routing cannot disagree.
+#[must_use]
+pub fn egress_proxy_plan(
+    caveats: &Caveats,
+    policy: &Arc<SandboxPolicy>,
+) -> Option<(Vec<String>, Caveats)> {
+    let allow_hosts = net_egress_proxy_hosts(caveats)?;
+    let fenced = loopback_fenced_caveats(caveats);
+    if effective_sandbox_kind(best_available_sandbox(policy).kind(), &fenced) == SandboxKind::None {
+        return None; // no loopback fence available → not enforceable; fall through
+    }
+    Some((allow_hosts, fenced))
+}
+
 /// The [`SandboxKind`] honestly in force for `caveats` given the strongest
 /// `available` backend: the backend's own kind when it will actually confine
 /// *something*, else [`SandboxKind::None`]. The single honesty rule shared by the

@@ -3,7 +3,7 @@
 //! SBPL cannot name a remote host (ADR 0015), so a general `net: Only([host, …])`
 //! grant cannot be kernel-confined by hostname. The honest mechanism: kernel-fence
 //! a spawned child's egress to the **loopback interface** (the ADR 0015 rule, via
-//! [`agent_bridle_core::loopback_fenced_caveats`]), then run **this** loopback
+//! [`crate::loopback_fenced_caveats`]), then run **this** loopback
 //! forward proxy — which the child is pointed at through `*_PROXY` env — to enforce
 //! the hostname allow-list. The child can reach *nothing* off-box except through
 //! the proxy, and the proxy admits only allow-listed hosts.
@@ -295,6 +295,7 @@ impl HostPolicy {
 }
 
 /// A running loopback egress proxy. Dropping the handle shuts it down.
+#[derive(Debug)]
 pub struct ProxyHandle {
     addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
@@ -306,9 +307,10 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
-    /// The loopback address the fenced child is pointed at. Only tests read it
-    /// directly; production wires the child via [`Self::proxy_env`].
-    #[cfg(test)]
+    /// The loopback address the proxy listens on. A spawned child is wired via
+    /// [`Self::proxy_env`]; a **no-subprocess** caller (#257 — e.g. a
+    /// `reqwest::Client`) points itself here instead:
+    /// `reqwest::Proxy::all(format!("http://{}", handle.addr()))`.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -423,6 +425,42 @@ pub fn start(
         accept: Some(accept),
         refused,
     })
+}
+
+/// Start the egress proxy for a **general remote-host** `net` grant (#257) — the
+/// caveats-level convenience over [`start`], for an external caller.
+///
+/// `Ok(None)` when `caveats` does not call for a proxy
+/// ([`crate::net_egress_proxy_hosts`] is `None`): `net: All` needs no fence,
+/// and deny-all / loopback-only stay with their kernel owners. `Ok(Some(handle))`
+/// = the proxy is live on `handle.addr()`, admitting exactly the granted hosts.
+/// `Err` = the grant calls for a proxy but the loopback listener could not bind —
+/// the caller must fail closed, never proceed unfenced.
+///
+/// Two consumption shapes:
+/// - **Spawned child**: pair with [`crate::loopback_fenced_caveats`] (the kernel
+///   fence) and wire the child via [`ProxyHandle::proxy_env`] — what
+///   `ConfinedCommand::spawn_tokio` does automatically under this grant.
+/// - **No subprocess** (an in-process `reqwest::Client`): route the client at
+///   `http://{handle.addr()}` (`reqwest::Proxy::all`). No kernel fence applies —
+///   the caller is pointing *itself* at the proxy, so the per-host allow-list is
+///   exactly as strong as the caller's routing (advisory grade, honestly).
+///
+/// Audit is off ([`NullSink`]); an embedder that wants the audit trail or a
+/// custom resolver uses [`start`] directly.
+pub fn start_egress_proxy(caveats: &crate::Caveats) -> io::Result<Option<ProxyHandle>> {
+    let Some(hosts) = crate::net_egress_proxy_hosts(caveats) else {
+        return Ok(None);
+    };
+    start_for_hosts(hosts).map(Some)
+}
+
+/// [`start`] with the production defaults (platform resolver, audit off) — the
+/// shared entry both [`start_egress_proxy`] and `ConfinedCommand::spawn_tokio`'s
+/// egress wiring (#257) call, so "start the proxy for these hosts" has exactly
+/// one production spelling.
+pub fn start_for_hosts(allow_hosts: impl IntoIterator<Item = String>) -> io::Result<ProxyHandle> {
+    start(allow_hosts, Arc::new(StdResolver), Arc::new(NullSink))
 }
 
 /// Serve one client connection: parse its request line, enforce the allow-list,
@@ -698,6 +736,77 @@ fn splice_buffered(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    // ── #257: the caveats-level public entry ────────────────────────────────
+
+    /// `start_egress_proxy` starts NOTHING for the three grants that keep their
+    /// kernel owners: `net: All` (nothing to fence), deny-all (kernel-denied),
+    /// loopback-only (the ADR 0015 fence alone suffices) — criterion 3.
+    #[test]
+    fn start_egress_proxy_is_none_for_non_proxy_grants() {
+        use crate::{Caveats, Scope};
+        let all = Caveats::top();
+        assert!(start_egress_proxy(&all).unwrap().is_none(), "net: All");
+        let deny = Caveats {
+            net: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+        assert!(start_egress_proxy(&deny).unwrap().is_none(), "deny-all");
+        let loopback = Caveats {
+            net: Scope::only(["localhost".to_string()]),
+            ..Caveats::top()
+        };
+        assert!(
+            start_egress_proxy(&loopback).unwrap().is_none(),
+            "loopback-only"
+        );
+    }
+
+    /// A general remote-host grant starts a live proxy on loopback; a raw
+    /// CONNECT for a non-granted host is refused 403 and recorded in
+    /// `refused_hosts()` — the no-subprocess (reqwest-style) consumption shape,
+    /// exercised with a plain std TcpStream speaking the proxy protocol.
+    #[test]
+    fn start_egress_proxy_serves_a_remote_host_grant_and_refuses_off_list() {
+        use crate::{Caveats, Scope};
+        use std::io::{Read as _, Write as _};
+        let granted = Caveats {
+            net: Scope::only(["api.example.com".to_string()]),
+            ..Caveats::top()
+        };
+        let handle = start_egress_proxy(&granted)
+            .expect("bind loopback")
+            .expect("a remote-host grant calls for the proxy");
+        assert!(
+            handle.addr().ip().is_loopback(),
+            "proxy binds loopback only"
+        );
+
+        let mut client = TcpStream::connect(handle.addr()).expect("dial proxy");
+        client
+            .write_all(
+                b"CONNECT evil.example.net:443 HTTP/1.1\r\nHost: evil.example.net:443\r\n\r\n",
+            )
+            .expect("send CONNECT");
+        // The proxy answers 403 and closes; read to EOF so a short first read
+        // can't truncate the status line.
+        let mut reply = String::new();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let _ = client.read_to_string(&mut reply);
+        assert!(
+            reply.contains("403"),
+            "off-list CONNECT must be refused: {reply:?}"
+        );
+        assert!(
+            handle
+                .refused_hosts()
+                .contains(&"evil.example.net".to_string()),
+            "refusal must be recorded: {:?}",
+            handle.refused_hosts()
+        );
+    }
 
     /// #138 (SSRF pivot): the proxy must refuse to dial an allow-listed name that
     /// resolves to an internal address (RFC1918 / link-local incl. cloud metadata /
@@ -1343,7 +1452,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
     #[test]
     fn fenced_child_reaches_allowed_via_proxy_denied_refused_direct_kernel_blocked() {
-        use agent_bridle_core::{
+        use crate::{
             best_available_sandbox, loopback_fenced_caveats, seatbelt_is_supported, Caveats,
             SandboxPolicy, Scope,
         };

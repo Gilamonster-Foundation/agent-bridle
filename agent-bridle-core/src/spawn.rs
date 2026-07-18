@@ -163,10 +163,24 @@ impl ConfinedCommand {
     /// (3) on a fresh thread, apply the best available sandbox to that thread,
     /// then `spawn` so the child inherits the domain.
     pub fn spawn(self, cx: &ToolContext) -> ToolResult<ConfinedChild> {
+        let effective = cx.caveats().clone();
+        self.spawn_with_effective(cx, effective)
+    }
+
+    /// The spawn body, parameterized over the **effective** caveats the OS
+    /// sandbox confines to (#257). `spawn` passes the context's caveats
+    /// verbatim; the egress-proxy path (`spawn_tokio` under a proxied-net
+    /// grant) passes [`crate::loopback_fenced_caveats`] — same fs/exec axes,
+    /// `net` swapped for the loopback fence. The exec admission-check always
+    /// runs against the REAL context (the fence never widens or narrows exec).
+    fn spawn_with_effective(
+        self,
+        cx: &ToolContext,
+        effective: Caveats,
+    ) -> ToolResult<ConfinedChild> {
         // (1) Admission: the parent must be permitted to exec this program.
         cx.check_exec(&self.program)?;
 
-        let effective = cx.caveats().clone();
         let sandbox = best_available_sandbox(&self.sandbox_policy);
         let kind = sandbox.kind();
         // The kind that actually GOVERNS this spawn: the backend's kind only when
@@ -300,6 +314,8 @@ pub use tokio_spawn::ConfinedTokioChild;
 #[cfg(all(unix, feature = "spawn-tokio"))]
 mod tokio_spawn {
     use super::{ConfinedChild, ConfinedCommand, SandboxKind, ToolContext, ToolResult};
+    use crate::net_proxy::ProxyHandle;
+    use crate::{egress_proxy_plan, ToolError};
     use std::os::fd::OwnedFd;
     use std::process::Child;
     use tokio::net::unix::pipe;
@@ -327,6 +343,11 @@ mod tokio_spawn {
         stderr: Option<pipe::Receiver>,
         /// `Some` until dropped; owned so kill-on-drop governs the process.
         child: Option<Child>,
+        /// The live egress proxy fencing this child's net (#257) — `Some` iff the
+        /// grant was a general remote-host allow-list AND the loopback kernel
+        /// fence engaged. Owned here so the proxy's lifetime brackets the
+        /// child's: it is torn down after the child is killed on drop.
+        proxy: Option<ProxyHandle>,
     }
 
     impl ConfinedTokioChild {
@@ -346,6 +367,24 @@ mod tokio_spawn {
         /// or was already taken.
         pub fn take_stderr(&mut self) -> Option<pipe::Receiver> {
             self.stderr.take()
+        }
+
+        /// Whether this child's egress is fenced through the loopback proxy
+        /// (#257): kernel-fenced to loopback, per-host allow-list enforced by
+        /// the proxy it is pointed at via `*_PROXY` env.
+        pub fn egress_proxied(&self) -> bool {
+            self.proxy.is_some()
+        }
+
+        /// The off-allow-list hosts the child tried to reach through the proxy
+        /// (#196) — each was refused with 403. Empty when no proxy is in force
+        /// or nothing was refused. The exfil-attempt signal a host surfaces as
+        /// structured `net` denials.
+        pub fn refused_hosts(&self) -> Vec<String> {
+            self.proxy
+                .as_ref()
+                .map(ProxyHandle::refused_hosts)
+                .unwrap_or_default()
         }
     }
 
@@ -379,11 +418,40 @@ mod tokio_spawn {
         ///
         /// Must be called from within a tokio runtime — the pipe handles register
         /// with the reactor. Unix-only; gated on the `spawn-tokio` feature.
-        pub fn spawn_tokio(self, cx: &ToolContext) -> ToolResult<ConfinedTokioChild> {
+        pub fn spawn_tokio(mut self, cx: &ToolContext) -> ToolResult<ConfinedTokioChild> {
+            // #257 (Part A — Leg 4): under a general remote-host `net` grant,
+            // fence the child's egress. `egress_proxy_plan` is the ONE shared
+            // decision (also the shell engine's): engage only when the loopback
+            // kernel fence is actually emittable on this host — a proxy a rogue
+            // child can walk around is not confinement, so on fence-less hosts
+            // (e.g. Landlock, which cannot address-fence) the wiring stays
+            // INERT and the spawn proceeds exactly as before (net advisory,
+            // ADR 0015 posture).
+            let mut proxy = None;
+            let mut effective = cx.caveats().clone();
+            if let Some((hosts, fenced)) = egress_proxy_plan(&effective, &self.sandbox_policy) {
+                // Fail-closed: the grant calls for a fence + proxy; a proxy
+                // that cannot bind must refuse the spawn, never run unfenced.
+                let handle = crate::net_proxy::start_for_hosts(hosts).map_err(|e| {
+                    ToolError::Exec(std::io::Error::other(format!(
+                        "refusing to spawn {:?}: the egress proxy could not bind \
+                         loopback ({e})",
+                        self.program
+                    )))
+                })?;
+                // Point the child at the proxy through the explicit env
+                // grants (the only channel across the boundary).
+                for (k, v) in handle.proxy_env() {
+                    self = self.env(k, v);
+                }
+                proxy = Some(handle);
+                effective = fenced;
+            }
+
             let ConfinedChild {
                 mut child,
                 sandbox_kind,
-            } = self.spawn(cx)?;
+            } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
             // `pipe::{Sender,Receiver}::from_owned_fd` set O_NONBLOCK and register
@@ -413,6 +481,7 @@ mod tokio_spawn {
                 stdout,
                 stderr,
                 child: Some(child),
+                proxy,
             })
         }
     }
@@ -579,6 +648,91 @@ mod tokio_spawn_tests {
         assert_eq!(
             eof, None,
             "kill-on-drop must terminate the child and close its stdout (EOF)"
+        );
+    }
+
+    // ── #257: spawn_tokio's egress-proxy wiring ─────────────────────────────
+
+    /// Where the loopback fence is NOT emittable (any host whose backend does
+    /// not engage for the fenced caveats — e.g. Linux/Landlock, which cannot
+    /// address-fence), a remote-host `net` grant spawns with NO proxy: inert,
+    /// advisory-net, exactly the pre-#257 behavior (the ADR 0015 posture —
+    /// never a proxy the child can walk around).
+    #[tokio::test]
+    async fn remote_net_grant_without_fence_backend_spawns_inert() {
+        let caveats = Caveats {
+            exec: Scope::only(["true".to_string()]),
+            net: Scope::only(["api.example.com".to_string()]),
+            ..Caveats::top()
+        };
+        // Only meaningful where the fence would NOT engage; on a Seatbelt host
+        // this test's premise doesn't hold, so skip there.
+        let plan_engages = crate::egress_proxy_plan(
+            &caveats,
+            &std::sync::Arc::new(crate::SandboxPolicy::default()),
+        )
+        .is_some();
+        if plan_engages {
+            eprintln!("skipping: this host CAN emit the loopback fence (engage path)");
+            return;
+        }
+        let cx = ctx(caveats);
+        let child = ConfinedCommand::new("true")
+            .spawn_tokio(&cx)
+            .expect("inert path spawns as before");
+        assert!(!child.egress_proxied(), "no fence backend → no proxy");
+        assert!(child.refused_hosts().is_empty());
+        // Reap deterministically (kill-on-drop covers it regardless).
+        drop(child);
+    }
+
+    /// The engage path — gated to hosts whose backend CAN emit the loopback
+    /// fence (macOS Seatbelt): a remote-host grant spawns the child with the
+    /// proxy live, `*_PROXY` granted into its (otherwise empty) env, and an
+    /// off-allow-list fetch landing in `refused_hosts()`.
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    #[tokio::test]
+    async fn remote_net_grant_with_fence_spawns_proxied_and_refuses_off_list() {
+        use tokio::io::AsyncReadExt;
+        if !crate::seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        // `sh` prints its proxy env, then tries an off-allow-list CONNECT via
+        // /usr/bin/curl (always present on macOS) through the proxy.
+        let caveats = Caveats {
+            exec: Scope::only(["/bin/sh".to_string()]),
+            net: Scope::only(["api.example.com".to_string()]),
+            ..Caveats::top()
+        };
+        let cx = ctx(caveats);
+        let mut child = ConfinedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "echo \"proxy=$HTTPS_PROXY\"; \
+                 /usr/bin/curl -s -m 5 https://evil.example.net/ >/dev/null 2>&1; \
+                 exit 0",
+            )
+            .stdout(Stdio::piped())
+            .spawn_tokio(&cx)
+            .expect("proxied spawn");
+        assert!(child.egress_proxied(), "fence host → proxy must engage");
+
+        let mut stdout = child.take_stdout().expect("stdout piped");
+        let mut out = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), stdout.read_to_string(&mut out))
+            .await
+            .expect("child did not finish");
+        assert!(
+            out.contains("proxy=http://127.0.0.1:"),
+            "the child must see the granted *_PROXY env: {out:?}"
+        );
+        assert!(
+            child
+                .refused_hosts()
+                .contains(&"evil.example.net".to_string()),
+            "the off-allow-list host must be refused and recorded: {:?}",
+            child.refused_hosts()
         );
     }
 }
