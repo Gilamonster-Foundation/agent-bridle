@@ -1,0 +1,6 @@
+# Lake build output
+/.lake/
+# machine-local symlink to <aeneas>/backends/lean (created by setup.sh)
+/aeneas-lean
+# TLC-style scratch, extraction temp
+*.llbc

@@ -199,3 +199,50 @@ async fn restricted_exec_allows_in_scope_command() {
     assert_ne!(out["denied"], true, "in-scope command must run: {out}");
     assert_eq!(out["stdout"].as_str().unwrap_or("").trim(), "ok", "{out}");
 }
+
+/// The schema's `env` seam now reaches the shell (EPIC #1243 Leg 2). Before
+/// this, brush silently DROPPED `args["env"]` — a caller var expanded to empty.
+/// This is the regression guard: a passed var expands inside the confined shell.
+#[tokio::test]
+async fn env_seam_delivers_caller_vars_to_the_shell() {
+    let out = BrushShellTool::new()
+        .invoke(
+            serde_json::json!({
+                "cmd": "echo \"$NEWT_SEAM_PROBE\"",
+                "env": { "NEWT_SEAM_PROBE": "delivered" },
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    assert_ne!(out["denied"], true, "{out}");
+    assert_eq!(
+        out["stdout"].as_str().unwrap_or("").trim(),
+        "delivered",
+        "the caller-provided env var must expand in the shell (was dropped before Leg 2): {out}"
+    );
+}
+
+/// HOME crosses the seam — the concrete #783-class motivation: without it,
+/// `~` expansion and HOME-relative tooling misbehave under the brush engine.
+/// Nothing ambient leaks in (do_not_inherit_env); only the passed value shows.
+#[tokio::test]
+async fn env_seam_delivers_home_for_tilde_class_tooling() {
+    let out = BrushShellTool::new()
+        .invoke(
+            serde_json::json!({
+                "cmd": "echo \"$HOME\"",
+                "env": { "HOME": "/seam/home" },
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    assert_eq!(
+        out["stdout"].as_str().unwrap_or("").trim(),
+        "/seam/home",
+        "HOME must cross the import surface: {out}"
+    );
+}

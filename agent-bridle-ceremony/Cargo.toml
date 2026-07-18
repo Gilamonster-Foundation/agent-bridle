@@ -1,0 +1,19 @@
+[package]
+name = "agent-bridle-ceremony"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Ceremony Suite authority kernel (P0): the Effect × Assurance × Scope product meet-lattice. Pure, dependency-free, mirrors formal/Ceremony/P0/Authority.lean — the Charon/Aeneas refinement target."
+
+# NONBINDING SPIKE (roadmap Phase 1, docs/spec/ROADMAP.md): the pure algebra is
+# "safe to build now"; wire structs / serialized records stay HELD until the
+# Phase-1d conformance vectors. Hence NO serde, NO deps, and publish = false
+# until the waist is proven and vectors exist.
+publish = false
+
+[dependencies]
+# Intentionally EMPTY. This crate is pure functions over finite enums so Charon
+# can extract it to LLBC and Aeneas can prove it refines Authority.lean. Adding a
+# dependency here is a design decision, not a convenience — keep it dep-free.

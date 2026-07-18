@@ -14,7 +14,7 @@
 //! L3 backstop is a follow-up. The curated builtin set removes `exec` (the one
 //! builtin that spawns outside the `before_exec` funnel — a proven bypass).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use agent_bridle_core::{
@@ -149,6 +149,22 @@ impl Tool for BrushShellTool {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
 
+        // The schema's `env` seam: the DELIBERATE import surface across the
+        // confinement boundary (this engine runs `do_not_inherit_env(true)`, so
+        // nothing ambient leaks in). String values only, mirroring the host and
+        // safe-subset engines. Before this, brush silently DROPPED `env` even
+        // though the schema advertised it — losing HOME/USER/VIRTUAL_ENV and
+        // re-opening the #783-class `~`-expansion bug under this engine.
+        let env: BTreeMap<String, String> = args
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // PATH parity: the FULL ambient path when `exec` is unrestricted (so the
         // agent's own tools — `~/.cargo/bin`, `/opt/homebrew/bin`, … — resolve
         // like a host shell); a minimal standard path when `exec` is RESTRICTED,
@@ -168,7 +184,7 @@ impl Tool for BrushShellTool {
         // brush's shell API is async and blocks on a per-invocation current-thread
         // runtime; run it off the async runtime on a blocking worker.
         let captured = tokio::task::spawn_blocking(move || {
-            run_in_brush(cmd, cwd, path_value, interceptor, max_output, output)
+            run_in_brush(cmd, cwd, path_value, env, interceptor, max_output, output)
         })
         .await
         .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
@@ -207,6 +223,7 @@ fn run_in_brush(
     cmd: String,
     cwd: Option<String>,
     path_value: String,
+    env: BTreeMap<String, String>,
     interceptor: CaveatInterceptor,
     max_output: usize,
     output: OutputEmitter,
@@ -294,6 +311,19 @@ fn run_in_brush(
             if let Ok(val) = std::env::var(key) {
                 let _ = shell.env_mut().set_global(key, ShellVariable::new(val));
             }
+        }
+
+        // Import the caller-provided env (the schema's `env` seam) LAST, so a
+        // caller `PATH` (e.g. a venv-prepended one) wins over the exec-scope
+        // seed above — matching the host and safe-subset engines. This does NOT
+        // widen authority: `before_exec` gates the RESOLVED PROGRAM against the
+        // caveats regardless of `PATH` (host_shell.schema.json). Nothing ambient
+        // is inherited; only these explicitly-passed vars cross the boundary.
+        for (key, val) in &env {
+            shell
+                .env_mut()
+                .set_global(key, ShellVariable::new(val.clone()))
+                .map_err(|e| ToolError::Exec(brush_io("seed env var", &e)))?;
         }
 
         let result = shell
