@@ -256,10 +256,12 @@ pub fn loopback_fenced_caveats(caveats: &Caveats) -> Caveats {
 /// The egress-proxy plan for `caveats` (#124/#257, ADR 0016), or `None` to fall
 /// through to the ordinary confinement paths. `Some((allow_hosts, fenced))`
 /// **iff** the grant is a general remote-host `net` allow-list
-/// ([`net_egress_proxy_hosts`]) *and* the loopback fence it needs is actually
-/// emittable on this host — [`loopback_fenced_caveats`] engages a real backend
-/// under `policy`. A proxy a rogue child can walk around is not confinement, so
-/// fence-less hosts stay inert (the ADR 0015 honest posture).
+/// ([`net_egress_proxy_hosts`]) *and* the available backend can kernel-fence the
+/// child's egress **to the loopback interface** ([`loopback_net_enforceable`]) —
+/// the precondition for the proxy to be real confinement instead of a
+/// walk-around-able advisory. A proxy a rogue child can dial around is not
+/// confinement, so backends that cannot address-fence stay inert (the ADR 0015
+/// honest posture); their `net` remains honestly advisory.
 ///
 /// The ONE decision both consumers route through — the shell engine's
 /// proxied-pipeline path and `ConfinedCommand::spawn_tokio` (#257) — so the
@@ -269,12 +271,54 @@ pub fn egress_proxy_plan(
     caveats: &Caveats,
     policy: &Arc<SandboxPolicy>,
 ) -> Option<(Vec<String>, Caveats)> {
+    egress_proxy_plan_for(best_available_sandbox(policy).kind(), caveats)
+}
+
+/// The egress-proxy plan given an **already-resolved** available backend
+/// `kind` — the pure, host-independent core of [`egress_proxy_plan`], split out
+/// so the enforceability decision can be unit-tested against each backend
+/// deterministically (the fail-open at #257/#275 hid behind a host-only path).
+pub(crate) fn egress_proxy_plan_for(
+    available: SandboxKind,
+    caveats: &Caveats,
+) -> Option<(Vec<String>, Caveats)> {
     let allow_hosts = net_egress_proxy_hosts(caveats)?;
-    let fenced = loopback_fenced_caveats(caveats);
-    if effective_sandbox_kind(best_available_sandbox(policy).kind(), &fenced) == SandboxKind::None {
-        return None; // no loopback fence available → not enforceable; fall through
+    // Engage the proxy ONLY where the child's egress can be kernel-fenced to
+    // loopback. Checking merely that the sandbox confines *something* (as the
+    // pre-fix gate did via `effective_sandbox_kind != None`) is a fail-open:
+    // Landlock engages on the *fs* axis (`restricts_fs`) while its `net` fence is
+    // port-based and cannot confine a loopback-only host set (`apply` sets
+    // `confine_net = net_fully_denied` only) — so under a general remote-host
+    // grant with restricted fs on Linux, the proxy would start, the child would
+    // be handed `*_PROXY`, yet the child could ignore it and dial any host
+    // directly (exfil unblocked AND unrecorded). That is the exact "proxy a rogue
+    // child can walk around" this must never engage. See [`loopback_net_enforceable`].
+    if !loopback_net_enforceable(available) {
+        return None; // net-loopback fence unenforceable → advisory, no proxy
     }
-    Some((allow_hosts, fenced))
+    Some((allow_hosts, loopback_fenced_caveats(caveats)))
+}
+
+/// Whether `available` can kernel-fence a spawned child's egress to the
+/// **loopback interface** — the precondition for the egress-proxy pattern
+/// (ADR 0016) to be real confinement rather than an advisory a child can dial
+/// around. True only for the address-fenceable backends:
+/// - [`SandboxKind::Seatbelt`] — SBPL `(allow network* (remote ip "localhost:*"))`.
+/// - [`SandboxKind::AppContainer`] — `NetworkIsolation` loopback exemption (#133).
+///
+/// False for the rest, each honestly advisory on `net` for a loopback-only set:
+/// - [`SandboxKind::Landlock`] — TCP rules are **port-based**, not address-based
+///   (ADR 0014/0015); it can deny *all* egress (`net: none`) but cannot admit
+///   only loopback. **The Linux enabler is the network-namespace egress fence**
+///   (netns + veth-to-parent proxy) tracked separately — until it lands, a
+///   remote-host `net` grant on Linux is advisory, not proxy-fenced.
+/// - [`SandboxKind::MinimalRootfs`] — net is not namespaced at this tier.
+/// - [`SandboxKind::MicroVm`] — no guest network device: egress is impossible, so
+///   the loopback proxy has no path anyway (net is confined by absence, not proxy).
+/// - [`SandboxKind::None`] — no backend.
+#[must_use]
+const fn loopback_net_enforceable(available: SandboxKind) -> bool {
+    matches!(available, SandboxKind::Seatbelt | SandboxKind::AppContainer)
 }
 
 /// The [`SandboxKind`] honestly in force for `caveats` given the strongest
@@ -1668,6 +1712,65 @@ mod tests {
         // … while fs/exec are preserved verbatim (the fence keeps their rules).
         assert_eq!(fenced.fs_write, granted.fs_write);
         assert_eq!(fenced.exec, granted.exec);
+    }
+
+    /// Regression (#257/#275 fail-open): the egress proxy must engage ONLY where
+    /// the backend can address-fence the child's egress to loopback. The prior
+    /// gate (`effective_sandbox_kind != None`) let Landlock through whenever the
+    /// *fs* axis engaged — but Landlock's `net` fence is port-based and cannot
+    /// confine a loopback-only host set, so the child could dial around the proxy
+    /// while the system reported it fenced. This asserts the net-axis-specific gate.
+    #[test]
+    fn egress_proxy_plan_engages_only_where_loopback_net_is_enforceable() {
+        // The Leg-4 config that triggered the fail-open: a remote-host `net`
+        // allow-list AND a restricted fs axis (so Landlock engages on fs).
+        let leg4 = Caveats {
+            net: Scope::only(["api.github.com".to_string()]),
+            fs_write: Scope::only(["/work".to_string()]),
+            ..Caveats::top()
+        };
+        // Address-fenceable backends engage the proxy (real confinement).
+        assert!(
+            egress_proxy_plan_for(SandboxKind::Seatbelt, &leg4).is_some(),
+            "Seatbelt fences net to loopback (SBPL) → proxy is real confinement"
+        );
+        assert!(
+            egress_proxy_plan_for(SandboxKind::AppContainer, &leg4).is_some(),
+            "AppContainer loopback-exemption → proxy is real confinement"
+        );
+        // THE FIX: Landlock engages on fs but CANNOT address-fence net, so the
+        // proxy must NOT engage — otherwise it is walk-around-able false
+        // confinement. This assertion fails against the pre-fix gate.
+        assert_eq!(
+            egress_proxy_plan_for(SandboxKind::Landlock, &leg4),
+            None,
+            "Landlock is port-based; loopback-only net is unenforceable → advisory, no walk-around proxy"
+        );
+        // Tiers that don't namespace net at their level, and 'no backend', are
+        // advisory too — never a walk-around proxy.
+        for k in [
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+            SandboxKind::None,
+        ] {
+            assert_eq!(
+                egress_proxy_plan_for(k, &leg4),
+                None,
+                "{k:?} does not address-fence net → advisory"
+            );
+        }
+        // A non-proxy grant (net: All) never engages, even on a fenceable backend.
+        assert_eq!(
+            egress_proxy_plan_for(
+                SandboxKind::Seatbelt,
+                &Caveats {
+                    net: Scope::All,
+                    ..Caveats::top()
+                }
+            ),
+            None,
+            "net: All needs no fence"
+        );
     }
 
     #[test]
