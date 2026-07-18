@@ -686,47 +686,51 @@ mod tokio_spawn_tests {
         drop(child);
     }
 
-    /// The engage path — gated to hosts whose backend CAN emit the loopback
-    /// fence (macOS Seatbelt): a remote-host grant spawns the child with the
-    /// proxy live, `*_PROXY` granted into its (otherwise empty) env, and an
-    /// off-allow-list fetch landing in `refused_hosts()`.
+    /// The engage path — INTEGRATION tier (real Seatbelt + real subprocess +
+    /// the loopback proxy), so `#[ignore]`d out of the per-PR unit run; the
+    /// deterministic engage proof lives in `net_proxy::tests` (the proxy 403s +
+    /// records an off-list host with no subprocess) and the inert case above.
+    /// Run on macOS with `--ignored`.
+    ///
+    /// Under a remote-host grant on a fence-capable host, a spawned `curl`
+    /// (exec-scoped to itself — no shell re-exec) inherits the granted
+    /// `*_PROXY` env and its CONNECT to an off-allow-list host is refused by
+    /// the proxy (recorded in `refused_hosts()`) BEFORE any real dial — so this
+    /// needs no network. Proves the full spawn_tokio ∘ fence ∘ proxy compose.
     #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
     #[tokio::test]
+    #[ignore = "integration: real Seatbelt fence + curl subprocess + loopback proxy"]
     async fn remote_net_grant_with_fence_spawns_proxied_and_refuses_off_list() {
-        use tokio::io::AsyncReadExt;
         if !crate::seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
         }
-        // `sh` prints its proxy env, then tries an off-allow-list CONNECT via
-        // /usr/bin/curl (always present on macOS) through the proxy.
+        let curl = "/usr/bin/curl"; // always present on macOS; no shell re-exec
         let caveats = Caveats {
-            exec: Scope::only(["/bin/sh".to_string()]),
+            exec: Scope::only([curl.to_string()]),
             net: Scope::only(["api.example.com".to_string()]),
             ..Caveats::top()
         };
         let cx = ctx(caveats);
-        let mut child = ConfinedCommand::new("/bin/sh")
-            .arg("-c")
-            .arg(
-                "echo \"proxy=$HTTPS_PROXY\"; \
-                 /usr/bin/curl -s -m 5 https://evil.example.net/ >/dev/null 2>&1; \
-                 exit 0",
-            )
-            .stdout(Stdio::piped())
+        // curl honors the lowercase `https_proxy` the proxy env grant sets; the
+        // off-list CONNECT is refused at the allow-list (403) before any dial.
+        let mut child = ConfinedCommand::new(curl)
+            .arg("-s")
+            .arg("-m")
+            .arg("5")
+            .arg("https://evil.example.net/")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn_tokio(&cx)
             .expect("proxied spawn");
         assert!(child.egress_proxied(), "fence host → proxy must engage");
 
-        let mut stdout = child.take_stdout().expect("stdout piped");
-        let mut out = String::new();
-        let _ = tokio::time::timeout(Duration::from_secs(10), stdout.read_to_string(&mut out))
-            .await
-            .expect("child did not finish");
-        assert!(
-            out.contains("proxy=http://127.0.0.1:"),
-            "the child must see the granted *_PROXY env: {out:?}"
-        );
+        // Reap via the kill-on-drop guard after curl exits; the proxy records
+        // the refusal synchronously as it serves the CONNECT.
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+        .await;
         assert!(
             child
                 .refused_hosts()
