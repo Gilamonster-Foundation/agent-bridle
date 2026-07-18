@@ -19,6 +19,30 @@
 
 ## Decision
 
+### D0 — Freeze the minimum; lock down as little as possible each turn
+
+The governing discipline, above every specific decision below: **freeze only
+what the current step forces, and no more.** Every entry in this ADR and every
+conformance vector is a *commitment* a downstream consumer binds to and that is
+then expensive to change — so we move conservatively, preferring the smallest
+lock-down that unblocks progress and leaving everything else open.
+
+Two mechanisms make minimal freezing cheap without ceding ground:
+- **Self-describing identifiers** (multihash / multicodec / CIDv1): an algorithm
+  is a *tagged value on the wire*, not a structural assumption. Nothing in the
+  grammar or the kernel assumes *which* hash/signature/codec.
+- **Rotation is a forward ratchet** (Signal-style; the P0·L5 re-naming
+  ceremony): a live mesh advances to a new algorithm *going forward* — old
+  records stay verifiable under their own tags, a signed rotation record links
+  the transition, and there is never a flag day. You can only move forward, and
+  you never have to move all at once.
+
+**Consequence:** the "decisions" below lock down only the *current* choice, not a
+permanent one. In particular D5 (BLAKE3-256 + `blake3_dart`) records only what we
+are using *now*; a mesh can forward-ratchet to a different hash later. This is
+the concrete application of law-minimalism (nothing enters the frozen layer
+without a proof obligation) to the wire.
+
 ### D1 — Hand-roll a small constrained canonical encoder per language; do NOT depend on DAG-CBOR libraries
 
 Every implementation encodes the restricted value space (D2) with a
@@ -75,13 +99,25 @@ with length-first for text-string keys, while sorting by raw UTF-8 *content*
 does not (`"z"` vs `"aa"`). The prototypes empirically confirm this: a 1-byte
 key sorts **before** a 6-byte key across all four encoders.
 
-### D4 — The golden test-vector corpus IS the contract
+### D4 — The golden test-vector corpus IS the contract — and is grown minimally (per D0)
 
 Byte-identity is delivered by **conformance testing against one golden corpus**,
 not by trusting the specs or heterogeneous libraries. Every language cross-
 validates against the same vectors (positive: input → exact `body`/`cid`/
-`protected`/`sig`; negative: each tampered field → the specific rejection). The
+`protected`/`sig`; negative: each tampered field → the specific *rejection
+reason/step*, not an exact error string, so the assertion stays portable). The
 four-language harness in `prototypes/phase1d-codec/` (`check.sh`) is the seed.
+
+**Publishing a vector is the freeze** — a consumer binds to those exact bytes and
+they are then a versioned migration to change. So by D0 the corpus is grown
+**conservatively**: freeze only the vectors the current step actually needs, and
+no pre-emptive breadth. Each added vector must assert a *normative rule*, never an
+incidental encoding artifact. And because a vector enshrines whatever the
+reference produces — bug included — every vector is reviewed against the **spec**
+before it is frozen (the four independent hand-rolls agreeing is strong evidence
+the reference is right, but four impls can still share one spec-misreading). The
+current prototype vectors remain **non-normative demos** until deliberately
+promoted.
 
 ### D5 — Ed25519 and BLAKE3-256 both work across all four languages (empirically resolved)
 
@@ -118,8 +154,10 @@ four-language harness in `prototypes/phase1d-codec/` (`check.sh`) is the seed.
   (D4): drift fails a vector, loudly.
 - The value-space constraints must be *enforced* by every encoder (reject floats
   etc.), not merely documented — a conformance-vector obligation.
-- The Dart BLAKE3 path (FFI) adds a native build dependency to newt-mobile if
-  BLAKE3 is kept (D5).
+- BLAKE3 in Dart is `blake3_dart`, **pure-Dart with no FFI/native build** — so no
+  native dependency is added to newt-mobile. The only residual is a
+  library-assurance preference (community pure-Dart vs. an FFI binding to the
+  reference), which the multihash law + D0 forward-ratchet keep replaceable.
 
 ## Alternatives considered
 
