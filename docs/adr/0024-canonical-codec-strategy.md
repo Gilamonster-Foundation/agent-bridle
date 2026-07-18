@@ -95,12 +95,13 @@ four-language harness in `prototypes/phase1d-codec/` (`check.sh`) is the seed.
   TypeScript (`@noble/hashes`) — confirmed on the full vector. So the v1
   content-hash pin **stays BLAKE3-256**; no hash reconsideration and no FFI is
   required to build the codec cross-language.
-- **Residual (a maturity call, not a blocker):** `blake3_dart` is a
-  community pure-Dart implementation. For a security-critical production hash,
-  the choice is between (a) depending on a byte-verified pure-Dart package,
-  vs. (b) an FFI binding to the official BLAKE3 reference for higher assurance —
-  a library-assurance decision, independent of the codec (the multihash law
-  keeps even the algorithm replaceable if needed). This does not affect D1–D4.
+- **Decided (Shawn, 2026-07-18): keep BLAKE3-256.** "If Dart produces
+  byte-identical BLAKE3, I see no reason not to choose it." The pure-Dart
+  `blake3_dart` byte-identity is the deciding factor; no FFI and no hash
+  reconsideration. (A production may still prefer an FFI binding to the official
+  reference over a community pure-Dart package for assurance — a library-choice
+  detail, not a hash or codec decision; the multihash law keeps even the
+  algorithm replaceable if ever needed.)
 
 ## Consequences
 
