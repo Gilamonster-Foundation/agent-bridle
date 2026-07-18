@@ -66,6 +66,10 @@ pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
 pub use spawn::{
     confinement_unenforceable, spawn_confined_subprocess, ConfinedChild, ConfinedCommand,
 };
+// The async-host confined spawn (tokio pipe handles). Unix-only, feature-gated,
+// so it re-exports only when built — mirroring the OS-sandbox re-exports above.
+#[cfg(all(unix, feature = "spawn-tokio"))]
+pub use spawn::ConfinedTokioChild;
 #[cfg(feature = "verifier-ed25519")]
 pub use step_up::Ed25519Verifier;
 #[cfg(feature = "verifier-webauthn")]

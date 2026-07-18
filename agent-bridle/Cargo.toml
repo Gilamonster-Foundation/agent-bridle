@@ -36,6 +36,10 @@ carried-coreutils = ["brush", "agent-bridle-tool-shell/carried-coreutils"]
 # `web` adds the confined `web_fetch` tool (the `net` enforcer). Off by default
 # so the heavy reqwest/readability/DNS deps only enter a build that asks for it.
 web = ["dep:agent-bridle-tool-web"]
+# Forward `ConfinedCommand::spawn_tokio` (Unix): tokio-native confined spawn for
+# an async host (an MCP-server stdio transport — newt Leg 3, #1180). Off by
+# default so a non-async embedder keeps tokio out of the core graph.
+spawn-tokio = ["agent-bridle-core/spawn-tokio"]
 linux-landlock = [
     "agent-bridle-core/linux-landlock",
     "agent-bridle-tool-shell?/linux-landlock",

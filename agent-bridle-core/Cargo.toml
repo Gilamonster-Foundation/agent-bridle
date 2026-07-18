@@ -47,6 +47,13 @@ verifier-ed25519 = ["dep:ed25519-dalek"]
 # `ed25519-dalek` (EdDSA assertions) + `sha2` (SHA-256 over clientDataJSON).
 # ADR 0007. agent-bridle#72.
 verifier-webauthn = ["dep:ed25519-dalek", "dep:sha2"]
+# `spawn-tokio` exposes `ConfinedCommand::spawn_tokio` (Unix): the SAME confined
+# spawn as `spawn` (identical admission-check / OS-sandbox / env-scrub), but the
+# child's stdio is returned as tokio-native pipe handles wrapped in a
+# kill-on-drop guard — for an async host such as an MCP-server stdio transport
+# (newt Leg 3, #1180). Pulls an optional tokio dep; off by default so a
+# non-async embedder builds core with no tokio in the graph.
+spawn-tokio = ["dep:tokio"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -67,6 +74,14 @@ ed25519-dalek = { version = "2", optional = true }
 # `verifier-webauthn`. Already in the lockfile (transitive via ed25519-dalek), so
 # enabling the feature pulls nothing new.
 sha2 = { version = "0.10", optional = true }
+
+# Optional: tokio-native pipe ends for `ConfinedCommand::spawn_tokio`, gated by
+# `spawn-tokio`. Inherits the workspace tokio features (rt/macros/…) and adds
+# `net` (`tokio::net::unix::pipe`, the std-fd → async-pipe bridge) + `io-util`
+# (the async read/write ext traits the tests exercise). Unix-only in use (the
+# API is `cfg(unix)`); on other targets the dep is inert. NOT in the default
+# build — core stays tokio-free unless the feature asks for it.
+tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
 
 # Landlock is Linux-only; gate the dep on the target so enabling the feature on
 # macOS/Windows does not try to build it. Used only under
