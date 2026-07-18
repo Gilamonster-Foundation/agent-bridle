@@ -1,6 +1,6 @@
 name = "ceremony-formal"
 version = "0.1.0"
-defaultTargets = ["CeremonyFormal", "CeremonyTests"]
+defaultTargets = ["CeremonyFormal", "CeremonyTests", "AxiomAudit"]
 
 [[lean_lib]]
 name = "CeremonyFormal"
@@ -12,6 +12,12 @@ moreLeanArgs = ["-DwarningAsError=true"]
 name = "CeremonyTests"
 srcDir = "."
 roots = ["Tests"]
+moreLeanArgs = ["-DwarningAsError=true"]
+
+[[lean_lib]]
+name = "AxiomAudit"
+srcDir = "."
+roots = ["AxiomAudit"]
 moreLeanArgs = ["-DwarningAsError=true"]
 
 [[lean_exe]]
