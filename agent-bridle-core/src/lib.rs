@@ -31,6 +31,12 @@ mod context;
 mod envelope;
 mod error;
 mod gate;
+// The loopback egress proxy (#124/#257, ADR 0016) — moved here from
+// agent-bridle-tool-shell so BOTH the shell engine and external long-lived
+// callers (a confined MCP subprocess via `ConfinedCommand::spawn_tokio`, or a
+// no-subprocess `reqwest` client) share ONE implementation. Std-only; public so
+// the audit seams (`AuditSink`/`Resolver`) stay embedder-extensible.
+pub mod net_proxy;
 pub mod policy;
 mod registry;
 mod report;
@@ -51,12 +57,13 @@ pub use context::ToolContext;
 pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
+pub use net_proxy::{start_egress_proxy, ProxyHandle};
 pub use registry::{Registry, RegistryBuilder};
 pub use report::{enforcement_report, fence_strength, AxisEnforcement, EnforcementReport};
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
 pub use sandbox::{
-    best_available_sandbox, effective_sandbox_kind, loopback_fenced_caveats,
+    best_available_sandbox, effective_sandbox_kind, egress_proxy_plan, loopback_fenced_caveats,
     net_egress_proxy_hosts, NoopSandbox, Sandbox, SandboxKind,
 };
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
