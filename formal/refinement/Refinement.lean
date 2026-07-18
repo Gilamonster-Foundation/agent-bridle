@@ -129,11 +129,130 @@ theorem resolve_swap_len3_last_two_exhaustive :
         = authority.resolve ⟨[x, z, y], by scalar_tac⟩ := by
   native_decide
 
--- FOLLOW-UP (ROADMAP 1c): the GENERAL order-independence over ARBITRARY-length
--- inputs needs `meet_from` `partial_fixpoint` induction (its equation loops the
--- default `simp`) — beyond what the finite `native_decide` above can reach. The
--- safety law (no fail-open) is proven, and order-independence is now exhaustive
--- (all value-triples) on the extracted code at length 3.
+-- ══ GENERAL order-independence (L1), arbitrary length ══
+-- Strategy: characterize the extracted `meet_from` as a pure left-fold of a
+-- pure `pmeet` (via `dspec_induction` over its `partial_fixpoint`), then get
+-- permutation-invariance from `pmeet` being commutative + associative.
+
+/-! A pure meet mirroring the extracted (monadic) `authority.Authority.meet`,
+    with the bottom of each axis absorbing. -/
+def pmeetE : authority.Effect → authority.Effect → authority.Effect
+  | .Deny, _ => .Deny
+  | .Allow, b => b
+def pmeetA : authority.Assurance → authority.Assurance → authority.Assurance
+  | .None, _ => .None
+  | .Presence, .None => .None
+  | .Presence, .Presence => .Presence
+  | .Presence, .Hardware => .Presence
+  | .Hardware, b => b
+def pmeetS : authority.Scope → authority.Scope → authority.Scope
+  | .Once, _ => .Once
+  | .Session, .Once => .Once
+  | .Session, .Session => .Session
+  | .Session, .Durable => .Session
+  | .Durable, b => b
+def pmeet (a b : authority.Authority) : authority.Authority :=
+  ⟨pmeetE a.effect b.effect, pmeetA a.assurance b.assurance, pmeetS a.scope b.scope⟩
+
+theorem effmeet_eq (a b : authority.Effect) :
+    authority.Effect.meet a b = ok (pmeetE a b) := by cases a <;> cases b <;> rfl
+theorem assmeet_eq (a b : authority.Assurance) :
+    authority.Assurance.meet a b = ok (pmeetA a b) := by cases a <;> cases b <;> rfl
+theorem scomeet_eq (a b : authority.Scope) :
+    authority.Scope.meet a b = ok (pmeetS a b) := by cases a <;> cases b <;> rfl
+
+theorem meet_eq_pmeet (a b : authority.Authority) :
+    authority.Authority.meet a b = ok (pmeet a b) := by
+  obtain ⟨ae, aa, az⟩ := a; obtain ⟨be, ba, bz⟩ := b
+  cases ae <;> cases aa <;> cases az <;> cases be <;> cases ba <;> cases bz <;> rfl
+
+theorem pmeetE_comm (a b) : pmeetE a b = pmeetE b a := by cases a <;> cases b <;> rfl
+theorem pmeetA_comm (a b) : pmeetA a b = pmeetA b a := by cases a <;> cases b <;> rfl
+theorem pmeetS_comm (a b) : pmeetS a b = pmeetS b a := by cases a <;> cases b <;> rfl
+theorem pmeetE_assoc (a b c) : pmeetE (pmeetE a b) c = pmeetE a (pmeetE b c) := by
+  cases a <;> cases b <;> cases c <;> rfl
+theorem pmeetA_assoc (a b c) : pmeetA (pmeetA a b) c = pmeetA a (pmeetA b c) := by
+  cases a <;> cases b <;> cases c <;> rfl
+theorem pmeetS_assoc (a b c) : pmeetS (pmeetS a b) c = pmeetS a (pmeetS b c) := by
+  cases a <;> cases b <;> cases c <;> rfl
+
+theorem pmeet_comm (a b : authority.Authority) : pmeet a b = pmeet b a := by
+  simp only [pmeet, pmeetE_comm a.effect, pmeetA_comm a.assurance, pmeetS_comm a.scope]
+theorem pmeet_assoc (a b c : authority.Authority) :
+    pmeet (pmeet a b) c = pmeet a (pmeet b c) := by
+  simp only [pmeet, pmeetE_assoc, pmeetA_assoc, pmeetS_assoc]
+-- left-commutativity: the swap that, with assoc, gives full permutation-invariance.
+theorem pmeet_left_comm (a b c : authority.Authority) :
+    pmeet a (pmeet b c) = pmeet b (pmeet a c) := by
+  rw [← pmeet_assoc, pmeet_comm a b, pmeet_assoc]
+
+/-- **The load-bearing characterization.** The extracted `meet_from` (a
+    `partial_fixpoint` tail-recursion) TOTALLY equals a pure left-fold of `pmeet`
+    over the suffix `cs[start..]`. Proven by well-founded recursion on the
+    measure `len - start` (Aeneas gives an unfolding equation but no termination;
+    this supplies it). Gives the *value*, not just partial correctness. -/
+theorem meet_from_eq_foldl (cs : Slice authority.Authority) (start : Std.Usize)
+    (acc : authority.Authority) :
+    authority.meet_from cs start acc
+      = ok (List.foldl pmeet acc (cs.val.drop start.val)) := by
+  rw [authority.meet_from]
+  simp only [Slice.len]
+  split
+  · -- start ≥ len: the suffix is empty, fold returns acc.
+    rename_i hge
+    have : cs.val.length ≤ start.val := by scalar_tac
+    simp [List.drop_eq_nil_of_le this]
+  · -- start < len: read cs[start], meet, recurse (smaller measure).
+    rename_i hlt
+    have hlt' : start.val < cs.val.length := by scalar_tac
+    have hidx : Slice.index_usize cs start = ok cs.val[start.val] := by
+      simp [Slice.index_usize, hlt']
+    -- (start+1) is in-bounds → ok i1 with i1.val = start.val+1 (raw form via
+    -- add_equiv); index = hidx; meet = pmeet; tail call is the IH (smaller measure).
+    have hadd := UScalar.add_equiv start (1#usize)
+    cases hstep : (start + 1#usize) with
+    | ok i1 =>
+      rw [hstep] at hadd
+      obtain ⟨_, hi1v, _⟩ := hadd
+      simp only [hidx, meet_eq_pmeet, bind_tc_ok]
+      rw [meet_from_eq_foldl cs i1 (pmeet acc cs.val[start.val])]
+      congr 1
+      rw [hi1v, List.drop_eq_getElem_cons hlt']
+      rfl
+    | fail e => rw [hstep] at hadd; simp only [UScalar.inBounds] at hadd; scalar_tac
+    | div => rw [hstep] at hadd; exact hadd.elim
+termination_by cs.val.length - start.val
+decreasing_by
+  rw [hstep] at hadd; obtain ⟨_, hi1v, _⟩ := hadd; scalar_tac
+
+/-- `resolve` of a non-empty list is `Decided` of the pure left-fold of `pmeet`
+    over the whole list (head as the seed) — the clean reduction of the extracted
+    `resolve`, via `meet_from_eq_foldl`. -/
+theorem resolve_cons (a : authority.Authority) (rest : List authority.Authority)
+    (h : (a :: rest).length ≤ Std.Usize.max) :
+    authority.resolve ⟨a :: rest, h⟩
+      = ok (authority.Resolution.Decided (List.foldl pmeet a rest)) := by
+  have hidx : Slice.index_usize (⟨a :: rest, h⟩ : Slice _) 0#usize = ok a := by
+    simp [Slice.index_usize]
+  simp only [authority.resolve, core.slice.Slice.is_empty, Slice.length, List.length_cons,
+             Nat.add_one_ne_zero, decide_false, Bool.false_eq_true, if_false, hidx, bind_tc_ok]
+  rw [meet_from_eq_foldl]
+  simp only [bind_tc_ok]
+  rfl
+
+/-- **General order-independence (L1), arbitrary length.** For ANY two adjacent
+    elements and ANY tail, a list and its adjacent-swap resolve identically — on
+    the extracted `resolve`, for lists of UNBOUNDED length. Adjacent
+    transpositions generate every permutation, so this is FULL order-independence
+    (not just length 3). `foldl pmeet x (y::xs) = foldl pmeet (x⊓y) xs =
+    foldl pmeet (y⊓x) xs` by `pmeet_comm`. -/
+theorem resolve_adjacent_swap (x y : authority.Authority)
+    (xs : List authority.Authority)
+    (h1 : (x :: y :: xs).length ≤ Std.Usize.max)
+    (h2 : (y :: x :: xs).length ≤ Std.Usize.max) :
+    authority.resolve ⟨x :: y :: xs, h1⟩ = authority.resolve ⟨y :: x :: xs, h2⟩ := by
+  rw [resolve_cons, resolve_cons]
+  simp only [List.foldl_cons, pmeet_comm x y]
 
 -- ══ P1 signed-object: the allowlist is a CLOSED gate (PO-8, law §4·4) ══
 -- The extracted `admit` threads `allows_* = core.slice.Slice.contains(profile.axis,
