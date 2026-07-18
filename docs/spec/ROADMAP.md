@@ -150,12 +150,16 @@ key custody is a separate Shamir threshold.
 - **Proof CI (Tier-3 gate).** No Rust kernel merges unless its Aeneas
   refinement proof passes; mirrored in the pre-push hook (HOOK/PIPELINE
   PARITY). TLA+/TLC and Tamarin runs wired into CI as they land.
-  - *Audit obligation (F-233-06, epic #263):* `formal/Gate.lean` is a **source
-    substring scan** for `sorry`/`admit`/`axiom` — hygiene only; it misses
-    imported axioms, unsafe decls, and dependency trust. Add machine-readable
-    auditing — `#print axioms` / `Lean.collectAxioms` over the exported security
-    theorems with a whitelist of acceptable classical/quotient axioms — plus a
-    pinned toolchain + immutable action SHAs and retained axiom-set artifacts.
+  - *Audit obligation (F-233-06, epic #263) — machine-readable audit LANDED
+    (2026-07-18).* `formal/AxiomAudit.lean` runs at `lake build` time: a
+    `Lean.collectAxioms` sweep over every theorem under `Ceremony`/`Tests` that
+    **fails the build** if any transitively depends on a postulate outside the
+    permitted base `{propext, Quot.sound}` (constructive — no `Classical.choice`).
+    It is a `defaultTarget`, so `just check-formal`, the pre-push hook, and CI all
+    enforce it. This is the semantic complement to `Gate.lean`'s text scan (kept as
+    cheap hygiene; both retained). Toolchain is already pinned
+    (`formal/lean-toolchain` = v4.31.0). *Residual CI hardening (follow-up):*
+    immutable action SHAs in `formal.yml` + retained audit-output artifacts.
 - **Spec ↔ impl parity.** Every wire change updates the spec, the vectors,
   and the ADR in one PR.
 - **The `#231` rename** (`passkey`→`attest`→now `Assurance`) rides Phase 1.
