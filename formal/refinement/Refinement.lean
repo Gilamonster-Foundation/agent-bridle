@@ -84,13 +84,12 @@ theorem resolve_singleton (a : authority.Authority) :
   simp [authority.resolve, authority.meet_from, core.slice.Slice.is_empty,
         Slice.length, Slice.index_usize, Slice.len]
 
--- FOLLOW-UP (ROADMAP 1c): correctness through the *recursion* (length ≥ 2) and
--- the general order-independence (L1) over arbitrary-length inputs need
--- controlled unfolding of `meet_from` — its `partial_fixpoint` equation loops
--- the default `simp`. The general L1 result is already exhaustively covered by
--- the Rust unit tests (`resolve_is_order_independent`); porting it to Lean is a
--- meet_from-induction proof left as follow-up. The *safety* law (no fail-open)
--- is fully proven above.
+-- FOLLOW-UP (ROADMAP 1c): general order-independence (L1) over arbitrary-length
+-- inputs needs `meet_from` `partial_fixpoint` induction (its equation loops the
+-- default `simp`); a bounded value-exhaustive version needs a `Fintype Authority`
+-- instance (no `deriving` handler; hand-construction pending). The property is
+-- already exhaustively covered by the Rust `resolve_is_order_independent` test;
+-- the safety law (no fail-open) is proven above.
 
 -- ══ P1 signed-object: the allowlist is a CLOSED gate (PO-8, law §4·4) ══
 -- The extracted `admit` threads `allows_* = core.slice.Slice.contains(profile.axis,
