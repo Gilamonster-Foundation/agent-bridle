@@ -14,6 +14,19 @@ import AgentBridleCeremony.Funs
 open Aeneas Aeneas.Std Result
 open agent_bridle_ceremony
 
+-- `native_decide` on the (computable) P1 allowlist needs `DecidableEq` for the
+-- goal's `Result (Option Allowed…)`. Aeneas's `Error`/`Result` and the extracted
+-- signed-object enums/witnesses only `deriving BEq`, so derive the `DecidableEq`
+-- chain here (all are plain inductives / single-field structs).
+deriving instance DecidableEq for Aeneas.Std.Error
+deriving instance DecidableEq for Aeneas.Std.Result
+deriving instance DecidableEq for signed_object.HashAlgorithm
+deriving instance DecidableEq for signed_object.SignatureAlgorithm
+deriving instance DecidableEq for signed_object.Codec
+deriving instance DecidableEq for signed_object.AllowedHash
+deriving instance DecidableEq for signed_object.AllowedSignature
+deriving instance DecidableEq for signed_object.AllowedCodec
+
 namespace CeremonyRefinement
 
 -- ── axis meet: commutative, idempotent ──
@@ -71,12 +84,40 @@ theorem resolve_singleton (a : authority.Authority) :
   simp [authority.resolve, authority.meet_from, core.slice.Slice.is_empty,
         Slice.length, Slice.index_usize, Slice.len]
 
--- FOLLOW-UP (ROADMAP 1c): correctness through the *recursion* (length ≥ 2) and
--- the general order-independence (L1) over arbitrary-length inputs need
--- controlled unfolding of `meet_from` — its `partial_fixpoint` equation loops
--- the default `simp`. The general L1 result is already exhaustively covered by
--- the Rust unit tests (`resolve_is_order_independent`); porting it to Lean is a
--- meet_from-induction proof left as follow-up. The *safety* law (no fail-open)
--- is fully proven above.
+-- FOLLOW-UP (ROADMAP 1c): general order-independence (L1) over arbitrary-length
+-- inputs needs `meet_from` `partial_fixpoint` induction (its equation loops the
+-- default `simp`); a bounded value-exhaustive version needs a `Fintype Authority`
+-- instance (no `deriving` handler; hand-construction pending). The property is
+-- already exhaustively covered by the Rust `resolve_is_order_independent` test;
+-- the safety law (no fail-open) is proven above.
+
+-- ══ P1 signed-object: the allowlist is a CLOSED gate (PO-8, law §4·4) ══
+-- The extracted `admit` threads `allows_* = core.slice.Slice.contains(profile.axis,
+-- algo) = List.anyM (eq …)` over the `v1` Vec — closed and computable. The v1
+-- profile admits EXACTLY its member on each axis and rejects every other value,
+-- the Rust image of SignedObject.lean's `allows_*` + `TrustedProfile` (v1-only).
+-- Discharged on the extracted code by `native_decide` (via the DecidableEq chain
+-- above), the Aeneas analogue of Lean's `by decide` over the finite domain.
+
+open signed_object in
+theorem admit_hash_v1_admits_blake3_rejects_sha1 :
+    ((do let p ← Profile.v1; AllowedHash.admit p HashAlgorithm.Blake3_256)
+      = ok (some { algorithm := HashAlgorithm.Blake3_256 }))
+    ∧ ((do let p ← Profile.v1; AllowedHash.admit p HashAlgorithm.Sha1) = ok none) := by
+  native_decide
+
+open signed_object in
+theorem admit_signature_v1_admits_ed25519_rejects_ecdsa :
+    ((do let p ← Profile.v1; AllowedSignature.admit p SignatureAlgorithm.Ed25519)
+      = ok (some { algorithm := SignatureAlgorithm.Ed25519 }))
+    ∧ ((do let p ← Profile.v1; AllowedSignature.admit p SignatureAlgorithm.Ecdsa) = ok none) := by
+  native_decide
+
+open signed_object in
+theorem admit_codec_v1_admits_dagcbor_rejects_json :
+    ((do let p ← Profile.v1; AllowedCodec.admit p Codec.DagCbor)
+      = ok (some { codec := Codec.DagCbor }))
+    ∧ ((do let p ← Profile.v1; AllowedCodec.admit p Codec.Json) = ok none) := by
+  native_decide
 
 end CeremonyRefinement
