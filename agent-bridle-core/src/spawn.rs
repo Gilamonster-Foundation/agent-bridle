@@ -283,6 +283,141 @@ pub fn spawn_confined_subprocess(
     cmd.spawn(cx)
 }
 
+// ── Async-host spawn (tokio pipe handles) ────────────────────────────────────
+//
+// `spawn` above returns a `std::process::Child` — the caller owns the pipe
+// plumbing. An async host (an MCP-server **stdio** transport speaking JSON-RPC
+// over the child's stdin/stdout) needs those pipes as tokio-native, reactor-
+// registered handles, and it needs the child reaped when the transport drops.
+// `spawn_tokio` is that async-facing sibling: the confinement is **identical**
+// (it calls `spawn`, so the admission-check / OS-sandbox / env-scrub are the
+// same audited path — the boundary is unchanged), only the returned handle
+// types differ. Unix-only and gated on `spawn-tokio`, so core stays tokio-free
+// by default (the confinement primitives themselves have no async dependency).
+#[cfg(all(unix, feature = "spawn-tokio"))]
+pub use tokio_spawn::ConfinedTokioChild;
+
+#[cfg(all(unix, feature = "spawn-tokio"))]
+mod tokio_spawn {
+    use super::{ConfinedChild, ConfinedCommand, SandboxKind, ToolContext, ToolResult};
+    use std::os::fd::OwnedFd;
+    use std::process::Child;
+    use tokio::net::unix::pipe;
+
+    /// A confined child whose stdio is exposed as **tokio-native** pipe handles,
+    /// for an async host (e.g. an MCP-server stdio transport). The async-facing
+    /// sibling of [`ConfinedChild`](super::ConfinedChild): the confinement is
+    /// identical (produced by [`ConfinedCommand::spawn`]), only the pipe types
+    /// differ.
+    ///
+    /// **Kill-on-drop.** Dropping this SIGKILLs the child and reaps it on a
+    /// detached thread — restoring the guarantee a host loses by moving off
+    /// `tokio::process::Command::kill_on_drop(true)` onto the std child
+    /// underneath (tokio's runtime reaper only tracks *its own* children, so the
+    /// std child would otherwise linger as a zombie). Take the pipe ends with
+    /// the `take_*` accessors; the child stays owned here so this value's
+    /// lifetime governs the process.
+    #[derive(Debug)]
+    pub struct ConfinedTokioChild {
+        /// The OS-level sandbox actually applied to the child — the honest record
+        /// (mirrors [`ConfinedChild::sandbox_kind`](super::ConfinedChild)).
+        pub sandbox_kind: SandboxKind,
+        stdin: Option<pipe::Sender>,
+        stdout: Option<pipe::Receiver>,
+        stderr: Option<pipe::Receiver>,
+        /// `Some` until dropped; owned so kill-on-drop governs the process.
+        child: Option<Child>,
+    }
+
+    impl ConfinedTokioChild {
+        /// Take the child's stdin pipe (writer). `None` if stdin was not
+        /// [`piped`](std::process::Stdio::piped) or was already taken.
+        pub fn take_stdin(&mut self) -> Option<pipe::Sender> {
+            self.stdin.take()
+        }
+
+        /// Take the child's stdout pipe (reader). `None` if stdout was not piped
+        /// or was already taken.
+        pub fn take_stdout(&mut self) -> Option<pipe::Receiver> {
+            self.stdout.take()
+        }
+
+        /// Take the child's stderr pipe (reader). `None` if stderr was not piped
+        /// or was already taken.
+        pub fn take_stderr(&mut self) -> Option<pipe::Receiver> {
+            self.stderr.take()
+        }
+    }
+
+    impl Drop for ConfinedTokioChild {
+        fn drop(&mut self) {
+            // Reinstate kill-on-drop. `spawn_tokio` hands back a std child, which
+            // tokio's runtime reaper does NOT track — so kill it and `wait` on a
+            // detached thread to avoid a zombie without blocking this (possibly
+            // async) drop.
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+        }
+    }
+
+    impl ConfinedCommand {
+        /// Admission-check, confine, and spawn the child — like
+        /// [`spawn`](ConfinedCommand::spawn), but the stdio pipes are returned as
+        /// **tokio-native** handles wrapped in a kill-on-drop
+        /// [`ConfinedTokioChild`], for an async host (an MCP-server stdio
+        /// transport).
+        ///
+        /// The confinement is exactly `spawn`'s (this delegates to it): the
+        /// `exec` admission-check, the fail-closed refusal when a restricted fs
+        /// axis cannot be kernel-enforced, the OS sandbox, and the env scrub all
+        /// happen there. This method only converts the piped std handles into
+        /// tokio pipe ends.
+        ///
+        /// Must be called from within a tokio runtime — the pipe handles register
+        /// with the reactor. Unix-only; gated on the `spawn-tokio` feature.
+        pub fn spawn_tokio(self, cx: &ToolContext) -> ToolResult<ConfinedTokioChild> {
+            let ConfinedChild {
+                mut child,
+                sandbox_kind,
+            } = self.spawn(cx)?;
+
+            // Convert each *piped* std handle into a tokio pipe end.
+            // `pipe::{Sender,Receiver}::from_owned_fd` set O_NONBLOCK and register
+            // the fd with the reactor. The `OwnedFd` conversion moves ownership
+            // out of the std `Child`, so each fd is closed exactly once (the tokio
+            // end owns it; `Child` no longer does after `take`). A handle that was
+            // not piped stays `None`. `?` maps the io error via `ToolError::from`.
+            let stdin = child
+                .stdin
+                .take()
+                .map(|h| pipe::Sender::from_owned_fd(OwnedFd::from(h)))
+                .transpose()?;
+            let stdout = child
+                .stdout
+                .take()
+                .map(|h| pipe::Receiver::from_owned_fd(OwnedFd::from(h)))
+                .transpose()?;
+            let stderr = child
+                .stderr
+                .take()
+                .map(|h| pipe::Receiver::from_owned_fd(OwnedFd::from(h)))
+                .transpose()?;
+
+            Ok(ConfinedTokioChild {
+                sandbox_kind,
+                stdin,
+                stdout,
+                stderr,
+                child: Some(child),
+            })
+        }
+    }
+}
+
 /// Prepend a backend command prefix (Seatbelt's `sandbox-exec -p <profile>`) to
 /// a `(program, args)`, yielding the argv to actually spawn. An empty prefix is
 /// the identity — thread-confining (Landlock) and Noop backends spawn the
@@ -333,6 +468,119 @@ pub fn confinement_unenforceable(
     }
     // (2) exec/net: refuse only when the strength floor is not met by reality.
     fence_strength(&report).is_some_and(|s| s < floor)
+}
+
+// Async-path proof for `spawn_tokio`: the child's stdio survives the std→tokio
+// pipe conversion (a JSON-RPC line round-trips), and kill-on-drop actually kills
+// the child. Real-subprocess tests, matching this module's convention (the
+// landlock/seatbelt child proofs above also spawn real programs).
+#[cfg(all(unix, feature = "spawn-tokio", test))]
+mod tokio_spawn_tests {
+    use super::*;
+    use crate::{Gate, Tool};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    fn ctx(granted: Caveats) -> ToolContext {
+        struct AnyTool;
+        #[async_trait::async_trait]
+        impl Tool for AnyTool {
+            fn name(&self) -> &str {
+                "any"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn invoke(
+                &self,
+                _a: serde_json::Value,
+                _c: &ToolContext,
+            ) -> ToolResult<serde_json::Value> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+        Gate::new(0)
+            .authorize(&AnyTool, &granted)
+            .expect("authorize")
+    }
+
+    fn find_cat() -> Option<&'static str> {
+        ["/usr/bin/cat", "/bin/cat"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+    }
+
+    /// The MCP-transport use case: a newline-delimited JSON-RPC line written to
+    /// the child's tokio stdin comes back on its tokio stdout (`cat` echoes),
+    /// proving the std→tokio pipe conversion preserves a working duplex stream.
+    #[tokio::test]
+    async fn json_line_round_trips_over_tokio_pipes() {
+        let Some(cat) = find_cat() else {
+            eprintln!("skipping: no cat(1) found");
+            return;
+        };
+        let cx = ctx(Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            ..Caveats::top()
+        });
+        let mut child = ConfinedCommand::new(cat)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn_tokio(&cx)
+            .expect("spawn_tokio cat");
+
+        let mut stdin = child.take_stdin().expect("stdin piped");
+        let stdout = child.take_stdout().expect("stdout piped");
+        assert!(child.take_stdin().is_none(), "stdin taken once");
+
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        stdin.write_all(msg.as_bytes()).await.expect("write");
+        stdin.write_all(b"\n").await.expect("write nl");
+        stdin.flush().await.expect("flush");
+
+        let mut lines = BufReader::new(stdout).lines();
+        let got = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("recv did not time out")
+            .expect("recv ok");
+        assert_eq!(got.as_deref(), Some(msg));
+    }
+
+    /// Kill-on-drop: dropping the [`ConfinedTokioChild`] SIGKILLs the child, which
+    /// closes its stdout write end — so the retained reader reaches EOF. `stdin`
+    /// is held so `cat` cannot exit on its own from a stdin EOF; the only thing
+    /// that ends it is the drop.
+    #[tokio::test]
+    async fn dropping_the_guard_kills_the_child() {
+        let Some(cat) = find_cat() else {
+            eprintln!("skipping: no cat(1) found");
+            return;
+        };
+        let cx = ctx(Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            ..Caveats::top()
+        });
+        let mut child = ConfinedCommand::new(cat)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn_tokio(&cx)
+            .expect("spawn_tokio cat");
+
+        let stdout = child.take_stdout().expect("stdout piped");
+        // Hold stdin so `cat` does not exit from a stdin EOF — isolate the kill.
+        let _stdin = child.take_stdin().expect("stdin piped");
+        drop(child);
+
+        let mut lines = BufReader::new(stdout).lines();
+        let eof = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("EOF did not time out")
+            .expect("read ok");
+        assert_eq!(
+            eof, None,
+            "kill-on-drop must terminate the child and close its stdout (EOF)"
+        );
+    }
 }
 
 #[cfg(test)]
