@@ -31,22 +31,3 @@ axiom Isize.Insts.CoreHashHash.hash
 axiom Bool.Insts.CoreHashHash.hash
   {H : Type} (HasherInst : core.hash.Hasher H) : Bool → H → Result H
 
-/-- [core::slice::iter::{impl core::iter::traits::iterator::Iterator<&'a T> for core::slice::iter::Iter<'a, T>}::fold]:
-    Source: '/rustc/library/core/src/slice/iter/macros.rs', lines 259:12-261:49
-    Name pattern: [core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::fold]
-    Visibility: public -/
-@[rust_fun
-  "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::fold"]
-axiom core.slice.iter.Iter.Insts.CoreIterTraitsIteratorIteratorSharedAT.fold
-  {T : Type} {B : Type} {F : Type} (opsfunctionFnMutFPairBSharedATBInst :
-  core.ops.function.FnMut F (B × T) B) :
-  core.slice.iter.Iter T → B → F → Result B
-
-/-- [core::slice::{[T]}::split_first]:
-    Source: '/rustc/library/core/src/slice/mod.rs', lines 198:4-198:57
-    Name pattern: [core::slice::{[@T]}::split_first]
-    Visibility: public -/
-@[rust_fun "core::slice::{[@T]}::split_first"]
-axiom core.slice.Slice.split_first
-  {T : Type} : Slice T → Result (Option (T × (Slice T)))
-

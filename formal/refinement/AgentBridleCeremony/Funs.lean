@@ -719,71 +719,35 @@ def authority.Resolution.Insts.CoreHashHash : core.hash.Hash
     authority.Resolution.Insts.CoreHashHash.hash corehashHasherInst
 }
 
-/-- [agent_bridle_ceremony::authority::resolve::{impl core::ops::function::FnMut<(agent_bridle_ceremony::authority::Authority, &'_ agent_bridle_ceremony::authority::Authority), agent_bridle_ceremony::authority::Authority> for agent_bridle_ceremony::authority::resolve::closure}::call_mut]:
-    Source: 'agent-bridle-ceremony/src/authority.rs', lines 171:76-171:97 -/
-def
-  authority.resolve.closure.Insts.CoreOpsFunctionFnMutPairAuthoritySharedAuthorityAuthority.call_mut
-  (c : authority.resolve.closure)
-  (tupled_args : (authority.Authority × authority.Authority)) :
-  Result (authority.Authority × authority.resolve.closure)
-  := do
-  let (acc, a) := tupled_args
-  let a1 ← authority.Authority.meet acc a
-  ok (a1, c)
-
-/-- [agent_bridle_ceremony::authority::resolve::{impl core::ops::function::FnOnce<(agent_bridle_ceremony::authority::Authority, &'_ agent_bridle_ceremony::authority::Authority), agent_bridle_ceremony::authority::Authority> for agent_bridle_ceremony::authority::resolve::closure}::call_once]:
-    Source: 'agent-bridle-ceremony/src/authority.rs', lines 171:76-171:97 -/
-def
-  authority.resolve.closure.Insts.CoreOpsFunctionFnOncePairAuthoritySharedAuthorityAuthority.call_once
-  (c : authority.resolve.closure)
-  (p : (authority.Authority × authority.Authority)) :
+/-- [agent_bridle_ceremony::authority::meet_from]:
+    Source: 'agent-bridle-ceremony/src/authority.rs', lines 185:0-191:1 -/
+def authority.meet_from
+  (candidates : Slice authority.Authority) (start : Std.Usize)
+  (acc : authority.Authority) :
   Result authority.Authority
   := do
-  let (a, _) ←
-    authority.resolve.closure.Insts.CoreOpsFunctionFnMutPairAuthoritySharedAuthorityAuthority.call_mut
-      c p
-  ok a
-
-/-- Trait implementation: [agent_bridle_ceremony::authority::resolve::{impl core::ops::function::FnOnce<(agent_bridle_ceremony::authority::Authority, &'_ agent_bridle_ceremony::authority::Authority), agent_bridle_ceremony::authority::Authority> for agent_bridle_ceremony::authority::resolve::closure}]
-    Source: 'agent-bridle-ceremony/src/authority.rs', lines 171:76-171:97 -/
-@[reducible]
-def
-  authority.resolve.closure.Insts.CoreOpsFunctionFnOncePairAuthoritySharedAuthorityAuthority
-  : core.ops.function.FnOnce authority.resolve.closure (authority.Authority ×
-  authority.Authority) authority.Authority := {
-  call_once :=
-    authority.resolve.closure.Insts.CoreOpsFunctionFnOncePairAuthoritySharedAuthorityAuthority.call_once
-}
-
-/-- Trait implementation: [agent_bridle_ceremony::authority::resolve::{impl core::ops::function::FnMut<(agent_bridle_ceremony::authority::Authority, &'_ agent_bridle_ceremony::authority::Authority), agent_bridle_ceremony::authority::Authority> for agent_bridle_ceremony::authority::resolve::closure}]
-    Source: 'agent-bridle-ceremony/src/authority.rs', lines 171:76-171:97 -/
-@[reducible]
-def
-  authority.resolve.closure.Insts.CoreOpsFunctionFnMutPairAuthoritySharedAuthorityAuthority
-  : core.ops.function.FnMut authority.resolve.closure (authority.Authority ×
-  authority.Authority) authority.Authority := {
-  FnOnceInst :=
-    authority.resolve.closure.Insts.CoreOpsFunctionFnOncePairAuthoritySharedAuthorityAuthority
-  call_mut :=
-    authority.resolve.closure.Insts.CoreOpsFunctionFnMutPairAuthoritySharedAuthorityAuthority.call_mut
-}
+  let i := Slice.len candidates
+  if start >= i
+  then ok acc
+  else
+    let i1 ← start + 1#usize
+    let a ← Slice.index_usize candidates start
+    let a1 ← authority.Authority.meet acc a
+    authority.meet_from candidates i1 a1
+partial_fixpoint
 
 /-- [agent_bridle_ceremony::authority::resolve]:
-    Source: 'agent-bridle-ceremony/src/authority.rs', lines 168:0-173:1
+    Source: 'agent-bridle-ceremony/src/authority.rs', lines 173:0-179:1
     Visibility: public -/
 def authority.resolve
   (candidates : Slice authority.Authority) : Result authority.Resolution := do
-  let o ← core.slice.Slice.split_first candidates
-  match o with
-  | none => ok authority.Resolution.NeedsDecision
-  | some p =>
-    let (first, rest) := p
-    let i ← core.slice.Slice.iter rest
-    let a ←
-      core.slice.iter.Iter.Insts.CoreIterTraitsIteratorIteratorSharedAT.fold
-        authority.resolve.closure.Insts.CoreOpsFunctionFnMutPairAuthoritySharedAuthorityAuthority
-        i first ()
-    ok (authority.Resolution.Decided a)
+  let b ← core.slice.Slice.is_empty candidates
+  if b
+  then ok authority.Resolution.NeedsDecision
+  else
+    let a ← Slice.index_usize candidates 0#usize
+    let a1 ← authority.meet_from candidates 1#usize a
+    ok (authority.Resolution.Decided a1)
 
 /-- [agent_bridle_ceremony::boundary::{impl core::clone::Clone for agent_bridle_ceremony::boundary::Fence}::clone]:
     Source: 'agent-bridle-ceremony/src/boundary.rs', lines 25:9-25:14

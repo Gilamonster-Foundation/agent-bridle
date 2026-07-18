@@ -56,11 +56,6 @@ inductive authority.Resolution where
 | NeedsDecision : authority.Resolution
 | Decided : authority.Authority → authority.Resolution
 
-/-- [agent_bridle_ceremony::authority::resolve::closure]
-    Source: 'agent-bridle-ceremony/src/authority.rs', lines 171:76-171:97 -/
-@[reducible]
-def authority.resolve.closure := Unit
-
 /-- [agent_bridle_ceremony::boundary::Fence]
     Source: 'agent-bridle-ceremony/src/boundary.rs', lines 26:0-29:1
     Visibility: public -/

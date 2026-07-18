@@ -52,4 +52,31 @@ theorem attenuate_le_ceiling (a c : authority.Authority) :
 theorem attenuate_is_meet (a c : authority.Authority) :
     authority.Authority.attenuate a c = authority.Authority.meet a c := by rfl
 
+-- ── resolve: now PROVABLE. `resolve` was rewritten from `iter().fold` (which
+-- extracts to Aeneas's opaque slice-iterator axioms) to explicit index
+-- recursion, so it extracts to a real function and the laws below reduce. ──
+
+/-- **No fail-open (OB-9 / OB-12).** An EMPTY candidate set resolves to
+    `NeedsDecision`, never `Decided ⊤`. The safety-critical law — unprovable when
+    `resolve` used `iter().fold`; now discharged on the extracted `resolve`. -/
+theorem resolve_empty :
+    authority.resolve (Slice.new authority.Authority)
+      = ok authority.Resolution.NeedsDecision := by
+  simp [authority.resolve, core.slice.Slice.is_empty, Slice.new, Slice.length]
+
+/-- Bounded correctness: a single candidate resolves to itself (`meet_from`
+    returns in one step, no recursion). -/
+theorem resolve_singleton (a : authority.Authority) :
+    authority.resolve ⟨[a], by scalar_tac⟩ = ok (authority.Resolution.Decided a) := by
+  simp [authority.resolve, authority.meet_from, core.slice.Slice.is_empty,
+        Slice.length, Slice.index_usize, Slice.len]
+
+-- FOLLOW-UP (ROADMAP 1c): correctness through the *recursion* (length ≥ 2) and
+-- the general order-independence (L1) over arbitrary-length inputs need
+-- controlled unfolding of `meet_from` — its `partial_fixpoint` equation loops
+-- the default `simp`. The general L1 result is already exhaustively covered by
+-- the Rust unit tests (`resolve_is_order_independent`); porting it to Lean is a
+-- meet_from-induction proof left as follow-up. The *safety* law (no fail-open)
+-- is fully proven above.
+
 end CeremonyRefinement
