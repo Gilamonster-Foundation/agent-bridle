@@ -31,7 +31,10 @@ check:
 
 # Tier-3 formal proof gate: build the Lean project (P0 authority algebra +
 # P1 signed-object contracts + counterexample tests) and reject proof escapes
-# (sorry/omitted modules) via `lake exe formalGate`. Skips gracefully if Lean
+# (omitted modules / escape words) via `lake exe formalGate`. The `lake build`
+# also elaborates AxiomAudit (F-233-06), which fails the build if any security
+# theorem transitively depends on a postulate outside {propext, Quot.sound} —
+# the semantic complement to formalGate's text scan. Skips gracefully if Lean
 # (`lake`) is not installed, like cov-ci/py-test.
 # HOOK PARITY: run by .githooks/pre-push and mirrored by .github/workflows/formal.yml.
 check-formal:

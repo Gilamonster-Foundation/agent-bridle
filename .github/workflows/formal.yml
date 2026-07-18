@@ -3,6 +3,11 @@
 # HOOK PARITY: `just check-formal` and `.githooks/pre-push` run the same
 # `lake build` plus `lake exe formalGate` locally. Keep all three in sync when
 # the proof command changes.
+#
+# `lake build` also elaborates AxiomAudit (F-233-06): a `Lean.collectAxioms`
+# sweep that fails the build if any security theorem depends on a postulate
+# outside {propext, Quot.sound}. It runs here automatically because AxiomAudit
+# is a defaultTarget — no separate step needed.
 
 name: Formal proofs
 
