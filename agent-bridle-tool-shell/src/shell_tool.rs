@@ -47,6 +47,7 @@ use agent_bridle_core::{
 use async_trait::async_trait;
 
 use crate::net_proxy;
+use crate::output_observer::{output_session, OutputEmitter};
 use crate::parse::{
     classify, seg_literal, Arg, Command, Redirect, Refusal, Script, ScriptItem, Seg, Sep, StderrTo,
 };
@@ -54,8 +55,10 @@ use crate::parse::{
 /// What a finished pipeline produced (the last stage's exit code; concatenated
 /// output). The unit of the [`Spawner`] seam. The captured output is bounded by
 /// the configured cap ([`LimitsPolicy::max_output_bytes`]) so a chatty command
-/// cannot return unbounded output. Streaming caps are a follow-up; the timeout
-/// bounds runaway producers in the meantime.
+/// cannot return unbounded output. A configured observer receives a bounded
+/// live view while pipes are drained. For multi-stage stderr, live delivery
+/// follows reader scheduling while this value is assembled in stage order, so
+/// the completed envelope remains the authoritative capture.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Captured {
     pub exit_code: i32,
@@ -96,6 +99,8 @@ pub(crate) struct SpawnCfg {
     /// pipeline natively. The L2 grant checks in `invoke` still gate (advisory);
     /// only the kernel mechanism is skipped. Read once from the process marker.
     pub unbridled: bool,
+    /// Bounded presentation observer for this invocation (authority-neutral).
+    pub output: OutputEmitter,
 }
 
 pub(crate) trait Spawner: Send + Sync {
@@ -134,7 +139,7 @@ impl Spawner for OsSpawner {
         // run natively, no OS sandbox and no egress proxy. The L2 grant checks in
         // `invoke` already gated this run (advisory); confinement is off by consent.
         if cfg.unbridled {
-            return run_pipeline(stages, cwd, &[], env, cfg.max_output);
+            return run_pipeline(stages, cwd, &[], env, cfg.max_output, cfg.output.clone());
         }
         // A general remote-host `net` allow-list that cannot be named in SBPL is
         // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
@@ -147,7 +152,7 @@ impl Spawner for OsSpawner {
         // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
         // 0006 D4). Otherwise run directly — no need to spend a thread.
         if intended_sandbox_kind(caveats, &cfg.sandbox) == SandboxKind::None {
-            run_pipeline(stages, cwd, &[], env, cfg.max_output)
+            run_pipeline(stages, cwd, &[], env, cfg.max_output, cfg.output.clone())
         } else {
             run_confined(stages, cwd, caveats, env, cfg)
         }
@@ -212,12 +217,13 @@ fn run_with_egress_proxy(
     let cwd = cwd.map(str::to_string);
     let fenced = fenced.clone();
     let max_output = cfg.max_output;
+    let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
     let captured = std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox(&sandbox).apply(&fenced)?;
-            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output)
+            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output, output)
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -295,12 +301,13 @@ fn run_confined(
     let caveats = caveats.clone();
     let env = env.clone();
     let max_output = cfg.max_output;
+    let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
     std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox(&sandbox).apply(&caveats)?;
-            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output)
+            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output, output)
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -333,6 +340,7 @@ pub struct ShellTool {
     /// Sandbox mechanism policy (read/exec allow-lists, ABI floors) the L3 backend
     /// enforces (I5-B, #144). Rides the tool, not the `ToolContext`.
     sandbox: Arc<SandboxPolicy>,
+    output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -359,7 +367,20 @@ impl ShellTool {
             lister: Arc::new(RealDirLister),
             limits,
             sandbox: Arc::new(SandboxPolicy::default()),
+            output_observer: None,
         }
+    }
+
+    /// Attach a presentation-only observer for bounded stdout/stderr chunks.
+    ///
+    /// The observer is queued only after leash admission. It receives at most
+    /// the configured output cap per stream and cannot change authorization or
+    /// the final result envelope. Delivery may finish asynchronously after the
+    /// invocation returns; `on_finish` marks the queue-drained boundary.
+    #[must_use]
+    pub fn with_output_observer(mut self, observer: Arc<dyn crate::ShellOutputObserver>) -> Self {
+        self.output_observer = Some(observer);
+        self
     }
 
     /// Set the sandbox mechanism policy (read/exec allow-lists, ABI floors) the L3
@@ -379,6 +400,7 @@ impl ShellTool {
             lister: Arc::new(RealDirLister),
             limits: LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
+            output_observer: None,
         }
     }
 
@@ -393,6 +415,7 @@ impl ShellTool {
             lister: Arc::new(RealDirLister),
             limits: LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
+            output_observer: None,
         }
     }
 
@@ -411,6 +434,7 @@ impl ShellTool {
             lister,
             limits: LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
+            output_observer: None,
         }
     }
 }
@@ -710,11 +734,14 @@ impl Tool for ShellTool {
         let spawner = Arc::clone(&self.spawner);
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
+        let (output_guard, output) =
+            output_session(self.output_observer.clone(), self.limits.max_output_bytes);
         let cfg = SpawnCfg {
             max_output: self.limits.max_output_bytes,
             audit_sink: self.limits.audit_sink.clone(),
             sandbox: Arc::clone(&self.sandbox),
             unbridled,
+            output,
         };
         // Disclosed on every envelope this run returns (ADR 0018 D5/D11 / I11).
         let disclosure = Disclosure {
@@ -736,7 +763,7 @@ impl Tool for ShellTool {
                 // #196: a run that reached an out-of-allow-list host was refused
                 // by the egress proxy — surface those as structured `net` denials
                 // (sets `denied: true`; empty is a no-op on the common path).
-                Ok(ToolEnvelope::new(sandbox_kind)
+                let envelope = ToolEnvelope::new(sandbox_kind)
                     .with_enforcement(enforcement)
                     .with_disclosure(disclosure)
                     .with_exit_code(captured.exit_code)
@@ -745,14 +772,21 @@ impl Tool for ShellTool {
                     .with_stderr(captured.stderr)
                     .with_denials(captured.net_denials)
                     .with_timed_out(false)
+                    .into_json();
+                output_guard.finish();
+                Ok(envelope)
+            }
+            Err(_elapsed) => {
+                // Stop accepting presentation events at the timeout boundary;
+                // the detached blocking worker may still be unwinding.
+                drop(output_guard);
+                Ok(ToolEnvelope::new(sandbox_kind)
+                    .with_enforcement(enforcement)
+                    .with_disclosure(disclosure)
+                    .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
+                    .with_timed_out(true)
                     .into_json())
             }
-            Err(_elapsed) => Ok(ToolEnvelope::new(sandbox_kind)
-                .with_enforcement(enforcement)
-                .with_disclosure(disclosure)
-                .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
-                .with_timed_out(true)
-                .into_json()),
         }
     }
 }
@@ -1366,6 +1400,7 @@ fn run_pipeline(
     wrap: &[String],
     env: &BTreeMap<String, String>,
     max_output: usize,
+    output: OutputEmitter,
 ) -> ToolResult<Captured> {
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
@@ -1470,7 +1505,10 @@ fn run_pipeline(
 
         if matches!(stage.stderr_disposition(), StderrTo::Capture) {
             let err = child.stderr.take().expect("stderr is piped");
-            stderr_threads.push(std::thread::spawn(move || read_capped(err, max_output)));
+            let output = output.clone();
+            stderr_threads.push(std::thread::spawn(move || {
+                read_capped_observed(err, max_output, &output, crate::ShellOutputStream::Stderr)
+            }));
         }
         children.push(child);
     }
@@ -1478,8 +1516,16 @@ fn run_pipeline(
     // The parent now holds no pipe writers, so a captured reader sees EOF once
     // the child(ren) exit. Read stdout (bounded by the cap) concurrently with
     // waiting; a child producing past the cap is cut off via EPIPE.
-    let stdout_thread =
-        stdout_capture.map(|reader| std::thread::spawn(move || read_capped(reader, max_output)));
+    let stdout_thread = stdout_capture.map(|reader| {
+        std::thread::spawn(move || {
+            read_capped_observed(
+                reader,
+                max_output,
+                &output,
+                crate::ShellOutputStream::Stdout,
+            )
+        })
+    });
 
     // Wait all stages; the pipeline's exit code is the last stage's.
     let mut exit_code = -1;
@@ -1540,14 +1586,46 @@ fn ok_or_kill<T>(result: std::io::Result<T>, children: &mut [Child]) -> ToolResu
 /// remainder is **not** drained: dropping `reader` closes the pipe read end, so a
 /// still-writing child gets `EPIPE`/`SIGPIPE` on its next write (the `| head`
 /// model) rather than blocking us — and we never read past `cap + 1` bytes.
-fn read_capped(mut reader: impl Read, max_output: usize) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    // `take` bounds total bytes read into `buf` to the cap.
-    let _ = (&mut reader).take(max_output as u64).read_to_end(&mut buf);
-    // One probe read: any byte beyond the cap means the source was truncated.
+fn read_capped_observed(
+    mut reader: impl Read,
+    max_output: usize,
+    output: &OutputEmitter,
+    stream: crate::ShellOutputStream,
+) -> (Vec<u8>, bool) {
+    let mut buf = Vec::with_capacity(max_output.min(8 * 1024));
+    let mut chunk = [0u8; 8 * 1024];
+    while buf.len() < max_output {
+        let remaining = max_output - buf.len();
+        let read_len = remaining.min(chunk.len());
+        match reader.read(&mut chunk[..read_len]) {
+            Ok(0) => return (buf, false),
+            Ok(n) => {
+                output.emit(stream, &chunk[..n]);
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return (buf, false),
+        }
+    }
     let mut probe = [0u8; 1];
-    let truncated = matches!(reader.read(&mut probe), Ok(n) if n > 0);
+    let truncated = loop {
+        match reader.read(&mut probe) {
+            Ok(n) => break n > 0,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break false,
+        }
+    };
     (buf, truncated)
+}
+
+#[cfg(test)]
+fn read_capped(reader: impl Read, max_output: usize) -> (Vec<u8>, bool) {
+    read_capped_observed(
+        reader,
+        max_output,
+        &OutputEmitter::default(),
+        crate::ShellOutputStream::Stdout,
+    )
 }
 
 /// Lossy-decode captured output (already bounded to ≤ `max_output` by
@@ -1577,7 +1655,7 @@ mod tests {
     use super::*;
     use agent_bridle_core::{Caveats, Gate, Scope};
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
 
     /// The schema loads from the embedded `shell_tool.schema.json` data file (not
     /// an inline literal) with the expected shape. Guards the data file against
@@ -1680,6 +1758,334 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    struct CoordinatedSpawner {
+        proceed: Mutex<mpsc::Receiver<()>>,
+        finished: mpsc::Sender<()>,
+    }
+
+    impl Spawner for CoordinatedSpawner {
+        fn run(
+            &self,
+            _stages: &[Command],
+            _cwd: Option<&str>,
+            _caveats: &Caveats,
+            _env: &BTreeMap<String, String>,
+            cfg: &SpawnCfg,
+        ) -> ToolResult<Captured> {
+            cfg.output.emit(crate::ShellOutputStream::Stdout, b"first");
+            self.proceed
+                .lock()
+                .expect("proceed lock")
+                .recv()
+                .expect("test releases spawner");
+            cfg.output.emit(crate::ShellOutputStream::Stdout, b"second");
+            self.finished.send(()).expect("test observes completion");
+            Ok(Captured {
+                exit_code: 0,
+                stdout: "firstsecond".to_string(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn coordinated_spawner() -> (
+        Arc<CoordinatedSpawner>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+    ) {
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        (
+            Arc::new(CoordinatedSpawner {
+                proceed: Mutex::new(proceed_rx),
+                finished: finished_tx,
+            }),
+            proceed_tx,
+            finished_rx,
+        )
+    }
+
+    struct BlockingObserver {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        finished: mpsc::Sender<()>,
+    }
+
+    impl crate::ShellOutputObserver for BlockingObserver {
+        fn on_output(
+            &self,
+            _invocation: crate::ShellInvocationId,
+            _stream: crate::ShellOutputStream,
+            _chunk: &[u8],
+        ) {
+            self.entered.send(()).expect("observer entered callback");
+            self.release
+                .lock()
+                .expect("observer release lock")
+                .recv()
+                .expect("test releases blocked observer");
+        }
+
+        fn on_finish(&self, _invocation: crate::ShellInvocationId) {
+            self.finished.send(()).expect("record unexpected finish");
+        }
+    }
+
+    struct TemporalPipelineSpawner;
+
+    impl Spawner for TemporalPipelineSpawner {
+        fn run(
+            &self,
+            stages: &[Command],
+            _cwd: Option<&str>,
+            _caveats: &Caveats,
+            _env: &BTreeMap<String, String>,
+            cfg: &SpawnCfg,
+        ) -> ToolResult<Captured> {
+            assert_eq!(stages.len(), 2, "the test request is one pipeline");
+            // Stage two becomes readable first, but the final envelope is
+            // assembled in pipeline-stage order by the real spawner.
+            cfg.output
+                .emit(crate::ShellOutputStream::Stderr, b"second-stage");
+            cfg.output
+                .emit(crate::ShellOutputStream::Stderr, b"first-stage");
+            Ok(Captured {
+                exit_code: 0,
+                stderr: "firs".to_string(),
+                stderr_truncated: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum PipelineObserverEvent {
+        Output(crate::ShellInvocationId, crate::ShellOutputStream, Vec<u8>),
+        Finish(crate::ShellInvocationId),
+    }
+
+    struct PipelineObserver(mpsc::Sender<PipelineObserverEvent>);
+
+    impl crate::ShellOutputObserver for PipelineObserver {
+        fn on_output(
+            &self,
+            invocation: crate::ShellInvocationId,
+            stream: crate::ShellOutputStream,
+            chunk: &[u8],
+        ) {
+            self.0
+                .send(PipelineObserverEvent::Output(
+                    invocation,
+                    stream,
+                    chunk.to_vec(),
+                ))
+                .expect("record pipeline output");
+        }
+
+        fn on_finish(&self, invocation: crate::ShellInvocationId) {
+            self.0
+                .send(PipelineObserverEvent::Finish(invocation))
+                .expect("record pipeline finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_receives_output_before_invoke_completes() {
+        let (spawner, proceed, finished) = coordinated_spawner();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let seen_rx = Arc::new(Mutex::new(seen_rx));
+        let observer = Arc::new(move |invocation, stream, chunk: &[u8]| {
+            seen_tx
+                .send((invocation, stream, chunk.to_vec()))
+                .expect("test receives observer callback");
+        });
+        let tool = ShellTool::with_spawner(spawner).with_output_observer(observer);
+        let context = ctx(exec_only(&["anything"]));
+
+        let invoke = tokio::spawn(async move {
+            tool.invoke(serde_json::json!({"program": "anything"}), &context)
+                .await
+        });
+        let first_rx = Arc::clone(&seen_rx);
+        let first = tokio::task::spawn_blocking(move || {
+            first_rx
+                .lock()
+                .expect("observer receiver lock")
+                .recv_timeout(Duration::from_secs(2))
+        })
+        .await
+        .expect("receiver task")
+        .expect("live callback before completion");
+        let invocation = first.0;
+        assert_eq!(
+            first,
+            (
+                invocation,
+                crate::ShellOutputStream::Stdout,
+                b"first".to_vec()
+            )
+        );
+        assert!(!invoke.is_finished(), "the tool must still be running");
+
+        proceed.send(()).expect("release spawner");
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("spawner completion");
+        let out = invoke.await.expect("invoke task").expect("invoke result");
+        assert_eq!(out["stdout"], "firstsecond");
+        assert_eq!(
+            seen_rx
+                .lock()
+                .expect("observer receiver lock")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second callback"),
+            (
+                invocation,
+                crate::ShellOutputStream::Stdout,
+                b"second".to_vec()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_stderr_live_cap_is_temporal_but_envelope_is_authoritative() {
+        let (events_tx, events_rx) = mpsc::channel();
+        let mut tool = ShellTool::with_spawner(Arc::new(TemporalPipelineSpawner));
+        tool.limits.max_output_bytes = 4;
+        let tool = tool.with_output_observer(Arc::new(PipelineObserver(events_tx)));
+
+        let out = tool
+            .invoke(
+                serde_json::json!({"cmd": "first | second"}),
+                &ctx(exec_only(&["first", "second"])),
+            )
+            .await
+            .expect("invoke pipeline");
+
+        assert_eq!(out["stderr"], "firs");
+        assert_eq!(out["stderr_truncated"], true);
+        let first = events_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("live stderr event");
+        let invocation = match first {
+            PipelineObserverEvent::Output(id, crate::ShellOutputStream::Stderr, bytes) => {
+                assert_eq!(bytes, b"seco", "the live cap follows enqueue order");
+                id
+            }
+            other => panic!("unexpected first observer event: {other:?}"),
+        };
+        assert_eq!(
+            events_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queue-drained finish"),
+            PipelineObserverEvent::Finish(invocation)
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "the later stage-order bytes are outside the live cap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_does_not_wait_for_a_blocked_observer_or_deliver_late_output() {
+        let (spawner, proceed, finished) = coordinated_spawner();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_observer_tx, release_observer_rx) = mpsc::channel();
+        let release_observer_rx = Mutex::new(release_observer_rx);
+        let observer = Arc::new(move |invocation, stream, chunk: &[u8]| {
+            seen_tx
+                .send((invocation, stream, chunk.to_vec()))
+                .expect("observer receiver remains alive");
+            entered_tx.send(()).expect("observer entered callback");
+            release_observer_rx
+                .lock()
+                .expect("observer release lock")
+                .recv()
+                .expect("test releases blocked observer");
+        });
+        let tool = ShellTool::with_spawner(spawner).with_output_observer(observer);
+        let context = ctx(exec_only(&["anything"]));
+
+        let mut invoke = tokio::spawn(async move {
+            tool.invoke(serde_json::json!({"program": "anything"}), &context)
+                .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("observer is blocked in its first callback");
+        let first = seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first callback");
+        assert_eq!(first.1, crate::ShellOutputStream::Stdout);
+        assert_eq!(first.2, b"first");
+
+        invoke.abort();
+        let cancelled = tokio::time::timeout(Duration::from_millis(500), &mut invoke).await;
+        proceed.send(()).expect("release detached worker");
+        release_observer_tx
+            .send(())
+            .expect("release presentation callback");
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("detached worker attempted its late write");
+        let cancelled = cancelled.expect("cancellation must not wait for observer code");
+        assert!(
+            cancelled.expect_err("invoke is cancelled").is_cancelled(),
+            "the invocation future was cancelled"
+        );
+        assert!(
+            seen_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "output emitted by the detached worker after cancellation is ignored"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_does_not_wait_for_a_blocked_observer_or_finish_the_session() {
+        let (spawner, proceed, worker_finished) = coordinated_spawner();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let observer = Arc::new(BlockingObserver {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            finished: finish_tx,
+        });
+        let tool = ShellTool::with_spawner(spawner).with_output_observer(observer);
+        let context = ctx(exec_only(&["anything"]));
+
+        let mut invoke = tokio::spawn(async move {
+            tool.invoke(
+                serde_json::json!({"program": "anything", "timeout_secs": 1}),
+                &context,
+            )
+            .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("observer is blocked in its first callback");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut invoke).await;
+        if result.is_err() {
+            invoke.abort();
+        }
+        proceed.send(()).expect("release detached worker");
+        release_tx.send(()).expect("release presentation callback");
+        worker_finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("detached worker attempted its late write");
+
+        let output = result
+            .expect("tool timeout must not wait for observer code")
+            .expect("invoke task")
+            .expect("timeout envelope");
+        assert_eq!(output["timed_out"], true);
+        assert!(
+            finish_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a timed-out observer session must not report ordinary completion"
+        );
     }
 
     fn ctx(granted: Caveats) -> ToolContext {
@@ -2414,6 +2820,33 @@ mod tests {
         let (buf2, trunc2) = read_capped(&b"hello"[..], CAP);
         assert_eq!(buf2, b"hello");
         assert!(!trunc2, "a sub-cap source is not truncated");
+    }
+
+    #[test]
+    fn read_capped_retries_an_interrupted_read() {
+        struct InterruptedOnce {
+            interrupted: bool,
+            inner: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                self.inner.read(buf)
+            }
+        }
+
+        let reader = InterruptedOnce {
+            interrupted: false,
+            inner: std::io::Cursor::new(b"abcdef".to_vec()),
+        };
+        let (captured, truncated) = read_capped(reader, 4);
+
+        assert_eq!(captured, b"abcd");
+        assert!(truncated);
     }
 
     #[test]

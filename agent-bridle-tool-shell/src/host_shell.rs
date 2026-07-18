@@ -26,6 +26,8 @@ use agent_bridle_core::{
 };
 use async_trait::async_trait;
 
+use crate::output_observer::{drain_capped, output_session};
+
 /// The engine identity stamped on the disclosure (ADR 0019 D4).
 const ENGINE_NAME: &str = "sandbox-host";
 
@@ -62,6 +64,7 @@ pub struct HostShellTool {
     /// [`DEFAULT_SCHEMA`] data file; overridable via
     /// [`HostShellTool::with_schema`] (three-Cs: Configuration).
     schema: Arc<serde_json::Value>,
+    output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
 }
 
 impl std::fmt::Debug for HostShellTool {
@@ -87,7 +90,19 @@ impl HostShellTool {
             max_output: DEFAULT_MAX_OUTPUT,
             sandbox: Arc::new(SandboxPolicy::default()),
             schema: DEFAULT_SCHEMA.clone(),
+            output_observer: None,
         }
+    }
+
+    /// Attach a presentation-only observer for bounded stdout/stderr chunks.
+    ///
+    /// The observer is queued only for a shell that passed admission and cannot
+    /// change the final result envelope. Delivery may finish asynchronously
+    /// after the invocation returns; `on_finish` marks the queue-drained boundary.
+    #[must_use]
+    pub fn with_output_observer(mut self, observer: Arc<dyn crate::ShellOutputObserver>) -> Self {
+        self.output_observer = Some(observer);
+        self
     }
 
     /// Override the tool's input schema (three-Cs: Configuration). Defaults to
@@ -230,32 +245,74 @@ impl Tool for HostShellTool {
         // thread, so the child inherits confinement.
         let confined = command.spawn(cx)?;
         let sandbox_kind = confined.sandbox_kind;
-        let child = confined.child;
+        let mut child = confined.child;
+        let stdout_reader = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::Exec(std::io::Error::other("stdout pipe missing")))?;
+        let stderr_reader = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::Exec(std::io::Error::other("stderr pipe missing")))?;
+        let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
 
-        let output = tokio::task::spawn_blocking(move || child.wait_with_output())
-            .await
-            .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))?
-            .map_err(ToolError::Exec)?;
+        let captured = tokio::task::spawn_blocking(move || {
+            let stdout_output = output.clone();
+            let stdout = std::thread::spawn(move || {
+                drain_capped(
+                    stdout_reader,
+                    max_output,
+                    &stdout_output,
+                    crate::ShellOutputStream::Stdout,
+                )
+            });
+            let stderr = std::thread::spawn(move || {
+                drain_capped(
+                    stderr_reader,
+                    max_output,
+                    &output,
+                    crate::ShellOutputStream::Stderr,
+                )
+            });
 
-        let stdout = cap_utf8(&output.stdout, max_output);
-        let stderr = cap_utf8(&output.stderr, max_output);
-        Ok(ToolEnvelope::new(sandbox_kind)
+            let status = child.wait().map_err(ToolError::Exec);
+            let stdout = stdout.join().map_err(|_| {
+                ToolError::Exec(std::io::Error::other("stdout reader thread panicked"))
+            });
+            let stderr = stderr.join().map_err(|_| {
+                ToolError::Exec(std::io::Error::other("stderr reader thread panicked"))
+            });
+
+            let status = status?;
+            let (stdout, stdout_truncated) = stdout??;
+            let (stderr, stderr_truncated) = stderr??;
+            Ok::<_, ToolError>((status, stdout, stdout_truncated, stderr, stderr_truncated))
+        })
+        .await
+        .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
+
+        let (status, stdout, stdout_truncated, stderr, stderr_truncated) = captured;
+        let stdout = cap_utf8(&stdout, max_output, stdout_truncated);
+        let stderr = cap_utf8(&stderr, max_output, stderr_truncated);
+        let envelope = ToolEnvelope::new(sandbox_kind)
             .with_disclosure(self.disclosure())
-            .with_exit_code(output.status.code().unwrap_or(-1))
+            .with_exit_code(status.code().unwrap_or(-1))
             .with_stdout(stdout)
             .with_stderr(stderr)
             .with_timed_out(false)
-            .into_json())
+            .into_json();
+        output_guard.finish();
+        Ok(envelope)
     }
 }
 
 /// Lossy-decode captured bytes and cap at `max` bytes (on a char boundary).
-fn cap_utf8(bytes: &[u8], max: usize) -> String {
+fn cap_utf8(bytes: &[u8], max: usize, truncated: bool) -> String {
     let s = String::from_utf8_lossy(bytes);
-    if s.len() <= max {
+    if !truncated && s.len() <= max {
         return s.into_owned();
     }
-    let mut end = max;
+    let mut end = max.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
