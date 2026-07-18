@@ -27,6 +27,31 @@ deriving instance DecidableEq for signed_object.AllowedHash
 deriving instance DecidableEq for signed_object.AllowedSignature
 deriving instance DecidableEq for signed_object.AllowedCodec
 
+-- For the value-exhaustive resolve order-independence (L1): `native_decide` on a
+-- `∀ x y z : Authority, …` needs `DecidableEq` + `Fintype` over the finite
+-- Authority domain. Lean has no `Fintype` deriving handler, so build it by hand:
+-- the axis enums enumerate directly, and the product via `Fintype.ofEquiv`.
+deriving instance DecidableEq for authority.Effect
+deriving instance DecidableEq for authority.Assurance
+deriving instance DecidableEq for authority.Scope
+deriving instance DecidableEq for authority.Authority
+deriving instance DecidableEq for authority.Resolution
+
+instance : Fintype authority.Effect :=
+  ⟨{authority.Effect.Deny, authority.Effect.Allow}, fun x => by cases x <;> decide⟩
+instance : Fintype authority.Assurance :=
+  ⟨{authority.Assurance.None, authority.Assurance.Presence, authority.Assurance.Hardware},
+   fun x => by cases x <;> decide⟩
+instance : Fintype authority.Scope :=
+  ⟨{authority.Scope.Once, authority.Scope.Session, authority.Scope.Durable},
+   fun x => by cases x <;> decide⟩
+instance : Fintype authority.Authority :=
+  Fintype.ofEquiv (authority.Effect × authority.Assurance × authority.Scope)
+    { toFun := fun p => ⟨p.1, p.2.1, p.2.2⟩
+      invFun := fun a => (a.effect, a.assurance, a.scope)
+      left_inv := fun _ => rfl
+      right_inv := fun _ => rfl }
+
 namespace CeremonyRefinement
 
 -- ── axis meet: commutative, idempotent ──
@@ -84,12 +109,31 @@ theorem resolve_singleton (a : authority.Authority) :
   simp [authority.resolve, authority.meet_from, core.slice.Slice.is_empty,
         Slice.length, Slice.index_usize, Slice.len]
 
--- FOLLOW-UP (ROADMAP 1c): general order-independence (L1) over arbitrary-length
+/-- **Order-independence (L1), value-exhaustive at length 3.** For EVERY triple
+    of authorities, resolving a list and its adjacent-swap resolve identically,
+    on the extracted `resolve` (which runs `meet_from` over the slice). Proven by
+    `native_decide` over the whole finite `Authority³` domain — the extracted-code
+    analogue of the Rust `resolve_is_order_independent` test. -/
+theorem resolve_swap_len3_exhaustive :
+    ∀ x y z : authority.Authority,
+      authority.resolve ⟨[x, y, z], by scalar_tac⟩
+        = authority.resolve ⟨[y, x, z], by scalar_tac⟩ := by
+  native_decide
+
+/-- The other adjacent transposition (positions 1,2). Together with the swap
+    above, these generate all of `S₃`, so `resolve` is FULLY order-independent
+    at length 3 — every permutation resolves identically, for every triple. -/
+theorem resolve_swap_len3_last_two_exhaustive :
+    ∀ x y z : authority.Authority,
+      authority.resolve ⟨[x, y, z], by scalar_tac⟩
+        = authority.resolve ⟨[x, z, y], by scalar_tac⟩ := by
+  native_decide
+
+-- FOLLOW-UP (ROADMAP 1c): the GENERAL order-independence over ARBITRARY-length
 -- inputs needs `meet_from` `partial_fixpoint` induction (its equation loops the
--- default `simp`); a bounded value-exhaustive version needs a `Fintype Authority`
--- instance (no `deriving` handler; hand-construction pending). The property is
--- already exhaustively covered by the Rust `resolve_is_order_independent` test;
--- the safety law (no fail-open) is proven above.
+-- default `simp`) — beyond what the finite `native_decide` above can reach. The
+-- safety law (no fail-open) is proven, and order-independence is now exhaustive
+-- (all value-triples) on the extracted code at length 3.
 
 -- ══ P1 signed-object: the allowlist is a CLOSED gate (PO-8, law §4·4) ══
 -- The extracted `admit` threads `allows_* = core.slice.Slice.contains(profile.axis,
