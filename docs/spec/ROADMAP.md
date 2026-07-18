@@ -49,6 +49,25 @@ formal proof → conformance vectors.
   protected-tuple constructor + verify order (ADR 0022); algorithm allowlist;
   genesis sentinel. Property tests (round-trip, tamper, unknown-field
   fail-closed). *Gate:* PO-1c, PO-8 as Lean contracts + vectors.
+  - *Audit obligations (2026-07-18, epic #263):* the harvested P1 kernel is an
+    **abstract semantic** skeleton until these are discharged; keep claims
+    narrow (audit §12) — do **not** say "formally verified" yet.
+    - **F-233-01 / F-233-04:** `digest_binding` asserts impossible *global*
+      injectivity over arbitrary `ByteArray` (BLAKE3-256 cannot inhabit it),
+      and `signature_binding` / `signature_deterministic` are algebraic-equality
+      stand-ins, not EUF-CMA. Restate both as bounded-domain / **computational**
+      assumptions under the **Tier-1 "assumed crypto"** boundary (or drop them
+      if unused) and align the Rust doc gloss. Hard blocker only at Tier-3
+      crypto refinement.
+    - **F-233-02:** no proved-injective `encodeSignaturePreimage` exists, so the
+      theorem does not bind the exact signed bytes. Owed as a domain-separated,
+      versioned, tagged, length-delimited canonical codec + `encode_injective` /
+      `decode_encode`; **freeze with the 1d vectors** (below).
+    - **AB-005 (runtime wiring):** `Registry::dispatch` feeds
+      `CallRequest::unspecified(name)` into the step-up challenge, so approval
+      binds the tool name, not the resolved `(tool, args, resource)` tuple. The
+      enforcement seam must feed the resolved tuple (`CallRequest::new`) — needs
+      a resolver-seam decision. Tracked in epic #258.
 - **1b P2 Chain-Store (CAS).** The append CAS + the anti-rollback trusted-state
   machine. **TLA+/TLC model checked first** (`CeremonyStore.tla`), then the
   pure Rust state machine refined to it. *Gate:* PO-2/2a/2c; TLC invariants
@@ -62,9 +81,21 @@ formal proof → conformance vectors.
     Charon/Aeneas-extracted code. **Remaining:** rewrite `resolve` from an
     iterator-`fold` (Aeneas axiomatizes slice iterators, so it won't reduce) to
     explicit recursion, then extend the refinement proof to cover it.
+  - *Audit obligation (AB-012, epic #259):* the `agent-bridle-jaild` broker
+    accepts client-supplied caveats without establishing who minted them or the
+    caller's entitlement — it enforces *confinement relative to a request*, not
+    *authorization to make it*. The P0 authority relation owes a signer/trust
+    lookup so the broker can verify an **attested** grant (or the design must
+    explicitly narrow the broker to confinement-only). Cross-link #231.
 - **1d Conformance vectors.** `tests/vectors/*.json` — positive **and
   negative** — the cross-language behavioral contract. *This unblocks the
   "held" wire freeze.*
+  - *Audit obligation (F-233-02, epic #263):* the injective, prefix-free
+    `encodeSignaturePreimage` codec + its injectivity proof is owed **here** —
+    freeze it with the DAG-CBOR vectors. **F-233-05** (concrete DAG-CBOR/JSON/
+    TOML adapters) is *already this phase* — on track, **not a defect**:
+    implementing a wire codec before its vectors would violate the governing
+    rule ("never fossilize a wire format ahead of its conformance vectors").
 
 **Exit (the big one):** the Rust waist compiles, refines the Lean model,
 passes the TLA+-checked store invariants, and the conformance vectors are
@@ -75,6 +106,10 @@ published. Only now do wire structs stop being nonbinding.
 - **2a P4 Identity Lifecycle.** Roles/delegation, records, quorum revocation
   (exact policy predicate), break-glass/succession (conditional PO-R). Implements
   P0's `AttestEvidence`/`ValidAssociationProof`.
+  - *Audit note (F-233-03):* "signer is committed data, not established origin"
+    is **not a P1 defect** — the trusted-key registry / `TrustedKey(profile,
+    signer_id, pubkey, epoch, purpose)` lookup is deliberately scheduled here
+    (with P0 authority). Do not re-triage it onto Phase 1.
 - **2b P3 Enrollment.** SAS pairing, PoP introductions (recipient-issued
   challenge, consume-last). **Tier-2: Tamarin/ProVerif** proofs of
   freshness / no-MITM / no-unknown-key-share.
@@ -115,11 +150,41 @@ key custody is a separate Shamir threshold.
 - **Proof CI (Tier-3 gate).** No Rust kernel merges unless its Aeneas
   refinement proof passes; mirrored in the pre-push hook (HOOK/PIPELINE
   PARITY). TLA+/TLC and Tamarin runs wired into CI as they land.
+  - *Audit obligation (F-233-06, epic #263):* `formal/Gate.lean` is a **source
+    substring scan** for `sorry`/`admit`/`axiom` — hygiene only; it misses
+    imported axioms, unsafe decls, and dependency trust. Add machine-readable
+    auditing — `#print axioms` / `Lean.collectAxioms` over the exported security
+    theorems with a whitelist of acceptable classical/quotient axioms — plus a
+    pinned toolchain + immutable action SHAs and retained axiom-set artifacts.
 - **Spec ↔ impl parity.** Every wire change updates the spec, the vectors,
   and the ADR in one PR.
 - **The `#231` rename** (`passkey`→`attest`→now `Assurance`) rides Phase 1.
 - **L1+L4 unification** (five laws → four) — attempt during 1c if the Lean
   formulation collapses them.
+
+## Runtime enforcement hardening — off the ceremony track
+
+The 2026-07-18 adversarial audit (`docs/agent-bridle-adversarial-audit.md`,
+verified against `origin/main`) found defects in the **runtime enforcement
+layer** (registry/gate, shell, web, jaild, MCP, Python, config) that are **not**
+Ceremony phases and must not be forced onto them. They live in standalone
+hardening epics; only two bridge into the formal track (AB-005 → Phase 1a,
+AB-012 → Phase 1c, both recorded above):
+
+| Epic | Theme | Flagship findings |
+|---|---|---|
+| #258 | Registry/gate: grant identity, cross-dispatch budget, action-bound step-up | AB-001, AB-005, AB-013, AB-014 |
+| #259 | jaild hardening (fail-closed root drop, verified mounts, unpredictable roots, attested grants) | AB-002, AB-003, AB-008, AB-012 |
+| #260 | Shell hostile-child & env hygiene (env is authority; timeouts must reap) | AB-004/016, AB-006, AB-015 (→#10) |
+| #261 | MCP transport & dispatch conformance | AB-019 (PR #273), AB-020, AB-021 |
+| #262 | Fail-closed defaults (no error/absence silently permissive) | AB-009, AB-010, AB-007, AB-024 (→#138), AB-023 (→#138) |
+| #263 | **P1 signed-object refinement obligations** (this doc's Phase-1 riders) | F-233-01/02/04/06 |
+
+The claim language in audit §12 governs until epics #258–#262 clear their P0
+items: prefer "centralizes tool admission" / "applies platform confinement where
+available" over "call limits enforced across a session," "timed-out commands are
+stopped," "the jail always drops root," or "human approval is bound to the exact
+action."
 
 ## Milestone summary
 
