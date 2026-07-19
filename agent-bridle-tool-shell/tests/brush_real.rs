@@ -253,6 +253,39 @@ async fn confined_stdin_reader_gets_eof_not_the_operator_terminal() {
     );
 }
 
+/// FIX 3 (critical #2/#8): the brush path had NO wall-clock timeout and hardcoded
+/// `timed_out:false`, so a grinding/blocking confined command ran unbounded. With
+/// a ceiling, a command that outlasts it is cut AT the ceiling — `timed_out:true`,
+/// exit 124 — not after the command's full duration.
+///
+/// A short `sleep` (not the 30s of the field repro) keeps this real-spawn test
+/// fast: the timed-out child is not itself killed here (that needs kill-on-drop
+/// in the brush fork — Effort B), so the detached worker outlives the invoke and
+/// the test's own runtime drop waits for it. The invoke still returns at the
+/// ~1s ceiling, which is what this asserts.
+#[cfg(unix)]
+#[tokio::test]
+async fn confined_run_is_bounded_by_the_wall_clock_ceiling() {
+    let cx = ctx(Caveats::top());
+    let tool = BrushShellTool::new().with_timeout(Duration::from_secs(1));
+    let start = std::time::Instant::now();
+    let out = tokio::time::timeout(
+        Duration::from_secs(20),
+        tool.invoke(serde_json::json!({ "cmd": "sleep 3" }), &cx),
+    )
+    .await
+    .expect("invoke must return at the ~1s ceiling, not after the sleep completes")
+    .expect("invoke");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the run must be cut at the ~1s ceiling, took {elapsed:?}: {out}"
+    );
+    assert_eq!(out["timed_out"], true, "timed_out must be raised: {out}");
+    assert_eq!(out["exit_code"], 124, "the timeout exit code is 124: {out}");
+}
+
 /// HOME crosses the seam — the concrete #783-class motivation: without it,
 /// `~` expansion and HOME-relative tooling misbehave under the brush engine.
 /// Nothing ambient leaks in (do_not_inherit_env); only the passed value shows.

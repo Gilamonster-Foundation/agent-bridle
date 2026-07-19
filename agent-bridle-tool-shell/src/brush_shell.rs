@@ -15,8 +15,9 @@
 //! builtin that spawns outside the `before_exec` funnel — a proven bypass).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use agent_bridle_core::{
     default_exec_path, Denial, Disclosure, SandboxKind, Scope, Tool, ToolContext, ToolEnvelope,
@@ -50,6 +51,14 @@ const RESTRICTED_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// hook and is intentionally kept.
 const REMOVED_BUILTINS: &[&str] = &["exec"];
 
+/// Default wall-clock ceiling for a confined run (FIX 3). Sourced from the shared
+/// shell-limits contract — [`LimitsPolicy::default_timeout_secs`](agent_bridle_core::LimitsPolicy)
+/// (60s) — so the brush path bounds itself exactly like the safe-subset and host
+/// engines instead of running unbounded.
+fn default_timeout() -> Duration {
+    Duration::from_secs(agent_bridle_core::LimitsPolicy::default().default_timeout_secs)
+}
+
 /// The brush [`ShellExtensions`](brush_core::extensions::ShellExtensions) carried
 /// by this engine: the default error formatter plus the capability interceptor.
 type LeashedExtensions = ShellExtensionsImpl<DefaultErrorFormatter, CaveatInterceptor>;
@@ -73,6 +82,9 @@ pub struct BrushShellTool {
     max_output: usize,
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
+    /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
+    /// and reported `timed_out:true` with exit 124.
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for BrushShellTool {
@@ -95,7 +107,17 @@ impl BrushShellTool {
             max_output: DEFAULT_MAX_OUTPUT,
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
+            timeout: default_timeout(),
         }
+    }
+
+    /// Override the wall-clock ceiling (three-Cs: Configuration). A run that
+    /// exceeds `timeout` is stopped — the FIX-2 cancel flag is tripped so the
+    /// worker unwinds — and reported `timed_out:true` with exit 124.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Attach a presentation-only observer for bounded stdout/stderr chunks.
@@ -183,32 +205,57 @@ impl Tool for BrushShellTool {
         // interrupt) and the interceptor aborts the run at the next command /
         // redirect boundary — so a runaway confined command is recoverable.
         let cancel = Arc::new(AtomicBool::new(false));
-        let interceptor = CaveatInterceptor::new(cx.clone(), Arc::clone(&sink))
-            .with_cancel(Arc::clone(&cancel));
+        let interceptor =
+            CaveatInterceptor::new(cx.clone(), Arc::clone(&sink)).with_cancel(Arc::clone(&cancel));
         let max_output = self.max_output;
         let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
 
         // brush's shell API is async and blocks on a per-invocation current-thread
-        // runtime; run it off the async runtime on a blocking worker.
-        let captured = tokio::task::spawn_blocking(move || {
+        // runtime; run it off the async runtime on a blocking worker, bounded by
+        // the wall-clock ceiling (FIX 3). Mirrors the safe-subset / host engines.
+        let run = tokio::task::spawn_blocking(move || {
             run_in_brush(cmd, cwd, path_value, env, interceptor, max_output, output)
-        })
-        .await
-        .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
-
-        // Any denial the interceptor recorded lifts the envelope to `denied:true`.
-        let denials: Vec<Denial> = sink.lock().map(|g| g.clone()).unwrap_or_default();
-
-        let envelope = ToolEnvelope::new(SandboxKind::None)
-            .with_disclosure(self.disclosure())
-            .with_exit_code(captured.exit_code)
-            .with_stdout(captured.stdout)
-            .with_stderr(captured.stderr)
-            .with_timed_out(false)
-            .with_denials(denials)
-            .into_json();
-        output_guard.finish();
-        Ok(envelope)
+        });
+        let timeout = self.timeout;
+        match tokio::time::timeout(timeout, run).await {
+            Ok(joined) => {
+                let captured = joined
+                    .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
+                // Any denial the interceptor recorded lifts the envelope to `denied:true`.
+                let denials: Vec<Denial> = sink.lock().map(|g| g.clone()).unwrap_or_default();
+                let envelope = ToolEnvelope::new(SandboxKind::None)
+                    .with_disclosure(self.disclosure())
+                    .with_exit_code(captured.exit_code)
+                    .with_stdout(captured.stdout)
+                    .with_stderr(captured.stderr)
+                    .with_timed_out(false)
+                    .with_denials(denials)
+                    .into_json();
+                output_guard.finish();
+                Ok(envelope)
+            }
+            Err(_elapsed) => {
+                // FIX 3: on elapse, TRIP the FIX-2 cancel flag so the detached
+                // blocking worker observes it at the next command boundary and
+                // unwinds — a bare timeout that just returned would leave it
+                // grinding on the blocking pool. Then report the real timeout
+                // signal (`timed_out:true` + exit 124), mirroring the safe-subset
+                // and host paths, so a runaway confined command is BOUNDED. (An
+                // already-spawned long child, e.g. `sleep 30`, is not itself
+                // killed here — that needs kill-on-drop in the brush fork — but
+                // the operator recovers immediately at the ceiling.)
+                cancel.store(true, Ordering::SeqCst);
+                // Stop accepting presentation events at the timeout boundary; the
+                // detached worker may still be unwinding.
+                drop(output_guard);
+                Ok(ToolEnvelope::new(SandboxKind::None)
+                    .with_disclosure(self.disclosure())
+                    .with_exit_code(124)
+                    .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
+                    .with_timed_out(true)
+                    .into_json())
+            }
+        }
     }
 }
 
