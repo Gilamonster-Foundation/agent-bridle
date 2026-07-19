@@ -224,6 +224,35 @@ async fn env_seam_delivers_caller_vars_to_the_shell() {
     );
 }
 
+/// FIX 1 (critical #4): a confined stdin-reader must get **immediate EOF**, not
+/// the operator's terminal. Before the fix `run_in_brush` seeded `STDIN_FD` from
+/// the real `std::io::stdin()`, so a bare `cat`/`wc`/`grep` with no pipe read the
+/// operator's fd 0 — hanging the turn and stealing keystrokes. With `STDIN_FD`
+/// backed by `/dev/null`, a bare `cat` returns promptly with empty output + EOF.
+/// The `tokio::time::timeout` here is the regression teeth: on the old behavior a
+/// terminal fd 0 would block `cat` forever and this test would time out.
+#[cfg(unix)]
+#[tokio::test]
+async fn confined_stdin_reader_gets_eof_not_the_operator_terminal() {
+    let cx = ctx(Caveats::top());
+    let tool = BrushShellTool::new();
+    // Path-separator form runs the real external `/bin/cat` (the carried-coreutils
+    // `cat` shim would otherwise re-exec this non-dispatch test binary); an
+    // external child inherits the shell's STDIN_FD, so this proves the null fd
+    // reaches spawned children.
+    let invoke = tool.invoke(serde_json::json!({ "cmd": "/bin/cat" }), &cx);
+    let out = tokio::time::timeout(Duration::from_secs(10), invoke)
+        .await
+        .expect("a confined stdin-reader must not block on the operator terminal")
+        .expect("invoke");
+
+    assert_eq!(out["exit_code"], 0, "cat on /dev/null exits 0: {out}");
+    assert_eq!(
+        out["stdout"], "",
+        "stdin is /dev/null → cat reads immediate EOF, empty output: {out}"
+    );
+}
+
 /// HOME crosses the seam — the concrete #783-class motivation: without it,
 /// `~` expansion and HOME-relative tooling misbehave under the brush engine.
 /// Nothing ambient leaks in (do_not_inherit_env); only the passed value shows.

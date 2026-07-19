@@ -262,6 +262,18 @@ fn run_in_brush(
 
     let exit_code = rt.block_on(async move {
         let mut fds: HashMap<ShellFd, OpenFile> = HashMap::new();
+        // FIX 1 (critical #4): seed STDIN_FD with `/dev/null` (an at-EOF reader).
+        // Otherwise brush defaults STDIN_FD to the real `std::io::stdin()`
+        // (`openfiles.rs` `default_files`), so a confined `cat`/`wc`/`grep`/`sort`
+        // with no pipe would read the OPERATOR'S TERMINAL — hanging the turn,
+        // stealing keystrokes, and corrupting MCP stdio. `openfiles::null()` is the
+        // cross-platform sink (`/dev/null` on unix, `NUL` on Windows), mirroring
+        // how the safe-subset engine gives spawned children `Stdio::null()`.
+        fds.insert(
+            OpenFiles::STDIN_FD,
+            brush_core::openfiles::null()
+                .map_err(|e| ToolError::Exec(brush_io("open /dev/null stdin", &e)))?,
+        );
         fds.insert(OpenFiles::STDOUT_FD, OpenFile::from(out_writer));
         fds.insert(OpenFiles::STDERR_FD, OpenFile::from(err_writer));
 
