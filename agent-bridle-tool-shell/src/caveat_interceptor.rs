@@ -19,10 +19,25 @@
 //! source of truth.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_bridle_core::{Denial, DenialKind, ToolContext};
 use brush_core::extensions::{CommandInterceptor, ExecDecision, OpenDecision};
+
+/// The panic payload raised to **abort a confined brush run** when its
+/// cancellation flag is tripped (FIX 2). The `CommandInterceptor` trait can only
+/// return `Allow`/`Deny`, and a `Deny` is *swallowed* by the interpreter
+/// (converted to a failed-command exit code — `interp.rs` catches it and the
+/// enclosing `while`/`for` loop keeps running), so a returned decision can never
+/// unwind a runaway loop. Unwinding is the only in-process seam that stops the
+/// interpreter promptly at a command/redirect boundary, so on cancel the hook
+/// raises this sentinel; [`run_in_brush`](crate::brush_shell) catches *exactly*
+/// this payload and converts it to a clean cancellation error, re-raising any
+/// other panic unchanged. brush-core performs no `catch_unwind` on the execution
+/// path, so the unwind reaches the run's `block_on` intact.
+#[derive(Debug)]
+pub(crate) struct BrushCancelled;
 
 /// The shared, per-invocation denial sink.
 ///
@@ -60,6 +75,11 @@ pub struct CaveatInterceptor {
     /// [`Default`] interceptor (which still denies, just records nothing —
     /// it never reaches a live shell).
     sink: Option<DenialSink>,
+    /// Per-run cancellation flag (FIX 2). When an outer caller (the wall-clock
+    /// timeout, or a future interrupt) trips this, the next `before_exec` /
+    /// `before_open` aborts the run by raising [`BrushCancelled`]. `None` (the
+    /// default) means "no cancellation wired" — the hooks never abort.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl CaveatInterceptor {
@@ -70,7 +90,32 @@ impl CaveatInterceptor {
         Self {
             cx: Some(cx),
             sink: Some(sink),
+            cancel: None,
         }
+    }
+
+    /// Wire a per-run cancellation flag (FIX 2). When tripped, the next
+    /// `before_exec` / `before_open` aborts the run by unwinding the interpreter.
+    #[must_use]
+    pub(crate) fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Whether the run has been cancelled. `false` when no flag is wired.
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::SeqCst))
+    }
+
+    /// Abort a cancelled run: record the cancellation as a structured denial,
+    /// then unwind the interpreter via the [`BrushCancelled`] sentinel. This is
+    /// the fail-closed direction — it refuses further spawns/opens, never
+    /// permits one — so the per-command OCAP guarantee is preserved.
+    fn abort_cancelled(&self, kind: DenialKind, target: impl Into<String>) -> ! {
+        self.record(kind, target, "run cancelled (timeout or interrupt)");
+        std::panic::panic_any(BrushCancelled);
     }
 
     /// Record a denial into the shared sink (a no-op if there is no sink).
@@ -103,6 +148,12 @@ impl CommandInterceptor for CaveatInterceptor {
     /// neither `rm` nor `/bin/rm` is granted (the path-separator bypass stays
     /// closed at the funnel).
     fn before_exec(&self, program: &str, _args: &[String]) -> ExecDecision {
+        // FIX 2: a cancelled run aborts here — the next external-spawn boundary —
+        // before any admission, so a runaway loop stops promptly and no
+        // un-admitted program can slip through on the way out.
+        if self.is_cancelled() {
+            self.abort_cancelled(DenialKind::Exec, program);
+        }
         match &self.cx {
             Some(cx) => match cx.check_exec(program) {
                 Ok(()) => ExecDecision::Allow,
@@ -128,6 +179,12 @@ impl CommandInterceptor for CaveatInterceptor {
     /// reject paths that escape the granted scope via `..` or a symlink — that
     /// logic is the shared one in `agent-bridle-core`, reused here, not copied.
     fn before_open(&self, path: &Path, write: bool) -> OpenDecision {
+        // FIX 2: a cancelled run aborts at the next file-open boundary too, so a
+        // redirect-driven loop (`while read … < file`) stops promptly. Checked
+        // before the /dev/null allowance below so cancellation wins outright.
+        if self.is_cancelled() {
+            self.abort_cancelled(DenialKind::Open, path.to_string_lossy());
+        }
         // newt#969: the standard sinks are ALWAYS-permitted write targets.
         // `2>/dev/null` is the most common idiom in shell training data, and
         // writing to /dev/null|stdout|stderr is not a filesystem mutation in
