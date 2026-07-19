@@ -77,6 +77,13 @@ static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
 /// through an in-process bash-in-Rust shell confined by the `CommandInterceptor`
 /// leash. Registered under `"shell"` (the ADR 0005 D2 seam), a peer of
 /// [`ShellTool`](crate::ShellTool) / [`HostShellTool`](crate::HostShellTool).
+///
+/// **Requires `panic = "unwind"` (the default profile setting).** The
+/// timeout/interrupt cancellation seam (FIX 2/3) stops a runaway run by unwinding
+/// a private [`BrushCancelled`](crate::caveat_interceptor) sentinel out of the
+/// interpreter and catching it in `run_in_brush`. Building with `panic = "abort"`
+/// would turn every routine timeout or interrupt into a whole-process `SIGABRT`,
+/// so an embedder that sets `panic = "abort"` must not enable this engine.
 #[derive(Clone)]
 pub struct BrushShellTool {
     max_output: usize,
@@ -235,16 +242,25 @@ impl Tool for BrushShellTool {
                 Ok(envelope)
             }
             Err(_elapsed) => {
-                // FIX 3: on elapse, TRIP the FIX-2 cancel flag so the detached
-                // blocking worker observes it at the next command boundary and
-                // unwinds — a bare timeout that just returned would leave it
-                // grinding on the blocking pool. Then report the real timeout
-                // signal (`timed_out:true` + exit 124), mirroring the safe-subset
-                // and host paths, so a runaway confined command is BOUNDED. (An
-                // already-spawned long child, e.g. `sleep 30`, is not itself
-                // killed here — that needs kill-on-drop in the brush fork — but
-                // the operator recovers immediately at the ceiling.)
+                // FIX 3: on elapse, TRIP the FIX-2 cancel flag so the worker
+                // observes it at its NEXT exec/open boundary and unwinds. What
+                // this guarantees: the OPERATOR always recovers at the ceiling
+                // (`timed_out:true` + exit 124, mirroring the safe-subset/host
+                // paths). What it does NOT guarantee: that the worker/loop is
+                // actually stopped. The stop only lands if the interpreter next
+                // reaches an exec or file-open boundary; a pure-builtin loop
+                // (`while true; do :; done`), a `wait` on a background job, or a
+                // blocking fifo read reach no such boundary and keep a background
+                // thread alive until process exit. An already-spawned long child
+                // (`sleep 30`) is likewise not killed here. Closing those needs a
+                // fork-level per-iteration cancellation hook + kill-on-drop — that
+                // is Effort B (the brush fork), out of scope for this backstop.
                 cancel.store(true, Ordering::SeqCst);
+                // FIX 5: surface denials the run recorded BEFORE it timed out, so
+                // leash telemetry survives a timed-out run (the Ok branch does the
+                // same). The still-running worker may append more, but a lock
+                // serializes the read; we take the snapshot as of now.
+                let denials: Vec<Denial> = sink.lock().map(|g| g.clone()).unwrap_or_default();
                 // Stop accepting presentation events at the timeout boundary; the
                 // detached worker may still be unwinding.
                 drop(output_guard);
@@ -253,6 +269,7 @@ impl Tool for BrushShellTool {
                     .with_exit_code(124)
                     .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
                     .with_timed_out(true)
+                    .with_denials(denials)
                     .into_json())
             }
         }
@@ -297,23 +314,31 @@ fn run_in_brush(
         std::io::pipe().map_err(|e| ToolError::Exec(brush_io("create stderr pipe", &e)))?;
 
     // Drain the read ends on background threads so a chatty command cannot
-    // deadlock by filling the pipe buffer before the shell exits.
+    // deadlock by filling the pipe buffer before the shell exits. Each thread
+    // reports its captured output over a channel (FIX 4) rather than via
+    // `JoinHandle::join`: a `join` blocks the caller for the ENTIRE lifetime of
+    // any background child that inherited a dup of the write pipe (brush hands
+    // each child a real `dup(2)`; there is no kill-on-drop), which would pin a
+    // scarce `spawn_blocking` worker — so `collect_drained` bounded-waits then
+    // DETACHES instead.
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
     let stdout_output = output.clone();
-    let out_handle = std::thread::spawn(move || {
-        drain(
+    std::thread::spawn(move || {
+        let _ = out_tx.send(drain(
             out_reader,
             max_output,
             &stdout_output,
             crate::ShellOutputStream::Stdout,
-        )
+        ));
     });
-    let err_handle = std::thread::spawn(move || {
-        drain(
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = err_tx.send(drain(
             err_reader,
             max_output,
             &output,
             crate::ShellOutputStream::Stderr,
-        )
+        ));
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -329,6 +354,14 @@ fn run_in_brush(
     // run promptly and cleanly, instead of leaving a runaway loop grinding on a
     // detached blocking-pool thread. Any *other* panic is a real bug and is
     // re-raised unchanged below.
+    //
+    // Scope note: this catches a sentinel unwound out of the interpreter's *own*
+    // future. A `BrushCancelled` raised inside a `$(...)`/`&`/coprocess SUBTASK
+    // is caught at the tokio task boundary as a `JoinError`, not here — harmless
+    // for today's timeout path (that JoinHandle's result is discarded), but a
+    // future newt-interrupt path must NOT assume the sentinel unwinds all the way
+    // out of a subtask. The reliable stop for those cases is the outer timeout
+    // envelope; a subtask-level stop is Effort B (fork-side).
     let block = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async move {
             let mut fds: HashMap<ShellFd, OpenFile> = HashMap::new();
@@ -424,14 +457,14 @@ fn run_in_brush(
     let exit_code = match block {
         Ok(inner) => inner?,
         Err(payload) => {
-            // A cancel-triggered unwind is a clean stop, not a crash. The shell
-            // (and its pipe-writer clones) was dropped during the unwind, so the
-            // drain threads have already seen EOF — join them so the blocking
-            // worker finishes with no leaked thread, then return a cancellation
-            // error. Any other payload is a genuine panic; re-raise it.
+            // A cancel-triggered unwind is a clean stop, not a crash. Return the
+            // cancellation error WITHOUT waiting on the drain threads: a
+            // background child may still hold a pipe-writer dup (so the reads
+            // would never see EOF), and blocking the worker on that is exactly
+            // the pool-exhaustion bug — the drains detach and self-terminate when
+            // the child finally exits. The timeout envelope carries no captured
+            // output anyway. Any other payload is a genuine panic; re-raise it.
             if payload.is::<crate::caveat_interceptor::BrushCancelled>() {
-                let _ = out_handle.join();
-                let _ = err_handle.join();
                 return Err(ToolError::denied(
                     "brush run cancelled (timeout or interrupt)",
                 ));
@@ -440,18 +473,47 @@ fn run_in_brush(
         }
     };
 
-    let stdout = out_handle
-        .join()
-        .map_err(|_| ToolError::denied("stdout reader thread panicked"))??;
-    let stderr = err_handle
-        .join()
-        .map_err(|_| ToolError::denied("stderr reader thread panicked"))??;
+    let stdout = collect_drained(&out_rx, "stdout")?;
+    let stderr = collect_drained(&err_rx, "stderr")?;
 
     Ok(Captured {
         exit_code,
         stdout,
         stderr,
     })
+}
+
+/// Wall-clock ceiling for waiting on a drain thread before DETACHING it (FIX 4).
+/// The drain finishes as soon as every writer — the shell's own clones plus any
+/// dup a background child inherited — is closed; in the common case (no surviving
+/// child) that is immediate after `drop(shell)`, so this bound is only ever hit
+/// when a background child keeps a pipe-writer dup open. It caps how long a single
+/// confined run can hold its `spawn_blocking` worker on drain, well under the
+/// engine's wall-clock timeout.
+const DRAIN_DETACH_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Collect a drain thread's captured output without ever pinning the (scarce)
+/// `spawn_blocking` worker on it (FIX 4 / finding #7). Returns as soon as the
+/// drain finishes; if a background child holds a pipe-writer dup past
+/// [`DRAIN_DETACH_DEADLINE`], DETACHES the drain thread (a cheap leaked OS thread
+/// that self-terminates when the child eventually exits) and returns empty — the
+/// observer already received the live bytes; the worker is freed rather than hung
+/// for the child's whole lifetime.
+fn collect_drained(
+    rx: &std::sync::mpsc::Receiver<ToolResult<String>>,
+    stream: &str,
+) -> ToolResult<String> {
+    use std::sync::mpsc::RecvTimeoutError;
+    match rx.recv_timeout(DRAIN_DETACH_DEADLINE) {
+        // The drain finished and reported its captured output (or a drain error).
+        Ok(result) => result,
+        // A background child still holds the write pipe: detach, free the worker.
+        Err(RecvTimeoutError::Timeout) => Ok(String::new()),
+        // The drain thread dropped its sender without reporting — it panicked.
+        Err(RecvTimeoutError::Disconnected) => Err(ToolError::denied(format!(
+            "{stream} reader thread panicked"
+        ))),
+    }
 }
 
 /// The curated builtin set: the bash-mode default set with [`REMOVED_BUILTINS`]
@@ -627,6 +689,80 @@ mod cancel_tests {
         assert!(
             res.is_err(),
             "a cancelled run returns a cancellation error: {res:?}"
+        );
+    }
+}
+
+/// FIX 4 detach-mechanism tests. The load-bearing behavior — free the scarce
+/// `spawn_blocking` worker instead of pinning it for the whole lifetime of a
+/// background child that holds a pipe-writer dup — lives in `collect_drained`, so
+/// it is exercised DIRECTLY here. (An end-to-end `sleep 5 & echo hi` invoke would
+/// route through brush's real `&` job control, which is inherently racy on the
+/// per-run current-thread runtime — finding #7 / Effort B — and makes a timing
+/// assertion flaky; the detach itself is deterministic.)
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Instant;
+
+    /// A writer kept open (as a surviving background child would keep its dup)
+    /// must NOT pin the caller: `collect_drained` bounded-waits to the deadline,
+    /// then DETACHES and returns — freeing the worker while a cheap OS drain
+    /// thread lingers until the writer finally closes.
+    #[test]
+    fn collect_drained_detaches_when_a_writer_stays_open() {
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(drain(
+                reader,
+                DEFAULT_MAX_OUTPUT,
+                &OutputEmitter::default(),
+                crate::ShellOutputStream::Stdout,
+            ));
+        });
+
+        let start = Instant::now();
+        let out = collect_drained(&rx, "stdout").expect("no drain error");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= DRAIN_DETACH_DEADLINE
+                && elapsed < DRAIN_DETACH_DEADLINE + Duration::from_secs(2),
+            "must detach ~at the deadline, not block on the held-open writer: {elapsed:?}"
+        );
+        assert_eq!(out, "", "detached before EOF → empty captured output");
+
+        // Releasing the writer lets the detached drain thread reach EOF and end.
+        drop(writer);
+    }
+
+    /// The common case: once every writer is closed the drain reaches EOF and
+    /// `collect_drained` returns the FULL captured output PROMPTLY — well under
+    /// the detach deadline — so normal runs lose nothing to the backstop.
+    #[test]
+    fn collect_drained_returns_full_output_promptly_when_writers_close() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"captured-output").expect("write");
+        drop(writer); // EOF: no surviving writer dup.
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(drain(
+                reader,
+                DEFAULT_MAX_OUTPUT,
+                &OutputEmitter::default(),
+                crate::ShellOutputStream::Stdout,
+            ));
+        });
+
+        let start = Instant::now();
+        let out = collect_drained(&rx, "stdout").expect("no drain error");
+        assert_eq!(out, "captured-output", "full foreground output is captured");
+        assert!(
+            start.elapsed() < DRAIN_DETACH_DEADLINE,
+            "must return as soon as the drain EOFs, not wait out the detach deadline"
         );
     }
 }

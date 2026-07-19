@@ -34,8 +34,19 @@ use brush_core::extensions::{CommandInterceptor, ExecDecision, OpenDecision};
 /// interpreter promptly at a command/redirect boundary, so on cancel the hook
 /// raises this sentinel; [`run_in_brush`](crate::brush_shell) catches *exactly*
 /// this payload and converts it to a clean cancellation error, re-raising any
-/// other panic unchanged. brush-core performs no `catch_unwind` on the execution
-/// path, so the unwind reaches the run's `block_on` intact.
+/// other panic unchanged.
+///
+/// Reach: this stops the interpreter's OWN future. When the offending command
+/// runs in a subtask — `$(...)`, `&`, a coprocess — the sentinel unwinds only to
+/// that subtask's tokio boundary, where it surfaces as a `JoinError`, not to
+/// `run_in_brush`'s `catch_unwind`. That is harmless for the timeout path (whose
+/// worker result is discarded), but a future newt-interrupt path must not rely on
+/// the sentinel propagating out of a subtask; the reliable stop there is the
+/// outer wall-clock timeout, and a true subtask-level stop is Effort B (fork).
+///
+/// Requires `panic = "unwind"` (the default). Under `panic = "abort"` this
+/// sentinel would turn a routine timeout/interrupt into a whole-process
+/// `SIGABRT` — see the note on [`BrushShellTool`](crate::BrushShellTool).
 #[derive(Debug)]
 pub(crate) struct BrushCancelled;
 
