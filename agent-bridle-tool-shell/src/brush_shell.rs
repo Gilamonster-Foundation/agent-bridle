@@ -255,6 +255,33 @@ impl Tool for BrushShellTool {
                 // (`sleep 30`) is likewise not killed here. Closing those needs a
                 // fork-level per-iteration cancellation hook + kill-on-drop — that
                 // is Effort B (the brush fork), out of scope for this backstop.
+                //
+                // ENGINE DEFECT this ceiling is currently masking (measured
+                // 2026-07-19, brush-ocap-core 0.5.0): a COMPOUND command
+                // (`while`/`for`/`if`/`{…}`/subshell) used as a NON-FINAL pipeline
+                // stage deadlocks once it writes more than one pipe buffer
+                // (64 KiB on macOS). `interp.rs` `ExecuteInPipeline for
+                // ast::Command`, arm `Self::Compound(..)`, runs the compound
+                // INLINE to completion (`.await` → `ExecutionSpawnResult::
+                // Completed`) instead of spawning it like the `Self::Simple` arm
+                // does, and `spawn_pipeline_processes` awaits each stage in
+                // order — so the DOWNSTREAM stage is not created until the
+                // compound finishes. The compound therefore writes into a pipe
+                // with no reader, fills the buffer, and blocks forever.
+                //
+                // Measured: `while …; done | cat` emitting 2000×32B (62 KiB)
+                // completes in 0.23s; the same loop at 2100×32B (65 KiB) never
+                // completes (still running at a 240s ceiling). It needs NO
+                // external command to reproduce — a pure-builtin `echo` body is
+                // enough — so this is NOT a spawn-cost problem, and it is the
+                // real reason the canonical `find … | while read f; do wc -l
+                // "$f"; done | sort -rn | head` "hangs" on a large tree while
+                // bash runs it in ~3s. Below the threshold the same pipeline is
+                // byte-identical to bash and already at spawn-cost parity.
+                //
+                // The fix is fork-side (Effort B): the `Compound` arm must spawn
+                // to a task and return `StartedTask` when it is a non-final
+                // stage, mirroring `execute_via_builtin_in_owned_shell`.
                 cancel.store(true, Ordering::SeqCst);
                 // FIX 5: surface denials the run recorded BEFORE it timed out, so
                 // leash telemetry survives a timed-out run (the Ok branch does the
@@ -689,6 +716,85 @@ mod cancel_tests {
         assert!(
             res.is_err(),
             "a cancelled run returns a cancellation error: {res:?}"
+        );
+    }
+
+    /// **The carried-coreutils cancellation guard.** A loop whose body is a
+    /// CARRIED util (`cat`, registered as a shim builtin) must remain
+    /// cancellable — the same property the plain-external loop above pins.
+    ///
+    /// This holds today *because* the carried shim re-execs, so every iteration
+    /// still crosses `before_exec`, where both the leash and the cancel flag
+    /// live. It is pinned here as a REGRESSION GUARD for the in-process
+    /// carried-coreutils work (B1.1): the moment a carried util stops leaving
+    /// the process, it stops crossing `before_exec`, and this test fails unless
+    /// that new in-process dispatch path checks the cancel flag itself. Do not
+    /// delete it when making carried utils in-process — make it pass.
+    ///
+    /// Hermetic by construction: the caveats grant nothing, so each iteration's
+    /// re-exec is refused at `before_exec` (a cheap recorded denial, no real
+    /// subprocess) while still hitting the cancellation seam every time.
+    #[cfg(feature = "carried-coreutils")]
+    #[test]
+    fn tripping_cancel_stops_a_loop_of_a_carried_coreutil() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
+        let cx = ctx(Caveats {
+            exec: Scope::only(["__never_in_scope__".to_string()]),
+            ..Caveats::top()
+        });
+        let interceptor =
+            CaveatInterceptor::new(cx, Arc::clone(&sink)).with_cancel(Arc::clone(&cancel));
+
+        // `cat` resolves to the carried shim, NOT to /bin/cat: PATH is empty, so
+        // nothing external could satisfy it.
+        let worker = std::thread::spawn(move || {
+            run_in_brush(
+                "while true; do cat /etc/hostname; done".to_string(),
+                None,
+                String::new(),
+                BTreeMap::new(),
+                interceptor,
+                DEFAULT_MAX_OUTPUT,
+                OutputEmitter::default(),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !worker.is_finished(),
+            "the carried-util loop should still be spinning before cancel"
+        );
+
+        cancel.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "cancel did not stop a loop of a CARRIED util — it is unbounded"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let res = worker
+            .join()
+            .expect("the worker must return cleanly, not panic (sentinel is caught)");
+        assert!(
+            res.is_err(),
+            "a cancelled carried-util run returns a cancellation error: {res:?}"
+        );
+
+        // The loop really did reach the admission seam every iteration (rather
+        // than running the util in-process, invisible to the leash).
+        let recorded = sink.lock().expect("sink").clone();
+        assert!(
+            !recorded.is_empty(),
+            "a carried util must cross the interceptor, leaving denials"
+        );
+        assert!(
+            recorded.iter().any(|d| d.kind == DenialKind::Exec),
+            "the carried-util loop must register exec-axis denials: {recorded:?}"
         );
     }
 }
