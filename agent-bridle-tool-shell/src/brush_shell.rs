@@ -77,13 +77,6 @@ static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
 /// through an in-process bash-in-Rust shell confined by the `CommandInterceptor`
 /// leash. Registered under `"shell"` (the ADR 0005 D2 seam), a peer of
 /// [`ShellTool`](crate::ShellTool) / [`HostShellTool`](crate::HostShellTool).
-///
-/// **Requires `panic = "unwind"` (the default profile setting).** The
-/// timeout/interrupt cancellation seam (FIX 2/3) stops a runaway run by unwinding
-/// a private [`BrushCancelled`](crate::caveat_interceptor) sentinel out of the
-/// interpreter and catching it in `run_in_brush`. Building with `panic = "abort"`
-/// would turn every routine timeout or interrupt into a whole-process `SIGABRT`,
-/// so an embedder that sets `panic = "abort"` must not enable this engine.
 #[derive(Clone)]
 pub struct BrushShellTool {
     max_output: usize,
@@ -119,8 +112,9 @@ impl BrushShellTool {
     }
 
     /// Override the wall-clock ceiling (three-Cs: Configuration). A run that
-    /// exceeds `timeout` is stopped — the FIX-2 cancel flag is tripped so the
-    /// worker unwinds — and reported `timed_out:true` with exit 124.
+    /// exceeds `timeout` is stopped — the FIX-2 cancel flag is tripped, and the
+    /// worker's next command is denied terminatingly — and reported
+    /// `timed_out:true` with exit 124.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -242,19 +236,19 @@ impl Tool for BrushShellTool {
                 Ok(envelope)
             }
             Err(_elapsed) => {
-                // FIX 3: on elapse, TRIP the FIX-2 cancel flag so the worker
-                // observes it at its NEXT exec/open boundary and unwinds. What
-                // this guarantees: the OPERATOR always recovers at the ceiling
+                // FIX 3: on elapse, TRIP the FIX-2 cancel flag. The worker
+                // observes it at its next COMMAND boundary — `before_command`
+                // fires for every command, builtins included, and its `Deny` is
+                // terminating — so the operator recovers at the ceiling
                 // (`timed_out:true` + exit 124, mirroring the safe-subset/host
-                // paths). What it does NOT guarantee: that the worker/loop is
-                // actually stopped. The stop only lands if the interpreter next
-                // reaches an exec or file-open boundary; a pure-builtin loop
-                // (`while true; do :; done`), a `wait` on a background job, or a
-                // blocking fifo read reach no such boundary and keep a background
-                // thread alive until process exit. An already-spawned long child
-                // (`sleep 30`) is likewise not killed here. Closing those needs a
-                // fork-level per-iteration cancellation hook + kill-on-drop — that
-                // is Effort B (the brush fork), out of scope for this backstop.
+                // paths) AND the interpreter actually stops, including a
+                // pure-builtin loop (`while true; do :; done`).
+                //
+                // Residual gap: a run already blocked INSIDE a command reaches no
+                // further command boundary, so it is not stopped here — a `wait`
+                // on a background job, a blocking fifo read, or an
+                // already-spawned long child (`sleep 30`, which is also not
+                // killed). Those need kill-on-drop at the fork level (Effort B).
                 //
                 // ENGINE DEFECT this ceiling is currently masking (measured
                 // 2026-07-19, brush-ocap-core 0.5.0): a COMPOUND command
@@ -289,7 +283,7 @@ impl Tool for BrushShellTool {
                 // serializes the read; we take the snapshot as of now.
                 let denials: Vec<Denial> = sink.lock().map(|g| g.clone()).unwrap_or_default();
                 // Stop accepting presentation events at the timeout boundary; the
-                // detached worker may still be unwinding.
+                // detached worker may still be winding down.
                 drop(output_guard);
                 Ok(ToolEnvelope::new(SandboxKind::None)
                     .with_disclosure(self.disclosure())
@@ -327,14 +321,6 @@ fn run_in_brush(
     max_output: usize,
     output: OutputEmitter,
 ) -> ToolResult<Captured> {
-    // FIX 2: cancellation unwinds via a `BrushCancelled` panic. That is expected
-    // control flow, not a crash, so silence the default panic hook's stderr
-    // report *for that sentinel only* — otherwise every timeout/interrupt would
-    // spew "thread panicked at … BrushCancelled" onto the operator's terminal
-    // (the very stdio-corruption FIX 1 guards against). All other panics still
-    // reach the previous hook unchanged.
-    install_cancel_silence_hook();
-
     let (out_reader, out_writer) =
         std::io::pipe().map_err(|e| ToolError::Exec(brush_io("create stdout pipe", &e)))?;
     let (err_reader, err_writer) =
@@ -375,130 +361,104 @@ fn run_in_brush(
 
     let working_dir = cwd.map(std::path::PathBuf::from);
 
-    // FIX 2: run the interpreter under `catch_unwind` so a cancel-triggered
-    // `BrushCancelled` unwind — raised by the interceptor at the next
-    // command/redirect boundary when the run's cancel flag is tripped — stops the
-    // run promptly and cleanly, instead of leaving a runaway loop grinding on a
-    // detached blocking-pool thread. Any *other* panic is a real bug and is
-    // re-raised unchanged below.
-    //
-    // Scope note: this catches a sentinel unwound out of the interpreter's *own*
-    // future. A `BrushCancelled` raised inside a `$(...)`/`&`/coprocess SUBTASK
-    // is caught at the tokio task boundary as a `JoinError`, not here — harmless
-    // for today's timeout path (that JoinHandle's result is discarded), but a
-    // future newt-interrupt path must NOT assume the sentinel unwinds all the way
-    // out of a subtask. The reliable stop for those cases is the outer timeout
-    // envelope; a subtask-level stop is Effort B (fork-side).
-    let block = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(async move {
-            let mut fds: HashMap<ShellFd, OpenFile> = HashMap::new();
-            // FIX 1 (critical #4): seed STDIN_FD with `/dev/null` (an at-EOF reader).
-            // Otherwise brush defaults STDIN_FD to the real `std::io::stdin()`
-            // (`openfiles.rs` `default_files`), so a confined `cat`/`wc`/`grep`/`sort`
-            // with no pipe would read the OPERATOR'S TERMINAL — hanging the turn,
-            // stealing keystrokes, and corrupting MCP stdio. `openfiles::null()` is the
-            // cross-platform sink (`/dev/null` on unix, `NUL` on Windows), mirroring
-            // how the safe-subset engine gives spawned children `Stdio::null()`.
-            fds.insert(
-                OpenFiles::STDIN_FD,
-                brush_core::openfiles::null()
-                    .map_err(|e| ToolError::Exec(brush_io("open /dev/null stdin", &e)))?,
-            );
-            fds.insert(OpenFiles::STDOUT_FD, OpenFile::from(out_writer));
-            fds.insert(OpenFiles::STDERR_FD, OpenFile::from(err_writer));
+    let exit_code = rt.block_on(async move {
+        let mut fds: HashMap<ShellFd, OpenFile> = HashMap::new();
+        // FIX 1 (critical #4): seed STDIN_FD with `/dev/null` (an at-EOF reader).
+        // Otherwise brush defaults STDIN_FD to the real `std::io::stdin()`
+        // (`openfiles.rs` `default_files`), so a confined `cat`/`wc`/`grep`/`sort`
+        // with no pipe would read the OPERATOR'S TERMINAL — hanging the turn,
+        // stealing keystrokes, and corrupting MCP stdio. `openfiles::null()` is the
+        // cross-platform sink (`/dev/null` on unix, `NUL` on Windows), mirroring
+        // how the safe-subset engine gives spawned children `Stdio::null()`.
+        fds.insert(
+            OpenFiles::STDIN_FD,
+            brush_core::openfiles::null()
+                .map_err(|e| ToolError::Exec(brush_io("open /dev/null stdin", &e)))?,
+        );
+        fds.insert(OpenFiles::STDOUT_FD, OpenFile::from(out_writer));
+        fds.insert(OpenFiles::STDERR_FD, OpenFile::from(err_writer));
 
-            let mut shell: Shell<LeashedExtensions> =
-                Shell::builder_with_extensions::<LeashedExtensions>()
-                    .command_interceptor(interceptor)
-                    .builtins(confined_builtins())
-                    .do_not_inherit_env(true)
-                    .no_editing(true)
-                    .interactive(false)
-                    .fds(fds)
-                    .maybe_working_dir(working_dir)
-                    .build()
-                    .await
-                    .map_err(|e| ToolError::Exec(brush_io("build shell", &e)))?;
+        let mut shell: Shell<LeashedExtensions> =
+            Shell::builder_with_extensions::<LeashedExtensions>()
+                .command_interceptor(interceptor)
+                .builtins(confined_builtins())
+                .do_not_inherit_env(true)
+                .no_editing(true)
+                .interactive(false)
+                .fds(fds)
+                .maybe_working_dir(working_dir)
+                .build()
+                .await
+                .map_err(|e| ToolError::Exec(brush_io("build shell", &e)))?;
 
-            // Register the carried coreutils shims (issue #206). They re-exec
-            // `<self> --invoke-bundled <name>`, so they resolve in-process ONLY when
-            // the host binary is dispatch-capable (calls `maybe_dispatch()` in main).
-            // The re-exec still funnels through the `before_exec` interceptor.
-            #[cfg(feature = "carried-coreutils")]
-            {
-                crate::coreutils_dispatch::install_default_providers();
-                crate::coreutils_dispatch::register_shims(&mut shell);
+        // Register the carried coreutils shims (issue #206). They re-exec
+        // `<self> --invoke-bundled <name>`, so they resolve in-process ONLY when
+        // the host binary is dispatch-capable (calls `maybe_dispatch()` in main).
+        // The re-exec still funnels through the `before_exec` interceptor.
+        #[cfg(feature = "carried-coreutils")]
+        {
+            crate::coreutils_dispatch::install_default_providers();
+            crate::coreutils_dispatch::register_shims(&mut shell);
+        }
+
+        shell
+            .env_mut()
+            .set_global("PATH", ShellVariable::new(path_value))
+            .map_err(|e| ToolError::Exec(brush_io("seed PATH", &e)))?;
+
+        // Windows: a child spawned under `do_not_inherit_env(true)` needs the
+        // OS-minimal vars (`SystemRoot`, …) or `CreateProcess`/CRT init fails to
+        // start it at all. These are not secrets — every Windows process needs
+        // them — so seeding them keeps external commands and the carried-coreutils
+        // re-exec runnable under confinement. Unix needs none of this.
+        #[cfg(windows)]
+        for key in [
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "NUMBER_OF_PROCESSORS",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                let _ = shell.env_mut().set_global(key, ShellVariable::new(val));
             }
+        }
 
+        // Import the caller-provided env (the schema's `env` seam) LAST, so a
+        // caller `PATH` (e.g. a venv-prepended one) wins over the exec-scope
+        // seed above — matching the host and safe-subset engines. This does NOT
+        // widen authority: `before_exec` gates the RESOLVED PROGRAM against the
+        // caveats regardless of `PATH` (host_shell.schema.json). Nothing ambient
+        // is inherited; only these explicitly-passed vars cross the boundary.
+        for (key, val) in &env {
             shell
                 .env_mut()
-                .set_global("PATH", ShellVariable::new(path_value))
-                .map_err(|e| ToolError::Exec(brush_io("seed PATH", &e)))?;
-
-            // Windows: a child spawned under `do_not_inherit_env(true)` needs the
-            // OS-minimal vars (`SystemRoot`, …) or `CreateProcess`/CRT init fails to
-            // start it at all. These are not secrets — every Windows process needs
-            // them — so seeding them keeps external commands and the carried-coreutils
-            // re-exec runnable under confinement. Unix needs none of this.
-            #[cfg(windows)]
-            for key in [
-                "SystemRoot",
-                "SystemDrive",
-                "windir",
-                "TEMP",
-                "TMP",
-                "USERPROFILE",
-                "NUMBER_OF_PROCESSORS",
-            ] {
-                if let Ok(val) = std::env::var(key) {
-                    let _ = shell.env_mut().set_global(key, ShellVariable::new(val));
-                }
-            }
-
-            // Import the caller-provided env (the schema's `env` seam) LAST, so a
-            // caller `PATH` (e.g. a venv-prepended one) wins over the exec-scope
-            // seed above — matching the host and safe-subset engines. This does NOT
-            // widen authority: `before_exec` gates the RESOLVED PROGRAM against the
-            // caveats regardless of `PATH` (host_shell.schema.json). Nothing ambient
-            // is inherited; only these explicitly-passed vars cross the boundary.
-            for (key, val) in &env {
-                shell
-                    .env_mut()
-                    .set_global(key, ShellVariable::new(val.clone()))
-                    .map_err(|e| ToolError::Exec(brush_io("seed env var", &e)))?;
-            }
-
-            let result = shell
-                .run_dash_c_command(cmd)
-                .await
-                .map_err(|e| ToolError::Exec(brush_io("run command", &e)))?;
-
-            // Drop the shell so it releases its clones of the pipe writers; only then
-            // do the reader threads see EOF.
-            drop(shell);
-
-            Ok::<i32, ToolError>(i32::from(u8::from(result.exit_code)))
-        })
-    }));
-
-    let exit_code = match block {
-        Ok(inner) => inner?,
-        Err(payload) => {
-            // A cancel-triggered unwind is a clean stop, not a crash. Return the
-            // cancellation error WITHOUT waiting on the drain threads: a
-            // background child may still hold a pipe-writer dup (so the reads
-            // would never see EOF), and blocking the worker on that is exactly
-            // the pool-exhaustion bug — the drains detach and self-terminate when
-            // the child finally exits. The timeout envelope carries no captured
-            // output anyway. Any other payload is a genuine panic; re-raise it.
-            if payload.is::<crate::caveat_interceptor::BrushCancelled>() {
-                return Err(ToolError::denied(
-                    "brush run cancelled (timeout or interrupt)",
-                ));
-            }
-            std::panic::resume_unwind(payload);
+                .set_global(key, ShellVariable::new(val.clone()))
+                .map_err(|e| ToolError::Exec(brush_io("seed env var", &e)))?;
         }
-    };
+
+        let result = shell.run_dash_c_command(cmd).await.map_err(|e| {
+            // FIX 2: the interceptor's `before_command` answers a cancelled
+            // run with a TERMINATING `CommandDenied`, which the interpreter
+            // propagates out of the run instead of folding into an exit
+            // status an enclosing loop would shrug off. That is the only
+            // terminating error we can provoke, so it is exactly this run's
+            // clean cancellation.
+            if e.is_terminating() {
+                ToolError::denied("brush run cancelled (timeout or interrupt)")
+            } else {
+                ToolError::Exec(brush_io("run command", &e))
+            }
+        })?;
+
+        // Drop the shell so it releases its clones of the pipe writers; only then
+        // do the reader threads see EOF.
+        drop(shell);
+
+        Ok::<i32, ToolError>(i32::from(u8::from(result.exit_code)))
+    })?;
 
     let stdout = collect_drained(&out_rx, "stdout")?;
     let stderr = collect_drained(&err_rx, "stderr")?;
@@ -571,26 +531,6 @@ fn brush_io(ctx: &str, e: &impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(format!("{ctx}: {e}"))
 }
 
-/// Install (once, process-wide) a panic hook that swallows the [`BrushCancelled`]
-/// cancellation sentinel and delegates every other panic to the hook that was
-/// installed before it. Idempotent via [`std::sync::Once`]; suppresses only our
-/// private sentinel type, so no real panic is ever hidden.
-fn install_cancel_silence_hook() {
-    static HOOK: std::sync::Once = std::sync::Once::new();
-    HOOK.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if info
-                .payload()
-                .is::<crate::caveat_interceptor::BrushCancelled>()
-            {
-                return;
-            }
-            previous(info);
-        }));
-    });
-}
-
 /// FIX 2 cancellation-seam tests. These exercise the private `run_in_brush`
 /// funnel directly (the cancel flag is per-run and, until the timeout wiring in
 /// FIX 3, not reachable through `invoke`), and are real-spawn by nature — brush
@@ -660,16 +600,17 @@ mod cancel_tests {
         assert_eq!(recorded[0].kind, DenialKind::Exec);
     }
 
-    /// The load-bearing recovery test: a loop that would spin forever is stopped
-    /// PROMPTLY by tripping the flag mid-run, and the blocking worker FINISHES —
-    /// no leaked, grinding thread (report open-Q #4). The worker returns an error
-    /// (not a panic escaping the funnel: `catch_unwind` converts the sentinel).
+    /// The load-bearing recovery property, shared by every loop shape below: a
+    /// loop that would spin forever is stopped PROMPTLY by tripping the flag
+    /// mid-run, and the blocking worker FINISHES — no leaked, grinding thread
+    /// (report open-Q #4) — returning a cancellation error rather than panicking.
     ///
-    /// The loop body is an out-of-scope external, so pre-cancel each iteration is
-    /// a cheap `before_exec` denial (no real subprocess) — a light, hermetic busy
-    /// loop that still hits the cancellation seam every iteration.
-    #[test]
-    fn tripping_cancel_stops_a_running_loop_and_the_worker_finishes() {
+    /// Hermetic by construction: the caveats grant no exec authority, so a loop
+    /// body that *is* an external is refused at `before_exec` (a cheap recorded
+    /// denial, no real subprocess) while still cycling the interpreter.
+    ///
+    /// Returns the recorded denials so a caller can assert on them.
+    fn assert_loop_is_cancellable(cmd: &str, path: &str, what: &str) -> Vec<Denial> {
         let cancel = Arc::new(AtomicBool::new(false));
         let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
         let cx = ctx(Caveats {
@@ -679,11 +620,12 @@ mod cancel_tests {
         let interceptor =
             CaveatInterceptor::new(cx, Arc::clone(&sink)).with_cancel(Arc::clone(&cancel));
 
+        let (cmd, path) = (cmd.to_string(), path.to_string());
         let worker = std::thread::spawn(move || {
             run_in_brush(
-                "while true; do /bin/true; done".to_string(),
+                cmd,
                 None,
-                RESTRICTED_PATH.to_string(),
+                path,
                 BTreeMap::new(),
                 interceptor,
                 DEFAULT_MAX_OUTPUT,
@@ -695,103 +637,76 @@ mod cancel_tests {
         std::thread::sleep(Duration::from_millis(150));
         assert!(
             !worker.is_finished(),
-            "the loop should still be spinning before cancel"
+            "the {what} loop should still be spinning before cancel"
         );
 
-        // Trip the flag: the next `before_exec` observes it and unwinds.
+        // Trip the flag: the next `before_command` observes it and terminates.
         cancel.store(true, Ordering::SeqCst);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !worker.is_finished() {
             assert!(
                 Instant::now() < deadline,
-                "cancel did not stop the loop — the blocking worker leaked"
+                "cancel did not stop the {what} loop — the blocking worker leaked"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
 
         let res = worker
             .join()
-            .expect("the worker must return cleanly, not panic (sentinel is caught)");
+            .expect("the worker must return cleanly, not panic");
         assert!(
             res.is_err(),
-            "a cancelled run returns a cancellation error: {res:?}"
+            "a cancelled {what} run returns a cancellation error: {res:?}"
+        );
+        let recorded = sink.lock().expect("sink").clone();
+        recorded
+    }
+
+    /// **The headline bound.** A loop of PURE BUILTINS reaches no external-spawn
+    /// and no file-open boundary, so before `before_command` existed it had no
+    /// observation point at all: the timeout fired, the caller got exit 124, and
+    /// the detached worker span a CPU until process exit. `before_command` fires
+    /// once per command — builtins included — and its `Deny` terminates the run
+    /// instead of being folded into an exit status the enclosing loop shrugs off.
+    #[test]
+    fn tripping_cancel_stops_a_pure_builtin_loop() {
+        assert_loop_is_cancellable("while true; do :; done", "", "pure-builtin");
+    }
+
+    /// The external-command shape: unchanged behavior, now observed one hook
+    /// earlier (`before_command` precedes `before_exec` on every path).
+    #[test]
+    fn tripping_cancel_stops_a_loop_of_an_external_command() {
+        assert_loop_is_cancellable(
+            "while true; do /bin/true; done",
+            RESTRICTED_PATH,
+            "external",
         );
     }
 
     /// **The carried-coreutils cancellation guard.** A loop whose body is a
     /// CARRIED util (`cat`, registered as a shim builtin) must remain
-    /// cancellable — the same property the plain-external loop above pins.
+    /// cancellable — the same property the shapes above pin.
     ///
-    /// This holds today *because* the carried shim re-execs, so every iteration
-    /// still crosses `before_exec`, where both the leash and the cancel flag
-    /// live. It is pinned here as a REGRESSION GUARD for the in-process
-    /// carried-coreutils work (B1.1): the moment a carried util stops leaving
-    /// the process, it stops crossing `before_exec`, and this test fails unless
-    /// that new in-process dispatch path checks the cancel flag itself. Do not
-    /// delete it when making carried utils in-process — make it pass.
-    ///
-    /// Hermetic by construction: the caveats grant nothing, so each iteration's
-    /// re-exec is refused at `before_exec` (a cheap recorded denial, no real
-    /// subprocess) while still hitting the cancellation seam every time.
+    /// This now holds for the strongest reason: `before_command` fires for the
+    /// shim itself, so cancellation no longer depends on the shim's re-exec
+    /// crossing `before_exec`. It stays a REGRESSION GUARD for the in-process
+    /// carried-coreutils work (B1.1) — the denial assertion below still pins
+    /// that a carried util crosses the leash — so do not delete it when making
+    /// carried utils in-process; make it pass.
     #[cfg(feature = "carried-coreutils")]
     #[test]
     fn tripping_cancel_stops_a_loop_of_a_carried_coreutil() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
-        let cx = ctx(Caveats {
-            exec: Scope::only(["__never_in_scope__".to_string()]),
-            ..Caveats::top()
-        });
-        let interceptor =
-            CaveatInterceptor::new(cx, Arc::clone(&sink)).with_cancel(Arc::clone(&cancel));
-
         // `cat` resolves to the carried shim, NOT to /bin/cat: PATH is empty, so
         // nothing external could satisfy it.
-        let worker = std::thread::spawn(move || {
-            run_in_brush(
-                "while true; do cat /etc/hostname; done".to_string(),
-                None,
-                String::new(),
-                BTreeMap::new(),
-                interceptor,
-                DEFAULT_MAX_OUTPUT,
-                OutputEmitter::default(),
-            )
-        });
-
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(
-            !worker.is_finished(),
-            "the carried-util loop should still be spinning before cancel"
+        let recorded = assert_loop_is_cancellable(
+            "while true; do cat /etc/hostname; done",
+            "",
+            "carried-util",
         );
-
-        cancel.store(true, Ordering::SeqCst);
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !worker.is_finished() {
-            assert!(
-                Instant::now() < deadline,
-                "cancel did not stop a loop of a CARRIED util — it is unbounded"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        let res = worker
-            .join()
-            .expect("the worker must return cleanly, not panic (sentinel is caught)");
-        assert!(
-            res.is_err(),
-            "a cancelled carried-util run returns a cancellation error: {res:?}"
-        );
-
         // The loop really did reach the admission seam every iteration (rather
         // than running the util in-process, invisible to the leash).
-        let recorded = sink.lock().expect("sink").clone();
-        assert!(
-            !recorded.is_empty(),
-            "a carried util must cross the interceptor, leaving denials"
-        );
         assert!(
             recorded.iter().any(|d| d.kind == DenialKind::Exec),
             "the carried-util loop must register exec-axis denials: {recorded:?}"
