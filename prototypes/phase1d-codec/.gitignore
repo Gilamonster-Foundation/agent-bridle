@@ -1,0 +1,4 @@
+# build artifacts — keep source, lockfiles, and golden vectors
+rust/target/
+ts/node_modules/
+dart/.dart_tool/

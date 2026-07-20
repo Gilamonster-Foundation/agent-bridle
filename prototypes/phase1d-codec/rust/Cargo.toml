@@ -1,0 +1,15 @@
+[package]
+name = "phase1d-codec-rust"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone prototype — NOT an agent-bridle workspace member (see the
+# `[workspace]` stanza below, which detaches it from the parent workspace).
+[workspace]
+
+[dependencies]
+blake3 = "1"
+ed25519-dalek = "2"
+hex = "0.4"
+serde_json = "1"
