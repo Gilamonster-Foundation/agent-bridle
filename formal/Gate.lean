@@ -18,6 +18,7 @@ def proofEscapeErrors
 
 def isFormalRoot (module : String) : Bool :=
   module == "Ceremony" || module == "Tests" || module == "Gate"
+    || module == "AxiomAudit"
 
 def main : IO Unit := do
   let ceremonyRoot <- IO.FS.readFile "Ceremony.lean"
