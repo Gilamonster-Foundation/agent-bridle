@@ -9,6 +9,8 @@
 //! `Shell::open_file` — so a policy applied here cannot be circumvented by
 //! spelling a command (or a redirection target) differently. This makes the
 //! confined shell a true superset of an `sh -c` cmd-string shell, cross-OS.
+//! A third hook, `before_command`, fires once per command — builtins included —
+//! and is where **cancellation** is observed; see the impl below.
 //!
 //! [`CaveatInterceptor`] carries one invocation's **effective** caveats (the
 //! `ToolContext` minted by the gate) and delegates every decision to the
@@ -24,32 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_bridle_core::{Denial, DenialKind, ToolContext};
-use brush_core::extensions::{CommandInterceptor, ExecDecision, OpenDecision};
-
-/// The panic payload raised to **abort a confined brush run** when its
-/// cancellation flag is tripped (FIX 2). The `CommandInterceptor` trait can only
-/// return `Allow`/`Deny`, and a `Deny` is *swallowed* by the interpreter
-/// (converted to a failed-command exit code — `interp.rs` catches it and the
-/// enclosing `while`/`for` loop keeps running), so a returned decision can never
-/// unwind a runaway loop. Unwinding is the only in-process seam that stops the
-/// interpreter promptly at a command/redirect boundary, so on cancel the hook
-/// raises this sentinel; [`run_in_brush`](crate::brush_shell) catches *exactly*
-/// this payload and converts it to a clean cancellation error, re-raising any
-/// other panic unchanged.
-///
-/// Reach: this stops the interpreter's OWN future. When the offending command
-/// runs in a subtask — `$(...)`, `&`, a coprocess — the sentinel unwinds only to
-/// that subtask's tokio boundary, where it surfaces as a `JoinError`, not to
-/// `run_in_brush`'s `catch_unwind`. That is harmless for the timeout path (whose
-/// worker result is discarded), but a future newt-interrupt path must not rely on
-/// the sentinel propagating out of a subtask; the reliable stop there is the
-/// outer wall-clock timeout, and a true subtask-level stop is Effort B (fork).
-///
-/// Requires `panic = "unwind"` (the default). Under `panic = "abort"` this
-/// sentinel would turn a routine timeout/interrupt into a whole-process
-/// `SIGABRT` — see the note on [`BrushShellTool`](crate::BrushShellTool).
-#[derive(Debug)]
-pub(crate) struct BrushCancelled;
+use brush_core::extensions::{CommandDecision, CommandInterceptor, ExecDecision, OpenDecision};
 
 /// The shared, per-invocation denial sink.
 ///
@@ -88,7 +65,9 @@ pub(crate) type DenialSink = Arc<Mutex<Vec<Denial>>>;
 ///    nothing.
 /// 3. **Only `Allow` is memoized.** Denials are recomputed and re-recorded every
 ///    time, exactly as before, so the denial log and its telemetry are unchanged.
-/// 4. **Cancellation is checked before the memo.** See `before_exec`.
+/// 4. **Cancellation is observed strictly earlier.** `before_command` fires (and
+///    terminates a cancelled run) before control can ever reach `before_exec`,
+///    so no memoized `Allow` can outlive a cancellation. See `before_command`.
 ///
 /// `Arc<Mutex<_>>` for the same reason as [`DenialSink`]: brush clones the
 /// interceptor internally, and every clone must consult the one shared memo.
@@ -121,9 +100,9 @@ pub struct CaveatInterceptor {
     /// it never reaches a live shell).
     sink: Option<DenialSink>,
     /// Per-run cancellation flag (FIX 2). When an outer caller (the wall-clock
-    /// timeout, or a future interrupt) trips this, the next `before_exec` /
-    /// `before_open` aborts the run by raising [`BrushCancelled`]. `None` (the
-    /// default) means "no cancellation wired" — the hooks never abort.
+    /// timeout, or a future interrupt) trips this, the next `before_command` —
+    /// or `before_open`, for a redirect opened outside any command — terminates
+    /// the run. `None` (the default) means "no cancellation wired".
     cancel: Option<Arc<AtomicBool>>,
     /// Per-invocation memo of programs already admitted under `cx` (B1.3).
     /// `None` for the [`Default`] interceptor, which denies everything and so
@@ -169,7 +148,7 @@ impl CaveatInterceptor {
     }
 
     /// Wire a per-run cancellation flag (FIX 2). When tripped, the next
-    /// `before_exec` / `before_open` aborts the run by unwinding the interpreter.
+    /// `before_command` terminates the run.
     #[must_use]
     pub(crate) fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancel = Some(cancel);
@@ -183,13 +162,13 @@ impl CaveatInterceptor {
             .is_some_and(|c| c.load(Ordering::SeqCst))
     }
 
-    /// Abort a cancelled run: record the cancellation as a structured denial,
-    /// then unwind the interpreter via the [`BrushCancelled`] sentinel. This is
-    /// the fail-closed direction — it refuses further spawns/opens, never
-    /// permits one — so the per-command OCAP guarantee is preserved.
-    fn abort_cancelled(&self, kind: DenialKind, target: impl Into<String>) -> ! {
-        self.record(kind, target, "run cancelled (timeout or interrupt)");
-        std::panic::panic_any(BrushCancelled);
+    /// Record a cancelled run's refusal as a structured denial and return the
+    /// reason to hand back as a `Deny`. This is the fail-closed direction — it
+    /// refuses, never permits — so the OCAP guarantee is preserved.
+    fn cancelled(&self, kind: DenialKind, target: impl Into<String>) -> String {
+        const REASON: &str = "run cancelled (timeout or interrupt)";
+        self.record(kind, target, REASON);
+        REASON.to_string()
     }
 
     /// Record a denial into the shared sink (a no-op if there is no sink).
@@ -211,6 +190,26 @@ impl CaveatInterceptor {
 }
 
 impl CommandInterceptor for CaveatInterceptor {
+    /// **The cancellation seam.** Fires once per command — builtin, function,
+    /// and external alike — so a run can be stopped wherever it is, and returns
+    /// a `Deny` that *terminates* the run rather than becoming an exit status an
+    /// enclosing loop would shrug off (`brush_core::error::Error::is_terminating`).
+    ///
+    /// This is what bounds a PURE-BUILTIN runaway (`while true; do :; done`),
+    /// which reaches neither the external-spawn funnel (`before_exec`) nor the
+    /// file-open one (`before_open`) and so had no observation point at all.
+    ///
+    /// It makes **no capability decision**: admission stays in `before_exec` /
+    /// `before_open`, which have the resolved program path and the canonicalized
+    /// file path this hook does not. Uncancelled runs always `Allow` — the hot
+    /// path is one relaxed atomic load, no allocation.
+    fn before_command(&self, name: &str) -> CommandDecision {
+        if self.is_cancelled() {
+            return CommandDecision::Deny(self.cancelled(DenialKind::Exec, name));
+        }
+        CommandDecision::Allow
+    }
+
     /// Deny unless the effective `exec` caveat allows `program`.
     ///
     /// `program` is what brush is about to spawn: for `PATH`-resolved commands
@@ -221,21 +220,14 @@ impl CommandInterceptor for CaveatInterceptor {
     /// matches the resolved `/usr/bin/git`, while `/bin/rm` is denied whenever
     /// neither `rm` nor `/bin/rm` is granted (the path-separator bypass stays
     /// closed at the funnel).
+    ///
+    /// Carries no cancellation check: `before_command` fires first on *every*
+    /// path that reaches here (`ExecutionContext::execute` consults it before
+    /// dispatching to `execute_via_external`, the sole caller of the
+    /// `before_exec` site), so a cancelled run is already terminated. That is
+    /// also what keeps the allow memo below sound —
+    /// `memoized_allow_does_not_outlive_cancellation` pins it.
     fn before_exec(&self, program: &str, _args: &[String]) -> ExecDecision {
-        // FIX 2: a cancelled run aborts here — the next external-spawn boundary —
-        // before any admission, so a runaway loop stops promptly and no
-        // un-admitted program can slip through on the way out.
-        if self.is_cancelled() {
-            self.abort_cancelled(DenialKind::Exec, program);
-        }
-        // B1.3: the allow memo is consulted STRICTLY AFTER the cancellation
-        // check above, never before. Ordering is load-bearing: a memoized
-        // `Allow` must not let a cancelled run keep spawning. Since the hot
-        // loop this memo exists for (`while read f; do wc -l "$f"; done`) is
-        // exactly the loop cancellation must be able to stop, a memo placed
-        // ahead of the cancel check would make the run *unstoppable* from the
-        // second iteration on. `memoized_allow_still_aborts_when_cancelled`
-        // pins this.
         if self.is_memoized_allow(program) {
             return ExecDecision::Allow;
         }
@@ -269,12 +261,15 @@ impl CommandInterceptor for CaveatInterceptor {
     /// `write` selects the axis. Both checks canonicalize first (realpath) and
     /// reject paths that escape the granted scope via `..` or a symlink — that
     /// logic is the shared one in `agent-bridle-core`, reused here, not copied.
+    ///
+    /// Keeps its cancellation check, unlike `before_exec`: a redirect on a
+    /// COMPOUND command (`while …; done > f`) is opened by the interpreter's
+    /// redirect setup, outside any command dispatch, so `before_command` is not
+    /// provably ahead of this hook. Checked before the /dev/null allowance below
+    /// so cancellation wins outright. Fail-closed and cheap.
     fn before_open(&self, path: &Path, write: bool) -> OpenDecision {
-        // FIX 2: a cancelled run aborts at the next file-open boundary too, so a
-        // redirect-driven loop (`while read … < file`) stops promptly. Checked
-        // before the /dev/null allowance below so cancellation wins outright.
         if self.is_cancelled() {
-            self.abort_cancelled(DenialKind::Open, path.to_string_lossy());
+            return OpenDecision::Deny(self.cancelled(DenialKind::Open, path.to_string_lossy()));
         }
         // newt#969: the standard sinks are ALWAYS-permitted write targets.
         // `2>/dev/null` is the most common idiom in shell training data, and
@@ -599,12 +594,13 @@ mod tests {
     }
 
     /// **The cancellation-ordering guard.** A program already memoized as
-    /// allowed must STILL abort the run once the cancel flag is tripped — the
-    /// memo is consulted after the cancel check, never before. Without this
-    /// ordering, the very loop the memo speeds up would become uncancellable
-    /// from its second iteration onward.
+    /// allowed must not outlive a cancellation. The memo lives in `before_exec`,
+    /// which brush only reaches AFTER `before_command` has allowed the same
+    /// command — so a cancelled run is terminated one hook earlier and the memo
+    /// is never consulted. Without that ordering, the very loop the memo speeds
+    /// up would become uncancellable from its second iteration onward.
     #[test]
-    fn memoized_allow_still_aborts_when_cancelled() {
+    fn memoized_allow_does_not_outlive_cancellation() {
         let cancel = Arc::new(AtomicBool::new(false));
         let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
         let interceptor = CaveatInterceptor::new(ctx(Caveats::top()), Arc::clone(&sink))
@@ -617,22 +613,34 @@ mod tests {
         ));
         assert!(interceptor.is_memoized_allow("/bin/echo"));
 
-        // Trip cancellation; the memoized program must abort, not sail through.
+        // Trip cancellation; the gate the memoized program must pass first is
+        // `before_command`, and it terminatingly refuses.
         cancel.store(true, Ordering::SeqCst);
-        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            interceptor.before_exec("/bin/echo", &[])
-        }))
-        .expect_err("a cancelled run must unwind even for a memoized-Allow program");
         assert!(
-            payload.is::<BrushCancelled>(),
-            "the abort must be the BrushCancelled sentinel, not another panic"
+            matches!(
+                interceptor.before_command("/bin/echo"),
+                CommandDecision::Deny(_)
+            ),
+            "a cancelled run must be denied even for a memoized-Allow program"
         );
 
-        // The cancellation is still recorded as a structured exec denial — the
-        // memo did not swallow the telemetry either.
+        // The cancellation is recorded as a structured exec denial — the memo
+        // did not swallow the telemetry either.
         let recorded = drain(&sink);
         assert_eq!(recorded.len(), 1, "one cancellation denial: {recorded:?}");
         assert_eq!(recorded[0].kind, DenialKind::Exec);
+    }
+
+    /// An uncancelled run's `before_command` makes no capability decision: it
+    /// allows everything, leaving admission to `before_exec`/`before_open`.
+    #[test]
+    fn before_command_allows_when_not_cancelled() {
+        let (interceptor, sink) = interceptor_with_sink(Caveats::default());
+        assert!(matches!(
+            interceptor.before_command("rm"),
+            CommandDecision::Allow
+        ));
+        assert!(drain(&sink).is_empty(), "an Allow records no denial");
     }
 
     #[test]
