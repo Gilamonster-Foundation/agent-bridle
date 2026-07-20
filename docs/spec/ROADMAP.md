@@ -59,10 +59,18 @@ formal proof → conformance vectors.
       assumptions under the **Tier-1 "assumed crypto"** boundary (or drop them
       if unused) and align the Rust doc gloss. Hard blocker only at Tier-3
       crypto refinement.
-    - **F-233-02:** no proved-injective `encodeSignaturePreimage` exists, so the
-      theorem does not bind the exact signed bytes. Owed as a domain-separated,
-      versioned, tagged, length-delimited canonical codec + `encode_injective` /
-      `decode_encode`; **freeze with the 1d vectors** (below).
+    - **F-233-02 — DISCHARGED at the Lean tier (2026-07-18).**
+      `formal/Ceremony/P1/PreimageCodec.lean` now exhibits a domain-separated,
+      versioned, tagged, length-delimited `encodeSignaturePreimage` with a proved
+      `encodeSignaturePreimage_injective` (reader/round-trip technique; depends only
+      on `propext`+`Quot.sound`), plus the payoff bridge `structural_binding_from_bytes`:
+      the *structural* `signature_binding` is **derived** from a byte-level EUF-CMA
+      assumption (`ByteSigner.bytes_binding`, Tier-1) composed with that injectivity —
+      no structural binding postulate needed. Per ADR 0024 §D0 the Lean encoding
+      witnesses the *injectivity property*, not the frozen bytes; the exact wire
+      encoding is still **frozen with the 1d vectors** (below). *Remaining #263
+      riders:* rewire `CryptoBoundary` in `SignedObject.lean` onto `ByteSigner`
+      (F-233-01/04), and the `#print axioms` gate upgrade (F-233-06).
     - **AB-005 (runtime wiring):** `Registry::dispatch` feeds
       `CallRequest::unspecified(name)` into the step-up challenge, so approval
       binds the tool name, not the resolved `(tool, args, resource)` tuple. The
@@ -91,8 +99,10 @@ formal proof → conformance vectors.
   negative** — the cross-language behavioral contract. *This unblocks the
   "held" wire freeze.*
   - *Audit obligation (F-233-02, epic #263):* the injective, prefix-free
-    `encodeSignaturePreimage` codec + its injectivity proof is owed **here** —
-    freeze it with the DAG-CBOR vectors. **F-233-05** (concrete DAG-CBOR/JSON/
+    `encodeSignaturePreimage` codec + its injectivity proof — **now discharged at
+    the Lean tier** (`formal/Ceremony/P1/PreimageCodec.lean`; see Phase 1a). What
+    remains **here** is freezing the *exact wire bytes* (ADR 0024 encoding) with the
+    DAG-CBOR vectors. **F-233-05** (concrete DAG-CBOR/JSON/
     TOML adapters) is *already this phase* — on track, **not a defect**:
     implementing a wire codec before its vectors would violate the governing
     rule ("never fossilize a wire format ahead of its conformance vectors").
