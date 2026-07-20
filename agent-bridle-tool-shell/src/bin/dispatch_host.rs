@@ -22,7 +22,16 @@ fn main() {
     let cmd = args.next().expect("usage: dispatch_host <cmd> [cwd]");
     let cwd = args.next();
 
-    let tool = BrushShellTool::new();
+    // Benchmark/diagnosis seam: raise the engine's wall-clock ceiling so a
+    // measurement can distinguish "slow" from "deadlocked" (a run that never
+    // completes) instead of always reporting the default 60s timeout.
+    let tool = match std::env::var("AB_BRUSH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(secs) => BrushShellTool::new().with_timeout(std::time::Duration::from_secs(secs)),
+        None => BrushShellTool::new(),
+    };
     let ctx = Gate::new(0)
         .authorize(&tool, &Caveats::top())
         .expect("authorize");

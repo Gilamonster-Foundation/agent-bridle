@@ -18,11 +18,38 @@
 //! `agent-bridle-core` (realpath, reject symlink/`..` escapes) is the single
 //! source of truth.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_bridle_core::{Denial, DenialKind, ToolContext};
 use brush_core::extensions::{CommandInterceptor, ExecDecision, OpenDecision};
+
+/// The panic payload raised to **abort a confined brush run** when its
+/// cancellation flag is tripped (FIX 2). The `CommandInterceptor` trait can only
+/// return `Allow`/`Deny`, and a `Deny` is *swallowed* by the interpreter
+/// (converted to a failed-command exit code — `interp.rs` catches it and the
+/// enclosing `while`/`for` loop keeps running), so a returned decision can never
+/// unwind a runaway loop. Unwinding is the only in-process seam that stops the
+/// interpreter promptly at a command/redirect boundary, so on cancel the hook
+/// raises this sentinel; [`run_in_brush`](crate::brush_shell) catches *exactly*
+/// this payload and converts it to a clean cancellation error, re-raising any
+/// other panic unchanged.
+///
+/// Reach: this stops the interpreter's OWN future. When the offending command
+/// runs in a subtask — `$(...)`, `&`, a coprocess — the sentinel unwinds only to
+/// that subtask's tokio boundary, where it surfaces as a `JoinError`, not to
+/// `run_in_brush`'s `catch_unwind`. That is harmless for the timeout path (whose
+/// worker result is discarded), but a future newt-interrupt path must not rely on
+/// the sentinel propagating out of a subtask; the reliable stop there is the
+/// outer wall-clock timeout, and a true subtask-level stop is Effort B (fork).
+///
+/// Requires `panic = "unwind"` (the default). Under `panic = "abort"` this
+/// sentinel would turn a routine timeout/interrupt into a whole-process
+/// `SIGABRT` — see the note on [`BrushShellTool`](crate::BrushShellTool).
+#[derive(Debug)]
+pub(crate) struct BrushCancelled;
 
 /// The shared, per-invocation denial sink.
 ///
@@ -33,6 +60,39 @@ use brush_core::extensions::{CommandInterceptor, ExecDecision, OpenDecision};
 /// `invoke`, so two concurrent invocations never share one — that is what keeps
 /// denials from cross-contaminating across invocations.
 pub(crate) type DenialSink = Arc<Mutex<Vec<Denial>>>;
+
+/// The shared, per-invocation **allow memo** (B1.3).
+///
+/// A confined loop re-spawns the same program thousands of times
+/// (`while read f; do wc -l "$f"; done` → N identical `/usr/bin/wc` admissions),
+/// and [`ToolContext::check_exec`] recomputes the identical answer every time.
+/// This set records programs already admitted **under this invocation's `cx`** so
+/// the second and later admissions short-circuit to `Allow`.
+///
+/// # Security invariant (the one thing to enforce in review)
+///
+/// This is a **pure memo, not an authority**. It is sound only because:
+///
+/// 1. **The key is the whole admission input.** `check_exec` is a function of
+///    exactly `(cx.effective.exec, program)`. `cx` is fixed for the invocation
+///    (`ToolContext::effective` is private with no setter — a running tool cannot
+///    widen its own caveats), so for a fixed `cx` the answer is a function of
+///    `program` alone. Memoizing therefore returns the *same* decision the
+///    recomputation would, never a different one.
+/// 2. **One cache belongs to exactly one `cx`.** The cache is created *inside*
+///    [`CaveatInterceptor::new`], which is the only place a `cx` is installed, and
+///    there is no constructor, setter, or accessor that lets a caller inject or
+///    share a cache. So a cache cannot outlive, or be reused across, the
+///    invocation whose caveats minted it — an `Allow` can never bleed across
+///    leashes. The [`Default`] (fail-closed) interceptor gets `None` and caches
+///    nothing.
+/// 3. **Only `Allow` is memoized.** Denials are recomputed and re-recorded every
+///    time, exactly as before, so the denial log and its telemetry are unchanged.
+/// 4. **Cancellation is checked before the memo.** See `before_exec`.
+///
+/// `Arc<Mutex<_>>` for the same reason as [`DenialSink`]: brush clones the
+/// interceptor internally, and every clone must consult the one shared memo.
+pub(crate) type AllowCache = Arc<Mutex<HashSet<String>>>;
 
 /// A brush [`CommandInterceptor`] that enforces an invocation's effective
 /// caveats in-process **and records each denial it makes** into a shared sink.
@@ -60,17 +120,76 @@ pub struct CaveatInterceptor {
     /// [`Default`] interceptor (which still denies, just records nothing —
     /// it never reaches a live shell).
     sink: Option<DenialSink>,
+    /// Per-run cancellation flag (FIX 2). When an outer caller (the wall-clock
+    /// timeout, or a future interrupt) trips this, the next `before_exec` /
+    /// `before_open` aborts the run by raising [`BrushCancelled`]. `None` (the
+    /// default) means "no cancellation wired" — the hooks never abort.
+    cancel: Option<Arc<AtomicBool>>,
+    /// Per-invocation memo of programs already admitted under `cx` (B1.3).
+    /// `None` for the [`Default`] interceptor, which denies everything and so
+    /// has nothing to memoize. See [`AllowCache`] for the security invariant.
+    allow_cache: Option<AllowCache>,
 }
 
 impl CaveatInterceptor {
     /// Build an interceptor that enforces `cx`'s effective caveats and records
     /// every denial it makes into `sink`.
+    ///
+    /// The allow memo (B1.3) is minted **here**, together with `cx` — that is what
+    /// structurally ties one cache to exactly one caveat set. There is
+    /// deliberately no way to pass one in: see [`AllowCache`].
     #[must_use]
     pub(crate) fn new(cx: ToolContext, sink: DenialSink) -> Self {
         Self {
             cx: Some(cx),
             sink: Some(sink),
+            cancel: None,
+            allow_cache: Some(Arc::new(Mutex::new(HashSet::new()))),
         }
+    }
+
+    /// Whether `program` was already admitted under this invocation's `cx`.
+    fn is_memoized_allow(&self, program: &str) -> bool {
+        self.allow_cache.as_ref().is_some_and(|c| {
+            c.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(program)
+        })
+    }
+
+    /// Memoize an `Allow` for `program`. Only ever called after a real
+    /// [`ToolContext::check_exec`] returned `Ok`.
+    fn memoize_allow(&self, program: &str) {
+        if let Some(cache) = &self.allow_cache {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(program.to_string());
+        }
+    }
+
+    /// Wire a per-run cancellation flag (FIX 2). When tripped, the next
+    /// `before_exec` / `before_open` aborts the run by unwinding the interpreter.
+    #[must_use]
+    pub(crate) fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Whether the run has been cancelled. `false` when no flag is wired.
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::SeqCst))
+    }
+
+    /// Abort a cancelled run: record the cancellation as a structured denial,
+    /// then unwind the interpreter via the [`BrushCancelled`] sentinel. This is
+    /// the fail-closed direction — it refuses further spawns/opens, never
+    /// permits one — so the per-command OCAP guarantee is preserved.
+    fn abort_cancelled(&self, kind: DenialKind, target: impl Into<String>) -> ! {
+        self.record(kind, target, "run cancelled (timeout or interrupt)");
+        std::panic::panic_any(BrushCancelled);
     }
 
     /// Record a denial into the shared sink (a no-op if there is no sink).
@@ -103,9 +222,32 @@ impl CommandInterceptor for CaveatInterceptor {
     /// neither `rm` nor `/bin/rm` is granted (the path-separator bypass stays
     /// closed at the funnel).
     fn before_exec(&self, program: &str, _args: &[String]) -> ExecDecision {
+        // FIX 2: a cancelled run aborts here — the next external-spawn boundary —
+        // before any admission, so a runaway loop stops promptly and no
+        // un-admitted program can slip through on the way out.
+        if self.is_cancelled() {
+            self.abort_cancelled(DenialKind::Exec, program);
+        }
+        // B1.3: the allow memo is consulted STRICTLY AFTER the cancellation
+        // check above, never before. Ordering is load-bearing: a memoized
+        // `Allow` must not let a cancelled run keep spawning. Since the hot
+        // loop this memo exists for (`while read f; do wc -l "$f"; done`) is
+        // exactly the loop cancellation must be able to stop, a memo placed
+        // ahead of the cancel check would make the run *unstoppable* from the
+        // second iteration on. `memoized_allow_still_aborts_when_cancelled`
+        // pins this.
+        if self.is_memoized_allow(program) {
+            return ExecDecision::Allow;
+        }
         match &self.cx {
             Some(cx) => match cx.check_exec(program) {
-                Ok(()) => ExecDecision::Allow,
+                Ok(()) => {
+                    // Memoize only the affirmative decision; denials are
+                    // recomputed and re-recorded every time (below), so the
+                    // denial log is bit-for-bit what it was before B1.3.
+                    self.memoize_allow(program);
+                    ExecDecision::Allow
+                }
                 Err(e) => {
                     let reason = e.to_string();
                     // Record the denial as a structured signal BEFORE returning.
@@ -128,6 +270,12 @@ impl CommandInterceptor for CaveatInterceptor {
     /// reject paths that escape the granted scope via `..` or a symlink — that
     /// logic is the shared one in `agent-bridle-core`, reused here, not copied.
     fn before_open(&self, path: &Path, write: bool) -> OpenDecision {
+        // FIX 2: a cancelled run aborts at the next file-open boundary too, so a
+        // redirect-driven loop (`while read … < file`) stops promptly. Checked
+        // before the /dev/null allowance below so cancellation wins outright.
+        if self.is_cancelled() {
+            self.abort_cancelled(DenialKind::Open, path.to_string_lossy());
+        }
         // newt#969: the standard sinks are ALWAYS-permitted write targets.
         // `2>/dev/null` is the most common idiom in shell training data, and
         // writing to /dev/null|stdout|stderr is not a filesystem mutation in
@@ -340,6 +488,151 @@ mod tests {
         assert_eq!(recorded.len(), 1, "one open denial expected: {recorded:?}");
         assert_eq!(recorded[0].kind, DenialKind::Open);
         assert_eq!(recorded[0].target, "/etc/shadow");
+    }
+
+    // ---- B1.3: the per-invocation allow memo -------------------------------
+
+    /// The memo must not change any decision: repeated admissions return the
+    /// same answer the uncached path computes, for both axes.
+    #[test]
+    fn memo_never_changes_a_decision() {
+        let (interceptor, _sink) = interceptor_with_sink(Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        });
+        for _ in 0..5 {
+            assert!(matches!(
+                interceptor.before_exec("echo", &[]),
+                ExecDecision::Allow
+            ));
+            assert!(matches!(
+                interceptor.before_exec("rm", &[]),
+                ExecDecision::Deny(_)
+            ));
+        }
+    }
+
+    /// Denials are NEVER memoized: each one is recomputed and re-recorded, so
+    /// the denial log is exactly what it was before B1.3 (five attempts on the
+    /// same out-of-scope program still yield five records).
+    #[test]
+    fn denials_are_recorded_every_time_not_memoized() {
+        let (interceptor, sink) = interceptor_with_sink(Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        });
+        for _ in 0..5 {
+            let _ = interceptor.before_exec("rm", &[]);
+        }
+        let recorded = drain(&sink);
+        assert_eq!(
+            recorded.len(),
+            5,
+            "every denial must still be recorded: {recorded:?}"
+        );
+        assert!(recorded.iter().all(|d| d.kind == DenialKind::Exec));
+    }
+
+    /// An `Allow` memoized under one invocation's caveats MUST NOT be visible to
+    /// another invocation with different caveats. This is the security invariant:
+    /// the cache is minted inside `new` alongside the `cx`, so two interceptors
+    /// never share one — `echo` allowed over here stays denied over there.
+    #[test]
+    fn memo_does_not_bleed_across_invocations_with_different_caveats() {
+        let (permissive, _s1) = interceptor_with_sink(Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        });
+        // Warm the permissive interceptor's memo.
+        assert!(matches!(
+            permissive.before_exec("echo", &[]),
+            ExecDecision::Allow
+        ));
+
+        // A DIFFERENT invocation, whose caveats do not grant `echo`.
+        let (restrictive, sink) = interceptor_with_sink(Caveats {
+            exec: Scope::only(["ls".to_string()]),
+            ..Caveats::top()
+        });
+        assert!(
+            matches!(restrictive.before_exec("echo", &[]), ExecDecision::Deny(_)),
+            "a memoized Allow must never cross into an invocation with different caveats"
+        );
+        assert_eq!(drain(&sink).len(), 1, "and the denial is recorded");
+    }
+
+    /// brush clones the interceptor per pipeline stage; the clones must share the
+    /// one memo (that is the whole point — otherwise each stage re-pays the
+    /// admission). Sharing within ONE invocation is correct: same `cx`.
+    #[test]
+    fn clones_share_one_memo_within_an_invocation() {
+        let (interceptor, _sink) = interceptor_with_sink(Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        });
+        assert!(matches!(
+            interceptor.before_exec("echo", &[]),
+            ExecDecision::Allow
+        ));
+        let clone = interceptor.clone();
+        assert!(
+            clone.is_memoized_allow("echo"),
+            "a clone must see the memo its sibling warmed"
+        );
+        assert!(matches!(
+            clone.before_exec("echo", &[]),
+            ExecDecision::Allow
+        ));
+    }
+
+    /// The fail-closed default keeps no memo and still denies everything.
+    #[test]
+    fn default_interceptor_memoizes_nothing() {
+        let interceptor = CaveatInterceptor::default();
+        for _ in 0..3 {
+            assert!(matches!(
+                interceptor.before_exec("echo", &[]),
+                ExecDecision::Deny(_)
+            ));
+        }
+        assert!(!interceptor.is_memoized_allow("echo"));
+    }
+
+    /// **The cancellation-ordering guard.** A program already memoized as
+    /// allowed must STILL abort the run once the cancel flag is tripped — the
+    /// memo is consulted after the cancel check, never before. Without this
+    /// ordering, the very loop the memo speeds up would become uncancellable
+    /// from its second iteration onward.
+    #[test]
+    fn memoized_allow_still_aborts_when_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
+        let interceptor = CaveatInterceptor::new(ctx(Caveats::top()), Arc::clone(&sink))
+            .with_cancel(Arc::clone(&cancel));
+
+        // Warm the memo: `/bin/echo` is now a memoized Allow.
+        assert!(matches!(
+            interceptor.before_exec("/bin/echo", &[]),
+            ExecDecision::Allow
+        ));
+        assert!(interceptor.is_memoized_allow("/bin/echo"));
+
+        // Trip cancellation; the memoized program must abort, not sail through.
+        cancel.store(true, Ordering::SeqCst);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            interceptor.before_exec("/bin/echo", &[])
+        }))
+        .expect_err("a cancelled run must unwind even for a memoized-Allow program");
+        assert!(
+            payload.is::<BrushCancelled>(),
+            "the abort must be the BrushCancelled sentinel, not another panic"
+        );
+
+        // The cancellation is still recorded as a structured exec denial — the
+        // memo did not swallow the telemetry either.
+        let recorded = drain(&sink);
+        assert_eq!(recorded.len(), 1, "one cancellation denial: {recorded:?}");
+        assert_eq!(recorded[0].kind, DenialKind::Exec);
     }
 
     #[test]
