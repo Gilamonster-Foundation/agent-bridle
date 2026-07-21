@@ -479,15 +479,24 @@ pub trait SignedEnvelopeCodec {
 /// [`AllowedSignature`]), so the Lean profile-parameterization is captured by the
 /// witness types (PO-8 is discharged *before* any method here is called).
 ///
-/// **Contracts (HELD, Tier-1 assumed crypto), stated for completeness:**
-/// - `digest_binding`: equal digests imply equal `(algorithm, input)` — collision
-///   resistance across the *tagged* pair (spec §1).
-/// - `signature_sound` / `signature_binding`: a matching signature is `SignedBy`
-///   the exact `(algorithm, preimage)`; equal signatures imply equal
-///   `(algorithm, preimage)` — existential unforgeability.
-/// - `signature_deterministic`: for v1's Ed25519, one `(key, message)` ⇒ one
-///   signature (spec §5). This module *assumes* these; it does not implement
-///   BLAKE3 or Ed25519 (HELD).
+/// This is the **operational** interface only: `digest`, a signature relation, a
+/// `Bool` verifier, and its soundness (`signature_sound`). It is deliberately
+/// inhabitable by *real* crypto.
+///
+/// **Security contracts (HELD, Tier-1 assumed crypto) — not baked into this
+/// interface (epic #263, F-233-01/04):**
+/// - **Digest collision-resistance** is a *computational* assumption (spec §1), not
+///   a total-function property. The Lean model no longer postulates the impossible
+///   global digest-injectivity that only a fake identity hash could satisfy; a real
+///   BLAKE3-256 boundary now inhabits it.
+/// - **Signature binding + determinism** (existential unforgeability; Ed25519's
+///   one-`(key, message)`-one-signature, spec §5) are stated on the *bytes* a
+///   scheme signs — `encodeSignaturePreimage` — as the Tier-1 `ByteSigner`
+///   assumptions, from which the Lean model *derives* the structural guarantees
+///   (`PreimageCodec.structural_binding_from_bytes` /
+///   `structural_determinism_from_bytes`, composed with the proved encoding
+///   injectivity). This module *assumes* these; it does not implement BLAKE3 or
+///   Ed25519 (HELD).
 pub trait CryptoBoundary {
     /// Content hash of `bytes` under an admitted algorithm (Lean `digest`).
     fn digest(&self, algorithm: &AllowedHash, bytes: &[u8]) -> Vec<u8>;

@@ -277,31 +277,47 @@ theorem encodeSignaturePreimage_injective :
   subst ert; subst esi; subst etp; subst ebo; subst eci; subst esg; subst huc
   rfl
 
-/-! ## The payoff: structural binding from a byte-level assumption
+/-! ## The payoff: real crypto inhabits `CryptoBoundary` with honest assumptions
 
-`SignedObject.lean`'s `CryptoBoundary.signature_binding` is stated over
-`SignaturePreimage` *structures*. Today it is a bare postulate — the F-233-01/04
-"algebraic equality stand-in" the audit flags. The honest form places the
-cryptographic assumption where it belongs — on the **bytes** a signature scheme
-actually signs (Tier-1 "assumed crypto", i.e. EUF-CMA) — and *derives* the
-structural binding from that plus the injectivity proved above. This file shows the
-derivation is sound; rewiring `SignedObject.lean` to adopt it is the F-233-01/04
-follow-up. -/
+`SignedObject.lean`'s `CryptoBoundary` is the *operational* interface a signature
+scheme must provide (a digest, a signature relation, a `Bool` verifier, and its
+soundness). Its **security** properties are not baked into the structure — that was
+the F-233-01/04 defect: an impossible global-digest-injectivity postulate that only
+a fake identity "hash" could satisfy (BLAKE3-256 cannot), plus algebraic
+`signature_binding` / `signature_deterministic` stand-ins that were not EUF-CMA.
 
-/-- A byte-level signature relation carrying an EUF-CMA-style binding **assumption**
-    (Tier-1): a signature that validates two byte messages forces the messages and
-    the algorithm to agree. Stated over `List UInt8` — what is actually signed. -/
+They live here instead, as **Tier-1 assumptions on the bytes a scheme actually
+signs**, from which the structural guarantees are *derived* (composing with the
+Tier-3 injectivity proved above). `CryptoBoundary.ofByteSigner` then exhibits the
+shape a real Ed25519 + BLAKE3 boundary takes — a genuine inhabitant, where binding
+and determinism are theorems, not postulates. Digest collision-resistance is a
+Tier-1 *computational* assumption not expressible as a total function property, so
+it is intentionally absent from the structure (see `SignedObject.lean`). -/
+
+/-- A byte-level signature scheme carrying its Tier-1 "assumed crypto" properties,
+    stated over `List UInt8` — what a signer actually signs. -/
 structure ByteSigner (profile : Profile) where
+  /-- The abstract "this signature is valid for these bytes under this key" relation. -/
   SignedBytes : AllowedSignature profile → List UInt8 → ByteArray → Prop
+  /-- A concrete verifier. -/
+  matchesBytes : AllowedSignature profile → List UInt8 → ByteArray → Bool
+  /-- Verifier soundness: a `true` check yields the abstract relation. -/
+  bytes_sound : ∀ allowed msg signature,
+    matchesBytes allowed msg signature = true → SignedBytes allowed msg signature
+  /-- **Tier-1 EUF-CMA binding.** One signature validating two byte messages forces
+      the messages (and the algorithm) to agree. -/
   bytes_binding : ∀ leftAllowed rightAllowed leftMsg rightMsg signature,
-    SignedBytes leftAllowed leftMsg signature ->
-      SignedBytes rightAllowed rightMsg signature ->
-        leftAllowed.algorithm = rightAllowed.algorithm /\ leftMsg = rightMsg
+    SignedBytes leftAllowed leftMsg signature →
+      SignedBytes rightAllowed rightMsg signature →
+        leftAllowed.algorithm = rightAllowed.algorithm ∧ leftMsg = rightMsg
+  /-- **Tier-1 determinism** (e.g. Ed25519, RFC 8032): one message+key has one
+      valid signature. -/
+  bytes_deterministic : ∀ allowed msg left right,
+    SignedBytes allowed msg left → SignedBytes allowed msg right → left = right
 
-/-- **The bridge (F-233-02).** When the boundary signs `encodeSignaturePreimage p`,
-    the *structural* binding that `SignedObject.lean` assumes outright is instead
-    a **theorem**: byte-level EUF-CMA (Tier-1) composed with encoding injectivity
-    (Tier-3, proved above). No structural `signature_binding` postulate is needed. -/
+/-- **The binding bridge (F-233-02/04).** When the boundary signs
+    `encodeSignaturePreimage p`, the *structural* binding is a **theorem**:
+    byte-level EUF-CMA (Tier-1) composed with encoding injectivity (Tier-3). -/
 theorem structural_binding_from_bytes {profile : Profile} (signer : ByteSigner profile)
     {leftAllowed rightAllowed : AllowedSignature profile}
     {leftPreimage rightPreimage : SignaturePreimage} {signature : ByteArray}
@@ -309,9 +325,37 @@ theorem structural_binding_from_bytes {profile : Profile} (signer : ByteSigner p
       (encodeSignaturePreimage leftPreimage) signature)
     (hright : signer.SignedBytes rightAllowed
       (encodeSignaturePreimage rightPreimage) signature) :
-    leftAllowed.algorithm = rightAllowed.algorithm /\ leftPreimage = rightPreimage := by
+    leftAllowed.algorithm = rightAllowed.algorithm ∧ leftPreimage = rightPreimage := by
   obtain ⟨halg, hbytes⟩ :=
     signer.bytes_binding _ _ _ _ _ hleft hright
   exact ⟨halg, encodeSignaturePreimage_injective hbytes⟩
+
+/-- **The determinism bridge (F-233-04).** Structural `signature_deterministic` is a
+    **theorem** from the Tier-1 byte-level determinism assumption. -/
+theorem structural_determinism_from_bytes {profile : Profile} (signer : ByteSigner profile)
+    {allowed : AllowedSignature profile} {preimage : SignaturePreimage}
+    {left right : ByteArray}
+    (hleft : signer.SignedBytes allowed (encodeSignaturePreimage preimage) left)
+    (hright : signer.SignedBytes allowed (encodeSignaturePreimage preimage) right) :
+    left = right :=
+  signer.bytes_deterministic _ _ _ _ hleft hright
+
+/-- **A genuine `CryptoBoundary` inhabitant.** From a byte-level `ByteSigner` (whose
+    `SignedBy` is `SignedBytes` over `encodeSignaturePreimage`) plus any digest,
+    build the operational boundary. Unlike the identity-hash-only mock the impossible
+    `digest_binding` used to force, this is the shape a real Ed25519 + BLAKE3
+    boundary takes; its binding/determinism are `structural_binding_from_bytes` /
+    `structural_determinism_from_bytes`, not postulates. -/
+def _root_.Ceremony.P1.CryptoBoundary.ofByteSigner {profile : Profile}
+    (signer : ByteSigner profile)
+    (digest : AllowedHash profile → ByteArray → ByteArray) :
+    Ceremony.P1.CryptoBoundary profile where
+  digest := digest
+  SignedBy := fun allowed preimage signature =>
+    signer.SignedBytes allowed (encodeSignaturePreimage preimage) signature
+  signatureMatches := fun allowed preimage signature =>
+    signer.matchesBytes allowed (encodeSignaturePreimage preimage) signature
+  signature_sound := fun allowed _preimage signature h =>
+    signer.bytes_sound allowed _ signature h
 
 end Ceremony.P1.PreimageCodec

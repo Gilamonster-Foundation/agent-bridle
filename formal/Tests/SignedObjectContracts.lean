@@ -155,14 +155,12 @@ def goodPreimage : SignaturePreimage :=
     signer := goodSigner
     unknownCritical := [] }
 
+-- The operational boundary the `verifyEnvelope` examples run against. It no
+-- longer carries the (removed, dishonest) `digest_binding` / `signature_binding`
+-- / `signature_deterministic` postulates — see `CryptoBoundary` in
+-- `SignedObject.lean` and the byte-level bridges in `PreimageCodec.lean`.
 def exactCrypto : CryptoBoundary Profile.v1 where
   digest := fun _allowed body => body
-  digest_binding := by
-    intro leftAllowed rightAllowed left right sameDigest
-    exact
-      ⟨(trusted_hash_is_blake3 TrustedProfile.v1 leftAllowed).trans
-          (trusted_hash_is_blake3 TrustedProfile.v1 rightAllowed).symm,
-        sameDigest⟩
   SignedBy := fun allowed preimage signature =>
     allowed.algorithm = .ed25519 /\ preimage = goodPreimage /\
       signature = goodSignature
@@ -172,14 +170,6 @@ def exactCrypto : CryptoBoundary Profile.v1 where
   signature_sound := by
     intro allowed preimage signature valid
     exact of_decide_eq_true valid
-  signature_binding := by
-    intro leftAllowed rightAllowed left right _signature leftValid rightValid
-    exact
-      ⟨leftValid.1.trans rightValid.1.symm,
-        leftValid.2.1.trans rightValid.2.1.symm⟩
-  signature_deterministic := by
-    intro _allowed _preimage left right leftValid rightValid
-    exact leftValid.2.2.trans rightValid.2.2.symm
 
 example {received envelope}
     (decoded : testEnvelopeCodec.decode received = some envelope) :

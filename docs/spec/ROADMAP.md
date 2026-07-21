@@ -52,13 +52,21 @@ formal proof → conformance vectors.
   - *Audit obligations (2026-07-18, epic #263):* the harvested P1 kernel is an
     **abstract semantic** skeleton until these are discharged; keep claims
     narrow (audit §12) — do **not** say "formally verified" yet.
-    - **F-233-01 / F-233-04:** `digest_binding` asserts impossible *global*
-      injectivity over arbitrary `ByteArray` (BLAKE3-256 cannot inhabit it),
-      and `signature_binding` / `signature_deterministic` are algebraic-equality
-      stand-ins, not EUF-CMA. Restate both as bounded-domain / **computational**
-      assumptions under the **Tier-1 "assumed crypto"** boundary (or drop them
-      if unused) and align the Rust doc gloss. Hard blocker only at Tier-3
-      crypto refinement.
+    - **F-233-01 / F-233-04 — DISCHARGED (2026-07-21).** `CryptoBoundary`
+      (`SignedObject.lean`) is now the **operational** interface only (digest,
+      signature relation, `Bool` verifier, soundness) — inhabitable by *real*
+      crypto. The impossible global `digest_binding` (which only a fake identity
+      hash could satisfy) is removed; digest collision-resistance is documented as a
+      Tier-1 *computational* assumption, not a total-function field. The algebraic
+      `signature_binding` / `signature_deterministic` stand-ins are removed as
+      postulates and become **derived theorems** about a byte-level `ByteSigner`
+      (`PreimageCodec.structural_binding_from_bytes` /
+      `structural_determinism_from_bytes`), with `CryptoBoundary.ofByteSigner`
+      exhibiting a genuine (non-identity) inhabitant. Rust doc gloss aligned
+      (`signed_object.rs`). **This closes the epic-#263 P1 refinement obligations**
+      (F-233-01/02/04/06 all discharged; F-233-05 is on-track Phase-1d, F-233-03 is
+      Phase-2). The remaining basis for measured claims is now only the *held* wire
+      bytes (1d vectors) and the Tier-3 crypto refinement — not a modeling defect.
     - **F-233-02 — DISCHARGED at the Lean tier (2026-07-18).**
       `formal/Ceremony/P1/PreimageCodec.lean` now exhibits a domain-separated,
       versioned, tagged, length-delimited `encodeSignaturePreimage` with a proved
