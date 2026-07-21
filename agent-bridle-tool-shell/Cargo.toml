@@ -79,7 +79,14 @@ tokio = { workspace = true, optional = true }
 # published so this crate is crates.io-publishable with `brush` on. Temporary —
 # retire once #1184 merges upstream and a hooked `brush-*` release ships
 # (agent-bridle#20).
-brush-ocap-core = { version = "0.5", optional = true }
+# MIN-VERSION MATTERS: the interceptor code here uses the
+# `brush_core::extensions::CommandDecision` / `before_command` /
+# `Error::is_terminating` API that first shipped in brush-ocap-core 0.5.1. A
+# bare "0.5" lets a downstream resolver satisfy us with 0.5.0 (cargo's
+# conservative update does exactly that from an old lock) → unresolved imports
+# in a published crate (broke newt-agent's mesh contract job, newt-agent#1327).
+# The requirement must name the API floor we compile against.
+brush-ocap-core = { version = "0.5.1", optional = true }
 brush-ocap-builtins = { version = "0.2", optional = true }
 # A minimal carried coreutils set (ls/cat/echo) — enough for the embedded
 # dispatch path (issue #206) without the ~100-crate `coreutils.all` build.
