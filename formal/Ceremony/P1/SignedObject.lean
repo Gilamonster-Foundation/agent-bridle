@@ -150,23 +150,29 @@ def SignedEnvelopeCodec.signaturePreimage
     signer := envelopeCodec.signer unsigned
     unknownCritical := envelopeCodec.unknownCritical unsigned }
 
+/-- The **operational** crypto interface a signature scheme must provide: a digest,
+    an abstract signature relation, a concrete `Bool` verifier, and its soundness.
+    This is deliberately inhabitable by *real* crypto (a real Ed25519 + BLAKE3
+    boundary — see `PreimageCodec.CryptoBoundary.ofByteSigner`).
+
+    The **security** properties are NOT postulated here (F-233-01/04). The former
+    `digest_binding` asserted impossible *global* injectivity over arbitrary
+    `ByteArray` — only a fake identity "hash" could satisfy it, so BLAKE3-256 could
+    not inhabit this structure and every theorem over it was vacuous for real
+    crypto. Digest collision-resistance is a Tier-1 *computational* assumption, not
+    a total-function property, so it is intentionally absent. Likewise the former
+    `signature_binding` / `signature_deterministic` were algebraic stand-ins, not
+    EUF-CMA; they are now **derived theorems** about a byte-level signer
+    (`PreimageCodec.structural_binding_from_bytes` /
+    `structural_determinism_from_bytes`), resting on the Tier-1 `ByteSigner`
+    assumptions composed with the Tier-3 `encodeSignaturePreimage_injective`. -/
 structure CryptoBoundary (profile : Profile) where
   digest : AllowedHash profile -> ByteArray -> ByteArray
-  digest_binding : forall leftAllowed rightAllowed left right,
-    digest leftAllowed left = digest rightAllowed right ->
-      leftAllowed.algorithm = rightAllowed.algorithm /\ left = right
   SignedBy : AllowedSignature profile -> SignaturePreimage -> ByteArray -> Prop
   signatureMatches : AllowedSignature profile -> SignaturePreimage -> ByteArray -> Bool
   signature_sound : forall allowed preimage signature,
     signatureMatches allowed preimage signature = true ->
       SignedBy allowed preimage signature
-  signature_binding : forall leftAllowed rightAllowed left right signature,
-    SignedBy leftAllowed left signature ->
-      SignedBy rightAllowed right signature ->
-        leftAllowed.algorithm = rightAllowed.algorithm /\ left = right
-  signature_deterministic : forall allowed preimage left right,
-    SignedBy allowed preimage left ->
-      SignedBy allowed preimage right -> left = right
 
 structure VerifiedEnvelope
     (profile : Profile)
