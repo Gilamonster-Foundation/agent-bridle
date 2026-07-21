@@ -46,3 +46,35 @@ example :
   intro h
   have heq := encodeSignaturePreimage_injective h
   simp [samplePreimage, sampleDomain] at heq
+
+-- ── F-233-01/04: real crypto inhabits the slimmed CryptoBoundary ────────────
+-- A concrete byte-level signer whose Tier-1 properties (soundness, binding,
+-- determinism) are all *satisfiable* — the honest counterpart to the old
+-- identity-hash-only mock that the impossible `digest_binding` used to force.
+
+def demoMsg : List UInt8 := [1, 2, 3]
+def demoSig : ByteArray := ByteArray.mk #[9, 9]
+
+def demoByteSigner : ByteSigner Profile.v1 where
+  SignedBytes := fun allowed msg sig =>
+    allowed.algorithm = .ed25519 ∧ msg = demoMsg ∧ sig = demoSig
+  matchesBytes := fun allowed msg sig =>
+    decide (allowed.algorithm = .ed25519 ∧ msg = demoMsg ∧ sig = demoSig)
+  bytes_sound := by intro _ _ _ h; exact of_decide_eq_true h
+  bytes_binding := by
+    intro _ _ _ _ _ hl hr
+    exact ⟨hl.1.trans hr.1.symm, hl.2.1.trans hr.2.1.symm⟩
+  bytes_deterministic := by intro _ _ _ _ hl hr; exact hl.2.2.trans hr.2.2.symm
+
+/-- The payoff, made concrete: a genuine `CryptoBoundary` built from the byte-level
+    signer via `ofByteSigner`. That this type-checks is the inhabitance the
+    impossible global-injectivity `digest_binding` denied to real crypto. -/
+def demoBoundary : Ceremony.P1.CryptoBoundary Profile.v1 :=
+  Ceremony.P1.CryptoBoundary.ofByteSigner demoByteSigner (fun _allowed body => body)
+
+-- The structural guarantees hold for it as the DERIVED theorems (no postulate):
+example {la ra : AllowedSignature Profile.v1} {lp rp : SignaturePreimage} {sig : ByteArray}
+    (hl : demoByteSigner.SignedBytes la (encodeSignaturePreimage lp) sig)
+    (hr : demoByteSigner.SignedBytes ra (encodeSignaturePreimage rp) sig) :
+    la.algorithm = ra.algorithm ∧ lp = rp :=
+  structural_binding_from_bytes demoByteSigner hl hr
