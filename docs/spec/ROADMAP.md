@@ -97,7 +97,9 @@ formal proof → conformance vectors.
     (rewritten from `iter().fold` to explicit recursion, so it reduces — empty →
     `NeedsDecision`, singleton, and full length-3 order-independence over every
     triple), and the P1 signed-object allowlist (`admit` + raw `allows_*`
-    membership on `v1`) **plus the genesis store-id binding** (ADR 0022:
+    membership on `v1`), the **profile-trust gate** (`TrustedProfile.admit` trusts
+    a profile iff it is `v1` — admits `v1`, rejects a tamper), **plus the genesis
+    store-id binding** (ADR 0022:
     `resolve_store_id` binds `STORE_ID_SELF` → own cid, universally in `own`;
     keeps a non-sentinel declared id). **Remaining Tier-3 depth:** the
     trait-generic `verify_envelope` / `signature_preimage` (extracted but not yet

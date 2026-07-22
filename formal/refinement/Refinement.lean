@@ -322,4 +322,17 @@ theorem resolve_store_id_non_genesis_keeps_declared (own : Slice Std.U8) :
       (⟨[1#u8], by scalar_tac⟩ : Slice Std.U8) STORE_ID_SELF = ok false := by native_decide
   simp [hb]
 
+-- **Profile-trust gate (PO-8, law §4·3).** The extracted `TrustedProfile.admit`
+-- trusts a profile IFF it equals `v1`: `v1` is admitted (`Some`), and any tamper —
+-- here the smallest, a version bump — is rejected (`None`). The Rust image of
+-- `SignedObject.lean`'s `TrustedProfile` being inhabited only at `v1`.
+open signed_object in
+theorem trusted_profile_admits_v1_rejects_tamper :
+    ((do let p ← Profile.v1; let t ← TrustedProfile.admit p; ok t.isSome) = ok true)
+    ∧ ((do let p ← Profile.v1
+           let t ← TrustedProfile.admit { p with version := 2#u64 }
+           ok t.isSome)
+        = ok false) := by
+  native_decide
+
 end CeremonyRefinement
