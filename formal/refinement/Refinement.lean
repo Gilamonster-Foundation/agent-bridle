@@ -283,4 +283,43 @@ theorem admit_codec_v1_admits_dagcbor_rejects_json :
     ∧ ((do let p ← Profile.v1; AllowedCodec.admit p Codec.Json) = ok none) := by
   native_decide
 
+-- ══ P1 signed-object: allowlist membership + genesis store-id binding ══
+-- Rounds the allowlist out to the raw `allows_*` predicate that `admit` wraps, and
+-- adds the genesis sentinel (ADR 0022 / OB-13): the extracted `resolve_store_id`
+-- binds a `STORE_ID_SELF` declaration to the record's OWN cid, and keeps any other
+-- declared id verbatim. All discharged on the Charon-extracted Rust.
+
+open signed_object in
+theorem allows_v1_membership :
+    ((do let p ← Profile.v1; p.allows_hash HashAlgorithm.Blake3_256) = ok true)
+    ∧ ((do let p ← Profile.v1; p.allows_hash HashAlgorithm.Sha1) = ok false)
+    ∧ ((do let p ← Profile.v1; p.allows_signature SignatureAlgorithm.Ed25519) = ok true)
+    ∧ ((do let p ← Profile.v1; p.allows_signature SignatureAlgorithm.Ecdsa) = ok false)
+    ∧ ((do let p ← Profile.v1; p.allows_codec Codec.DagCbor) = ok true)
+    ∧ ((do let p ← Profile.v1; p.allows_codec Codec.Json) = ok false) := by
+  native_decide
+
+-- **Genesis binding (ADR 0022, OB-13).** A record whose declared store-id is the
+-- `STORE_ID_SELF` sentinel resolves to its OWN cid — for EVERY `own_cid`. On the
+-- extracted `resolve_store_id`; the `native_decide` only evaluates the fixed
+-- sentinel slice-equality, so the conclusion is universal in `own`.
+open signed_object in
+theorem resolve_store_id_genesis_binds_own (own : Slice Std.U8) :
+    resolve_store_id STORE_ID_SELF own
+      = alloc.slice.Slice.to_vec core.clone.CloneU8 own := by
+  unfold resolve_store_id
+  have hb : core.slice.cmp.PartialEqSlice.eq core.cmp.PartialEqU8
+      STORE_ID_SELF STORE_ID_SELF = ok true := by native_decide
+  simp [hb]
+
+-- A NON-genesis declared store-id is kept verbatim (concrete witness `[0x01]`).
+open signed_object in
+theorem resolve_store_id_non_genesis_keeps_declared (own : Slice Std.U8) :
+    resolve_store_id ⟨[1#u8], by scalar_tac⟩ own
+      = alloc.slice.Slice.to_vec core.clone.CloneU8 ⟨[1#u8], by scalar_tac⟩ := by
+  unfold resolve_store_id
+  have hb : core.slice.cmp.PartialEqSlice.eq core.cmp.PartialEqU8
+      (⟨[1#u8], by scalar_tac⟩ : Slice Std.U8) STORE_ID_SELF = ok false := by native_decide
+  simp [hb]
+
 end CeremonyRefinement
