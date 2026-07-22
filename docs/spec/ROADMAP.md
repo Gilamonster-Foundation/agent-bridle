@@ -92,11 +92,19 @@ formal proof → conformance vectors.
   precedence + the gate-acceptance checklist. **Charon extracts the Rust
   kernel; Aeneas proves it refines `Authority.lean`.** *Gate:* PO-1/3/4/5
   + the refinement bridge theorem; CI blocks any kernel that fails it.
-  - *Started:* `agent-bridle-ceremony` (`authority.rs` + `boundary.rs`) is the
-    pure kernel; `formal/refinement/` proves the `meet`/`attenuate` laws on the
-    Charon/Aeneas-extracted code. **Remaining:** rewrite `resolve` from an
-    iterator-`fold` (Aeneas axiomatizes slice iterators, so it won't reduce) to
-    explicit recursion, then extend the refinement proof to cover it.
+  - *Refinement status (2026-07-22):* `formal/refinement/` proves, on the
+    Charon/Aeneas-extracted Rust: the P0 `meet`/`attenuate` laws, `resolve`
+    (rewritten from `iter().fold` to explicit recursion, so it reduces — empty →
+    `NeedsDecision`, singleton, and full length-3 order-independence over every
+    triple), and the P1 signed-object allowlist (`admit` + raw `allows_*`
+    membership on `v1`) **plus the genesis store-id binding** (ADR 0022:
+    `resolve_store_id` binds `STORE_ID_SELF` → own cid, universally in `own`;
+    keeps a non-sentinel declared id). **Remaining Tier-3 depth:** the
+    trait-generic `verify_envelope` / `signature_preimage` (extracted but not yet
+    refined), and *universal* (all-input) refinement of the slice-based predicates
+    — which, like `resolve`, needs the Rust rewritten off the axiomatized slice
+    iterators before it will reduce symbolically. Heavy tier: `just
+    check-refinement` (not the mandatory CI gate; needs the Aeneas backend).
   - *Audit obligation (AB-012, epic #259):* the `agent-bridle-jaild` broker
     accepts client-supplied caveats without establishing who minted them or the
     caller's entitlement — it enforces *confinement relative to a request*, not
