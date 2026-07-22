@@ -37,6 +37,10 @@ mod gate;
 // no-subprocess `reqwest` client) share ONE implementation. Std-only; public so
 // the audit seams (`AuditSink`/`Resolver`) stay embedder-extensible.
 pub mod net_proxy;
+// The operator-authz contract (newt-agent #1354): HumanPrincipal /
+// PrincipalBinding / PermissionChallenge / OperatorDecision. Public like
+// `policy` so consumers reach it as `agent_bridle::operator::…`.
+pub mod operator;
 pub mod policy;
 mod registry;
 mod report;

@@ -251,9 +251,10 @@ impl ApproveVerifier for Ed25519ApproveVerifier {
     }
 }
 
-/// Decode a lowercase/uppercase hex string (the `sig` wire encoding). Local on
-/// purpose — a two-line decoder beats a dependency for one field.
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+/// Decode a lowercase/uppercase hex string (the `sig` wire encoding). A two-line
+/// decoder beats a dependency for one field; `pub(crate)` so [`crate::operator`]
+/// (the web-authz contract) shares it rather than forking a second copy.
+pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
         return Err("hex string has odd length".into());
     }
