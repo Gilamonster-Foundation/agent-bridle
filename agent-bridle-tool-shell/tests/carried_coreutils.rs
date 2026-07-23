@@ -1,11 +1,11 @@
 //! Integration keystone for carried coreutils (Track 2 Gate 2 / issue #206).
 //!
 //! Runs the dispatch-capable `dispatch_host` binary with the **environment
-//! scrubbed** (`env_clear` — no `PATH`, no host tools), asking the embedded
-//! brush engine to run `ls`/`cat`. These succeed ONLY if the carried uutils
+//! scrubbed** (`env_clear` plus a guaranteed-dead `PATH`), asking the embedded
+//! brush engine to run `ls`/`cat`/`wc`. These succeed ONLY if the carried uutils
 //! coreutils dispatch in-process via re-exec of the (dispatch-capable) host
 //! binary — proving the "just a filesystem" story. If the dispatch machinery
-//! regressed, the shell would find no `ls`/`cat` at all.
+//! regressed, the shell would find none of these commands at all.
 #![cfg(feature = "carried-coreutils")]
 
 use std::path::{Path, PathBuf};
@@ -39,14 +39,16 @@ fn unique_temp(tag: &str) -> PathBuf {
     ))
 }
 
-/// A `dispatch_host` command with **host tools removed from PATH** (no `PATH` at
-/// all) but the OS-minimal environment preserved. On Windows a fully-empty
-/// environment breaks process startup (`SystemRoot`, …), so we keep only those
-/// non-secret, always-required vars — PATH stays absent, so only carried tools
-/// can satisfy a bare `ls`/`cat`. On unix nothing extra is needed.
+/// A `dispatch_host` command with **host tools removed from PATH**. PATH points
+/// at a unique nonexistent location and the helper passes it through the
+/// engine's explicit `env` seam, so the unrestricted test caveats cannot seed
+/// the host's default executable path. On Windows a fully-empty environment
+/// breaks process startup (`SystemRoot`, …), so we also keep only those
+/// non-secret, always-required vars.
 fn scrubbed() -> Command {
     let mut c = Command::new(dispatch_host());
     c.env_clear();
+    c.env("PATH", unique_temp("empty-path"));
     #[cfg(windows)]
     for key in [
         "SystemRoot",
@@ -65,8 +67,8 @@ fn scrubbed() -> Command {
 }
 
 /// Carried `ls` lists a directory with the environment fully scrubbed — no host
-/// `/bin/ls`, no `PATH`. It resolves to the in-process uutils `ls` via the shim's
-/// re-exec of the dispatch-capable host binary.
+/// `/bin/ls`, and a dead `PATH`. It resolves to the in-process uutils `ls` via
+/// the shim's re-exec of the dispatch-capable host binary.
 #[test]
 fn carried_ls_runs_in_process_with_env_scrubbed() {
     let dir = unique_temp("ls");
@@ -110,6 +112,47 @@ fn carried_cat_runs_in_process_with_env_scrubbed() {
     assert!(
         stdout.contains("carried-cat-ok"),
         "carried cat must read the file with NO host tools: stdout={stdout:?} stderr={stderr:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Carried `wc` counts lines in multiple files with the environment fully
+/// scrubbed. This grounds the command shape used by agents to inspect source
+/// files without relying on a host `/usr/bin/wc`.
+#[test]
+fn carried_wc_counts_lines_with_env_scrubbed() {
+    let dir = unique_temp("wc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let first = dir.join("first.txt");
+    let second = dir.join("second.txt");
+    std::fs::write(&first, b"one\ntwo\n").unwrap();
+    std::fs::write(&second, b"three\nfour\nfive\n").unwrap();
+
+    let out = scrubbed()
+        .arg(format!(
+            "wc -l {} {}",
+            shell_quote(&first),
+            shell_quote(&second)
+        ))
+        .output()
+        .expect("run dispatch_host");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "carried wc exited nonzero: stdout={stdout:?} stderr={stderr:?}"
+    );
+    let counts: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(
+        counts,
+        ["2", "3", "5"],
+        "carried wc must count both files and their total with NO host tools: \
+         stdout={stdout:?} stderr={stderr:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

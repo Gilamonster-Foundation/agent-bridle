@@ -88,12 +88,13 @@ tokio = { workspace = true, optional = true }
 # The requirement must name the API floor we compile against.
 brush-ocap-core = { version = "0.5.1", optional = true }
 brush-ocap-builtins = { version = "0.2", optional = true }
-# A minimal carried coreutils set (ls/cat/echo) — enough for the embedded
+# A minimal carried coreutils set (ls/cat/echo/wc) — enough for the embedded
 # dispatch path (issue #206) without the ~100-crate `coreutils.all` build.
 brush-ocap-coreutils-builtins = { version = "0.1", features = [
     "coreutils.ls",
     "coreutils.cat",
     "coreutils.echo",
+    "coreutils.wc",
 ], optional = true }
 
 [dev-dependencies]
