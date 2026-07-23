@@ -2,7 +2,7 @@
 //! (issue #206). Its `main` calls [`maybe_dispatch`] first, so the brush engine's
 //! carried coreutils shims — which re-exec `<self> --invoke-bundled <name>` —
 //! resolve **in-process against THIS binary**. Run it with the environment
-//! scrubbed (`env_clear`) to prove carried `ls`/`cat` work with no host tools.
+//! scrubbed (`env_clear`) to prove carried commands work with no host tools.
 //!
 //! Usage: `dispatch_host <cmd> [cwd]` — runs `<cmd>` through the confined brush
 //! engine under full-access, prints captured stdout/stderr, exits with the
@@ -39,6 +39,12 @@ fn main() {
     let mut json = serde_json::json!({ "cmd": cmd });
     if let Some(cwd) = cwd {
         json["cwd"] = serde_json::Value::String(cwd);
+    }
+    // The real-resource tests provide a guaranteed-dead PATH explicitly. Pass
+    // it through the brush engine's deliberate `env` seam so unrestricted
+    // caveats cannot seed the host's default executable path instead.
+    if let Some(path) = std::env::var_os("PATH") {
+        json["env"] = serde_json::json!({ "PATH": path.to_string_lossy() });
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
