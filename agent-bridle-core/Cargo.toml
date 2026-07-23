@@ -47,6 +47,11 @@ verifier-ed25519 = ["dep:ed25519-dalek"]
 # `ed25519-dalek` (EdDSA assertions) + `sha2` (SHA-256 over clientDataJSON).
 # ADR 0007. agent-bridle#72.
 verifier-webauthn = ["dep:ed25519-dalek", "dep:sha2"]
+# ES256 (COSE alg -7) passkey verifier — most platform passkeys sign ECDSA-P256,
+# not EdDSA, so this is what makes real phone/laptop hardware work. Shares the
+# `verifier-webauthn` gating; adds `p256` (ECDSA verify) + `sha2`. Off by default.
+# agent-bridle#295.
+verifier-webauthn-es256 = ["dep:p256", "dep:sha2"]
 # `spawn-tokio` exposes `ConfinedCommand::spawn_tokio` (Unix): the SAME confined
 # spawn as `spawn` (identical admission-check / OS-sandbox / env-scrub), but the
 # child's stdio is returned as tokio-native pipe handles wrapped in a
@@ -74,6 +79,11 @@ ed25519-dalek = { version = "2", optional = true }
 # `verifier-webauthn`. Already in the lockfile (transitive via ed25519-dalek), so
 # enabling the feature pulls nothing new.
 sha2 = { version = "0.10", optional = true }
+
+# Optional: P-256 ECDSA verification for the ES256 WebAuthn verifier, gated by
+# `verifier-webauthn-es256`. `default-features = false` + `ecdsa` keeps it lean
+# (verification + deterministic RFC6979 signing for tests; no PEM/PKCS8).
+p256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
 
 # Optional: tokio-native pipe ends for `ConfinedCommand::spawn_tokio`, gated by
 # `spawn-tokio`. Inherits the workspace tokio features (rt/macros/…) and adds

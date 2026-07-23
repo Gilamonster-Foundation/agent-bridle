@@ -83,6 +83,8 @@ pub use spawn::{
 pub use spawn::ConfinedTokioChild;
 #[cfg(feature = "verifier-ed25519")]
 pub use step_up::Ed25519Verifier;
+#[cfg(feature = "verifier-webauthn-es256")]
+pub use step_up::WebAuthnEs256Verifier;
 #[cfg(feature = "verifier-webauthn")]
 pub use step_up::WebAuthnVerifier;
 pub use step_up::{
