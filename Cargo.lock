@@ -52,6 +52,7 @@ dependencies = [
  "async-trait",
  "ed25519-dalek",
  "landlock",
+ "p256",
  "serde",
  "serde_json",
  "sha2",
