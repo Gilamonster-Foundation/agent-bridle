@@ -37,6 +37,7 @@ mod brush_shell;
 mod caveat_interceptor;
 #[cfg(feature = "carried-coreutils")]
 mod coreutils_dispatch;
+pub(crate) mod coreutils;
 #[cfg(feature = "host-shell")]
 mod host_shell;
 // #257: the loopback egress proxy moved to agent-bridle-core (shared with
