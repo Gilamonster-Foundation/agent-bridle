@@ -299,10 +299,34 @@ fn supervise_worker(
 ) -> ToolResult<Supervised> {
     let auth_started = std::time::Instant::now();
     if let Err(error) = confined.send_payload(payload, timeout) {
-        kill_worker_tree(&mut confined.child);
-        let _ = confined.child.wait();
-        return Err(error);
+        let mut child = confined.child;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
+        let protocol_cap = max_output.saturating_mul(4).saturating_add(1024 * 1024);
+        let stdout_reader = std::thread::spawn(move || read_capped(stdout, protocol_cap));
+        let stderr_reader =
+            std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
+
+        kill_worker_tree(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| ToolError::denied("brush worker stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| ToolError::denied("brush worker stderr reader panicked"))??;
+        let reason = brush_worker_handshake_error_message(&error.to_string(), &stdout, &stderr);
+        return Err(ToolError::denied(format!(
+            "brush worker authentication handshake failed: {reason}"
+        )));
     }
+
     let mut child = confined.child;
     let stdout = child
         .stdout
@@ -354,6 +378,31 @@ fn supervise_worker(
                 String::from_utf8_lossy(&stderr)
             ))
         })
+}
+
+fn brush_worker_handshake_error_message(
+    transport_error: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
+    if let Ok(response) = serde_json::from_slice::<WorkerResponse>(stdout) {
+        if let Some(reason) = response.error {
+            return reason;
+        }
+        if !response.denials.is_empty() {
+            return serde_json::to_string(&response.denials)
+                .unwrap_or_else(|_| String::from("unprintable denials"));
+        }
+        if response.exit_code != 0 {
+            return format!("exit_code {}", response.exit_code);
+        }
+    }
+    let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
+    if stderr_text.is_empty() {
+        transport_error.to_owned()
+    } else {
+        format!("{transport_error}: {stderr_text}")
+    }
 }
 
 fn read_capped(reader: impl Read, cap: usize) -> ToolResult<Vec<u8>> {
@@ -910,5 +959,37 @@ mod drain_tests {
             start.elapsed() < DRAIN_DETACH_DEADLINE,
             "must return as soon as the drain EOFs, not wait out the detach deadline"
         );
+    }
+}
+
+#[cfg(test)]
+mod handshake_error_tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn handshake_error_prefers_worker_error_over_transport_error() {
+        let response = WorkerResponse {
+            exit_code: 126,
+            stdout: String::new(),
+            stderr: String::new(),
+            denials: Vec::new(),
+            error: Some("worker nonce mismatch".to_string()),
+        };
+        let stdout = serde_json::to_vec(&response).expect("serialize response");
+        let reason = brush_worker_handshake_error_message("transport failed", &stdout, &[]);
+        assert_eq!(reason, "worker nonce mismatch");
+    }
+
+    #[test]
+    fn handshake_error_falls_back_to_stderr_when_no_structured_response() {
+        let transport_error = std::io::Error::from(ErrorKind::ConnectionReset);
+        let reason = brush_worker_handshake_error_message(
+            &transport_error.to_string(),
+            b"not-json",
+            b"stderr text",
+        );
+        assert!(reason.starts_with("connection reset"));
+        assert!(reason.contains("stderr text"));
     }
 }
