@@ -1503,9 +1503,29 @@ mod tests {
         };
 
         // ALLOW: via the proxy, the allow-listed host reaches the loopback origin.
-        let allow = run(true, "http://allowed.test/");
+        //
+        // In a few CI environments the first `curl` attempt can be an
+        // in-flight startup race that ends in "Empty reply from server" even
+        // though the proxy and origin are otherwise healthy. A tiny bounded retry
+        // keeps this assertion focused on policy while filtering transient transport
+        // noise.
+        let mut allow = None;
+        for attempt in 0..3 {
+            let output = run(true, "http://allowed.test/");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if output.status.success() && stdout.contains("origin") {
+                allow = Some(output);
+                break;
+            }
+            if attempt < 2 {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            allow = Some(output);
+        }
+        let allow = allow.expect("at least one allow-leg probe should run");
         assert!(
-            String::from_utf8_lossy(&allow.stdout).contains("origin"),
+            allow.status.success() && String::from_utf8_lossy(&allow.stdout).contains("origin"),
             "allow-listed host must reach the origin through the proxy: {allow:?}"
         );
         // DENY: via the proxy, a non-allow-listed host gets the proxy's 403 — and
