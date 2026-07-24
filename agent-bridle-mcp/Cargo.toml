@@ -12,12 +12,11 @@ name = "agent-bridle-mcp"
 path = "src/main.rs"
 
 [features]
-# Expose the confined brush-backed shell tool through the registry. On by
-# default so the server ships a useful, leashed tool surface; a host that wants
-# a leaner build can opt out with --no-default-features (the registry is then
-# valid but empty). Forwarded to the facade so its tool set follows suit.
-default = ["shell"]
+# Serve the carried Brush shell + bundled coreutils by default. `shell` remains
+# an explicit lean-build alternative selecting the argv + safe-subset engine.
+default = ["carried-coreutils"]
 shell = ["agent-bridle/shell"]
+carried-coreutils = ["agent-bridle/carried-coreutils"]
 # Expose the confined `web_fetch` tool (the `net` enforcer) through the server.
 # Off by default so the default MCP build stays light; enable with
 # `--features web` (or `--all-features`) to serve web_fetch over MCP.

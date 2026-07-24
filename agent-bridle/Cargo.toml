@@ -9,9 +9,11 @@ authors.workspace = true
 readme = "../README.md"
 
 [features]
-# Shell on by default so `agent-bridle::registry()` ships a useful tool set.
-# A host that wants a leaner build can opt out with --no-default-features.
-default = ["shell"]
+# The default registry uses the carried Brush engine and its bundled coreutils:
+# a batteries-included shell that does not depend on host `ls`/`cat`/`echo`.
+# A host that wants the smaller argv + safe-subset engine can opt out of default
+# features and enable `shell` explicitly.
+default = ["carried-coreutils"]
 shell = ["dep:agent-bridle-tool-shell"]
 # Forward the policy/step-up Ed25519 verifier (#226): lets facade consumers
 # (e.g. newt's signed-approve verify-at-load) enable it without a direct
@@ -30,8 +32,9 @@ host-shell = ["dep:agent-bridle-tool-shell", "agent-bridle-tool-shell/host-shell
 # default. Uses the temporary `brush-ocap-*` fork published to crates.io
 # (agent-bridle#20); retire once reubeno/brush#1184 ships upstream.
 brush = ["dep:agent-bridle-tool-shell", "agent-bridle-tool-shell/brush"]
-# Carried coreutils (issue #206): the brush engine carries bundled uu_* coreutils
-# so an embedded shell runs `ls`/`cat`/… with no host tools. Off by default.
+# Carried coreutils (issue #206): the Brush engine carries bundled uu_* coreutils
+# so an embedded shell runs `ls`/`cat`/… with no host tools. This is the facade's
+# default shell implementation; `shell` remains the lean safe-subset alternative.
 carried-coreutils = ["brush", "agent-bridle-tool-shell/carried-coreutils"]
 # `web` adds the confined `web_fetch` tool (the `net` enforcer). Off by default
 # so the heavy reqwest/readability/DNS deps only enter a build that asks for it.

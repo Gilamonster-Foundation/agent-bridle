@@ -18,6 +18,10 @@ use agent_bridle_tool_shell::{
     BrushShellTool, ShellInvocationId, ShellOutputObserver, ShellOutputStream,
 };
 
+fn tool() -> BrushShellTool {
+    BrushShellTool::new().with_worker_executable(env!("CARGO_BIN_EXE_dispatch_host"))
+}
+
 #[cfg(unix)]
 const OUTPUT_CAP: usize = 64 * 1024;
 
@@ -67,7 +71,7 @@ impl OutputRecorder {
 /// uses (mirrors `host_shell_real.rs`).
 fn ctx(granted: Caveats) -> ToolContext {
     Gate::new(0)
-        .authorize(&BrushShellTool::new(), &granted)
+        .authorize(&tool(), &granted)
         .expect("authorize")
 }
 
@@ -84,7 +88,7 @@ fn unique_temp(tag: &str) -> std::path::PathBuf {
 #[tokio::test]
 async fn output_observer_matches_the_brush_envelope() {
     let observer = Arc::new(OutputRecorder::default());
-    let out = BrushShellTool::new()
+    let out = tool()
         .with_output_observer(observer.clone())
         .invoke(
             serde_json::json!({ "cmd": "printf brush-out; printf brush-err >&2" }),
@@ -104,7 +108,7 @@ async fn output_observer_matches_the_brush_envelope() {
 #[tokio::test]
 async fn stderr_observer_and_brush_envelope_apply_the_output_cap() {
     let observer = Arc::new(OutputRecorder::default());
-    let out = BrushShellTool::new()
+    let out = tool()
         .with_output_observer(observer.clone())
         .invoke(
             serde_json::json!({
@@ -128,7 +132,7 @@ async fn stderr_observer_and_brush_envelope_apply_the_output_cap() {
 /// engine — RUNS in-process, and the engine identity is disclosed.
 #[tokio::test]
 async fn full_access_runs_dynamic_construct_and_captures() {
-    let out = BrushShellTool::new()
+    let out = tool()
         .invoke(
             serde_json::json!({ "cmd": "echo \"$(echo composed)\"" }),
             &ctx(Caveats::top()),
@@ -164,7 +168,7 @@ async fn restricted_exec_denies_out_of_scope_command_in_process() {
     // Path-separator form goes straight to the external-spawn funnel → before_exec.
     let cmd = format!("/bin/touch {}", sentinel.to_string_lossy());
 
-    let out = BrushShellTool::new()
+    let out = tool()
         .invoke(serde_json::json!({ "cmd": cmd }), &ctx(caveats))
         .await
         .expect("invoke");
@@ -191,7 +195,7 @@ async fn restricted_exec_allows_in_scope_command() {
         ..Caveats::top()
     };
 
-    let out = BrushShellTool::new()
+    let out = tool()
         .invoke(serde_json::json!({ "cmd": "echo ok" }), &ctx(caveats))
         .await
         .expect("invoke");
@@ -200,12 +204,37 @@ async fn restricted_exec_allows_in_scope_command() {
     assert_eq!(out["stdout"].as_str().unwrap_or("").trim(), "ok", "{out}");
 }
 
+/// A restricted filesystem grant is never silently downgraded to the L2
+/// interceptor when this build has no OS backend for the worker boundary.
+#[cfg(not(any(
+    feature = "linux-landlock",
+    feature = "macos-seatbelt",
+    feature = "windows-appcontainer"
+)))]
+#[tokio::test]
+async fn restricted_filesystem_without_l3_refuses_before_execution() {
+    let marker = unique_temp("l3-refusal");
+    let caveats = Caveats {
+        fs_write: Scope::only([marker.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let result = tool()
+        .invoke(
+            serde_json::json!({ "cmd": format!("echo escaped > '{}'", marker.display()) }),
+            &ctx(caveats),
+        )
+        .await;
+
+    assert!(result.is_err(), "restricted fs must fail closed without L3");
+    assert!(!marker.exists(), "refused command must not execute");
+}
+
 /// The schema's `env` seam now reaches the shell (EPIC #1243 Leg 2). Before
 /// this, brush silently DROPPED `args["env"]` — a caller var expanded to empty.
 /// This is the regression guard: a passed var expands inside the confined shell.
 #[tokio::test]
 async fn env_seam_delivers_caller_vars_to_the_shell() {
-    let out = BrushShellTool::new()
+    let out = tool()
         .invoke(
             serde_json::json!({
                 "cmd": "echo \"$NEWT_SEAM_PROBE\"",
@@ -235,7 +264,7 @@ async fn env_seam_delivers_caller_vars_to_the_shell() {
 #[tokio::test]
 async fn confined_stdin_reader_gets_eof_not_the_operator_terminal() {
     let cx = ctx(Caveats::top());
-    let tool = BrushShellTool::new();
+    let tool = tool();
     // Path-separator form runs the real external `/bin/cat` (the carried-coreutils
     // `cat` shim would otherwise re-exec this non-dispatch test binary); an
     // external child inherits the shell's STDIN_FD, so this proves the null fd
@@ -267,7 +296,7 @@ async fn confined_stdin_reader_gets_eof_not_the_operator_terminal() {
 #[tokio::test]
 async fn confined_run_is_bounded_by_the_wall_clock_ceiling() {
     let cx = ctx(Caveats::top());
-    let tool = BrushShellTool::new().with_timeout(Duration::from_secs(1));
+    let tool = tool().with_timeout(Duration::from_secs(1));
     let start = std::time::Instant::now();
     let out = tokio::time::timeout(
         Duration::from_secs(20),
@@ -286,12 +315,35 @@ async fn confined_run_is_bounded_by_the_wall_clock_ceiling() {
     assert_eq!(out["exit_code"], 124, "the timeout exit code is 124: {out}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn timeout_kills_worker_descendants() {
+    let marker = unique_temp("timeout-descendant");
+    let _ = std::fs::remove_file(&marker);
+    let tool = tool().with_timeout(Duration::from_millis(150));
+    let out = tool
+        .invoke(
+            serde_json::json!({
+                "cmd": format!("(sleep 1; touch '{}') & wait", marker.display())
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["timed_out"], true, "{out}");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        !marker.exists(),
+        "a descendant must not survive the worker timeout"
+    );
+}
+
 /// HOME crosses the seam — the concrete #783-class motivation: without it,
 /// `~` expansion and HOME-relative tooling misbehave under the brush engine.
 /// Nothing ambient leaks in (do_not_inherit_env); only the passed value shows.
 #[tokio::test]
 async fn env_seam_delivers_home_for_tilde_class_tooling() {
-    let out = BrushShellTool::new()
+    let out = tool()
         .invoke(
             serde_json::json!({
                 "cmd": "echo \"$HOME\"",

@@ -118,6 +118,8 @@ dependencies = [
  "brush-ocap-builtins",
  "brush-ocap-core",
  "brush-ocap-coreutils-builtins",
+ "getrandom 0.2.17",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

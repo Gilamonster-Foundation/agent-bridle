@@ -153,23 +153,23 @@ mod tests {
     /// denial tests run an *out-of-scope* program, so the leash refuses them
     /// before any spawn — those are portable as-is. (Fixes agent-bridle#43: the
     /// nightly Windows `cargo test` failed on the `echo` spawn.)
-    #[cfg(all(feature = "shell", not(windows)))]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils"), not(windows)))]
     const OK_PROGRAM: &str = "echo";
-    #[cfg(all(feature = "shell", windows))]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils"), windows))]
     const OK_PROGRAM: &str = "cmd";
 
-    #[cfg(all(feature = "shell", not(windows)))]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils"), not(windows)))]
     fn ok_args() -> serde_json::Value {
         serde_json::json!(["hi"])
     }
-    #[cfg(all(feature = "shell", windows))]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils"), windows))]
     fn ok_args() -> serde_json::Value {
         serde_json::json!(["/c", "echo hi"])
     }
 
     /// A grant that allows only the host's in-scope success program
     /// ([`OK_PROGRAM`]) — used by the shell-tool tests.
-    #[cfg(feature = "shell")]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
     fn echo_grant() -> Caveats {
         use agent_bridle::{CountBound, Scope};
         Caveats {
@@ -187,7 +187,7 @@ mod tests {
         assert!(v["capabilities"]["tools"].is_object());
     }
 
-    #[cfg(feature = "shell")]
+    #[cfg(any(feature = "shell", feature = "carried-coreutils"))]
     #[test]
     fn tools_list_wraps_definitions_with_descriptions() {
         let reg = agent_bridle::registry();
@@ -206,7 +206,7 @@ mod tests {
     // surfaced as an in-band denial, and a free-form denial read from the
     // structured `denied` field (not stderr).
 
-    #[cfg(feature = "shell")]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
     #[tokio::test]
     async fn call_in_scope_succeeds() {
         let reg = agent_bridle::registry();
@@ -221,7 +221,7 @@ mod tests {
         assert!(text.contains("hi"), "stdout must carry through: {text}");
     }
 
-    #[cfg(feature = "shell")]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
     #[tokio::test]
     async fn call_out_of_scope_is_in_band_denial() {
         // `rm` is not in the echo-only grant: the exec leash denies it, surfaced
@@ -241,7 +241,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shell")]
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
     #[tokio::test]
     async fn call_freeform_denied_is_in_band_error_from_structured_field() {
         // A free-form cmd whose program is out of scope returns Ok(envelope) with

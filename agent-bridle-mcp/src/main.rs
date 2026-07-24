@@ -28,8 +28,19 @@ use agent_bridle::registry;
 use caveats_source::GrantedCaveats;
 use server::McpServer;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Carried coreutils re-exec this binary as
+    // `<self> --invoke-bundled <name> <args...>`. Handle that private dispatch
+    // protocol before MCP startup so `ls`/`cat`/`echo` need no host utilities.
+    #[cfg(feature = "carried-coreutils")]
+    if let Some(code) = agent_bridle::maybe_dispatch() {
+        std::process::exit(code);
+    }
+
+    tokio::runtime::Runtime::new()?.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Source the leash. stdout is reserved for the JSON-RPC stream, so the
     // provenance banner (and any unconfined WARNING) goes to stderr.
     let granted = GrantedCaveats::load()?;
@@ -51,8 +62,8 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Build the registry for this binary's compiled feature set (shell on by
-    // default) and serve it over stdio, confined to the granted leash.
+    // Build the registry for this binary's compiled feature set (carried Brush
+    // shell + coreutils by default) and serve it over stdio.
     let server = McpServer::new(registry(), granted.caveats);
     server.run_stdio().await
 }

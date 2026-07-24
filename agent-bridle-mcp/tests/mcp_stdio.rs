@@ -18,7 +18,7 @@
 //! The granted leash is supplied via `$AGENT_BRIDLE_CAVEATS` (the same path a
 //! real orchestrator uses), restricted to `exec: Only{echo}`.
 
-#![cfg(feature = "shell")]
+#![cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
 
 use std::process::Stdio;
 use std::time::Duration;

@@ -38,12 +38,9 @@ use brush_core::builtins::{BoxFuture, ContentOptions, ContentType, Registration}
 use brush_core::commands::{self, CommandArg, ExecutionContext};
 use brush_core::extensions::ShellExtensions;
 use brush_core::ExecutionExitCode;
-use crate::coreutils;
 
 /// The leading flag that signals a bundled-command dispatch. Deliberately
 /// obscure so it does not collide with real flags or script tokens.
-mod coreutils;
-
 pub const DISPATCH_FLAG: &str = "--invoke-bundled";
 
 /// Signature of a bundled command's entry point — matches `uu_*::uumain`.
@@ -70,43 +67,6 @@ pub fn install(commands: HashMap<String, BundledFn>) {
 pub fn install_default_providers() {
     let mut commands: HashMap<String, BundledFn> = HashMap::new();
     commands.extend(brush_coreutils_builtins::bundled_commands());
-coreutils::ls::register(&mut commands);
-coreutils::cat::register(&mut commands);
-coreutils::echo::register(&mut commands);
-coreutils::mkdir::register(&mut commands);
-coreutils::rm::register(&mut commands);
-coreutils::cp::register(&mut commands);
-coreutils::mv::register(&mut commands);
-coreutils::test::register(&mut commands);
-coreutils::head::register(&mut commands);
-coreutils::tail::register(&mut commands);
-coreutils::wc::register(&mut commands);
-coreutils::stat::register(&mut commands);
-coreutils::basename::register(&mut commands);
-coreutils::dirname::register(&mut commands);
-coreutils::readlink::register(&mut commands);
-coreutils::realpath::register(&mut commands);
-coreutils::sha256sum::register(&mut commands);
-coreutils::base32::register(&mut commands);
-coreutils::base64::register(&mut commands);
-coreutils::cksum::register(&mut commands);
-coreutils::comm::register(&mut commands);
-coreutils::cut::register(&mut commands);
-coreutils::expand::register(&mut commands);
-coreutils::fold::register(&mut commands);
-coreutils::join::register(&mut commands);
-coreutils::nl::register(&mut commands);
-coreutils::paste::register(&mut commands);
-coreutils::sort::register(&mut commands);
-coreutils::split::register(&mut commands);
-coreutils::tac::register(&mut commands);
-coreutils::tr::register(&mut commands);
-coreutils::unexpand::register(&mut commands);
-coreutils::uniq::register(&mut commands);
-coreutils::ln::register(&mut commands);
-coreutils::rmdir::register(&mut commands);
-coreutils::truncate::register(&mut commands);
-    install(commands);
     install(commands);
 }
 
@@ -122,6 +82,17 @@ pub fn maybe_dispatch() -> Option<i32> {
     let mut raw = std::env::args_os();
     let _argv0 = raw.next();
     let first = raw.next()?;
+    if first == crate::brush_worker::WORKER_FLAG {
+        return match raw.next().and_then(|value| value.into_string().ok()) {
+            Some(kind) if kind == crate::brush_worker::WORKER_KIND && raw.next().is_none() => {
+                Some(crate::brush_worker::main())
+            }
+            _ => {
+                eprintln!("agent-bridle: invalid private worker entrypoint");
+                Some(u8::from(ExecutionExitCode::InvalidUsage).into())
+            }
+        };
+    }
     if first != DISPATCH_FLAG {
         return None;
     }
@@ -151,6 +122,25 @@ pub fn maybe_dispatch() -> Option<i32> {
     argv.push(name.clone());
     argv.extend(args.iter().cloned());
     Some(func(argv))
+}
+
+/// Recover the model-visible identity of a carried command from the private
+/// re-exec argv. The executable must be this process and the command must be in
+/// the installed, closed registry; otherwise this is an ordinary external exec.
+pub(crate) fn logical_carried_command(program: &str, args: &[String]) -> Option<String> {
+    if REGISTRY.get().is_none() {
+        install_default_providers();
+    }
+    let program = std::path::Path::new(program).canonicalize().ok()?;
+    let current = std::env::current_exe().ok()?.canonicalize().ok()?;
+    if program != current || args.first().map(String::as_str) != Some(DISPATCH_FLAG) {
+        return None;
+    }
+    let name = args.get(1)?;
+    REGISTRY
+        .get()
+        .is_some_and(|registry| registry.contains_key(name))
+        .then(|| name.clone())
 }
 
 /// Path to the running executable (cached).
@@ -242,5 +232,41 @@ pub fn register_shims<SE: ShellExtensions>(shell: &mut brush_core::Shell<SE>) {
     };
     for name in registry.keys() {
         shell.register_builtin_if_unset(name.clone(), shim_registration::<SE>());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn carried_reexec_is_authorized_by_logical_name() {
+        install_default_providers();
+        let executable = std::env::current_exe().expect("current test executable");
+        let args = vec![
+            DISPATCH_FLAG.to_string(),
+            "cat".to_string(),
+            "fixture.txt".to_string(),
+        ];
+        assert_eq!(
+            logical_carried_command(&executable.to_string_lossy(), &args).as_deref(),
+            Some("cat")
+        );
+    }
+
+    #[test]
+    fn lookalike_dispatch_is_not_a_carried_command() {
+        install_default_providers();
+        let executable = std::env::current_exe().expect("current test executable");
+        assert!(logical_carried_command(
+            &executable.to_string_lossy(),
+            &[DISPATCH_FLAG.to_string(), "not-carried".to_string()]
+        )
+        .is_none());
+        assert!(logical_carried_command(
+            "/bin/echo",
+            &[DISPATCH_FLAG.to_string(), "cat".to_string()]
+        )
+        .is_none());
     }
 }

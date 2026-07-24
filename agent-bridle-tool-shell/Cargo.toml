@@ -39,11 +39,17 @@ shell = ["dep:tokio"]
 # tokio (spawn_blocking) like `shell`; independent of the safe-subset modules.
 host-shell = ["dep:tokio"]
 # The carried **brush** engine (agent-bridle#20 / Track 2): a bash-in-Rust shell
-# run in-process, confined by the `CommandInterceptor` L2 leash — the only engine
-# that also confines a *restricted* exec/net grant, and cross-platform. Uses the
+# run in a dedicated sandboxed worker, with the `CommandInterceptor` L2 leash
+# inside the inherited L3 boundary. Uses the
 # temporary `brush-ocap-*` fork, published to crates.io (reubeno/brush#1184 not
 # yet upstream). Off by default; the crate stays publish-clean with `brush` off.
-brush = ["dep:tokio", "dep:brush-ocap-core", "dep:brush-ocap-builtins"]
+brush = [
+    "dep:tokio",
+    "dep:brush-ocap-core",
+    "dep:brush-ocap-builtins",
+    "dep:getrandom",
+    "dep:rustix",
+]
 # Carried coreutils (agent-bridle#20 / issue #206): the brush engine registers
 # bundled uu_* coreutils shims that re-exec `<self> --invoke-bundled <name>`, so
 # an embedded shell runs `ls`/`cat`/… with NO host tools — IF the host binary is
@@ -73,6 +79,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, optional = true }
+getrandom = { version = "0.2", optional = true }
+rustix = { version = "1", features = ["process"], optional = true }
 
 # The `brush-ocap-*` fork on crates.io (github.com/hartsock/brush @ brush-ocap):
 # upstream brush + the CommandInterceptor hook (reubeno/brush#1184), renamed +

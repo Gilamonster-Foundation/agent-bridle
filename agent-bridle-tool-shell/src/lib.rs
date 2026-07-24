@@ -34,10 +34,11 @@
 #[cfg(feature = "brush")]
 mod brush_shell;
 #[cfg(feature = "brush")]
+mod brush_worker;
+#[cfg(feature = "brush")]
 mod caveat_interceptor;
 #[cfg(feature = "carried-coreutils")]
 mod coreutils_dispatch;
-pub(crate) mod coreutils;
 #[cfg(feature = "host-shell")]
 mod host_shell;
 // #257: the loopback egress proxy moved to agent-bridle-core (shared with
@@ -63,9 +64,9 @@ pub use shell_tool::ShellTool;
 pub use host_shell::HostShellTool;
 
 /// The carried **brush** engine (agent-bridle#20 / Track 2): a bash-in-Rust
-/// shell run in-process, confined by the `CommandInterceptor` L2 leash — the
-/// only engine that also confines a *restricted* `exec`/`net` grant, on any
-/// platform. Opt-in via the `brush` feature; a construction-time alternative to
+/// shell run in a dedicated sandboxed worker. Its `CommandInterceptor` provides
+/// the L2 leash while the worker and descendants inherit the available L3
+/// boundary. Opt-in via the `brush` feature; a construction-time alternative to
 /// [`ShellTool`] behind the ADR 0005 D2 seam, using the temporary `brush-ocap-*`
 /// fork (reubeno/brush#1184).
 #[cfg(feature = "brush")]
