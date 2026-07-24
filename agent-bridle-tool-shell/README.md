@@ -2,10 +2,12 @@
 
 A capability-confined family of shell engines for agent-bridle:
 
-- `BrushShellTool` (`brush`): a carried bash-in-Rust engine running in a fresh,
-  sandboxed worker whose command interceptor gates external spawns and opens.
-- `carried-coreutils`: adds bundled `ls`, `cat`, and `echo` to Brush and is the
-  default selected by the top-level `agent-bridle` facade.
+- `BrushShellTool` (`brush`): a carried bash-in-Rust engine running in a fresh
+  worker whose command interceptor gates Brush-originated external spawns and
+  opens.
+- `carried-coreutils`: adds bundled `ls`, `cat`, `echo`, `head`, `sort`, and
+  `wc` to Brush. The top-level facade selects it by default on supported
+  targets and falls back to `ShellTool` elsewhere.
 - `ShellTool` (`shell`): the lean **argv + safe-subset engine** (ADR 0005).
 - `HostShellTool` (`host-shell`): full host-shell semantics when the OS sandbox
   can carry the confinement guarantee.
@@ -24,20 +26,80 @@ listing itself, those filesystem touches are leash-checked (`fs_read`/`fs_write`
 **before any stage spawns**; out-of-scope `exec` is denied at the funnel.
 
 The Brush engine creates its worker through the shared confined-spawn funnel.
-The worker is born under the effective L3 policy, and carried utilities plus
-all other descendants inherit it. Its private request is nonce-bound, bounded,
-and receives only explicit environment values. Timeouts terminate the worker's
-whole process group. Restricted filesystem authority fails closed when no
-kernel backend is available; `unbridled` is the explicit opt-out.
+Linux and macOS authenticate that private transition over a fresh kernel socket:
+the child verifies that the frame sender is its real parent and the exact same
+executable image, while core freezes the launch nonce, effective caveats, and
+strength floor into a take-once envelope. Knowing the private argv, nonce, or
+child-generated challenge is not authority; direct invocation exits 126 before
+Brush runs. The worker replaces its control fd 0 with `/dev/null` after the
+handshake.
 
-The safe-subset path is the **L2 convenience** layer. The object-capability
-**boundary** is L3
-(ADR 0005): on a capable Linux build (`linux-landlock`) with `fs_write`
-restricted, the engine applies a kernel-enforced Landlock ruleset before
-spawning and the result reports `SandboxKind::Landlock`; otherwise the run is
-**honestly advisory** and reports `SandboxKind::None` — never overclaiming (the
-per-axis report refines this further, ADR 0004 D1). The cross-OS L3 strategy is
-ADR 0009 (#78/#35/#50/#51/#57).
+`brush_private_control_supported()` is the construction-time selection probe. It
+is true only on Linux and macOS in this release. Other targets deliberately fail
+closed rather than treating full access as authentication; a host must select
+`ShellTool` there. The top-level facade's default registry performs that
+fallback automatically, and its advertised input schema therefore changes from
+Brush's full `cmd` grammar to the safe-subset `program`/`args` schema.
+
+When the effective caveats engage an available native L3 backend, the worker,
+carried utilities, and all other descendants inherit it; otherwise the result
+honestly reports `SandboxKind::None`. It receives only explicit environment
+values. Timeout supervision terminates the worker's whole process group.
+Restricted filesystem authority fails closed when no kernel backend is
+available; `unbridled` is the explicit policy opt-out, not a private-control
+bypass.
+
+Each bundled provider is offered as a Brush shim, but Brush's native builtins
+win name conflicts, so `echo` normally remains Brush's in-process builtin.
+Invoking a non-conflicting utility such as `wc` re-executes the
+dispatch-capable embedding binary as
+`<current-exe> --invoke-bundled wc ...`; `maybe_dispatch()` recognizes that
+private entrypoint before an async runtime is constructed and calls the bundled
+uutils implementation. The carried child repeats a PID/image/peer-credential
+handshake that binds the exact utility name and raw argv; a direct
+`--invoke-bundled` is refused. Any L3 policy engaged for the worker therefore
+covers the carried child too. A host embedding Agent Bridle must call
+`maybe_dispatch()` at the very top of `main`.
+
+When the safe-subset parser refuses dynamic grammar and the `brush` feature is
+present, its denial envelope includes a versioned, non-executing
+`shell_inspection`. Embedders may also call `inspect_shell` before dispatching
+to Brush; the top-level `agent-bridle` facade re-exports that function and its
+schema types under the `brush` feature. It preserves the exact source and
+provides a flattened inventory of direct command stages, command substitutions,
+arithmetic expansions, redirections, quote context, and recognized delegated
+descendants. Pipeline and control-flow relationships remain visible in the
+exact source but are not encoded as graph edges; warnings call out those
+flattened relationships. Arithmetic is projected only when Brush's arithmetic
+AST proves it is state-free: integer literals and operators are accepted, while
+variables, array references, assignments, and nested shell expansions fail
+closed. This matters because bash-like arithmetic recursively interprets shell
+state and array indices. The same state-free check covers parameter array
+subscripts and substring offsets/lengths. Indirect parameter expansion and the
+prompt-expanding `@P` transformation also fail closed because they can
+reinterpret a runtime value as expansion syntax. It cannot show a
+substitution's value: that value exists only after the inner command runs.
+Known dispatch wrappers and interpreters fail closed when their runtime command
+cannot be projected. `find -exec` is explicitly marked as delegated because the
+external `find` process—not Brush—spawns that child. This projection is approval
+metadata, not enforcement or a complete process graph.
+
+The safe-subset path is the **L2 convenience** layer; the subprocess boundary is
+L3 (ADR 0005). Coverage is backend- and scope-shaped:
+
+- Landlock confines both filesystem axes, narrows direct exec (reported
+  `Interceptor` because the loader trampoline remains), and can deny all TCP on
+  ABI-v4 kernels.
+- Seatbelt confines both filesystem axes, restricted exec, and empty or
+  loopback-only network scopes.
+- AppContainer confines filesystem paths, empty or loopback-only network
+  scopes, and exec deny-all for supported subprocess engines; the Brush private
+  transport is currently unavailable on Windows, so hosts select `ShellTool`.
+
+The result's `sandbox_kind` and per-axis enforcement report are authoritative.
+When no backend engages, the kind is `None`; a restricted filesystem scope
+fails closed rather than running without its required boundary. The cross-OS L3
+strategy is ADR 0009.
 
 - Every engine registers under the same `shell` identity; the embedder selects
   one at registry construction.
@@ -66,12 +128,14 @@ threads and may enter the same observer concurrently. On ordinary completion,
 not wait for it. Cancellation stops accepting new chunks, though a callback
 already dequeued may finish afterward. Callback panics are contained.
 
-At most the configured output cap is delivered per stream. This is a live view,
-not a replacement result: separate safe-shell pipeline stderr readers follow
-live reader scheduling, while the completed envelope assembles stderr in
-pipeline-stage order and then applies its cap. The two can differ, and the
-completed envelope is authoritative. Excess host/brush output is drained and
-discarded to preserve child behavior without unbounded capture.
+At most the configured output cap is delivered per stream. For `ShellTool` and
+`HostShellTool` this is a live view. The Brush worker's single-response protocol
+delivers its bounded captured chunks after the worker completes; it is
+observation, not streaming. In every engine the completed envelope is
+authoritative. Separate safe-shell pipeline stderr readers follow live reader
+scheduling, while that envelope assembles stderr in pipeline-stage order and
+then applies its cap, so the two can differ. Excess host/Brush output is drained
+and discarded to preserve child behavior without unbounded capture.
 
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
 the capability leash for agent tools — a shared, capability-governed tool

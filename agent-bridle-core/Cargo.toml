@@ -17,20 +17,24 @@ unsafe_code = "forbid"
 [features]
 default = []
 # Real, kernel-enforced Landlock ruleset (Linux only). Enables the `landlock`
-# dependency and the `LandlockSandbox` (see src/sandbox.rs). First increment
-# confines the `fs_write` axis; without this feature (or off-Linux) the sandbox
-# is the advisory NoopSandbox reporting SandboxKind::None. ADR 0001 (L3).
+# dependency and the `LandlockSandbox` (see src/sandbox.rs). Confines both
+# filesystem axes, narrows direct execve (reported Interceptor because the
+# loader trampoline remains), and kernel-denies empty-scope TCP on ABI-v4
+# kernels. Without this feature/off-Linux, another native backend may apply or
+# the honest NoopSandbox reports SandboxKind::None. ADR 0001/0011 (L3).
 linux-landlock = ["dep:landlock"]
 # Real, kernel-enforced Seatbelt profile (macOS only). Enables the
 # `SeatbeltSandbox` (see src/sandbox.rs), which confines a spawned program via
 # the `sandbox-exec(1)` wrapper — no extra dependency and no FFI (core forbids
-# `unsafe`), so the feature is empty here. Confines `fs_write` + `fs_read`;
-# without it (or off-macOS) the sandbox is the advisory NoopSandbox reporting
-# SandboxKind::None. ADR 0006 (per-OS L3) / ADR 0009 (cross-platform).
+# `unsafe`), so the feature is empty here. Confines both filesystem axes,
+# restricted exec, and empty/loopback-only net scopes. Without it/off-macOS,
+# another native backend may apply or the honest NoopSandbox reports
+# SandboxKind::None. ADR 0006/0009/0014/0015.
 macos-seatbelt = []
 # Windows AppContainer process sandbox (Windows only). AppContainer is applied
-# at process creation via SECURITY_CAPABILITIES, not by restricting the current
-# thread; see src/sandbox.rs and agent-bridle#51.
+# by `agent-bridle-aclaunch` at process creation via SECURITY_CAPABILITIES.
+# Confines filesystem paths, empty/loopback-only net, and exec deny-all; a
+# non-empty exec allowlist remains Interceptor. See src/sandbox.rs and #51/#123.
 windows-appcontainer = []
 # One-knob convenience (ADR 0006 D2): every OS L3 backend (each inert off its
 # target OS, so a CI matrix can turn them all on).

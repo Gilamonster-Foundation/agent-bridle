@@ -28,6 +28,9 @@ check:
     cargo clippy --workspace --all-targets --no-default-features -- -D warnings
     cargo test --workspace --all-features
     cargo test --workspace --no-default-features
+    # The bare Brush worker protocol is a distinct feature cell: all-features
+    # enables carried-coreutils and no-default omits Brush entirely.
+    cargo test -p agent-bridle-tool-shell --no-default-features --features brush --test brush_real
 
 # Tier-3 formal proof gate: build the Lean project (P0 authority algebra +
 # P1 signed-object contracts + counterexample tests) and reject proof escapes
@@ -84,8 +87,10 @@ check-windows:
     set -e
     cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
     cargo test -p agent-bridle-core --features windows-appcontainer
-    # Exercise the shell ENGINES on Windows (#209) — clippy only compiles them.
-    # HOOK PARITY: mirrors the "Run the shell engines on Windows" step in ci.yml.
+    # Windows has no authenticated Brush private transport in this release:
+    # prove the facade selects safe-subset and direct Brush/carried use fails closed.
+    # HOOK PARITY: mirrors the Windows private-control step in ci.yml.
+    cargo test -p agent-bridle --all-features default_shell_falls_back_to_safe_subset_when_private_control_is_unsupported
     cargo test -p agent-bridle-tool-shell --features brush,carried-coreutils --test brush_real --test carried_coreutils
     cargo test -p agent-bridle-aclaunch --bins
     BRIDLE_REQUIRE_APPCONTAINER=1 cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1
@@ -165,13 +170,18 @@ fmt:
 # AUTH: run `cargo login` once, OR set CARGO_REGISTRY_TOKEN:
 #     CARGO_REGISTRY_TOKEN="$(cat /path/to/your/token)" just publish-crates
 #
-# NOT PUBLISHED: agent-bridle-py — PyO3 arm64 linker issues make it
-# unpublishable from this machine. Publish via a maturin wheel job if needed.
+# NOT PUBLISHED: `publish = false` internal packages (aclaunch ships inside the
+# Windows binary archive; config/jaild are host/deployment internals;
+# ceremony/gateway are non-public work). agent-bridle-py's PyO3 arm64 linker
+# issues keep it out of this crates.io path; publish its wheel via maturin.
 #
-# DRY_RUN=1 packages + verifies without uploading.
+# DRY_RUN=1 asks Cargo to package + verify without uploading. For a fresh
+# lock-step version it verifies the independent core crate, then may stop when
+# a dependent version is not yet indexed; `just publish-check` is the supported
+# pre-release package verification gate.
 #
 # HOOK PARITY: the crate list and order here must match the publish-crates
-# job matrix in .github/workflows/release.yml.
+# job's `PUBLISH_CRATES` list in .github/workflows/release.yml.
 publish-crates:
     #!/usr/bin/env bash
     set -euo pipefail

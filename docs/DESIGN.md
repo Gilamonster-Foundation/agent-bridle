@@ -74,7 +74,7 @@ only**, never in `bridle-core` or the host's default build.
 | Crate | Purpose | Heavy deps |
 |---|---|---|
 | `agent-bridle-core` | `Tool` trait, `Registry`, `Gate`, `Caveats` re-export, `Sandbox` trait, result envelope | **none** — `anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol` only. No tokio, no brush. |
-| `agent-bridle-tool-shell` | brush-backed confined shell (carried coreutils) | brush-core/builtins/coreutils-builtins (feature `shell`) |
+| `agent-bridle-tool-shell` | safe-subset, carried Brush worker, and host-shell engines | brush-core/builtins/coreutils-builtins (features `brush` / `carried-coreutils`) |
 | `agent-bridle-tool-web` | `web_fetch`/`http`/`web_search` | reqwest+rustls, readability/htmd (feature `web`) |
 | `agent-bridle-tool-fs` | confined read/edit/search/list | (light) |
 | `agent-bridle-tool-scm` | git tools (log/blame/diff/status/commit/branch/push/pull) | **`gix` (gitoxide)** — pure-Rust, on crates.io, **in-process** (feature `scm`). No heavy/private deps, no system `git`. |
@@ -131,22 +131,40 @@ The judges verified against brush 0.5 source that the naive in-process leash is
   `>`/`<`/`source`/glob opens. So in-process `fs_read`/`fs_write` enforcement for
   free-form scripts is impossible as-is.
 - **I/O capture via `Arc<Mutex<Vec<u8>>>` will not compile.** `openfiles::Stream`
-  requires (unix) real `OwnedFd`/`BorrowedFd`. **Capture must use `os_pipe` /
-  `PipeReader`+`PipeWriter` (or memfd) and drain it.**
+  requires (unix) real `OwnedFd`/`BorrowedFd`. **Capture must use real OS pipes
+  (`std::io::pipe`) and drain them.**
 
-**Resolution — two layers, and we own the fork:**
+**Resolution — a dedicated worker plus two enforcement layers:**
 
-1. **Landlock is the authoritative boundary on Linux** (kernel-real). The Gate
-   records `sandbox_kind` in **every** `ToolResult`, and the shell tool's
-   exec/fs *guarantee* is **gated on Landlock being active**. Off-Linux the leash
-   is documented as **advisory/best-effort** — no overclaiming.
-2. **Add a `ShellExtensions` exec/open hook to `hartsock/brush`** (our fork) — a
-   "before spawning argv0 / before opening path, ask bridle" callback. This makes
-   in-process confinement real cross-OS. `agent-bridle-tool-shell` git-depends on
-   the patched fork (intent to upstream). Until then, Linux+Landlock only.
+1. **Run Brush in a fixed-entrypoint `SandboxedWorker`.** Each invocation
+   re-execs the dispatch-capable embedder with a nonce-bound, bounded private
+   request and an empty ambient environment. The shared confined-spawn funnel
+   applies whichever native L3 backend the effective caveats engage, and the
+   worker plus descendants inherit it. An unrestricted run may honestly report
+   `SandboxKind::None`; a restricted filesystem axis fails closed without a
+   kernel backend.
+2. **Carry the published `brush-ocap-*` fork's exec/open hook.** Its
+   `CommandInterceptor` asks bridle before Brush-originated external spawns and
+   `Shell::open_file` operations. This is the worker-local L2 leash and denial
+   telemetry. It does not observe a permitted external program's own syscalls:
+   carried-uutils file opens and delegated descendants such as `find -exec`
+   rely on the inherited L3 boundary.
+
+Native L3 coverage is deliberately scope-shaped and reported per axis:
+
+- Linux Landlock confines both filesystem axes, narrows direct `execve`
+  (`exec` remains `Interceptor` because of the loader trampoline), and can
+  kernel-deny all TCP on ABI-v4 kernels.
+- macOS Seatbelt confines both filesystem axes, restricted exec, and empty or
+  loopback-only network scopes.
+- Windows AppContainer confines filesystem paths, empty or loopback-only
+  network scopes, and exec deny-all; non-empty exec allowlists remain
+  `Interceptor`.
+
 - **Path scoping is canonicalized in the Gate** (`check_path`: realpath, reject
   symlinks escaping scope) *before* the membership check — never string-prefix
-  matching — with Landlock as backstop. Closes the `@repo`/`../../etc` traversal.
+  matching — with the active L3 backend as backstop. Closes the
+  `@repo`/`../../etc` traversal.
 
 **Second-layer hardening — the hook is necessary but not sufficient (verified
 against the fork at rev 4e65a06):** wiring `before_exec`/`before_open` is not the
@@ -157,7 +175,7 @@ whole story, because not every brush *builtin* routes through those funnels.
   `cmd.exec()` (replace-process) **directly**, never consulting the hook. Proven:
   under `exec=only{echo}`, `exec /usr/bin/touch MARKER` ran `touch` and replaced
   the host process image — the leash never fired. So the confined shell is built
-  with a **curated builtin set** that omits `exec` (`shell_tool::confined_builtins`
+  with a **curated builtin set** that omits `exec` (`brush_shell::confined_builtins`
   / `REMOVED_BUILTINS`). `default_builtins` hands back a plain owned map and the
   shell builder seeds an empty one, so omission is robust-by-construction; nothing
   re-registers it (`enable -f` is `unimp`, `enable`/`builtin exec` only act on
@@ -175,9 +193,9 @@ whole story, because not every brush *builtin* routes through those funnels.
   `enable_all()` so substitution flows through the funnel and an out-of-scope
   inner command yields a clean recorded denial (fail-closed and legible).
 
-A complementary follow-up is to teach the brush fork's `exec` builtin to consult
-`before_exec` itself (so the hook is sufficient on its own); the curated builtin
-set makes the in-process leash airtight today regardless.
+A complementary upstream follow-up is to teach Brush's `exec` builtin to consult
+`before_exec` itself. Until then, omitting that builtin closes the worker-local
+L2 bypass; the process-tree guarantee remains the job of L3.
 
 ## 7. Web tools = the `net` enforcer
 
@@ -239,12 +257,10 @@ Downloads to a file are gated by `fs_write`.
    PR #18 (Python `Caveats`) is NOT in 0.6.0 → it ships in **0.6.1**, which gates
    only the Python pillars (§8), not P0. Decision: publish agent-mesh **0.6.1**
    (merge #18 → bump → tag `v0.6.1` → release.yml publishes wheels+crates).
-2. **brush exec/open hook — YES.** Implement a `ShellExtensions` exec/open hook
-   in `hartsock/brush` (our fork), git-dep it from `agent-bridle-tool-shell`, and
-   **contribute upstream**: file an issue on `reubeno/brush` explaining why
-   capability-confined embedding needs the hook, then open a PR to upstream it if
-   the author wants it. Until merged, Linux+Landlock is authoritative; off-Linux
-   advisory (recorded in `sandbox_kind`).
+2. **brush exec/open hook — CARRIED.** The published `brush-ocap-*` fork provides
+   the `CommandInterceptor` API used inside the dedicated worker. Contribute the
+   hook upstream and retire the temporary fork when an upstream release carries
+   it; L3 availability and per-axis strength remain independent of that merge.
 3. **Registry default — explicit.** `Registry::builder()` explicit registration
    is the default (safe under newt's `strip+lto`); `inventory` is opt-in sugar
    guarded by a CI presence-test.
@@ -264,15 +280,17 @@ lock-step workspace version.
 ## 12. Phase plan
 
 - **P0** `agent-bridle-core` (Tool trait, Registry dual-mode, Gate w/
-  mint-token + effective-meet, `Sandbox` trait, envelope) + `agent-bridle-tool-shell`
-  (brush, os_pipe capture, Landlock on Linux) + a 2nd demo tool + tests proving
-  the leash *denies* out-of-scope exec/fs/net. No newt changes.
+  mint-token + effective-meet, `Sandbox` trait, envelope) +
+  `agent-bridle-tool-shell` (safe-subset plus carried Brush worker, pipe capture,
+  native L3 seam) + a 2nd demo tool + tests proving the leash *denies*
+  out-of-scope exec/fs/net. No newt changes.
 - **P1** newt tool loop + adopt `agent_bridle::register` in newt-mcp-server +
   `~/.newt/tools`.
 - **P2** migrate `newt-tools-scm`; retire unconfined `shell_run`; git as subprocess.
-- **P3** Landlock + confined Python sidecar; canonicalizing `check_path`.
+- **P3** confined Python sidecar; canonicalizing `check_path`; continued
+  native-L3 hardening.
 - **P4** `agent-bridle-mcp` + PyPI wheel (Pillars A & B); web tools.
 - **P5** mesh-delegation demo (Desk mints attenuated AgentKey → worker enforces).
-- **Upstream** brush `ShellExtensions` exec/open hook.
+- **Upstream** merge the carried Brush `CommandInterceptor` hook.
 
 Prereq (done): agent-mesh Caveats exposed to Python — PR #18.

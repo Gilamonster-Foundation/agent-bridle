@@ -31,7 +31,7 @@ use server::McpServer;
 fn main() -> anyhow::Result<()> {
     // Carried coreutils re-exec this binary as
     // `<self> --invoke-bundled <name> <args...>`. Handle that private dispatch
-    // protocol before MCP startup so `ls`/`cat`/`echo` need no host utilities.
+    // protocol before MCP startup so carried utilities need no host tools.
     #[cfg(feature = "carried-coreutils")]
     if let Some(code) = agent_bridle::maybe_dispatch() {
         std::process::exit(code);

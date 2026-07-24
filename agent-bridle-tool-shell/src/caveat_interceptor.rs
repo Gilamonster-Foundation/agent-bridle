@@ -1,14 +1,15 @@
-//! [`CaveatInterceptor`] — the in-process capability hook for free-form shell.
+//! [`CaveatInterceptor`] — the worker-local capability hook for free-form shell.
 //!
-//! brush 0.5 cannot be confined in-process by a cleared `PATH` + a builtin
+//! Upstream brush 0.5 cannot be gated by a cleared `PATH` + a builtin
 //! allow-list: any command whose name contains a path separator (e.g.
 //! `/bin/rm`, `./payload`) bypasses both `PATH` and the builtin table and runs
 //! directly (DESIGN §6). Our brush fork closes this by exposing
 //! [`brush_core::extensions::CommandInterceptor`], whose `before_exec` /
 //! `before_open` hooks fire at the **single external-spawn funnel** and at
-//! `Shell::open_file` — so a policy applied here cannot be circumvented by
-//! spelling a command (or a redirection target) differently. This makes the
-//! confined shell a true superset of an `sh -c` cmd-string shell, cross-OS.
+//! `Shell::open_file`, so Brush-originated operations cannot bypass the L2 gate
+//! merely by spelling a command or redirect differently. Once an admitted
+//! external program runs, its own opens and delegated children do not re-enter
+//! these hooks; the worker's inherited L3 boundary is their confinement.
 //! A third hook, `before_command`, fires once per command — builtins included —
 //! and is where **cancellation** is observed; see the impl below.
 //!
@@ -27,6 +28,42 @@ use std::sync::{Arc, Mutex};
 
 use agent_bridle_core::{Denial, DenialKind, ToolContext};
 use brush_core::extensions::{CommandDecision, CommandInterceptor, ExecDecision, OpenDecision};
+
+/// Whether a path names the process descriptor namespace rather than a normal
+/// filesystem object.
+///
+/// These paths can duplicate already-open descriptors. They are therefore not
+/// ordinary `fs_read`/`fs_write` authority: while private worker/carried
+/// authentication is in flight, admitting one could expose a control endpoint
+/// that was intentionally never placed in model-visible data.
+pub(crate) fn is_private_descriptor_path(path: &Path) -> bool {
+    use std::path::Component;
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => parts.clear(),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = parts.pop();
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+        }
+    }
+    match parts.as_slice() {
+        [dev, fd, ..] if dev == "dev" && fd == "fd" => true,
+        [proc, owner, fd, ..]
+            if proc == "proc"
+                && fd == "fd"
+                && (owner == "self"
+                    || owner == "thread-self"
+                    || owner.bytes().all(|byte| byte.is_ascii_digit())) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
 
 /// The shared, per-invocation denial sink.
 ///
@@ -74,7 +111,8 @@ pub(crate) type DenialSink = Arc<Mutex<Vec<Denial>>>;
 pub(crate) type AllowCache = Arc<Mutex<HashSet<String>>>;
 
 /// A brush [`CommandInterceptor`] that enforces an invocation's effective
-/// caveats in-process **and records each denial it makes** into a shared sink.
+/// caveats inside the dedicated Brush worker **and records each denial it
+/// makes** into a shared sink.
 ///
 /// Holds an `Option<ToolContext>`:
 ///
@@ -232,6 +270,8 @@ impl CommandInterceptor for CaveatInterceptor {
         let logical = crate::coreutils_dispatch::logical_carried_command(program, args);
         #[cfg(feature = "carried-coreutils")]
         let program = logical.as_deref().unwrap_or(program);
+        #[cfg(not(feature = "carried-coreutils"))]
+        let _ = args;
         if self.is_memoized_allow(program) {
             return ExecDecision::Allow;
         }
@@ -287,6 +327,12 @@ impl CommandInterceptor for CaveatInterceptor {
             )
         {
             return OpenDecision::Allow;
+        }
+        if is_private_descriptor_path(path) {
+            let reason =
+                "raw process descriptor paths are reserved for private control".to_string();
+            self.record(DenialKind::Open, path.to_string_lossy(), &reason);
+            return OpenDecision::Deny(reason);
         }
         let Some(cx) = &self.cx else {
             let reason = "no effective caveats (default interceptor); open denied".to_string();
@@ -453,6 +499,31 @@ mod tests {
         assert!(matches!(
             i.before_open(Path::new("/etc/passwd"), true),
             OpenDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn raw_descriptor_namespaces_are_denied_even_with_ambient_fs() {
+        let (interceptor, sink) = interceptor_with_sink(Caveats::top());
+        for path in [
+            "/dev/fd/0",
+            "/dev/ignored/../fd/9",
+            "/proc/self/fd/3",
+            "/proc/thread-self/fd/4",
+            "/proc/1234/fd/5",
+        ] {
+            assert!(
+                matches!(
+                    interceptor.before_open(Path::new(path), false),
+                    OpenDecision::Deny(_)
+                ),
+                "{path} must not duplicate a private descriptor"
+            );
+        }
+        assert_eq!(drain(&sink).len(), 5);
+        assert!(matches!(
+            interceptor.before_open(Path::new("/proc/self/status"), false),
+            OpenDecision::Allow
         ));
     }
 

@@ -34,9 +34,10 @@ A tool harness is a [confused deputy](https://en.wikipedia.org/wiki/Confused_dep
 it holds full ambient authority while taking instructions from an untrusted
 source. Hardening the prompt does not fix this; it is an *architecture* problem.
 `agent-bridle` makes the fix structural — attenuated capabilities, delegated
-attenuation-only, with enforcement minted at a single choke point and (on Linux)
-backstopped by Landlock. The tool you ship can only ever do what its leash
-permits.
+attenuation-only, with enforcement minted at a single choke point and
+backstopped by an available native L3 backend. Every result discloses the
+boundary and per-axis strength actually achieved, so weaker enforcement is
+visible rather than overclaimed.
 
 ## Usage
 
@@ -54,7 +55,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    // The default registry carries the Brush shell and bundled coreutils.
+    // Linux/macOS select Brush + bundled coreutils. Targets without its
+    // authenticated private transport select the safe-subset shell.
     let reg = registry();
 
     // No external executable authority; shell builtins can still run.
@@ -64,7 +66,8 @@ async fn async_main() -> anyhow::Result<()> {
         ..Caveats::top()
     };
 
-    // ALLOWED: `echo` is a carried Brush builtin, so it spawns nothing.
+    // ALLOWED: `echo` is Brush's native builtin, carried with the engine, so it
+    // spawns nothing.
     let out = reg
         .dispatch(
             "shell",
@@ -88,13 +91,35 @@ async fn async_main() -> anyhow::Result<()> {
 }
 ```
 
-The default engine is the carried bash-in-Rust `BrushShellTool`. Each invocation
-runs in a fresh worker process born beneath the available L3 sandbox; the
-worker and every descendant inherit that boundary. Its L2 command interceptor
-also checks every external spawn and file open against the effective `exec`/`fs`
-leash. A restricted filesystem grant is refused when the platform cannot
-provide the required L3 boundary. The `carried-coreutils` feature supplies
-bundled `ls`/`cat`/`echo` implementations without depending on host utilities.
+On Linux and macOS, the default engine is the carried bash-in-Rust
+`BrushShellTool`. Each invocation runs in a fresh worker created through the
+L3-aware spawn funnel. Its parent-created private socket authenticates the real
+parent PID and exact executable image; core supplies the effective caveats in a
+take-once envelope. The hidden argv, nonce, and readable challenge are not
+authority, and direct worker or `--invoke-bundled` invocation is refused.
+`brush_private_control_supported()` lets an embedder make the same
+construction-time selection. It is a capability probe, not a security override.
+On unsupported targets (currently including Windows), Brush fails closed and
+the facade registry advertises the safe-subset `ShellTool` instead.
+
+If a host approves a command based on a prospective enforcement check, it
+should use `Registry::dispatch_with_strength_floor(...)` for the actual call.
+That stamps the approved minimum into the minted context and its trusted-worker
+envelope, so a backend downgrade at execution time is refused.
+
+When the effective caveats engage an available native backend, the worker and
+every descendant inherit that boundary; otherwise the result honestly reports
+`sandbox_kind: none`. Its L2 command interceptor checks every external spawn
+and file open initiated through Brush against the effective `exec`/`fs` leash;
+children delegated by an admitted external program (for example, `find -exec`)
+do not re-enter that interceptor and rely on any inherited L3 boundary. A
+restricted filesystem grant is refused when the platform cannot provide the
+required L3 boundary. The `carried-coreutils` feature supplies
+bundled `ls`/`cat`/`echo`/`head`/`sort`/`wc` implementations without depending
+on host utilities. Brush's native builtins win name conflicts, so `echo`
+normally remains Brush's in-process builtin; non-conflicting bundled utilities
+use the embedding binary's private `--invoke-bundled <name>` re-exec path. This
+is why `maybe_dispatch()` must run before the async runtime is constructed.
 
 For the smaller argv + safe-subset `ShellTool`, disable default features and
 enable `shell`; that engine accepts `program` + `args` as well as its restricted
@@ -118,10 +143,15 @@ speaks newline-delimited JSON-RPC 2.0 and handles `initialize`, `tools/list`,
 `tools/call`, and `shutdown`/`exit`.
 
 ```bash
-# Build the binary (carried Brush shell + coreutils on by default).
-cargo build -p agent-bridle-mcp --release
+# Build the release-equivalent binary: carried Brush/coreutils plus the native
+# Landlock, Seatbelt, or AppContainer backend selected for the target OS.
+cargo build -p agent-bridle-mcp --release --features os-sandbox
 # Binary: target/release/agent-bridle-mcp  (reads/writes JSON-RPC on stdio)
 ```
+
+A plain default build still carries the worker-local L2 shell interceptor, but
+does not compile a native L3 backend. Use `os-sandbox` for production
+confinement, or select one of the per-OS features directly.
 
 ### Wiring it into an MCP client
 
@@ -313,20 +343,20 @@ re-check, and DNS-rebinding IP pin are unit-tested in isolation and exercised
 end-to-end against a localhost mock server (a disallowed host, a private/loopback
 address, and a redirect to a disallowed host are all proven *denied*).
 
-Landlock `fs_write`/`fs_read` kernel enforcement is landed (Linux,
-`linux-landlock`). On **macOS** (`macos-seatbelt`) the Seatbelt backend
-kernel-confines `fs_write`/`fs_read`, denies all egress for `net: none`, and —
-per ADR 0014 — kernel-confines the **`exec` axis** via `process-exec*` (closing
-the loader trampoline with no seccomp backstop, by hardware W^X + code signing).
-The remaining cross-OS L3 boundary — the Linux `net`/`exec` axes (#35/#57) and
-the Windows backend (#51), per the three-tier strategy in ADR 0009 —
-the optional full-bash `brush` engine (#20), the Python pillars (sidecar + host
-tools dir), the browse tier (headless Chrome — subprocess), `web_search`, and scm
-tools are later phases (see `docs/DESIGN.md` §12).
+Landlock `fs_write`/`fs_read` kernel enforcement is landed on Linux, along with
+direct-exec narrowing (still honestly reported `Interceptor` because of the
+loader trampoline) and deny-all TCP on ABI-v4 kernels. On macOS, Seatbelt
+kernel-confines both filesystem axes, restricted exec, and deny-all or
+loopback-only network scopes. On Windows, the wired AppContainer launcher
+confines filesystem paths, deny-all or loopback-only network scopes, and exec
+deny-all; non-empty exec allowlists remain `Interceptor`. General remote-host
+network allowlists retain their documented proxy/advisory posture. Stronger
+Linux exec identity, the Python sidecar/tools-dir pillar, browse,
+`web_search`, and scm tools remain later phases (see `docs/DESIGN.md` §12).
 
 ## License
 
-Apache-2.0 (see [`LICENSE`](LICENSE)). The deferred, optional `brush` engine
-(#20) is MIT; its notice is carried in [`NOTICE`](NOTICE) for when it is adopted.
+Apache-2.0 (see [`LICENSE`](LICENSE)). The carried Brush dependencies are MIT;
+their notices are carried in [`NOTICE`](NOTICE).
 
 [`agent_mesh_protocol::Caveats`]: https://crates.io/crates/agent-mesh-protocol

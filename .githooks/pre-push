@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, full matrix)"
+echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, including bare Brush)"
 just check
 
 echo "[pre-push] running 'just check-windows' (AppContainer backend + kernel proofs; skips off Windows)"

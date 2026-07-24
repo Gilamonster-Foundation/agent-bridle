@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.13"
+version = "0.7.14"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Gilamonster-Foundation/agent-bridle"
@@ -23,12 +23,12 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 
 [workspace.dependencies]
 # In-workspace crates (lock-step version).
-agent-bridle-core = { version = "0.7.13", path = "agent-bridle-core" }
-agent-bridle-tool-shell = { version = "0.7.13", path = "agent-bridle-tool-shell" }
-agent-bridle-tool-web = { version = "0.7.13", path = "agent-bridle-tool-web" }
+agent-bridle-core = { version = "0.7.14", path = "agent-bridle-core" }
+agent-bridle-tool-shell = { version = "0.7.14", path = "agent-bridle-tool-shell" }
+agent-bridle-tool-web = { version = "0.7.14", path = "agent-bridle-tool-web" }
 # `default-features = false` here so `agent-bridle-mcp` controls the facade's
 # feature set (its own `shell`/`--no-default-features` forward through).
-agent-bridle = { version = "0.7.13", path = "agent-bridle", default-features = false }
+agent-bridle = { version = "0.7.14", path = "agent-bridle", default-features = false }
 
 # The leash. One canonical authority type, shared across the whole agent line.
 agent-mesh-protocol = "0.6"
@@ -45,27 +45,13 @@ async-trait = "0.1"
 # enabled at the crate, not here, so any non-wheel consumer stays clean.
 pyo3 = { version = "0.28", default-features = false, features = ["macros"] }
 
-# Leaf-tool-only deps (never enter core or a host's default build).
-# `net` is NOT included here — the stub shell no longer needs the IO driver.
-# Restore `net` when the brush `CommandInterceptor` feature is re-enabled
-# (tracked in https://github.com/Gilamonster-Foundation/agent-bridle/issues/20).
+# Leaf-tool-only runtime (never enters core). The safe-subset, sandboxed-host,
+# and carried Brush workers select the exact Tokio features they need through
+# their leaf crate features.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
-# brush — TEMPORARILY REMOVED pending reubeno/brush#1184.
-#
-# The shell tool is currently a stub (returns a clear error on invoke). Full
-# CommandInterceptor-backed execution is restored once the upstream PR merges
-# and brush publishes a crates.io release that includes the hook.  git deps are
-# forbidden by crates.io, so we cannot carry this as an optional dep in the
-# published package.
-#
-# To restore: uncomment these three lines, update the rev to the post-merge
-# commit, re-enable the `shell` feature body in agent-bridle-tool-shell, and
-# restore caveat_interceptor.rs + the full shell_tool.rs from git history.
-# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
-#
-# brush-core = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
-# brush-builtins = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
-# brush-coreutils-builtins = { git = "https://github.com/hartsock/brush", rev = "f0ef7715a02f44c670e7f5d5e59d1c7721ea282c" }
+# The publishable `brush-ocap-*` fork and focused uutils components are declared
+# only in `agent-bridle-tool-shell`; keeping them out of workspace/core
+# dependencies preserves the lean default construction boundary.
 
 # Web-tool-only deps (feature `web` in agent-bridle-tool-web). rustls, NOT
 # openssl, so the client is portable and builds on Windows with no system
