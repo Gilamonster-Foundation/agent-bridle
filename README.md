@@ -44,55 +44,68 @@ permits.
 use agent_bridle::registry;
 use agent_bridle_core::{Caveats, CountBound, Scope};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Build the default registry (shell tool included under `--features shell`).
+fn main() -> anyhow::Result<()> {
+    // Must run before constructing an async runtime. This handles both the
+    // private sandboxed worker and its carried-command re-exec entrypoint.
+    if let Some(code) = agent_bridle::maybe_dispatch() {
+        std::process::exit(code);
+    }
+    tokio::runtime::Runtime::new()?.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
+    // The default registry carries the Brush shell and bundled coreutils.
     let reg = registry();
 
-    // Grant a tightly-scoped leash: may only exec `echo`, at most twice.
+    // No external executable authority; shell builtins can still run.
     let granted = Caveats {
-        exec: Scope::only(["echo".to_string()]),
+        exec: Scope::only([]),
         max_calls: CountBound::AtMost(2),
         ..Caveats::top()
     };
 
-    // ALLOWED: echo is in scope, budget available.
+    // ALLOWED: `echo` is a carried Brush builtin, so it spawns nothing.
     let out = reg
         .dispatch(
             "shell",
-            serde_json::json!({ "program": "echo", "args": ["hello"] }),
+            serde_json::json!({ "cmd": "echo hello" }),
             &granted,
         )
         .await?;
     println!("{out}"); // -> { "exit_code": 0, "stdout": "hello\n", ... }
 
-    // DENIED: `rm` is not in the granted `exec` scope. The leash refuses
-    // before the tool ever runs — no prompt hygiene required.
+    // DENIED in-band: an external executable has not been granted.
     let denied = reg
         .dispatch(
             "shell",
-            serde_json::json!({ "program": "rm", "args": ["-rf", "/"] }),
+            serde_json::json!({ "cmd": "./not-granted" }),
             &granted,
         )
-        .await;
-    assert!(denied.is_err());
+        .await?;
+    assert_eq!(denied["denied"], true);
 
     Ok(())
 }
 ```
 
-The engine spawns `echo` as an external program (resolved via `PATH`) **after**
-the `exec` leash admits it at the single spawn funnel; an out-of-scope program
-(`rm`) is denied there before anything runs. agent-bridle parses the command
-itself and refuses dynamic constructs by design — it is the argv + safe-subset
-engine (ADR 0005), not a full shell.
+The default engine is the carried bash-in-Rust `BrushShellTool`. Each invocation
+runs in a fresh worker process born beneath the available L3 sandbox; the
+worker and every descendant inherit that boundary. Its L2 command interceptor
+also checks every external spawn and file open against the effective `exec`/`fs`
+leash. A restricted filesystem grant is refused when the platform cannot
+provide the required L3 boundary. The `carried-coreutils` feature supplies
+bundled `ls`/`cat`/`echo` implementations without depending on host utilities.
+
+For the smaller argv + safe-subset `ShellTool`, disable default features and
+enable `shell`; that engine accepts `program` + `args` as well as its restricted
+`cmd` grammar.
 
 ## Crates
 
 | Crate | Purpose | Heavy deps |
 |---|---|---|
 | `agent-bridle-core` | `Tool` trait, `Registry`, `Gate`, `Caveats` re-export, `Sandbox` trait, result envelope | none beyond `anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol` |
-| `agent-bridle-tool-shell` | confined shell — argv + safe-subset engine (ADR 0005), `shell` feature | tokio |
+| `agent-bridle-tool-shell` | carried Brush shell + coreutils by default; optional argv + safe-subset and host-shell engines | brush (default facade), tokio |
 | `agent-bridle-tool-web` | confined `web_fetch` (the `net` enforcer), `web` feature | reqwest+rustls, dom_smoothie, htmd, hickory-resolver, url, tokio |
 | `agent-bridle` | facade re-exporting a ready-to-use registry | — |
 | `agent-bridle-mcp` | MCP (Model Context Protocol) stdio server frontend over the registry (binary) | tokio, toml |
@@ -105,7 +118,7 @@ speaks newline-delimited JSON-RPC 2.0 and handles `initialize`, `tools/list`,
 `tools/call`, and `shutdown`/`exit`.
 
 ```bash
-# Build the binary (shell tool on by default).
+# Build the binary (carried Brush shell + coreutils on by default).
 cargo build -p agent-bridle-mcp --release
 # Binary: target/release/agent-bridle-mcp  (reads/writes JSON-RPC on stdio)
 ```
@@ -173,25 +186,25 @@ valid_for_generation = "all"
 
 ### Confinement example (restricting `exec`)
 
-Grant a leash that may exec only `echo`, then watch the server enforce it
-*through the MCP boundary*:
+Grant no external executable authority. The carried Brush `echo` builtin still
+works because it spawns nothing, while an attempted external is refused:
 
 ```bash
-export AGENT_BRIDLE_CAVEATS='{"fs_read":"all","fs_write":"all","exec":{"only":["echo"]},"net":"all","max_calls":"unlimited","valid_for_generation":"all"}'
+export AGENT_BRIDLE_CAVEATS='{"fs_read":"all","fs_write":"all","exec":{"only":[]},"net":"all","max_calls":"unlimited","valid_for_generation":"all"}'
 
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shell","arguments":{"program":"echo","args":["hi"]}}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"shell","arguments":{"program":"rm","args":["-rf","/"]}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shell","arguments":{"cmd":"echo hi"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"shell","arguments":{"cmd":"./not-granted"}}}' \
   | agent-bridle-mcp
 ```
 
-`echo` runs (`isError: false`, stdout `hi`). `rm` is **denied** — the leash
-refuses it and the reason comes back as an MCP *tool error*, not a transport
-fault:
+`echo` runs (`isError: false`, stdout `hi`). The external is **denied** — the
+leash refuses it and the reason comes back as an MCP *tool error*, not a
+transport fault:
 
 ```json
-{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"denied: exec of \"rm\" is not within the granted authority","type":"text"}],"isError":true}}
+{"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"exec of \"./not-granted\" is not within the granted authority","type":"text"}],"isError":true}}
 ```
 
 ## The `net` enforcer: `web_fetch` (`agent-bridle-tool-web`)
@@ -287,12 +300,12 @@ even under `net: "all"`).
 ## Status
 
 This is **P0** plus the **MCP frontend** (DESIGN §4 frontend 2): the core leash,
-a confined argv + safe-subset shell (ADR 0005), and an `agent-bridle-mcp` stdio
-JSON-RPC server, with
-tests proving the leash *denies* out-of-scope exec, exhausted budgets,
-generation mismatch, and path-escape (`..` / symlink) attempts — including a
-through-MCP integration test that drives the real binary over stdio and proves
-an out-of-scope `tools/call` is denied across the protocol boundary.
+a confined carried Brush shell (with the argv + safe-subset alternative), and
+an `agent-bridle-mcp` stdio JSON-RPC server, with tests proving the leash
+*denies* out-of-scope exec, exhausted budgets, generation mismatch, and
+path-escape (`..` / symlink) attempts — including a through-MCP integration test
+that drives the real binary over stdio and proves an out-of-scope `tools/call`
+is denied across the protocol boundary.
 
 The **`net` enforcer** (`agent-bridle-tool-web`, `web` feature) is also landed:
 a confined `web_fetch` whose host allowlist, SSRF IP screen, per-redirect

@@ -1,10 +1,18 @@
 # agent-bridle-tool-shell
 
-A capability-confined shell tool for agent-bridle — the **argv + safe-subset
-engine** (ADR 0005). agent-bridle *is* the exec funnel: it parses the request
-itself, checks the `exec`/`fs` leash, spawns the program(s) directly, and
-**refuses the dynamic constructs by design** (`$(…)`, backticks, subshells,
-`eval`). The tool accepts two input shapes:
+A capability-confined family of shell engines for agent-bridle:
+
+- `BrushShellTool` (`brush`): a carried bash-in-Rust engine running in a fresh,
+  sandboxed worker whose command interceptor gates external spawns and opens.
+- `carried-coreutils`: adds bundled `ls`, `cat`, and `echo` to Brush and is the
+  default selected by the top-level `agent-bridle` facade.
+- `ShellTool` (`shell`): the lean **argv + safe-subset engine** (ADR 0005).
+- `HostShellTool` (`host-shell`): full host-shell semantics when the OS sandbox
+  can carry the confinement guarantee.
+
+The safe-subset engine makes agent-bridle the exec funnel: it parses the request
+itself, checks the `exec`/`fs` leash, spawns programs directly, and refuses
+dynamic constructs by design. It accepts two input shapes:
 
 - argv form (`program` + `args`), and
 - free-form `cmd` — a safe subset: pipelines (`|`), redirections
@@ -15,7 +23,15 @@ Because agent-bridle performs each redirect's open and each glob's directory
 listing itself, those filesystem touches are leash-checked (`fs_read`/`fs_write`)
 **before any stage spawns**; out-of-scope `exec` is denied at the funnel.
 
-This is the **L2 convenience** layer. The object-capability **boundary** is L3
+The Brush engine creates its worker through the shared confined-spawn funnel.
+The worker is born under the effective L3 policy, and carried utilities plus
+all other descendants inherit it. Its private request is nonce-bound, bounded,
+and receives only explicit environment values. Timeouts terminate the worker's
+whole process group. Restricted filesystem authority fails closed when no
+kernel backend is available; `unbridled` is the explicit opt-out.
+
+The safe-subset path is the **L2 convenience** layer. The object-capability
+**boundary** is L3
 (ADR 0005): on a capable Linux build (`linux-landlock`) with `fs_write`
 restricted, the engine applies a kernel-enforced Landlock ruleset before
 spawning and the result reports `SandboxKind::Landlock`; otherwise the run is
@@ -23,13 +39,12 @@ spawning and the result reports `SandboxKind::Landlock`; otherwise the run is
 per-axis report refines this further, ADR 0004 D1). The cross-OS L3 strategy is
 ADR 0009 (#78/#35/#50/#51/#57).
 
-- `ShellTool` — the registry tool, gated by the `exec`/`fs` axes of `Caveats`
+- Every engine registers under the same `shell` identity; the embedder selects
+  one at registry construction.
 - Compiles with the `shell` feature off (exposing only the lightweight observer
   contract), so workspaces build under `--no-default-features`
-- No `brush` dependency. `brush-bridle-core` (a renamed brush fork published to
-  crates.io) is the **deferred, reversible** full-bash alternative engine behind
-  the same registry seam (ADR 0005 D4) — adopted under its own optional feature
-  if/when needed, not shipped today (#20/#28).
+- Brush remains isolated behind leaf-crate features; `agent-bridle-core` stays
+  free of heavy shell dependencies.
 
 ## Live output observation
 

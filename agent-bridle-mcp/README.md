@@ -12,7 +12,10 @@ else a loudly-warned unconfined default. Every `tools/call` is dispatched
 through the registry against that grant, so confinement holds *through* the
 MCP boundary.
 
-- `shell` feature (default-on): serves the confined, brush-backed shell tool
+- `carried-coreutils` feature (default-on): serves the sandbox-worker Brush
+  shell with bundled `ls`/`cat`/`echo`
+- `shell` feature (off by default): selects the lean argv + safe-subset shell
+  when default features are disabled
 - `web` feature (off by default): serves the confined `web_fetch` tool
 - `--no-default-features` yields a valid but empty registry
 

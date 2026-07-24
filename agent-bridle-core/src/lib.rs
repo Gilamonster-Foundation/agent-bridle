@@ -76,6 +76,7 @@ pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSand
 pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
 pub use spawn::{
     confinement_unenforceable, spawn_confined_subprocess, ConfinedChild, ConfinedCommand,
+    SandboxedWorker, TrustedWorkerKind,
 };
 // The async-host confined spawn (tokio pipe handles). Unix-only, feature-gated,
 // so it re-exports only when built — mirroring the OS-sandbox re-exports above.

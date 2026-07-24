@@ -68,7 +68,9 @@ pub use agent_bridle_tool_web::WebFetchTool;
 /// set is deterministic and DCE-proof. Which tools are present depends on the
 /// compiled features:
 ///
-/// - `shell` (default): adds the confined brush-backed `shell` tool.
+/// - `carried-coreutils` (default): adds the carried Brush-backed `shell` tool.
+/// - `shell`: selects the lean argv + safe-subset `shell` instead when
+///   `carried-coreutils` is disabled.
 /// - `web`: adds the confined `web_fetch` tool — the `net` enforcer (host
 ///   allowlist + SSRF block + per-redirect re-check + IP pinning).
 ///
@@ -79,7 +81,12 @@ pub fn registry() -> Registry {
     #[allow(unused_mut)]
     let mut builder = Registry::builder();
 
-    #[cfg(feature = "shell")]
+    #[cfg(feature = "carried-coreutils")]
+    {
+        builder = builder.tool(std::sync::Arc::new(BrushShellTool::new()));
+    }
+
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
     {
         builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
     }
@@ -96,9 +103,9 @@ pub fn registry() -> Registry {
 mod tests {
     use super::*;
 
-    /// Presence test (DESIGN §5): under `--features shell` the `shell` tool must
-    /// be registered. This is the CI guard that linker DCE has not dropped it.
-    #[cfg(feature = "shell")]
+    /// Presence test (DESIGN §5): either registry-selected shell feature must
+    /// register exactly the public `shell` identity.
+    #[cfg(any(feature = "shell", feature = "carried-coreutils"))]
     #[test]
     fn shell_tool_is_present_with_feature() {
         let reg = registry();
@@ -113,9 +120,29 @@ mod tests {
         );
     }
 
-    /// Without the `shell` feature the shell tool must be absent (proves the
-    /// feature actually gates it).
-    #[cfg(not(feature = "shell"))]
+    /// The default carried engine publishes its full-shell `cmd` schema, not
+    /// the safe-subset engine's argv form.
+    #[cfg(feature = "carried-coreutils")]
+    #[test]
+    fn default_shell_is_the_carried_brush_engine() {
+        let reg = registry();
+        let shell = reg
+            .tool_definitions()
+            .into_iter()
+            .find(|definition| definition["name"] == "shell")
+            .expect("carried shell present");
+        let properties = shell["inputSchema"]["properties"]
+            .as_object()
+            .expect("shell schema properties");
+        assert!(properties.contains_key("cmd"), "Brush schema needs `cmd`");
+        assert!(
+            !properties.contains_key("program"),
+            "default registry must not select the argv safe-subset engine"
+        );
+    }
+
+    /// Without either registry-selected shell feature the tool must be absent.
+    #[cfg(not(any(feature = "shell", feature = "carried-coreutils")))]
     #[test]
     fn shell_tool_absent_without_feature() {
         let reg = registry();
@@ -151,7 +178,11 @@ mod tests {
 
     /// Under `--no-default-features` (no `shell`, no `web`) the registry is empty
     /// but valid.
-    #[cfg(all(not(feature = "shell"), not(feature = "web")))]
+    #[cfg(all(
+        not(feature = "shell"),
+        not(feature = "carried-coreutils"),
+        not(feature = "web")
+    ))]
     #[test]
     fn registry_is_empty_with_no_tool_features() {
         let reg = registry();

@@ -297,7 +297,7 @@ mod tests {
         assert!(result["capabilities"]["tools"].is_object());
     }
 
-    #[cfg(feature = "shell")]
+    #[cfg(any(feature = "shell", feature = "carried-coreutils"))]
     #[tokio::test]
     async fn tools_list_includes_shell() {
         let resp = roundtrip(&serde_json::json!({

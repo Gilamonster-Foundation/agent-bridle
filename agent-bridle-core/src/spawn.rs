@@ -71,6 +71,9 @@ pub struct ConfinedCommand {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    /// Put the child in a fresh process group so a supervising caller can
+    /// terminate the complete descendant tree at a timeout boundary.
+    new_process_group: bool,
     /// The sandbox mechanism config (read/exec allow-lists). Rides the builder —
     /// NOT the `ToolContext`, which carries only authority (I5-B, #144, ADR 0017
     /// D2). Defaults to today's built-in allow-lists.
@@ -88,6 +91,7 @@ impl ConfinedCommand {
             stdin: None,
             stdout: None,
             stderr: None,
+            new_process_group: false,
             sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
     }
@@ -156,6 +160,17 @@ impl ConfinedCommand {
         self
     }
 
+    /// Start the child as leader of a fresh process group.
+    ///
+    /// This is used by trusted worker supervisors that must terminate the
+    /// worker and every descendant together. It is currently effective on
+    /// Unix; other platforms retain their native child-process behavior.
+    #[must_use]
+    pub fn new_process_group(mut self) -> Self {
+        self.new_process_group = true;
+        self
+    }
+
     /// Admission-check, confine, and spawn the child.
     ///
     /// Order: (1) `cx.check_exec(program)` — deny before doing anything; (2) if
@@ -178,8 +193,24 @@ impl ConfinedCommand {
         cx: &ToolContext,
         effective: Caveats,
     ) -> ToolResult<ConfinedChild> {
-        // (1) Admission: the parent must be permitted to exec this program.
-        cx.check_exec(&self.program)?;
+        self.spawn_authorized(cx, effective, SpawnAuthority::ModelSelected)
+    }
+
+    /// Shared spawn funnel for model-selected programs and fixed internal
+    /// workers. The latter skips only the model-facing executable admission
+    /// check; its executable and entrypoint are fixed by [`SandboxedWorker`].
+    fn spawn_authorized(
+        self,
+        cx: &ToolContext,
+        effective: Caveats,
+        authority: SpawnAuthority,
+    ) -> ToolResult<ConfinedChild> {
+        // (1) Admission: model-selected programs must be in the exec grant.
+        // A trusted worker transition is not model-selected; its fixed program
+        // is added only to the mechanism policy below.
+        if authority == SpawnAuthority::ModelSelected {
+            cx.check_exec(&self.program)?;
+        }
 
         let sandbox = best_available_sandbox(&self.sandbox_policy);
         let kind = sandbox.kind();
@@ -210,7 +241,16 @@ impl ConfinedCommand {
         // `sandbox-exec -p <profile>` argv that confines the child; empty for
         // thread-confining backends (Landlock, via `apply`) and Noop. Computed
         // here so a fail-closed wrapper error aborts *before* we spawn the thread.
-        let prefix = sandbox.command_prefix(&effective)?;
+        // A fixed worker executable is an internal transition, not authority
+        // delegated to the model. Kernel exec policies nevertheless need to
+        // launch it, so add the exact canonical worker path to the mechanism
+        // caveats while keeping the reported/effective authority unchanged.
+        let mechanism_effective = if authority == SpawnAuthority::TrustedWorker {
+            caveats_with_trusted_program(&effective, &self.program)?
+        } else {
+            effective.clone()
+        };
+        let prefix = sandbox.command_prefix(&mechanism_effective)?;
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
         //     child inherits the OS confinement — the per-thread, fork/exec-
@@ -223,6 +263,7 @@ impl ConfinedCommand {
             stdin,
             stdout,
             stderr,
+            new_process_group,
             // Already consumed above into `sandbox` via `best_available_sandbox`.
             sandbox_policy: _,
         } = self;
@@ -239,7 +280,7 @@ impl ConfinedCommand {
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
             // non-empty.
             if prefix.is_empty() {
-                sandbox.apply(&effective)?;
+                sandbox.apply(&mechanism_effective)?;
             }
 
             // Wrap the child in the backend's command prefix when it confines via
@@ -263,6 +304,13 @@ impl ConfinedCommand {
             if let Some(cfg) = stderr {
                 cmd.stderr(cfg);
             }
+            #[cfg(unix)]
+            if new_process_group {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
+            #[cfg(not(unix))]
+            let _ = new_process_group;
             cmd.spawn().map_err(ToolError::from)
         })
         .join()
@@ -273,6 +321,144 @@ impl ConfinedCommand {
             sandbox_kind: reported_kind,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnAuthority {
+    ModelSelected,
+    TrustedWorker,
+}
+
+/// A closed set of internal worker entrypoints. The caller cannot supply
+/// arbitrary arguments: each kind maps to a fixed private protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustedWorkerKind {
+    /// The carried Brush shell worker.
+    Brush,
+}
+
+impl TrustedWorkerKind {
+    fn args(self) -> [&'static str; 2] {
+        match self {
+            Self::Brush => ["--agent-bridle-worker", "brush"],
+        }
+    }
+}
+
+/// Builder for a fixed Agent Bridle worker born under the ordinary confinement
+/// funnel. Unlike [`ConfinedCommand`], the executable is mechanism
+/// configuration chosen by the trusted embedder and the entrypoint arguments
+/// are fixed by [`TrustedWorkerKind`]; model-authored arguments never reach the
+/// spawn boundary.
+#[derive(Debug, Clone)]
+pub struct SandboxedWorker {
+    executable: PathBuf,
+    kind: TrustedWorkerKind,
+    sandbox_policy: Arc<SandboxPolicy>,
+}
+
+impl SandboxedWorker {
+    /// Configure the carried Brush worker at a fixed executable.
+    ///
+    /// Production embedders normally pass `std::env::current_exe()`. Tests and
+    /// split-binary hosts may pass a dedicated dispatch-capable helper.
+    #[must_use]
+    pub fn brush(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+            kind: TrustedWorkerKind::Brush,
+            sandbox_policy: Arc::new(SandboxPolicy::default()),
+        }
+    }
+
+    /// Set the sandbox mechanism policy used by the shared spawn funnel.
+    #[must_use]
+    pub fn sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
+        self.sandbox_policy = policy;
+        self
+    }
+
+    /// Spawn the fixed worker with empty ambient environment and piped stdio.
+    ///
+    /// `nonce` binds the worker request carried over stdin to this launch. The
+    /// worker is a fresh process-group leader so its supervisor can terminate
+    /// the complete process tree on timeout.
+    pub fn spawn(
+        self,
+        cx: &ToolContext,
+        nonce: &str,
+        cwd: &Path,
+        unbridled: bool,
+    ) -> ToolResult<ConfinedChild> {
+        cx.check_path_read(cwd)?;
+        let executable = self
+            .executable
+            .canonicalize()
+            .map_err(|error| ToolError::denied(format!("worker executable is invalid: {error}")))?;
+        let executable = executable.to_string_lossy().into_owned();
+        let [flag, kind] = self.kind.args();
+        let command = ConfinedCommand::new(executable)
+            .args([flag, kind])
+            .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .new_process_group()
+            .sandbox_policy(self.sandbox_policy);
+
+        if unbridled {
+            command.spawn_authorized(cx, Caveats::top(), SpawnAuthority::TrustedWorker)
+        } else {
+            let effective = cx.caveats().clone();
+            let available = best_available_sandbox(&command.sandbox_policy).kind();
+            let reported = effective_sandbox_kind(available, &effective);
+            #[cfg(not(target_os = "linux"))]
+            let _ = reported;
+            #[cfg(target_os = "linux")]
+            if reported == SandboxKind::Landlock
+                && crate::sandbox::restricts_fs(&effective)
+                && !linux_user_namespaces_hardened()
+            {
+                return Err(ToolError::denied(
+                    "refusing the Brush worker: Landlock filesystem confinement \
+                     is not a complete boundary while unprivileged user namespaces \
+                     remain available; disable them or add the namespace syscall backstop",
+                ));
+            }
+            command.spawn_authorized(cx, effective, SpawnAuthority::TrustedWorker)
+        }
+    }
+}
+
+/// Add the exact trusted worker executable only to the kernel mechanism's exec
+/// scope. This does not alter the effective authority carried by `ToolContext`
+/// or the enforcement report.
+fn caveats_with_trusted_program(effective: &Caveats, program: &str) -> ToolResult<Caveats> {
+    let canonical = Path::new(program)
+        .canonicalize()
+        .map_err(|error| ToolError::denied(format!("cannot resolve trusted worker: {error}")))?
+        .to_string_lossy()
+        .into_owned();
+    let mut mechanism = effective.clone();
+    if let crate::Scope::Only(programs) = &mut mechanism.exec {
+        programs.insert(canonical);
+    }
+    Ok(mechanism)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_user_namespaces_hardened() -> bool {
+    fn sysctl_is(path: &str, expected: &str) -> bool {
+        std::fs::read_to_string(path).is_ok_and(|value| value.trim() == expected)
+    }
+
+    sysctl_is("/proc/sys/kernel/unprivileged_userns_clone", "0")
+        || sysctl_is("/proc/sys/user/max_user_namespaces", "0")
+        || sysctl_is(
+            "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+            "1",
+        )
 }
 
 /// Spawn `program args` confined by `cx`, with the inherited stdio of the parent.

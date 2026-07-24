@@ -1,27 +1,31 @@
 //! The carried **brush engine** (agent-bridle#20 / Track 2): a bash-in-Rust
-//! shell run **in-process**, confined by the `CommandInterceptor` L2 leash.
+//! shell run in a dedicated worker, confined by the inherited L3 boundary and
+//! the `CommandInterceptor` L2 leash.
 //!
 //! Unlike [`HostShellTool`](crate::HostShellTool) — which *refuses* a restricted
 //! `exec`/`net` grant because it cannot bound a real `/bin/sh`'s forked children
 //! — this engine's interceptor fires on every resolved program name and every
 //! opened path *inside* brush (`before_exec` at the single external-spawn funnel,
 //! `before_open` at `Shell::open_file`). So it **serves** restricted `exec`/`fs`
-//! grants, in-process, on any platform, and records each denial into a shared
-//! sink surfaced as structured `denials` on the envelope.
+//! grants and records each denial into the worker response surfaced as
+//! structured `denials` on the envelope.
 //!
 //! It uses the temporary `brush-ocap-*` fork carrying the upstream hook PR
-//! (reubeno/brush#1184). Enforcement is L2 (advisory `sandbox_kind = None`); an
-//! L3 backstop is a follow-up. The curated builtin set removes `exec` (the one
-//! builtin that spawns outside the `before_exec` funnel — a proven bypass).
+//! (reubeno/brush#1184). The worker is born through `SandboxedWorker`, so its
+//! carried commands and descendants inherit L3. The curated builtin set removes
+//! `exec` (the one builtin that spawns outside the `before_exec` funnel — a
+//! proven bypass).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::Child;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    default_exec_path, Denial, Disclosure, SandboxKind, Scope, Tool, ToolContext, ToolEnvelope,
-    ToolError, ToolResult,
+    default_exec_path, enforcement_report, human_gate, is_unbridled, Disclosure, SandboxPolicy,
+    SandboxedWorker, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 use brush_builtins::{default_builtins, BuiltinSet};
@@ -31,7 +35,8 @@ use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::variables::ShellVariable;
 use brush_core::{Shell, ShellFd};
 
-use crate::caveat_interceptor::{CaveatInterceptor, DenialSink};
+use crate::brush_worker::{WorkerRequest, WorkerResponse};
+use crate::caveat_interceptor::CaveatInterceptor;
 use crate::output_observer::{drain_capped, output_session, OutputEmitter};
 
 /// The engine identity stamped on the disclosure (ADR 0005 D2 / ADR 0019 D4).
@@ -74,9 +79,10 @@ static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
 });
 
 /// The carried brush engine — a [`Tool`] that runs a free-form command string
-/// through an in-process bash-in-Rust shell confined by the `CommandInterceptor`
-/// leash. Registered under `"shell"` (the ADR 0005 D2 seam), a peer of
-/// [`ShellTool`](crate::ShellTool) / [`HostShellTool`](crate::HostShellTool).
+/// through a worker-hosted bash-in-Rust shell confined by the L3 boundary and
+/// `CommandInterceptor` leash. Registered under `"shell"` (the ADR 0005 D2
+/// seam), a peer of [`ShellTool`](crate::ShellTool) /
+/// [`HostShellTool`](crate::HostShellTool).
 #[derive(Clone)]
 pub struct BrushShellTool {
     max_output: usize,
@@ -85,6 +91,8 @@ pub struct BrushShellTool {
     /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
     /// and reported `timed_out:true` with exit 124.
     timeout: Duration,
+    worker_executable: PathBuf,
+    sandbox_policy: Arc<SandboxPolicy>,
 }
 
 impl std::fmt::Debug for BrushShellTool {
@@ -108,6 +116,8 @@ impl BrushShellTool {
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             timeout: default_timeout(),
+            worker_executable: std::env::current_exe().unwrap_or_default(),
+            sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
     }
 
@@ -118,6 +128,20 @@ impl BrushShellTool {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Select a fixed dispatch-capable worker executable.
+    #[must_use]
+    pub fn with_worker_executable(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.worker_executable = executable.into();
+        self
+    }
+
+    /// Select the OS-sandbox mechanism policy for the private worker.
+    #[must_use]
+    pub fn with_sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
+        self.sandbox_policy = policy;
         self
     }
 
@@ -142,7 +166,9 @@ impl BrushShellTool {
 
     fn disclosure(&self) -> Disclosure {
         Disclosure {
+            unbridled: is_unbridled(),
             engine: Some(ENGINE_NAME.to_string()),
+            human_gate: human_gate(),
             ..Disclosure::default()
         }
     }
@@ -171,7 +197,11 @@ impl Tool for BrushShellTool {
         let cwd = args
             .get("cwd")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_dir().map_err(ToolError::from)?)
+            .canonicalize()
+            .map_err(|error| ToolError::denied(format!("brush cwd is invalid: {error}")))?;
+        cx.check_path_read(&cwd)?;
 
         // The schema's `env` seam: the DELIBERATE import surface across the
         // confinement boundary (this engine runs `do_not_inherit_env(true)`, so
@@ -200,109 +230,175 @@ impl Tool for BrushShellTool {
             RESTRICTED_PATH.to_string()
         };
 
-        let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
-        // FIX 2: a per-run cancellation flag wired into the interceptor. An outer
-        // caller trips it (the FIX-3 wall-clock timeout below, or a future newt
-        // interrupt) and the interceptor aborts the run at the next command /
-        // redirect boundary — so a runaway confined command is recoverable.
-        let cancel = Arc::new(AtomicBool::new(false));
-        let interceptor =
-            CaveatInterceptor::new(cx.clone(), Arc::clone(&sink)).with_cancel(Arc::clone(&cancel));
         let max_output = self.max_output;
         let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
-
-        // brush's shell API is async and blocks on a per-invocation current-thread
-        // runtime; run it off the async runtime on a blocking worker, bounded by
-        // the wall-clock ceiling (FIX 3). Mirrors the safe-subset / host engines.
-        let run = tokio::task::spawn_blocking(move || {
-            run_in_brush(cmd, cwd, path_value, env, interceptor, max_output, output)
-        });
+        let mut nonce_bytes = [0_u8; 32];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|error| ToolError::denied(format!("cannot create worker nonce: {error}")))?;
+        let nonce = nonce_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let request = WorkerRequest::new(
+            nonce.clone(),
+            cx.caveats().clone(),
+            cx.strength_floor(),
+            cmd,
+            Some(cwd.to_string_lossy().into_owned()),
+            path_value,
+            env,
+            max_output,
+        );
+        let confined = SandboxedWorker::brush(self.worker_executable.clone())
+            .sandbox_policy(Arc::clone(&self.sandbox_policy))
+            .spawn(cx, &nonce, &cwd, is_unbridled())?;
+        let sandbox_kind = confined.sandbox_kind;
+        let caveats = cx.caveats().clone();
         let timeout = self.timeout;
-        match tokio::time::timeout(timeout, run).await {
-            Ok(joined) => {
-                let captured = joined
-                    .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
-                // Any denial the interceptor recorded lifts the envelope to `denied:true`.
-                let denials: Vec<Denial> = sink.lock().map(|g| g.clone()).unwrap_or_default();
-                let envelope = ToolEnvelope::new(SandboxKind::None)
+        let supervised = tokio::task::spawn_blocking(move || {
+            supervise_worker(confined.child, &request, timeout, max_output)
+        })
+        .await
+        .map_err(|error| ToolError::Exec(std::io::Error::other(format!("join: {error}"))))??;
+        match supervised {
+            Supervised::Complete(response) => {
+                if let Some(error) = response.error {
+                    return Err(ToolError::denied(format!(
+                        "brush worker refused request: {error}"
+                    )));
+                }
+                output.emit(crate::ShellOutputStream::Stdout, response.stdout.as_bytes());
+                output.emit(crate::ShellOutputStream::Stderr, response.stderr.as_bytes());
+                let envelope = ToolEnvelope::new(sandbox_kind)
+                    .with_enforcement(enforcement_report(&caveats, sandbox_kind))
                     .with_disclosure(self.disclosure())
-                    .with_exit_code(captured.exit_code)
-                    .with_stdout(captured.stdout)
-                    .with_stderr(captured.stderr)
+                    .with_exit_code(response.exit_code)
+                    .with_stdout(response.stdout)
+                    .with_stderr(response.stderr)
                     .with_timed_out(false)
-                    .with_denials(denials)
+                    .with_denials(response.denials)
                     .into_json();
                 output_guard.finish();
                 Ok(envelope)
             }
-            Err(_elapsed) => {
-                // FIX 3: on elapse, TRIP the FIX-2 cancel flag. The worker
-                // observes it at its next COMMAND boundary — `before_command`
-                // fires for every command, builtins included, and its `Deny` is
-                // terminating — so the operator recovers at the ceiling
-                // (`timed_out:true` + exit 124, mirroring the safe-subset/host
-                // paths) AND the interpreter actually stops, including a
-                // pure-builtin loop (`while true; do :; done`).
-                //
-                // Residual gap: a run already blocked INSIDE a command reaches no
-                // further command boundary, so it is not stopped here — a `wait`
-                // on a background job, a blocking fifo read, or an
-                // already-spawned long child (`sleep 30`, which is also not
-                // killed). Those need kill-on-drop at the fork level (Effort B).
-                //
-                // ENGINE DEFECT this ceiling is currently masking (measured
-                // 2026-07-19, brush-ocap-core 0.5.0): a COMPOUND command
-                // (`while`/`for`/`if`/`{…}`/subshell) used as a NON-FINAL pipeline
-                // stage deadlocks once it writes more than one pipe buffer
-                // (64 KiB on macOS). `interp.rs` `ExecuteInPipeline for
-                // ast::Command`, arm `Self::Compound(..)`, runs the compound
-                // INLINE to completion (`.await` → `ExecutionSpawnResult::
-                // Completed`) instead of spawning it like the `Self::Simple` arm
-                // does, and `spawn_pipeline_processes` awaits each stage in
-                // order — so the DOWNSTREAM stage is not created until the
-                // compound finishes. The compound therefore writes into a pipe
-                // with no reader, fills the buffer, and blocks forever.
-                //
-                // Measured: `while …; done | cat` emitting 2000×32B (62 KiB)
-                // completes in 0.23s; the same loop at 2100×32B (65 KiB) never
-                // completes (still running at a 240s ceiling). It needs NO
-                // external command to reproduce — a pure-builtin `echo` body is
-                // enough — so this is NOT a spawn-cost problem, and it is the
-                // real reason the canonical `find … | while read f; do wc -l
-                // "$f"; done | sort -rn | head` "hangs" on a large tree while
-                // bash runs it in ~3s. Below the threshold the same pipeline is
-                // byte-identical to bash and already at spawn-cost parity.
-                //
-                // The fix is fork-side (Effort B): the `Compound` arm must spawn
-                // to a task and return `StartedTask` when it is a non-final
-                // stage, mirroring `execute_via_builtin_in_owned_shell`.
-                cancel.store(true, Ordering::SeqCst);
-                // FIX 5: surface denials the run recorded BEFORE it timed out, so
-                // leash telemetry survives a timed-out run (the Ok branch does the
-                // same). The still-running worker may append more, but a lock
-                // serializes the read; we take the snapshot as of now.
-                let denials: Vec<Denial> = sink.lock().map(|g| g.clone()).unwrap_or_default();
-                // Stop accepting presentation events at the timeout boundary; the
-                // detached worker may still be winding down.
+            Supervised::TimedOut => {
                 drop(output_guard);
-                Ok(ToolEnvelope::new(SandboxKind::None)
+                Ok(ToolEnvelope::new(sandbox_kind)
+                    .with_enforcement(enforcement_report(&caveats, sandbox_kind))
                     .with_disclosure(self.disclosure())
                     .with_exit_code(124)
                     .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
                     .with_timed_out(true)
-                    .with_denials(denials)
                     .into_json())
             }
         }
     }
 }
 
+enum Supervised {
+    Complete(WorkerResponse),
+    TimedOut,
+}
+
+fn supervise_worker(
+    mut child: Child,
+    request: &WorkerRequest,
+    timeout: Duration,
+    max_output: usize,
+) -> ToolResult<Supervised> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ToolError::denied("brush worker stdin was not piped"))?;
+    serde_json::to_writer(&mut stdin, request)
+        .map_err(|error| ToolError::denied(format!("encode brush worker request: {error}")))?;
+    stdin.flush().map_err(ToolError::from)?;
+    drop(stdin);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
+    let protocol_cap = max_output.saturating_mul(4).saturating_add(1024 * 1024);
+    let stdout_reader = std::thread::spawn(move || read_capped(stdout, protocol_cap));
+    let stderr_reader =
+        std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(ToolError::from)? {
+            break Some(status);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break None;
+        }
+        std::thread::park_timeout(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10)),
+        );
+    };
+    if status.is_none() {
+        kill_worker_tree(&mut child);
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Ok(Supervised::TimedOut);
+    }
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| ToolError::denied("brush worker stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| ToolError::denied("brush worker stderr reader panicked"))??;
+    serde_json::from_slice::<WorkerResponse>(&stdout)
+        .map(Supervised::Complete)
+        .map_err(|error| {
+            ToolError::denied(format!(
+                "invalid brush worker response ({error}); worker stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            ))
+        })
+}
+
+fn read_capped(reader: impl Read, cap: usize) -> ToolResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(cap.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(ToolError::from)?;
+    if bytes.len() > cap {
+        return Err(ToolError::denied(
+            "brush worker protocol output exceeded its cap",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn kill_worker_tree(child: &mut Child) {
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_worker_tree(child: &mut Child) {
+    let _ = child.kill();
+}
+
 /// What a finished brush run produced.
 #[derive(Debug)]
-struct Captured {
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Captured {
+    pub(crate) exit_code: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Drive a brush shell to completion for one command, capturing stdout/stderr
@@ -312,7 +408,7 @@ struct Captured {
 /// on the runtime (not just time): `$(...)` sets up real pipes via tokio's IO
 /// driver, and with IO enabled the inner program hits the `before_exec` funnel
 /// (a legible recorded denial) rather than panicking.
-fn run_in_brush(
+pub(crate) fn run_in_brush(
     cmd: String,
     cwd: Option<String>,
     path_value: String,
@@ -540,9 +636,10 @@ fn brush_io(ctx: &str, e: &impl std::fmt::Display) -> std::io::Error {
 mod cancel_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use agent_bridle_core::{Caveats, DenialKind, Gate, Scope, Tool, ToolResult};
+    use agent_bridle_core::{Caveats, Denial, DenialKind, Gate, Scope, Tool, ToolResult};
 
     use crate::caveat_interceptor::DenialSink;
 

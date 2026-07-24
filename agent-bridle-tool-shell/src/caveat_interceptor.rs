@@ -227,7 +227,11 @@ impl CommandInterceptor for CaveatInterceptor {
     /// `before_exec` site), so a cancelled run is already terminated. That is
     /// also what keeps the allow memo below sound —
     /// `memoized_allow_does_not_outlive_cancellation` pins it.
-    fn before_exec(&self, program: &str, _args: &[String]) -> ExecDecision {
+    fn before_exec(&self, program: &str, args: &[String]) -> ExecDecision {
+        #[cfg(feature = "carried-coreutils")]
+        let logical = crate::coreutils_dispatch::logical_carried_command(program, args);
+        #[cfg(feature = "carried-coreutils")]
+        let program = logical.as_deref().unwrap_or(program);
         if self.is_memoized_allow(program) {
             return ExecDecision::Allow;
         }
