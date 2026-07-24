@@ -269,7 +269,7 @@ fn shim_execute<SE: ShellExtensions>(
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (context, args);
-            return Ok(ExecutionExitCode::CannotExecute.into());
+            Ok(ExecutionExitCode::CannotExecute.into())
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
