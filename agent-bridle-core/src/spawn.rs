@@ -674,10 +674,10 @@ impl SandboxedWorker {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (self, cx, nonce, cwd);
-            return Err(ToolError::denied(
+            Err(ToolError::denied(
                 "refusing the Brush worker: this platform has no authenticated \
                  private-control transport",
-            ));
+            ))
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
