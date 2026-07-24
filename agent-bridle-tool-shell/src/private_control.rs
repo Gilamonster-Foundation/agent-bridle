@@ -90,11 +90,7 @@ pub(crate) fn receive_worker_request<P: DeserializeOwned>(
             hex(&challenge)
         );
         prepare_receiver(&stream)?;
-        let mut bootstrap = [0_u8; TRUSTED_WORKER_BOOTSTRAP.len()];
-        let _bootstrap_credentials = recv_exact_frame(&stream, &mut bootstrap)?;
-        if bootstrap != TRUSTED_WORKER_BOOTSTRAP {
-            return Err("worker control bootstrap mismatch".to_string());
-        }
+        receive_bootstrap(&mut stream, "worker")?;
         let pre = parent_snapshot(&stream);
         stream
             .write_all(&encode_trusted_worker_hello(std::process::id(), challenge))
@@ -225,12 +221,7 @@ pub(crate) fn authenticate_carried_dispatch(name: &OsStr, args: &[OsString]) -> 
             .map_err(|error| format!("duplicate carried control socket: {error}"))?;
         let mut stream = UnixStream::from(owned);
         prepare_receiver(&stream)?;
-
-        let mut bootstrap = [0_u8; TRUSTED_WORKER_BOOTSTRAP.len()];
-        let _bootstrap_credentials = recv_exact_frame(&stream, &mut bootstrap)?;
-        if bootstrap != TRUSTED_WORKER_BOOTSTRAP {
-            return Err("carried control bootstrap mismatch".to_string());
-        }
+        receive_bootstrap(&mut stream, "carried")?;
         let mut challenge = [0_u8; 32];
         getrandom::getrandom(&mut challenge)
             .map_err(|error| format!("create carried control challenge: {error}"))?;
@@ -279,6 +270,25 @@ fn push_os(bytes: &mut Vec<u8>, value: &OsStr) {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Receive the fixed non-authority prelude with ordinary stream I/O.
+///
+/// The parent may queue this bootstrap immediately after spawning, before the
+/// child enables Linux `SO_PASSCRED`. Requiring credentials on that already
+/// queued prelude creates a startup race without authenticating any authority.
+/// Every authority-bearing frame follows the child's hello and is still read
+/// through `recv_exact_frame`, where credentials are mandatory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn receive_bootstrap(stream: &mut UnixStream, channel: &str) -> Result<(), String> {
+    let mut bootstrap = [0_u8; TRUSTED_WORKER_BOOTSTRAP.len()];
+    stream
+        .read_exact(&mut bootstrap)
+        .map_err(|error| format!("read {channel} control bootstrap: {error}"))?;
+    if bootstrap != TRUSTED_WORKER_BOOTSTRAP {
+        return Err(format!("{channel} control bootstrap mismatch"));
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -489,4 +499,35 @@ fn set_cloexec(fd: &impl AsFd) -> Result<(), String> {
     )
     .map(drop)
     .map_err(|error| format!("mark private control descriptor close-on-exec: {error}"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_bootstrap_precedes_credentialed_authority_frame_without_racing() {
+        let (mut sender, mut receiver) = UnixStream::pair().expect("private socketpair");
+
+        // Model the fast parent: the non-authority bootstrap is already queued
+        // before the child has enabled credential reception.
+        sender
+            .write_all(&TRUSTED_WORKER_BOOTSTRAP)
+            .expect("queue bootstrap");
+        prepare_receiver(&receiver).expect("prepare authenticated receiver");
+        receive_bootstrap(&mut receiver, "test").expect("receive queued bootstrap");
+
+        // Authority is sent only after receiver preparation and must still
+        // carry the sender's kernel credentials.
+        let authority = *b"AUTH-V1\0";
+        sender
+            .write_all(&authority)
+            .expect("write authority-shaped frame");
+        let mut received = [0_u8; 8];
+        let credentials =
+            recv_exact_frame(&receiver, &mut received).expect("receive credentialed frame");
+        assert_eq!(received, authority);
+        assert_eq!(credentials.pid, std::process::id() as i32);
+        assert_eq!(credentials.uid, nix::unistd::getuid().as_raw());
+    }
 }
