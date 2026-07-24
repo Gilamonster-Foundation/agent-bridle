@@ -20,17 +20,53 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # gh release create + binary asset upload
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # ── Release identity preflight ────────────────────────────────────────
+
+  release-preflight:
+    name: Verify release identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require tag to match the workspace version
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          version = manifest["workspace"]["package"]["version"]
+          expected = f"v{version}"
+          release_ref = os.environ["RELEASE_REF"]
+          release_tag = os.environ["RELEASE_TAG"]
+
+          if release_ref.startswith("refs/tags/") and release_tag != expected:
+              raise SystemExit(
+                  f"release tag {release_tag!r} does not match "
+                  f"workspace version {version!r}; expected {expected!r}"
+              )
+
+          if release_ref.startswith("refs/tags/"):
+              print(f"release identity verified: {release_tag}")
+          else:
+              print(f"manual build for workspace version {version}")
+          PY
+
   # ── Build the agent-bridle-mcp binary ─────────────────────────────────
 
   build-mcp-binary:
     name: Build agent-bridle-mcp (${{ matrix.label }})
+    needs: [release-preflight]
     strategy:
       fail-fast: false
       matrix:
@@ -64,10 +100,16 @@ jobs:
       - name: Build agent-bridle-mcp (+ aclaunch on Windows)
         shell: bash
         run: |
-          pkgs="-p agent-bridle-mcp"
+          # Release artifacts must carry the native L3 backend for their target.
+          # `os-sandbox` enables all three cfg-gated backends; each is inert away
+          # from its own OS.
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p agent-bridle-mcp --features os-sandbox
           # The AppContainer launcher is Windows-only; build it there so it ships.
-          [ -n "${{ matrix.aclaunch }}" ] && pkgs="$pkgs -p agent-bridle-aclaunch"
-          cargo build --release --locked --target ${{ matrix.target }} $pkgs
+          if [ -n "${{ matrix.aclaunch }}" ]; then
+            cargo build --release --locked --target ${{ matrix.target }} \
+              -p agent-bridle-aclaunch
+          fi
 
       - name: Stage archive
         shell: bash
@@ -82,7 +124,7 @@ jobs:
           if [ -n "${{ matrix.aclaunch }}" ]; then
             cp "$BIN/agent-bridle-aclaunch${{ matrix.ext }}" "$STAGE/"
           fi
-          cp LICENSE README.md "$STAGE/"
+          cp LICENSE NOTICE README.md "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
           echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
 
@@ -98,9 +140,11 @@ jobs:
 
   github-release:
     name: GitHub release (${{ github.ref_name }})
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [build-mcp-binary]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Download all binary artifacts
@@ -125,34 +169,125 @@ jobs:
   # ── Publish to crates.io (tag-only, topological order) ────────────────
   #
   # Order is load-bearing: each crate must land before its dependents.
-  # cargo >= 1.66 blocks until the new version is downloadable, so
-  # max-parallel: 1 + the ordered matrix ensures correct sequencing.
+  # This is deliberately one job and one shell loop: GitHub Actions does not
+  # guarantee matrix execution order, even when max-parallel is one.
   #
-  # agent-bridle-py is excluded: PyO3 arm64 linker issues on the GitHub
-  # Actions macOS runner make it unpublishable here. Publish manually or
-  # via a maturin wheel job if/when needed.
+  # Internal-only workspace packages (`publish = false`) are deliberately
+  # absent: aclaunch ships inside the Windows binary archive; config and jaild
+  # are host/deployment internals; ceremony and gateway are non-public work.
+  # agent-bridle-py is also excluded: PyO3 arm64 linker issues on the GitHub
+  # Actions macOS runner make it unpublishable here. Publish its wheel manually
+  # or via a maturin job if/when needed.
 
   publish-crates:
-    name: Publish ${{ matrix.crate }} → crates.io
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-mcp-binary]
+    name: Publish Agent Bridle crates → crates.io
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [release-preflight, build-mcp-binary]
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 1    # one at a time — internal deps need topological order
-      matrix:
-        crate:
-          - agent-bridle-core
-          - agent-bridle-tool-shell
-          - agent-bridle-tool-web
-          - agent-bridle          # facade — depends on the three above
-          - agent-bridle-mcp      # binary crate — depends on the facade
+    env:
+      # HOOK PARITY: keep this exact dependency order aligned with the
+      # `publish-crates` recipe in justfile.
+      PUBLISH_CRATES: >-
+        agent-bridle-core
+        agent-bridle-tool-shell
+        agent-bridle-tool-web
+        agent-bridle
+        agent-bridle-mcp
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: publish-${{ matrix.crate }}
+          key: publish-crates
+
+      - name: Verify the public package plan
+        run: |
+          set -euo pipefail
+          metadata="${RUNNER_TEMP:?}/agent-bridle-workspace-metadata.json"
+          cargo metadata --no-deps --format-version 1 > "${metadata}"
+          METADATA_PATH="${metadata}" python3 - <<'PY'
+          import json
+          import os
+
+          plan = os.environ["PUBLISH_CRATES"].split()
+          with open(os.environ["METADATA_PATH"], encoding="utf-8") as source:
+              packages = json.load(source)["packages"]
+
+          names = {package["name"] for package in packages}
+          publishable = {
+              package["name"]
+              for package in packages
+              if package.get("publish") is None
+              or "crates-io" in package["publish"]
+          }
+          dependencies = {
+              package["name"]: {
+                  dependency["name"]
+                  for dependency in package["dependencies"]
+                  if dependency["name"] in names
+                  and (
+                      dependency.get("kind") != "dev"
+                      or dependency.get("req") != "*"
+                  )
+              }
+              for package in packages
+          }
+
+          errors = []
+          duplicates = sorted({crate for crate in plan if plan.count(crate) > 1})
+          for crate in duplicates:
+              errors.append(f"{crate!r} appears more than once")
+          for crate in sorted(publishable - set(plan)):
+              errors.append(f"publishable workspace crate {crate!r} is missing")
+          for crate in plan:
+              if crate not in names:
+                  errors.append(f"{crate!r} is not a workspace package")
+              elif crate not in publishable:
+                  errors.append(f"{crate!r} is not publishable to crates.io")
+
+          positions = {crate: index for index, crate in enumerate(plan)}
+          for crate in plan:
+              for dependency in dependencies.get(crate, set()):
+                  if dependency not in positions:
+                      errors.append(
+                          f"{crate!r} depends on omitted workspace crate "
+                          f"{dependency!r}"
+                      )
+                  elif positions[dependency] > positions[crate]:
+                      errors.append(
+                          f"{crate!r} precedes its dependency {dependency!r}"
+                      )
+
+          if errors:
+              for error in errors:
+                  print(f"::error::publish plan: {error}")
+              raise SystemExit(1)
+
+          print(
+              f"publish plan OK: {len(plan)} crates, exact coverage, "
+              "topological order"
+          )
+          PY
+
+      - name: Verify legal files in every public package
+        run: |
+          set -euo pipefail
+          for crate in ${PUBLISH_CRATES}; do
+            for legal_file in LICENSE NOTICE; do
+              if [ ! -L "${crate}/${legal_file}" ] ||
+                 [ "$(readlink "${crate}/${legal_file}")" != "../${legal_file}" ]; then
+                echo "::error::${crate}/${legal_file} must link to ../${legal_file}"
+                exit 1
+              fi
+            done
+            files="$(cargo package --list --locked -p "${crate}")"
+            grep -qx 'LICENSE' <<<"${files}"
+            grep -qx 'NOTICE' <<<"${files}"
+            echo "${crate}: LICENSE + NOTICE present"
+          done
+
+      - name: Verify the independent root package without publish credentials
+        run: cargo publish --dry-run --locked -p agent-bridle-core
 
       - name: Confirm CARGO_REGISTRY_TOKEN is mounted
         env:
@@ -164,30 +299,46 @@ jobs:
           fi
           echo "CARGO_REGISTRY_TOKEN: present (${#CARGO_REGISTRY_TOKEN} chars)"
 
-      - name: cargo publish ${{ matrix.crate }}
+      - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # Resilient publish: idempotent on already-published versions,
-        # backs off on 429 rate-limits (new crate names), fails on anything else.
+        # Verification above is intentionally token-free. `--no-verify` here
+        # prevents dependency build scripts or proc macros from inheriting the
+        # publish credential while Cargo performs the upload.
         run: |
-          for attempt in 1 2 3 4 5 6; do
-            if cargo publish -p ${{ matrix.crate }} --locked --no-verify 2>publish.err; then
-              cat publish.err >&2 || true
-              echo "published ${{ matrix.crate }}"
-              exit 0
-            elif grep -qiE 'already (exists|uploaded)|is already uploaded|already published' publish.err; then
-              cat publish.err >&2
-              echo "::notice::${{ matrix.crate }} already published at this version — skipping"
-              exit 0
-            elif grep -qi '429 Too Many Requests' publish.err; then
-              cat publish.err >&2
-              wait=$((attempt * 90))
-              echo "::warning::crates.io rate-limited on ${{ matrix.crate }} — waiting ${wait}s, retry ${attempt}/6"
-              sleep "$wait"
-            else
-              cat publish.err >&2
+          set -euo pipefail
+          for crate in ${PUBLISH_CRATES}; do
+            published=0
+            publish_err="${RUNNER_TEMP:?}/publish-${crate}.err"
+            for attempt in 1 2 3 4 5 6; do
+              if cargo publish -p "${crate}" --locked --no-verify 2>"${publish_err}"; then
+                cat "${publish_err}" >&2 || true
+                echo "published ${crate}"
+                published=1
+                break
+              elif grep -qiE 'already (exists|uploaded)|is already uploaded|already published' "${publish_err}"; then
+                cat "${publish_err}" >&2
+                echo "::notice::${crate} already published at this version — skipping"
+                published=1
+                break
+              elif grep -qi '429 Too Many Requests' "${publish_err}"; then
+                cat "${publish_err}" >&2
+                wait=$((attempt * 90))
+                echo "::warning::crates.io rate-limited on ${crate} — waiting ${wait}s, retry ${attempt}/6"
+                sleep "$wait"
+              elif grep -qiE 'no matching package named|failed to select a version for the requirement' "${publish_err}"; then
+                cat "${publish_err}" >&2
+                wait=$((attempt * 30))
+                echo "::warning::dependency of ${crate} is not yet visible in the crates.io index — waiting ${wait}s, retry ${attempt}/6"
+                sleep "$wait"
+              else
+                cat "${publish_err}" >&2
+                exit 1
+              fi
+            done
+            if [ "${published}" -ne 1 ]; then
+              echo "::error::${crate} failed after 6 attempts"
               exit 1
             fi
           done
-          echo "::error::${{ matrix.crate }} still rate-limited after 6 retries"
-          exit 1
+          echo "All Agent Bridle crates published."

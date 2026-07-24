@@ -1,11 +1,10 @@
 //! Spawn an **arbitrary** child process confined by a [`ToolContext`]'s caveats.
 //!
-//! The in-process leash (L2) and the shell tool confine work that runs *inside*
-//! the bridle process. But a host often needs to launch a separate program — an
-//! MCP capability server, a language runtime — and put *it* under the leash. L2
-//! cannot follow a child across `execve`, so on Linux the **only** boundary that
-//! confines a spawned program's own syscalls is the Landlock sandbox (L3,
-//! [`crate::sandbox`]).
+//! The in-process leash (L2) gates operations the bridle process can observe.
+//! But a host often needs to launch a separate program — an MCP capability
+//! server, a language runtime — and put *its own syscalls* under the leash. L2
+//! cannot follow a child across a process boundary; that requires an available
+//! native L3 backend ([`crate::sandbox`]).
 //!
 //! [`ConfinedCommand`] is that primitive. It is deliberately *not* a confused
 //! deputy: the parent attenuates **before** the spawn (the child is never trusted
@@ -13,30 +12,35 @@
 //! (only explicitly-granted vars reach the child — the external-boundary
 //! invariant), and exec is admission-checked against the granted `exec` scope.
 //!
-//! Mechanism (mirrors [`crate::sandbox`]'s contract): `restrict_self` is
-//! per-thread and inherited across `fork`/`execve`, so the sandbox is applied on
-//! a fresh, throwaway thread that then performs the spawn. The child — and every
-//! descendant it forks — inherits the Landlock domain; the thread exits, leaving
-//! the caller's own threads unrestricted.
+//! Mechanism (mirrors [`crate::sandbox`]'s contract): thread-confining backends
+//! such as Landlock are applied on a fresh throwaway thread immediately before
+//! spawn; wrapper backends such as Seatbelt and AppContainer prefix the child
+//! launch. In either case the confined child and its descendants inherit the
+//! active OS boundary.
 //!
 //! Honesty & fail-closed: the achieved [`SandboxKind`] is returned on the
-//! [`ConfinedChild`]. When `fs_write` is meaningfully restricted (`Only(..)`) but
-//! no OS sandbox can enforce it (e.g. off-Linux, or a kernel without Landlock),
-//! the spawn is **refused** rather than launched unconfined — a restrictive
-//! grant that cannot be enforced would be a lie. (Today only `fs_write` is
-//! L3-enforced; `fs_read`/`exec`/`net` confinement of the child is advisory and
-//! not yet part of this guarantee — see [`crate::sandbox`] and ADR 0001.)
+//! [`ConfinedChild`]. A restricted filesystem axis that no active backend can
+//! kernel-enforce is **refused** rather than launched unconfined. Restricted
+//! `exec` and `net` axes are checked against the principal's requested strength
+//! floor because their kernel coverage differs by backend and scope. The
+//! per-axis enforcement report is the authoritative statement of what held.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
     best_available_sandbox, effective_sandbox_kind, enforcement_report, fence_strength,
     AxisEnforcement, Caveats, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
 };
+use agent_mesh_protocol::Fingerprint;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 // Used only by the test modules below (each `use super::*`); kept here so all
 // three (`tests`, `landlock_child_tests`, `seatbelt_child_tests`) see it without
 // an unused-import warning in the non-test build.
@@ -56,12 +60,283 @@ pub struct ConfinedChild {
     pub sandbox_kind: SandboxKind,
 }
 
+/// A fixed internal worker together with its take-once parent control channel.
+///
+/// Unlike an ordinary [`ConfinedChild`], a trusted worker is launched with a
+/// kernel object that model-selected commands do not receive. The worker
+/// validates that channel and its peer before accepting any authority-bearing
+/// request. The channel is private by default and can be taken only once by the
+/// trusted supervisor.
+#[derive(Debug)]
+pub struct SandboxedWorkerChild {
+    /// The spawned worker process.
+    pub child: Child,
+    /// The OS-level sandbox actually applied to the worker.
+    pub sandbox_kind: SandboxKind,
+    control: Option<TrustedWorkerControl>,
+}
+
+impl SandboxedWorkerChild {
+    /// Authenticate the fixed worker and send one authority-bearing request.
+    ///
+    /// Core—not the caller—serializes the effective caveats, strength floor,
+    /// and launch nonce captured by [`SandboxedWorker::spawn`]. `payload`
+    /// contains only tool-specific, non-authority fields. The control endpoint
+    /// is consumed and closed after this frame, so a launch can authorize at
+    /// most one request.
+    pub fn send_payload<T: Serialize>(&mut self, payload: &T, timeout: Duration) -> ToolResult<()> {
+        let mut control = self
+            .control
+            .take()
+            .ok_or_else(|| ToolError::denied("trusted worker request was already sent"))?;
+        control.send(payload, self.child.id(), timeout)
+    }
+}
+
+/// The supervisor-owned end of a trusted worker's private control channel.
+///
+/// The stream and authority are intentionally private. Callers can only send a
+/// non-authority payload through [`SandboxedWorkerChild::send_payload`].
+#[derive(Debug)]
+struct TrustedWorkerControl {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    stream: std::os::unix::net::UnixStream,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    unavailable: (),
+    nonce: String,
+    caveats: Caveats,
+    strength_floor: AxisEnforcement,
+}
+
+impl TrustedWorkerControl {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn send<T: Serialize>(
+        &mut self,
+        payload: &T,
+        child_pid: u32,
+        timeout: Duration,
+    ) -> ToolResult<()> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(ToolError::from)?;
+        self.stream
+            .set_write_timeout(Some(timeout))
+            .map_err(ToolError::from)?;
+
+        // Establish kernel peer metadata before the worker snapshots its
+        // parent. On macOS LOCAL_PEERTOKEN is populated only after a write
+        // from that peer; this fixed prelude carries no authority.
+        self.stream
+            .write_all(&TRUSTED_WORKER_BOOTSTRAP)
+            .and_then(|()| self.stream.flush())
+            .map_err(ToolError::from)?;
+        let mut hello = [0_u8; TRUSTED_WORKER_HELLO_LEN];
+        self.stream
+            .read_exact(&mut hello)
+            .map_err(ToolError::from)?;
+        let (reported_pid, challenge) = decode_trusted_worker_hello(&hello)
+            .map_err(|error| ToolError::denied(format!("invalid worker hello: {error}")))?;
+        if reported_pid != child_pid {
+            return Err(ToolError::denied(format!(
+                "worker hello PID mismatch: spawned {child_pid}, reported {reported_pid}"
+            )));
+        }
+
+        let request = TrustedWorkerRequest {
+            version: TRUSTED_WORKER_PROTOCOL_VERSION,
+            nonce: self.nonce.clone(),
+            caveats: self.caveats.clone(),
+            strength_floor: self.strength_floor,
+            payload,
+        };
+        let body = serde_json::to_vec(&request)
+            .map_err(|error| ToolError::denied(format!("encode worker request: {error}")))?;
+        if body.len() > TRUSTED_WORKER_MAX_BODY {
+            return Err(ToolError::denied(
+                "trusted worker request exceeds its 1 MiB cap",
+            ));
+        }
+        let header = encode_trusted_worker_frame_header(
+            challenge,
+            trusted_worker_frame_digest(&challenge, &body),
+            body.len(),
+        )
+        .map_err(ToolError::denied)?;
+        self.stream.write_all(&header).map_err(ToolError::from)?;
+        self.stream.write_all(&body).map_err(ToolError::from)?;
+        self.stream.flush().map_err(ToolError::from)?;
+        let mut ack = [0_u8; TRUSTED_WORKER_ACK.len()];
+        self.stream.read_exact(&mut ack).map_err(ToolError::from)?;
+        if ack != TRUSTED_WORKER_ACK {
+            return Err(ToolError::denied(
+                "trusted worker returned an invalid authentication ACK",
+            ));
+        }
+        // The control object is consumed immediately after this method. The
+        // worker may close its endpoint as soon as it writes the ACK, so a
+        // racing ENOTCONN here is not an authentication failure.
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn send<T: Serialize>(
+        &mut self,
+        payload: &T,
+        child_pid: u32,
+        timeout: Duration,
+    ) -> ToolResult<()> {
+        let _ = (
+            &self.unavailable,
+            &self.nonce,
+            &self.caveats,
+            self.strength_floor,
+            payload,
+            child_pid,
+            timeout,
+        );
+        Err(ToolError::denied(
+            "trusted worker control channels are unavailable on this platform",
+        ))
+    }
+}
+
+/// Version of the private trusted-worker authority envelope.
+pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 1;
+/// Maximum serialized trusted-worker request body.
+pub const TRUSTED_WORKER_MAX_BODY: usize = 1024 * 1024;
+/// Fixed, non-authority prelude used to establish kernel peer metadata.
+pub const TRUSTED_WORKER_BOOTSTRAP: [u8; 8] = *b"ABTW-B1\0";
+/// Fixed acknowledgement emitted only after a worker authenticates its frame.
+pub const TRUSTED_WORKER_ACK: [u8; 8] = *b"ABTW-A1\0";
+const TRUSTED_WORKER_HELLO_MAGIC: [u8; 8] = *b"ABTW-H1\0";
+const TRUSTED_WORKER_FRAME_MAGIC: [u8; 8] = *b"ABTW-R1\0";
+/// Exact byte length of a trusted-worker hello frame.
+pub const TRUSTED_WORKER_HELLO_LEN: usize = 8 + 4 + 32;
+/// Exact byte length of a trusted-worker response header.
+pub const TRUSTED_WORKER_FRAME_HEADER_LEN: usize = 8 + 4 + 32 + 32;
+const TRUSTED_WORKER_DIGEST_DOMAIN: &[u8] = b"agent-bridle/trusted-worker-frame/v1";
+
+/// Core-owned authority envelope received by a fixed trusted worker.
+///
+/// `P` is tool-specific data only. Authority fields are captured from the
+/// supervisor's minted [`ToolContext`] and cannot be supplied through
+/// [`SandboxedWorkerChild::send_payload`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrustedWorkerRequest<P> {
+    version: u8,
+    nonce: String,
+    caveats: Caveats,
+    strength_floor: AxisEnforcement,
+    payload: P,
+}
+
+impl<P> TrustedWorkerRequest<P> {
+    /// Consume the envelope into its core-authenticated authority and payload.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Caveats, AxisEnforcement, P) {
+        (self.nonce, self.caveats, self.strength_floor, self.payload)
+    }
+
+    /// Whether the envelope uses the protocol version understood by this core.
+    #[must_use]
+    pub fn has_supported_version(&self) -> bool {
+        self.version == TRUSTED_WORKER_PROTOCOL_VERSION
+    }
+}
+
+/// Encode the child-to-supervisor hello that carries a fresh challenge.
+#[must_use]
+pub fn encode_trusted_worker_hello(child_pid: u32, challenge: [u8; 32]) -> [u8; 44] {
+    let mut frame = [0_u8; TRUSTED_WORKER_HELLO_LEN];
+    frame[..8].copy_from_slice(&TRUSTED_WORKER_HELLO_MAGIC);
+    frame[8..12].copy_from_slice(&child_pid.to_le_bytes());
+    frame[12..].copy_from_slice(&challenge);
+    frame
+}
+
+/// Decode and validate a child-to-supervisor hello.
+pub fn decode_trusted_worker_hello(frame: &[u8]) -> Result<(u32, [u8; 32]), String> {
+    if frame.len() != TRUSTED_WORKER_HELLO_LEN || frame[..8] != TRUSTED_WORKER_HELLO_MAGIC {
+        return Err("bad trusted-worker hello framing".to_string());
+    }
+    let pid = u32::from_le_bytes(
+        frame[8..12]
+            .try_into()
+            .map_err(|_| "bad trusted-worker PID field")?,
+    );
+    let challenge = frame[12..]
+        .try_into()
+        .map_err(|_| "bad trusted-worker challenge field")?;
+    Ok((pid, challenge))
+}
+
+/// Encode a supervisor-to-worker header binding challenge, body length, and
+/// content digest.
+pub fn encode_trusted_worker_frame_header(
+    challenge: [u8; 32],
+    digest: [u8; 32],
+    body_len: usize,
+) -> Result<[u8; TRUSTED_WORKER_FRAME_HEADER_LEN], String> {
+    let body_len = u32::try_from(body_len)
+        .map_err(|_| "trusted-worker request length does not fit its frame".to_string())?;
+    let mut frame = [0_u8; TRUSTED_WORKER_FRAME_HEADER_LEN];
+    frame[..8].copy_from_slice(&TRUSTED_WORKER_FRAME_MAGIC);
+    frame[8..12].copy_from_slice(&body_len.to_le_bytes());
+    frame[12..44].copy_from_slice(&challenge);
+    frame[44..].copy_from_slice(&digest);
+    Ok(frame)
+}
+
+/// Decode a supervisor-to-worker frame header.
+pub fn decode_trusted_worker_frame_header(
+    frame: &[u8],
+) -> Result<(usize, [u8; 32], [u8; 32]), String> {
+    if frame.len() != TRUSTED_WORKER_FRAME_HEADER_LEN || frame[..8] != TRUSTED_WORKER_FRAME_MAGIC {
+        return Err("bad trusted-worker response framing".to_string());
+    }
+    let body_len = u32::from_le_bytes(
+        frame[8..12]
+            .try_into()
+            .map_err(|_| "bad trusted-worker length field")?,
+    ) as usize;
+    if body_len > TRUSTED_WORKER_MAX_BODY {
+        return Err("trusted-worker request exceeds its 1 MiB cap".to_string());
+    }
+    let challenge = frame[12..44]
+        .try_into()
+        .map_err(|_| "bad trusted-worker challenge field")?;
+    let digest = frame[44..]
+        .try_into()
+        .map_err(|_| "bad trusted-worker digest field")?;
+    Ok((body_len, challenge, digest))
+}
+
+/// Content digest binding one trusted-worker request to its fresh challenge.
+#[must_use]
+pub fn trusted_worker_frame_digest(challenge: &[u8; 32], body: &[u8]) -> [u8; 32] {
+    let mut framed =
+        Vec::with_capacity(TRUSTED_WORKER_DIGEST_DOMAIN.len() + challenge.len() + body.len());
+    framed.extend_from_slice(TRUSTED_WORKER_DIGEST_DOMAIN);
+    framed.extend_from_slice(challenge);
+    framed.extend_from_slice(body);
+    Fingerprint::of_bytes(&framed).0
+}
+
+/// Deserialize a verified trusted-worker request body.
+pub fn decode_trusted_worker_request<P: DeserializeOwned>(
+    body: &[u8],
+) -> Result<TrustedWorkerRequest<P>, String> {
+    serde_json::from_slice(body).map_err(|error| format!("invalid trusted-worker request: {error}"))
+}
+
 /// Builder for a subprocess confined by a [`ToolContext`].
 ///
 /// Like [`std::process::Command`], but: the environment starts **empty** (only
 /// vars added with [`ConfinedCommand::env`] reach the child), and
 /// [`ConfinedCommand::spawn`] admission-checks `exec`, applies the OS sandbox,
-/// and fails closed when a restrictive `fs_write` cannot be enforced.
+/// and fails closed when a restricted axis cannot meet its required
+/// enforcement floor.
 #[derive(Debug)]
 pub struct ConfinedCommand {
     program: String,
@@ -173,10 +448,10 @@ impl ConfinedCommand {
 
     /// Admission-check, confine, and spawn the child.
     ///
-    /// Order: (1) `cx.check_exec(program)` — deny before doing anything; (2) if
-    /// `fs_write` is restricted but unenforceable here, refuse (fail closed);
-    /// (3) on a fresh thread, apply the best available sandbox to that thread,
-    /// then `spawn` so the child inherits the domain.
+    /// Order: (1) `cx.check_exec(program)` — deny before doing anything; (2)
+    /// derive the backend's per-axis enforcement and refuse if a restricted
+    /// axis cannot meet its floor; (3) apply the selected thread- or
+    /// wrapper-based sandbox, then spawn inside that boundary.
     pub fn spawn(self, cx: &ToolContext) -> ToolResult<ConfinedChild> {
         let effective = cx.caveats().clone();
         self.spawn_with_effective(cx, effective)
@@ -237,16 +512,17 @@ impl ConfinedCommand {
             )));
         }
 
-        // For a *wrapper-based* backend (macOS Seatbelt) this is the
-        // `sandbox-exec -p <profile>` argv that confines the child; empty for
-        // thread-confining backends (Landlock, via `apply`) and Noop. Computed
-        // here so a fail-closed wrapper error aborts *before* we spawn the thread.
+        // For a wrapper-based backend (Seatbelt/AppContainer) this is the argv
+        // prefix that confines the child; empty for thread-confining backends
+        // (Landlock, via `apply`) and Noop. Computed here so a fail-closed wrapper
+        // error aborts *before* we spawn the thread.
         // A fixed worker executable is an internal transition, not authority
-        // delegated to the model. Kernel exec policies nevertheless need to
-        // launch it, so add the exact canonical worker path to the mechanism
-        // caveats while keeping the reported/effective authority unchanged.
+        // delegated to the model. Allowlist-based kernel exec policies need its
+        // exact path to launch it; AppContainer must instead preserve exec
+        // deny-all so its launcher applies the child-process block. Neither
+        // changes the reported/effective authority.
         let mechanism_effective = if authority == SpawnAuthority::TrustedWorker {
-            caveats_with_trusted_program(&effective, &self.program)?
+            trusted_worker_mechanism_caveats(kind, &effective, &self.program)?
         } else {
             effective.clone()
         };
@@ -254,7 +530,7 @@ impl ConfinedCommand {
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
         //     child inherits the OS confinement — the per-thread, fork/exec-
-        //     inherited Landlock domain and/or the `sandbox-exec` wrapper.
+        //     inherited Landlock domain or the selected process wrapper.
         let Self {
             program,
             args,
@@ -338,6 +614,7 @@ pub enum TrustedWorkerKind {
 }
 
 impl TrustedWorkerKind {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn args(self) -> [&'static str; 2] {
         match self {
             Self::Brush => ["--agent-bridle-worker", "brush"],
@@ -352,20 +629,21 @@ impl TrustedWorkerKind {
 /// spawn boundary.
 #[derive(Debug, Clone)]
 pub struct SandboxedWorker {
-    executable: PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     kind: TrustedWorkerKind,
     sandbox_policy: Arc<SandboxPolicy>,
 }
 
 impl SandboxedWorker {
-    /// Configure the carried Brush worker at a fixed executable.
+    /// Configure the carried Brush worker at this process's fixed executable.
     ///
-    /// Production embedders normally pass `std::env::current_exe()`. Tests and
-    /// split-binary hosts may pass a dedicated dispatch-capable helper.
+    /// The executable is intentionally not caller-selectable: trusted-worker
+    /// admission bypasses the model-facing exec check, so accepting an arbitrary
+    /// path here would turn the worker API into a generic confused deputy.
     #[must_use]
-    pub fn brush(executable: impl Into<PathBuf>) -> Self {
+    pub fn brush() -> Self {
         Self {
-            executable: executable.into(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             kind: TrustedWorkerKind::Brush,
             sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
@@ -378,36 +656,66 @@ impl SandboxedWorker {
         self
     }
 
-    /// Spawn the fixed worker with empty ambient environment and piped stdio.
+    /// Spawn the fixed worker with empty ambient environment, piped output, and
+    /// a private authenticated-control transport in place of ordinary stdin.
     ///
     /// `nonce` binds the worker request carried over stdin to this launch. The
-    /// worker is a fresh process-group leader so its supervisor can terminate
-    /// the complete process tree on timeout.
+    /// worker is a fresh process-group leader on Unix so its supervisor can
+    /// terminate the complete process tree on timeout. Other targets retain
+    /// their native child-process behavior. The process-wide unbridled state is
+    /// derived inside core; a caller cannot opt a single worker out of
+    /// confinement.
     pub fn spawn(
         self,
         cx: &ToolContext,
         nonce: &str,
         cwd: &Path,
-        unbridled: bool,
-    ) -> ToolResult<ConfinedChild> {
+    ) -> ToolResult<SandboxedWorkerChild> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (self, cx, nonce, cwd);
+            return Err(ToolError::denied(
+                "refusing the Brush worker: this platform has no authenticated \
+                 private-control transport",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.spawn_supported(cx, nonce, cwd)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_supported(
+        self,
+        cx: &ToolContext,
+        nonce: &str,
+        cwd: &Path,
+    ) -> ToolResult<SandboxedWorkerChild> {
         cx.check_path_read(cwd)?;
-        let executable = self
-            .executable
-            .canonicalize()
+        let request_caveats = cx.caveats().clone();
+        let request_strength_floor = cx.strength_floor();
+        let executable = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
             .map_err(|error| ToolError::denied(format!("worker executable is invalid: {error}")))?;
         let executable = executable.to_string_lossy().into_owned();
         let [flag, kind] = self.kind.args();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let (control, child_control) = std::os::unix::net::UnixStream::pair().map_err(|error| {
+            ToolError::denied(format!("create worker control channel: {error}"))
+        })?;
+
         let command = ConfinedCommand::new(executable)
             .args([flag, kind])
             .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
             .current_dir(cwd)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .new_process_group()
             .sandbox_policy(self.sandbox_policy);
 
-        if unbridled {
+        let confined = if crate::is_unbridled() {
             command.spawn_authorized(cx, Caveats::top(), SpawnAuthority::TrustedWorker)
         } else {
             let effective = cx.caveats().clone();
@@ -427,13 +735,48 @@ impl SandboxedWorker {
                 ));
             }
             command.spawn_authorized(cx, effective, SpawnAuthority::TrustedWorker)
-        }
+        }?;
+        Ok(SandboxedWorkerChild {
+            child: confined.child,
+            sandbox_kind: confined.sandbox_kind,
+            control: Some(TrustedWorkerControl {
+                stream: control,
+                nonce: nonce.to_string(),
+                caveats: request_caveats,
+                strength_floor: request_strength_floor,
+            }),
+        })
     }
 }
 
-/// Add the exact trusted worker executable only to the kernel mechanism's exec
-/// scope. This does not alter the effective authority carried by `ToolContext`
-/// or the enforcement report.
+/// Build the mechanism-only caveats for a trusted worker transition.
+///
+/// Landlock, Seatbelt, and the identity-closing stronger tiers need the fixed
+/// worker executable in their kernel execute allow-list so the boundary can
+/// launch it. AppContainer is different: its launcher creates the worker as the
+/// initial confined process, and `exec: Only([])` must remain empty so
+/// `--no-child-process` is attached to that worker. Adding the worker path there
+/// would silently turn deny-all into a non-empty allow-list, disable the kernel
+/// child-process mitigation, and leave an `exec → Kernel` report overclaiming.
+///
+/// This changes mechanism configuration only; it never alters the effective
+/// authority carried by `ToolContext` or the enforcement report.
+fn trusted_worker_mechanism_caveats(
+    kind: SandboxKind,
+    effective: &Caveats,
+    program: &str,
+) -> ToolResult<Caveats> {
+    match kind {
+        SandboxKind::Landlock
+        | SandboxKind::Seatbelt
+        | SandboxKind::MinimalRootfs
+        | SandboxKind::MicroVm => caveats_with_trusted_program(effective, program),
+        SandboxKind::AppContainer | SandboxKind::None => Ok(effective.clone()),
+    }
+}
+
+/// Add the exact trusted worker executable to an execute allow-list used by a
+/// mechanism that must authorize the initial worker launch.
 fn caveats_with_trusted_program(effective: &Caveats, program: &str) -> ToolResult<Caveats> {
     let canonical = Path::new(program)
         .canonicalize()
@@ -701,13 +1044,12 @@ fn wrap_argv(prefix: &[String], program: &str, args: &[OsString]) -> (OsString, 
 ///    `fs_write` **and** extends it to `fs_read` — closing the spawn-boundary
 ///    fail-open ADR 0012 D4 found (a restricted `fs_read` was run unconfined
 ///    under `None` because the old check looked at `fs_write` only).
-/// 2. **The strength floor (`exec`/`net`).** Those axes are not yet
-///    kernel-enforceable on a subprocess (#31/#57), so they refuse only when the
-///    principal's `floor` demands more than the real backend delivers
-///    (`fence_strength(report) < floor`). With the default floor
-///    ([`AxisEnforcement::Advisory`]) this is a no-op; a strong principal
-///    (`floor = Kernel`) fails closed on a restricted `exec`/`net` it cannot
-///    kernel-confine (ADR 0012 D3/D10).
+/// 2. **The strength floor (`exec`/`net`).** Coverage varies by backend and
+///    scope, so those axes refuse when the principal's `floor` demands more than
+///    the real report delivers (`fence_strength(report) < floor`). With the
+///    default floor ([`AxisEnforcement::Advisory`]), an honestly reported weaker
+///    axis may run; a strong principal (`floor = Kernel`) fails closed whenever
+///    the active backend cannot kernel-confine it (ADR 0012 D3/D10).
 #[must_use]
 pub fn confinement_unenforceable(
     kind: SandboxKind,
@@ -956,6 +1298,93 @@ mod tests {
             .expect("authorize")
     }
 
+    /// Core freezes authority at worker spawn and exposes only a one-shot
+    /// payload sender. Payload fields that merely *look* authority-bearing do
+    /// not replace the captured caveats, and a second send is structurally
+    /// refused.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn trusted_worker_control_freezes_authority_and_is_take_once() {
+        let true_program = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .expect("true executable");
+        let process = Command::new(true_program)
+            .spawn()
+            .expect("spawn PID holder");
+        let child_pid = process.id();
+        let (client, mut server) =
+            std::os::unix::net::UnixStream::pair().expect("private socketpair");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+
+        let peer = std::thread::spawn(move || {
+            let mut bootstrap = [0_u8; TRUSTED_WORKER_BOOTSTRAP.len()];
+            server.read_exact(&mut bootstrap).expect("read bootstrap");
+            assert_eq!(bootstrap, TRUSTED_WORKER_BOOTSTRAP);
+            let challenge = [0x5a; 32];
+            server
+                .write_all(&encode_trusted_worker_hello(child_pid, challenge))
+                .and_then(|()| server.flush())
+                .expect("write hello");
+
+            let mut header = [0_u8; TRUSTED_WORKER_FRAME_HEADER_LEN];
+            server.read_exact(&mut header).expect("read header");
+            let (body_len, echoed, digest) =
+                decode_trusted_worker_frame_header(&header).expect("decode header");
+            assert_eq!(echoed, challenge);
+            let mut body = vec![0_u8; body_len];
+            server.read_exact(&mut body).expect("read body");
+            assert_eq!(digest, trusted_worker_frame_digest(&challenge, &body));
+            let request: TrustedWorkerRequest<serde_json::Value> =
+                decode_trusted_worker_request(&body).expect("decode request");
+            seen_tx.send(request.into_parts()).expect("report request");
+            server
+                .write_all(&TRUSTED_WORKER_ACK)
+                .and_then(|()| server.flush())
+                .expect("write ACK");
+        });
+
+        let frozen = Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..Caveats::top()
+        };
+        let control = TrustedWorkerControl {
+            stream: client,
+            nonce: "core-owned-nonce".to_string(),
+            caveats: frozen.clone(),
+            strength_floor: AxisEnforcement::Advisory,
+        };
+        let mut worker = SandboxedWorkerChild {
+            child: process,
+            sandbox_kind: SandboxKind::None,
+            control: Some(control),
+        };
+        let forged_payload = serde_json::json!({
+            "cmd": "echo ok",
+            "caveats": Caveats::top(),
+            "strength_floor": AxisEnforcement::Kernel,
+        });
+        worker
+            .send_payload(&forged_payload, Duration::from_secs(5))
+            .expect("first payload");
+
+        let (nonce, authority, floor, payload) = seen_rx.recv().expect("receive decoded request");
+        assert_eq!(nonce, "core-owned-nonce");
+        assert_eq!(authority, frozen, "payload must not replace frozen caveats");
+        assert_eq!(floor, AxisEnforcement::Advisory);
+        assert_eq!(payload, forged_payload);
+        assert!(
+            matches!(
+                worker.send_payload(&serde_json::json!({}), Duration::from_secs(1)),
+                Err(ToolError::Denied { .. })
+            ),
+            "the private control endpoint must be take-once"
+        );
+
+        peer.join().expect("join fake worker");
+        let _ = worker.child.wait();
+    }
+
     #[test]
     fn exec_outside_scope_is_denied_before_any_spawn() {
         let cx = ctx(Caveats {
@@ -1024,14 +1453,9 @@ mod tests {
         ));
     }
 
-    /// Honesty fix (#136): AppContainer does NOT kernel-confine the fs axis (ACL
-    /// narrowing is deferred). A restricted fs scope must NOT engage AppContainer
-    /// as the governing kind — effective_sandbox_kind returns None — so the spawn
-    /// fails closed via confinement_unenforceable (fs→Interceptor < Kernel).
-    /// This is the same fail-closed behavior as SandboxKind::None.
-    /// fs restrictions now engage the AppContainer backend (ACL narrowing, #51).
-    /// AppContainer DOES engage for fs-only caveats — `--fs-read`/`--fs-write` flags
-    /// grant the AppContainer SID access to the workspace paths.
+    /// AppContainer's wired ACL narrowing means fs-only caveats engage the
+    /// launcher; `--fs-read`/`--fs-write` grant its SID the requested workspace
+    /// paths over the container's default deny of user directories.
     #[test]
     fn fs_restricted_under_appcontainer_engages_the_launcher() {
         let fs = Caveats {
@@ -1079,6 +1503,65 @@ mod tests {
             Some(AxisEnforcement::Kernel),
             "exec deny-all must be Kernel under AppContainer"
         );
+    }
+
+    /// Trusted-worker launch configuration must not erase AppContainer's
+    /// deny-all signal. The AppContainer launcher starts the worker itself, then
+    /// `--no-child-process` confines what that worker may spawn. This is pure and
+    /// host-independent so Linux/macOS CI protects the Windows policy routing.
+    #[test]
+    fn trusted_worker_preserves_appcontainer_exec_deny_all() {
+        let exec_denied = Caveats {
+            exec: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+
+        let mechanism = trusted_worker_mechanism_caveats(
+            SandboxKind::AppContainer,
+            &exec_denied,
+            "this-path-is-not-used-by-appcontainer",
+        )
+        .expect("AppContainer mechanism caveats");
+
+        assert!(
+            crate::sandbox::exec_fully_denied(&mechanism),
+            "the launcher must still select --no-child-process"
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &mechanism),
+            SandboxKind::AppContainer,
+            "deny-all must still engage the AppContainer boundary"
+        );
+        assert_eq!(
+            enforcement_report(&mechanism, SandboxKind::AppContainer).exec,
+            Some(AxisEnforcement::Kernel),
+            "the preserved mechanism matches the reported kernel guarantee"
+        );
+    }
+
+    /// Backends whose wrapper/domain must execute the trusted worker still get
+    /// its exact path as mechanism-only authority.
+    #[test]
+    fn trusted_worker_keeps_exec_allowance_for_allowlist_backends() {
+        let exec_denied = Caveats {
+            exec: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+        let current = std::env::current_exe()
+            .expect("current executable")
+            .canonicalize()
+            .expect("canonical current executable")
+            .to_string_lossy()
+            .into_owned();
+
+        for kind in [SandboxKind::Landlock, SandboxKind::Seatbelt] {
+            let mechanism = trusted_worker_mechanism_caveats(kind, &exec_denied, &current)
+                .expect("allowlist mechanism caveats");
+            assert!(
+                matches!(&mechanism.exec, Scope::Only(programs) if programs.contains(&current)),
+                "{kind:?} must authorize the fixed worker executable"
+            );
+        }
     }
 
     /// Builds with **no** available OS sandbox: a restrictive `fs_write` must be

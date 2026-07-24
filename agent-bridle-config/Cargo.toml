@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Layered configuration loader (defaults → file → env → API) for agent-bridle (agent-bridle#142, ADR 0017)."
+# Internal composition layer for the binaries in this workspace. It has not
+# been declared as a stable public dependency surface.
+publish = false
 
 [dependencies]
 # The config TYPES live in core (serde-only); this crate is the file/env LOADER

@@ -12,7 +12,7 @@
     },
     "cmd": {
       "type": "string",
-      "description": "Free-form command line run by the confined safe-subset engine: pipelines (a | b) joined by &&/||/;, with quoted arguments, redirections (> out, >> out, < in, 2> err, 2>&1; file targets gated by fs_write/fs_read), filename globbing (*, ?, [..]; gated by fs_read on the listed directory), and $VAR/${VAR} expansion (incl. mixed words like $HOME/config and inside double quotes) for an allowlisted, secret-free set (HOME, PWD, USER, TMPDIR, ...). Dynamic constructs ($(...), backticks, subshells) are refused by design; a $VAR outside the allowlist, a $VAR in a redirect target or combined with a glob, and fd redirections other than 1>/2>/0</2>&1, are refused. Mutually exclusive with `program`."
+      "description": "Free-form command line run by the confined safe-subset engine: pipelines (a | b) joined by &&/||/;, with quoted arguments, redirections (> out, >> out, < in, 2> err, 2>&1; file targets gated by fs_write/fs_read), filename globbing (*, ?, [..]; gated by fs_read on the listed directory), and $VAR/${VAR} expansion (incl. mixed words like $HOME/config and inside double quotes) for an allowlisted, secret-free set (HOME, PWD, USER, TMPDIR, ...). Dynamic constructs ($(...), $((...)), backticks, subshells) are refused by design; a $VAR outside the allowlist, a $VAR in a redirect target or combined with a glob, and fd redirections other than 1>/2>/0</2>&1, are refused. Mutually exclusive with `program`."
     },
     "cwd": {
       "type": "string",

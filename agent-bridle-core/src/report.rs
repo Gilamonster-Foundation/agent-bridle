@@ -1,10 +1,10 @@
 //! Axis-granular confinement honesty (ADR 0004 D1).
 //!
-//! A single [`SandboxKind`] cannot honestly describe a run where one axis is
-//! kernel-confined while others are only advisory. For example, the Landlock
-//! backend governs `fs_write` (always) and `fs_read` (when restricted) but
-//! leaves `exec` and `net` ungoverned for now (agent-bridle#31/#57). Reporting
-//! `sandbox_kind: landlock` for such a run is true coarsely but misleading at
+//! A single [`SandboxKind`] cannot honestly describe a run where axis coverage
+//! differs. For example, Landlock kernel-confines the filesystem, reports
+//! `exec` only at interceptor strength because of the loader trampoline, and
+//! can kernel-deny TCP only for an empty `net` scope on ABI-v4 kernels.
+//! Reporting only `sandbox_kind: landlock` is true coarsely but insufficient at
 //! the grain a caller reasons about.
 //!
 //! [`enforcement_report`] classifies each **restricted** Caveat axis (`Only(_)`,
@@ -121,24 +121,15 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 ///
 /// The mapping reflects what each layer *actually* enforces today:
 ///
-/// - **`fs_read` / `fs_write`** — `kernel` when a real OS sandbox is active
-///   (Landlock governs writes always and reads when restricted), otherwise
-///   `interceptor` (the in-process leash gates the engine's own opens).
-/// - **`exec`** — `kernel` under **Seatbelt** (macOS): the profile emits
-///   `(deny process-exec*)` + an allow-list of the granted programs, and
-///   `process-exec*` is kernel-checked on the confined process *and everything it
-///   spawns*, so a permitted child's own `exec` is confined too. Apple-Silicon
-///   hardware W^X + code signing close the `mmap(PROT_EXEC)` / loader-trampoline
-///   bypass with no seccomp backstop (ADR 0014). Under **Landlock** and a
-///   **Noop** host it stays `interceptor`: the spawn funnel (`before_exec` /
-///   `check_exec`) gates the engine's own spawns, but no OS execute allow-list
-///   confines a child's interior (the Landlock exec axis is held —
-///   agent-bridle#31/#57).
-/// - **`net`** — `advisory`: no kernel net rules are wired (agent-bridle#31) and
-///   the shell engine does not gate a spawned program's egress. Reported
-///   conservatively as advisory so the axis is never described as confined when
-///   it is not (honesty rule); a tool that does gate net for its own requests
-///   over-delivers relative to this floor, which is the safe direction.
+/// - **`fs_read` / `fs_write`** — `kernel` under the native filesystem
+///   boundaries (Landlock, Seatbelt, AppContainer, minimal-rootfs, micro-VM);
+///   otherwise `interceptor` for the engine's own opens.
+/// - **`exec`** — `kernel` under Seatbelt and identity-closing tiers, and for
+///   AppContainer's deny-all scope. Landlock, AppContainer non-empty allowlists,
+///   and `None` remain `interceptor`.
+/// - **`net`** — `kernel` for a micro-VM; for empty or loopback-only scopes under
+///   Seatbelt/AppContainer; and for empty TCP scope under Landlock ABI v4.
+///   Other restricted scopes remain honestly `advisory`.
 #[must_use]
 pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> EnforcementReport {
     // Filesystem axes: kernel when an OS sandbox actually governs them, else the

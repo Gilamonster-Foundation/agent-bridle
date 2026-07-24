@@ -1,12 +1,9 @@
 [package]
 name = "agent-bridle-tool-shell"
-# argv + safe-subset engine (ADR 0005): agent-bridle is the exec funnel — it
-# parses the request itself, checks the exec/fs leash, spawns directly, and
-# refuses the dynamic constructs by design. L2 convenience; the L3 boundary is
-# deferred (agent-bridle#35) so runs are honestly advisory (sandbox_kind=None).
-# Incremental build tracked on agent-bridle#34; brush-bridle-core is the
-# deferred, reversible full-bash alternative engine (ADR 0005 D4, #20).
-description = "Capability-confined shell tool for agent-bridle (argv + safe-subset engine)."
+# Complementary shell engines behind one construction-time seam: the lean
+# argv + safe-subset exec funnel, a carried Brush worker, and the L3-dependent
+# host shell. Each reports its effective enforcement honestly.
+description = "Capability-confined safe-subset, Brush, and host-shell engines for agent-bridle."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,13 +16,16 @@ authors.workspace = true
 name = "bridle-netmon"
 required-features = ["shell"]
 
-# A dispatch-capable host binary for the carried-coreutils integration test
-# (issue #206): its `main` calls `maybe_dispatch()` first, so the brush engine's
-# coreutils shims (which re-exec `<self> --invoke-bundled <name>`) resolve
-# in-process against THIS binary — proving carried `ls`/`cat` work with no host
-# tools. Only built with `carried-coreutils`.
-[[bin]]
-name = "dispatch_host"
+[[test]]
+name = "brush_real"
+path = "tests/brush_real.rs"
+harness = false
+required-features = ["brush"]
+
+[[test]]
+name = "carried_coreutils"
+path = "tests/carried_coreutils.rs"
+harness = false
 required-features = ["carried-coreutils"]
 
 [features]
@@ -42,12 +42,16 @@ host-shell = ["dep:tokio"]
 # run in a dedicated sandboxed worker, with the `CommandInterceptor` L2 leash
 # inside the inherited L3 boundary. Uses the
 # temporary `brush-ocap-*` fork, published to crates.io (reubeno/brush#1184 not
-# yet upstream). Off by default; the crate stays publish-clean with `brush` off.
+# yet upstream). Off by default in this leaf crate; the facade enables it by
+# default through `carried-coreutils`.
 brush = [
     "dep:tokio",
     "dep:brush-ocap-core",
     "dep:brush-ocap-builtins",
+    "dep:brush-parser",
     "dep:getrandom",
+    "dep:libproc",
+    "dep:nix",
     "dep:rustix",
 ]
 # Carried coreutils (agent-bridle#20 / issue #206): the brush engine registers
@@ -56,19 +60,17 @@ brush = [
 # dispatch-capable (calls `maybe_dispatch()` at the top of `main`). Off by
 # default; carries the fork's published coreutils crate.
 carried-coreutils = ["brush", "dep:brush-ocap-coreutils-builtins"]
-# Kernel-enforced L3 backstop (Linux). The engine applies the Landlock fs_write
-# ruleset before spawning when fs_write is restricted (agent-bridle#35); off this
-# build/OS it is the honest advisory None (ADR 0005 / ADR 0006). Exec/net axes
-# (#31/#57) and the Windows backend (#51) are follow-ups.
+# Kernel-enforced L3 backstop (Linux): confines both filesystem axes, narrows
+# direct execve (reported Interceptor because the loader trampoline remains),
+# and denies all TCP for an empty net scope on ABI-v4 kernels. Off this build/OS,
+# another native backend may apply or the run honestly reports None.
 linux-landlock = ["agent-bridle-core/linux-landlock"]
-# Kernel-enforced L3 backstop (macOS). When a filesystem axis is restricted the
-# engine wraps each spawned stage in `sandbox-exec` with an SBPL profile derived
-# from the caveats (agent-bridle#50, ADR 0006/0009); off this build/OS it is the
-# honest advisory None. Confines fs_write + fs_read; exec/net are follow-ups.
+# Kernel-enforced L3 backstop (macOS): wraps the worker/stage in `sandbox-exec`
+# with an SBPL profile derived from the caveats. Confines both filesystem axes,
+# restricted exec, and empty/loopback-only net scopes.
 macos-seatbelt = ["agent-bridle-core/macos-seatbelt"]
-# Windows AppContainer backend marker (agent-bridle#51). Process-launch wiring
-# requires a Windows CreateProcess launcher because AppContainer is a startup
-# attribute, not a current-thread sandbox like Landlock.
+# Windows AppContainer process boundary: the wired launcher confines filesystem
+# paths, empty/loopback-only net, and exec deny-all at process creation.
 windows-appcontainer = ["agent-bridle-core/windows-appcontainer"]
 os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
 
@@ -96,14 +98,23 @@ rustix = { version = "1", features = ["process"], optional = true }
 # The requirement must name the API floor we compile against.
 brush-ocap-core = { version = "0.5.1", optional = true }
 brush-ocap-builtins = { version = "0.2", optional = true }
-# A minimal carried coreutils set (ls/cat/echo/wc) — enough for the embedded
-# dispatch path (issue #206) without the ~100-crate `coreutils.all` build.
+brush-parser = { version = "0.4.0", optional = true }
+# A focused carried coreutils set — enough for common inspection pipelines
+# without the ~100-crate `coreutils.all` build.
 brush-ocap-coreutils-builtins = { version = "0.1", features = [
     "coreutils.ls",
     "coreutils.cat",
     "coreutils.echo",
+    "coreutils.head",
+    "coreutils.sort",
     "coreutils.wc",
 ], optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nix = { version = "0.31.3", features = ["fs", "process", "socket", "uio", "user"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = { version = "0.14.11", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -1,14 +1,22 @@
 //! Real-spawn reality-check for the carried **brush engine** (agent-bridle#20).
 //!
 //! Proves the engine's whole thesis: it runs a **dynamic construct the
-//! safe-subset engine refuses** (`$(...)`) in-process, AND — unlike the
-//! sandbox-host engine, which refuses a restricted `exec` grant — it **confines**
-//! a restricted `exec` grant in-process via the `CommandInterceptor`, denying an
-//! out-of-scope command (structured `denied:true`) while it never runs.
+//! safe-subset engine refuses** (`$(...)`) inside its dedicated worker, AND —
+//! unlike the sandbox-host engine, which refuses a restricted `exec` grant — it
+//! **confines** a restricted `exec` grant there via the `CommandInterceptor`,
+//! denying an out-of-scope command (structured `denied:true`) while it never
+//! runs.
 //!
-//! Kept out of the unit tests (which mock the spawner) per the workspace norm.
+//! This is a harnessless, same-image test executable. Its `main` handles private
+//! dispatch before running cases, so production builds do not ship a public
+//! full-authority helper merely to make re-exec integration tests possible.
 #![cfg(feature = "brush")]
+#![cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(dead_code, unused_imports)
+)]
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -19,7 +27,153 @@ use agent_bridle_tool_shell::{
 };
 
 fn tool() -> BrushShellTool {
-    BrushShellTool::new().with_worker_executable(env!("CARGO_BIN_EXE_dispatch_host"))
+    BrushShellTool::new()
+}
+
+fn selected(name: &str) -> bool {
+    let filters: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .collect();
+    filters.is_empty() || filters.iter().any(|filter| name.contains(filter))
+}
+
+fn run_case(name: &str, case: impl FnOnce()) {
+    if selected(name) {
+        eprintln!("test {name} ...");
+        case();
+        eprintln!("test {name} ... ok");
+    }
+}
+
+fn run_async_case<F>(runtime: &tokio::runtime::Runtime, name: &str, case: impl FnOnce() -> F)
+where
+    F: Future<Output = ()>,
+{
+    if selected(name) {
+        eprintln!("test {name} ...");
+        runtime.block_on(case());
+        eprintln!("test {name} ... ok");
+    }
+}
+
+fn main() {
+    // This must be the first branch: worker mode must never initialize the
+    // test runner or any ambient-authority fixture.
+    if let Some(code) = agent_bridle_tool_shell::maybe_dispatch() {
+        std::process::exit(code);
+    }
+    run_platform();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_platform() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    #[cfg(not(feature = "carried-coreutils"))]
+    run_async_case(
+        &runtime,
+        "brush_worker_dispatch_does_not_require_carried_coreutils",
+        brush_worker_dispatch_does_not_require_carried_coreutils,
+    );
+    run_case(
+        "direct_worker_dispatch_cannot_mint_its_own_authority",
+        direct_worker_dispatch_cannot_mint_its_own_authority,
+    );
+    #[cfg(unix)]
+    run_case(
+        "different_image_socket_parent_cannot_answer_worker_challenge",
+        different_image_socket_parent_cannot_answer_worker_challenge,
+    );
+    run_async_case(
+        &runtime,
+        "output_observer_matches_the_brush_envelope",
+        output_observer_matches_the_brush_envelope,
+    );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "stderr_observer_and_brush_envelope_apply_the_output_cap",
+        stderr_observer_and_brush_envelope_apply_the_output_cap,
+    );
+    run_async_case(
+        &runtime,
+        "full_access_runs_dynamic_construct_and_captures",
+        full_access_runs_dynamic_construct_and_captures,
+    );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "xtrace_ps4_cannot_hide_an_uninspected_command",
+        xtrace_ps4_cannot_hide_an_uninspected_command,
+    );
+    run_async_case(
+        &runtime,
+        "restricted_exec_denies_out_of_scope_command_in_worker",
+        restricted_exec_denies_out_of_scope_command_in_worker,
+    );
+    run_async_case(
+        &runtime,
+        "command_substitution_keeps_inner_exec_independently_gated",
+        command_substitution_keeps_inner_exec_independently_gated,
+    );
+    run_async_case(
+        &runtime,
+        "restricted_exec_allows_in_scope_command",
+        restricted_exec_allows_in_scope_command,
+    );
+    #[cfg(not(any(
+        feature = "linux-landlock",
+        feature = "macos-seatbelt",
+        feature = "windows-appcontainer"
+    )))]
+    run_async_case(
+        &runtime,
+        "restricted_filesystem_without_l3_refuses_before_execution",
+        restricted_filesystem_without_l3_refuses_before_execution,
+    );
+    run_async_case(
+        &runtime,
+        "env_seam_delivers_caller_vars_to_the_shell",
+        env_seam_delivers_caller_vars_to_the_shell,
+    );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "confined_stdin_reader_gets_eof_not_the_operator_terminal",
+        confined_stdin_reader_gets_eof_not_the_operator_terminal,
+    );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "confined_run_is_bounded_by_the_wall_clock_ceiling",
+        confined_run_is_bounded_by_the_wall_clock_ceiling,
+    );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "timeout_kills_worker_descendants",
+        timeout_kills_worker_descendants,
+    );
+    run_async_case(
+        &runtime,
+        "env_seam_delivers_home_for_tilde_class_tooling",
+        env_seam_delivers_home_for_tilde_class_tooling,
+    );
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_platform() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let tool = tool();
+    let result = runtime.block_on(tool.invoke(
+        serde_json::json!({ "cmd": "echo MUST-NOT-RUN" }),
+        &ctx(Caveats::top()),
+    ));
+    let error = result.expect_err("unsupported private control must fail closed");
+    assert!(
+        error.to_string().contains("private-control transport"),
+        "unsupported target must explain the fail-closed boundary: {error}"
+    );
 }
 
 #[cfg(unix)]
@@ -85,7 +239,170 @@ fn unique_temp(tag: &str) -> std::path::PathBuf {
     ))
 }
 
-#[tokio::test]
+/// The private worker protocol belongs to `brush`, not `carried-coreutils`.
+/// This test is compiled and run specifically in the lean Brush-only feature
+/// lane, proving the dispatch-capable helper can serve the worker without any
+/// bundled uutils provider.
+#[cfg(not(feature = "carried-coreutils"))]
+async fn brush_worker_dispatch_does_not_require_carried_coreutils() {
+    let out = tool()
+        .invoke(
+            serde_json::json!({ "cmd": "echo brush-only-worker-ok" }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke Brush-only worker");
+
+    assert_ne!(out["denied"], true, "Brush-only worker must run: {out}");
+    assert_eq!(out["exit_code"], 0, "Brush-only worker must succeed: {out}");
+    assert_eq!(
+        out["stdout"].as_str().unwrap_or("").trim(),
+        "brush-only-worker-ok"
+    );
+}
+
+/// A caller that selects the hidden worker argv, its environment nonce, and the
+/// complete JSON request still lacks the live inherited control capability. The
+/// worker must reject before parsing or executing the supplied command.
+fn direct_worker_dispatch_cannot_mint_its_own_authority() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::process::{Command, Stdio};
+
+    let nonce = "caller-selected-nonce";
+    let forged_payload = serde_json::json!({
+        "cmd": "echo FORGED-WORKER-RAN",
+        "cwd": null,
+        "path": "",
+        "env": {},
+        "max_output": 4096,
+    });
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--agent-bridle-worker", "brush"])
+        .env_clear()
+        .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn direct worker");
+
+    // Be a genuinely interactive attacker: wait for and inspect the worker's
+    // advertised challenge, then answer it and send a complete model-chosen
+    // payload. Challenge knowledge is deliberately insufficient without the
+    // parent-created kernel capability.
+    let mut stderr = std::io::BufReader::new(child.stderr.take().expect("worker stderr"));
+    let mut challenge_line = String::new();
+    stderr
+        .read_line(&mut challenge_line)
+        .expect("read advertised worker challenge");
+    let challenge = challenge_line
+        .strip_prefix("agent-bridle-private-control-v1 challenge ")
+        .and_then(|line| line.strip_suffix('\n'))
+        .expect("well-formed advertised challenge");
+    let mut stdin = child.stdin.take().expect("worker stdin");
+    let _ = writeln!(
+        stdin,
+        "agent-bridle-private-control-v1 response {challenge}"
+    );
+    let _ = serde_json::to_writer(&mut stdin, &forged_payload);
+    let _ = stdin.flush();
+    drop(stdin);
+
+    let status = child.wait().expect("wait direct worker");
+    let mut stdout_bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("worker stdout")
+        .read_to_end(&mut stdout_bytes)
+        .expect("read worker stdout");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    assert_eq!(
+        status.code(),
+        Some(126),
+        "authentication refusal must be a process-level cannot-execute"
+    );
+    assert!(
+        !stdout.contains("FORGED-WORKER-RAN"),
+        "the forged request must not execute: {stdout:?}"
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&stdout_bytes).expect("structured worker refusal");
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("trusted worker authentication failed")),
+        "worker must refuse the missing inherited capability: {response}"
+    );
+}
+
+/// Even a launcher that supplies a real socketpair, reads the child-selected
+/// challenge, and sends a correctly-shaped response is not the trusted parent.
+/// The kernel peer PID may match PPID, but its executable image is Python rather
+/// than this same-image host, so authentication must fail before payload decode.
+#[cfg(unix)]
+fn different_image_socket_parent_cannot_answer_worker_challenge() {
+    use std::process::Command;
+
+    let python = r#"
+import os, socket, struct, subprocess, sys
+parent, child = socket.socketpair()
+env = {"AGENT_BRIDLE_WORKER_NONCE": "different-image-attacker"}
+p = subprocess.Popen(
+    [sys.argv[1], "--agent-bridle-worker", "brush"],
+    stdin=child.fileno(),
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    pass_fds=(child.fileno(),),
+    env=env,
+)
+child.close()
+challenge_line = p.stderr.readline()
+parent.sendall(b"ABTW-B1\x00")
+hello = b""
+while len(hello) < 44:
+    chunk = parent.recv(44 - len(hello))
+    if not chunk:
+        break
+    hello += chunk
+if len(hello) == 44:
+    parent.sendall(b"ABTW-R1\x00" + struct.pack("<I", 0) + hello[12:44] + bytes(32))
+parent.shutdown(socket.SHUT_WR)
+stdout, stderr = p.communicate(timeout=10)
+sys.stdout.buffer.write(stdout)
+sys.stderr.buffer.write(challenge_line + stderr)
+sys.exit(p.returncode)
+"#;
+    let out = match Command::new("python3")
+        .arg("-c")
+        .arg(python)
+        .arg(std::env::current_exe().expect("current test executable"))
+        .output()
+    {
+        Ok(out) => out,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping different-image adversary: python3 is unavailable");
+            return;
+        }
+        Err(error) => panic!("launch different-image adversary: {error}"),
+    };
+
+    assert_eq!(
+        out.status.code(),
+        Some(126),
+        "different-image private parent must be refused: stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("structured image-mismatch refusal");
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("parent image is not this executable")),
+        "refusal must identify the image mismatch: {response}"
+    );
+}
+
 async fn output_observer_matches_the_brush_envelope() {
     let observer = Arc::new(OutputRecorder::default());
     let out = tool()
@@ -105,7 +422,6 @@ async fn output_observer_matches_the_brush_envelope() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
 async fn stderr_observer_and_brush_envelope_apply_the_output_cap() {
     let observer = Arc::new(OutputRecorder::default());
     let out = tool()
@@ -129,8 +445,8 @@ async fn stderr_observer_and_brush_envelope_apply_the_output_cap() {
 }
 
 /// Full-access: a `$(...)` command substitution — refused by the safe-subset
-/// engine — RUNS in-process, and the engine identity is disclosed.
-#[tokio::test]
+/// engine — runs inside the dedicated worker, and the engine identity is
+/// disclosed.
 async fn full_access_runs_dynamic_construct_and_captures() {
     let out = tool()
         .invoke(
@@ -145,7 +461,7 @@ async fn full_access_runs_dynamic_construct_and_captures() {
     assert_eq!(
         out["stdout"].as_str().unwrap_or("").trim(),
         "composed",
-        "the $(...) substitution must have executed in-process: {out}"
+        "the $(...) substitution must have executed in the Brush worker: {out}"
     );
     assert_eq!(
         out["disclosure"]["engine"], "brush",
@@ -153,12 +469,35 @@ async fn full_access_runs_dynamic_construct_and_captures() {
     );
 }
 
+/// Xtrace reparses PS4 as a prompt. A model-controlled PS4 could therefore hide
+/// a second command from the up-front shell inspection inventory. The confined
+/// runtime pins PS4 to a readonly literal after env import, so even full-access
+/// execution cannot smuggle an uninspected side effect through `set -x`.
+#[cfg(unix)]
+async fn xtrace_ps4_cannot_hide_an_uninspected_command() {
+    let sentinel = unique_temp("ps4-hidden-command");
+    let _ = std::fs::remove_file(&sentinel);
+    let cmd = format!(
+        "PS4='$(/usr/bin/touch \"{}\")'; set -x; echo ok",
+        sentinel.display()
+    );
+
+    let out = tool()
+        .invoke(serde_json::json!({ "cmd": cmd }), &ctx(Caveats::top()))
+        .await
+        .expect("invoke xtrace regression");
+
+    assert!(
+        !sentinel.exists(),
+        "readonly literal PS4 must prevent the hidden command: {out}"
+    );
+}
+
 /// Restricted `exec` (only `echo`): an out-of-scope external is DENIED by the
 /// interceptor — structured `denied:true`, `kind:"exec"` — and never runs. This
 /// is the engine's differentiator: it confines a restricted exec grant that the
 /// sandbox-host engine refuses to serve.
-#[tokio::test]
-async fn restricted_exec_denies_out_of_scope_command_in_process() {
+async fn restricted_exec_denies_out_of_scope_command_in_worker() {
     let caveats = Caveats {
         exec: Scope::only(["echo".to_string()]),
         ..Caveats::top()
@@ -187,8 +526,41 @@ async fn restricted_exec_denies_out_of_scope_command_in_process() {
     );
 }
 
+/// Syntax consent is not exec consent: even when Brush interprets `$()`, the
+/// inner command crosses the ordinary interceptor independently and is denied.
+async fn command_substitution_keeps_inner_exec_independently_gated() {
+    let caveats = Caveats {
+        exec: Scope::only(["echo".to_string()]),
+        ..Caveats::top()
+    };
+    let sentinel = unique_temp("substitution-exec-sentinel");
+    let _ = std::fs::remove_file(&sentinel);
+    let cmd = format!("echo \"$(/bin/touch '{}')\"", sentinel.display());
+
+    let out = tool()
+        .invoke(serde_json::json!({ "cmd": cmd }), &ctx(caveats))
+        .await
+        .expect("invoke");
+
+    assert_eq!(out["denied"], true, "inner touch must be denied: {out}");
+    assert!(
+        out["denials"]
+            .as_array()
+            .is_some_and(
+                |denials| denials.iter().any(|denial| denial["kind"] == "exec"
+                    && denial["target"]
+                        .as_str()
+                        .is_some_and(|target| target.ends_with("touch")))
+            ),
+        "the structured denial must name the inner executable: {out}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "syntax approval must not let an ungranted inner command run: {out}"
+    );
+}
+
 /// Restricted `exec` (only `echo`): an in-scope command still runs.
-#[tokio::test]
 async fn restricted_exec_allows_in_scope_command() {
     let caveats = Caveats {
         exec: Scope::only(["echo".to_string()]),
@@ -211,7 +583,6 @@ async fn restricted_exec_allows_in_scope_command() {
     feature = "macos-seatbelt",
     feature = "windows-appcontainer"
 )))]
-#[tokio::test]
 async fn restricted_filesystem_without_l3_refuses_before_execution() {
     let marker = unique_temp("l3-refusal");
     let caveats = Caveats {
@@ -232,7 +603,6 @@ async fn restricted_filesystem_without_l3_refuses_before_execution() {
 /// The schema's `env` seam now reaches the shell (EPIC #1243 Leg 2). Before
 /// this, brush silently DROPPED `args["env"]` — a caller var expanded to empty.
 /// This is the regression guard: a passed var expands inside the confined shell.
-#[tokio::test]
 async fn env_seam_delivers_caller_vars_to_the_shell() {
     let out = tool()
         .invoke(
@@ -261,7 +631,6 @@ async fn env_seam_delivers_caller_vars_to_the_shell() {
 /// The `tokio::time::timeout` here is the regression teeth: on the old behavior a
 /// terminal fd 0 would block `cat` forever and this test would time out.
 #[cfg(unix)]
-#[tokio::test]
 async fn confined_stdin_reader_gets_eof_not_the_operator_terminal() {
     let cx = ctx(Caveats::top());
     let tool = tool();
@@ -288,12 +657,9 @@ async fn confined_stdin_reader_gets_eof_not_the_operator_terminal() {
 /// exit 124 — not after the command's full duration.
 ///
 /// A short `sleep` (not the 30s of the field repro) keeps this real-spawn test
-/// fast: the timed-out child is not itself killed here (that needs kill-on-drop
-/// in the brush fork — Effort B), so the detached worker outlives the invoke and
-/// the test's own runtime drop waits for it. The invoke still returns at the
-/// ~1s ceiling, which is what this asserts.
+/// fast. The supervisor terminates the worker process group at the ceiling; the
+/// next test separately proves a background descendant cannot survive it.
 #[cfg(unix)]
-#[tokio::test]
 async fn confined_run_is_bounded_by_the_wall_clock_ceiling() {
     let cx = ctx(Caveats::top());
     let tool = tool().with_timeout(Duration::from_secs(1));
@@ -316,7 +682,6 @@ async fn confined_run_is_bounded_by_the_wall_clock_ceiling() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
 async fn timeout_kills_worker_descendants() {
     let marker = unique_temp("timeout-descendant");
     let _ = std::fs::remove_file(&marker);
@@ -341,7 +706,6 @@ async fn timeout_kills_worker_descendants() {
 /// HOME crosses the seam — the concrete #783-class motivation: without it,
 /// `~` expansion and HOME-relative tooling misbehave under the brush engine.
 /// Nothing ambient leaks in (do_not_inherit_env); only the passed value shows.
-#[tokio::test]
 async fn env_seam_delivers_home_for_tilde_class_tooling() {
     let out = tool()
         .invoke(

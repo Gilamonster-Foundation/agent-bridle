@@ -33,7 +33,7 @@ pub use agent_bridle_core::*;
 
 // Anchor each tool's symbol in the facade (DESIGN §5): an explicit `pub use`
 // keeps the linker from DCE-ing a tool module under strip+lto.
-#[cfg(feature = "shell")]
+#[cfg(any(feature = "shell", feature = "carried-coreutils"))]
 pub use agent_bridle_tool_shell::ShellTool;
 #[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
 pub use agent_bridle_tool_shell::{ShellInvocationId, ShellOutputObserver, ShellOutputStream};
@@ -44,21 +44,36 @@ pub use agent_bridle_tool_shell::{ShellInvocationId, ShellOutputObserver, ShellO
 // `"shell"` name with `ShellTool` (ADR 0019 D3).
 #[cfg(feature = "host-shell")]
 pub use agent_bridle_tool_shell::HostShellTool;
-// The carried brush engine (agent-bridle#20): a bash-in-Rust shell confined
-// in-process by the CommandInterceptor — the only engine that also confines a
-// restricted exec/net grant. Behind the `brush` feature (the crates.io
-// `brush-ocap-*` fork); NOT auto-added to `registry()` — it shares the
-// `"shell"` name with ShellTool (ADR 0005 D2), so the embedder selects it.
+// The carried brush engine (agent-bridle#20): a bash-in-Rust shell run in a
+// dedicated worker. Its CommandInterceptor provides the worker-local L2 leash;
+// when effective caveats engage a native L3 backend, the worker and descendants
+// inherit it. Behind the `brush` feature (the crates.io `brush-ocap-*` fork);
+// NOT auto-added to `registry()` — it shares the `"shell"` name with ShellTool
+// (ADR 0005 D2), so the embedder selects it.
 #[cfg(feature = "brush")]
-pub use agent_bridle_tool_shell::BrushShellTool;
-// Carried-coreutils dispatch (issue #206): an embedder's binary calls
-// `maybe_dispatch()` at the very top of `main` to become dispatch-capable, so the
-// brush engine's carried `ls`/`cat`/… shims (which re-exec `<self>
-// --invoke-bundled <name>`) resolve in-process against the host binary — carried
-// coreutils with no host tools. `register_shims`/`install_default_providers` are
-// used by the engine internally but re-exported for completeness.
+pub use agent_bridle_tool_shell::{brush_private_control_supported, BrushShellTool};
+/// Parse and inspect Brush shell source without expansion or execution.
+///
+/// The returned source-bound schema lets an embedder present command
+/// substitutions, state-free arithmetic expansions, redirections, and
+/// statically discoverable commands for approval before invoking
+/// [`BrushShellTool`]. Arithmetic that depends on shell variables, arrays,
+/// assignments, or nested expansion fails closed, as do parameter forms that
+/// can reinterpret runtime values as expansion syntax.
+#[cfg(feature = "brush")]
+pub use agent_bridle_tool_shell::{
+    inspect_shell, DescendantExec, InspectedCommand, InspectedConstruct, InspectedRedirect,
+    RedirectOperation, ShellConstructKind, ShellInspection, ShellInspectionError,
+};
+// An embedder calls `maybe_dispatch()` at the very top of `main` so the private
+// sandboxed Brush worker re-exec resolves before normal application startup.
+#[cfg(feature = "brush")]
+pub use agent_bridle_tool_shell::maybe_dispatch;
+// With carried-coreutils, non-conflicting `ls`/`cat`/… shims additionally
+// re-exec `<self> --invoke-bundled <name>` and resolve against the host binary.
+// Registration helpers are re-exported for completeness.
 #[cfg(feature = "carried-coreutils")]
-pub use agent_bridle_tool_shell::{install_default_providers, maybe_dispatch, register_shims};
+pub use agent_bridle_tool_shell::{install_default_providers, register_shims};
 #[cfg(feature = "web")]
 pub use agent_bridle_tool_web::WebFetchTool;
 
@@ -68,7 +83,9 @@ pub use agent_bridle_tool_web::WebFetchTool;
 /// set is deterministic and DCE-proof. Which tools are present depends on the
 /// compiled features:
 ///
-/// - `carried-coreutils` (default): adds the carried Brush-backed `shell` tool.
+/// - `carried-coreutils` (default): adds the carried Brush-backed `shell` tool
+///   where authenticated private control is supported; otherwise it selects
+///   the safe-subset shell rather than advertising an unusable worker.
 /// - `shell`: selects the lean argv + safe-subset `shell` instead when
 ///   `carried-coreutils` is disabled.
 /// - `web`: adds the confined `web_fetch` tool — the `net` enforcer (host
@@ -83,7 +100,11 @@ pub fn registry() -> Registry {
 
     #[cfg(feature = "carried-coreutils")]
     {
-        builder = builder.tool(std::sync::Arc::new(BrushShellTool::new()));
+        if brush_private_control_supported() {
+            builder = builder.tool(std::sync::Arc::new(BrushShellTool::new()));
+        } else {
+            builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
+        }
     }
 
     #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
@@ -122,7 +143,10 @@ mod tests {
 
     /// The default carried engine publishes its full-shell `cmd` schema, not
     /// the safe-subset engine's argv form.
-    #[cfg(feature = "carried-coreutils")]
+    #[cfg(all(
+        feature = "carried-coreutils",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn default_shell_is_the_carried_brush_engine() {
         let reg = registry();
@@ -138,6 +162,40 @@ mod tests {
         assert!(
             !properties.contains_key("program"),
             "default registry must not select the argv safe-subset engine"
+        );
+    }
+
+    /// A default build on a target without authenticated private control keeps
+    /// a functional shell, but advertises the safe-subset argv schema rather
+    /// than pretending the unavailable Brush worker can run.
+    #[cfg(all(
+        feature = "carried-coreutils",
+        not(any(target_os = "linux", target_os = "macos"))
+    ))]
+    #[test]
+    fn default_shell_falls_back_to_safe_subset_when_private_control_is_unsupported() {
+        assert!(!brush_private_control_supported());
+        let reg = registry();
+        let shell = reg
+            .tool_definitions()
+            .into_iter()
+            .find(|definition| definition["name"] == "shell")
+            .expect("safe-subset shell present");
+        let properties = shell["inputSchema"]["properties"]
+            .as_object()
+            .expect("shell schema properties");
+        assert!(
+            properties.contains_key("program"),
+            "fallback schema must disclose the argv safe-subset engine"
+        );
+    }
+
+    #[cfg(feature = "brush")]
+    #[test]
+    fn private_control_probe_matches_the_compiled_transport() {
+        assert_eq!(
+            brush_private_control_supported(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
         );
     }
 
@@ -196,5 +254,32 @@ mod tests {
         let _s: Scope<String> = Scope::top();
         let _b = CountBound::Unlimited;
         let _k = SandboxKind::None;
+    }
+
+    /// The facade exposes parse-only Brush inspection so a host can preflight
+    /// dynamic constructs before any shell tool is invoked.
+    #[cfg(feature = "brush")]
+    #[test]
+    fn brush_inspection_is_reexported_for_preflight() {
+        let inspected: ShellInspection =
+            inspect_shell(r#"echo "$(printf '%s' "$((1 + 2))")""#).expect("inspection");
+
+        let substitution: &InspectedConstruct = &inspected.constructs[0];
+        assert_eq!(substitution.kind, ShellConstructKind::CommandSubstitution);
+        assert!(substitution.quoted);
+
+        let nested = substitution
+            .inspection
+            .as_deref()
+            .expect("recursive substitution inspection");
+        assert_eq!(
+            nested.constructs[0].kind,
+            ShellConstructKind::ArithmeticExpansion
+        );
+        assert_eq!(nested.constructs[0].body, "1 + 2");
+
+        let error = inspect_shell("echo $((runtime_value))")
+            .expect_err("runtime-state arithmetic must fail closed through the facade");
+        assert!(error.message().contains("runtime shell state"));
     }
 }

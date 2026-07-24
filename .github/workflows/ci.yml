@@ -64,6 +64,11 @@ jobs:
       - name: Test (no default features)
         run: cargo test --workspace --no-default-features
 
+      - name: Test (bare Brush worker, no carried coreutils)
+        # Neither broad feature lane covers this cell: all-features enables
+        # carried-coreutils, while no-default-features omits Brush.
+        run: cargo test -p agent-bridle-tool-shell --no-default-features --features brush --test brush_real
+
       # HOOK PARITY: mirrors `just publish-check` run by .githooks/pre-push.
       # Guards the out-of-tree dependency boundary (ADR 0008): fails if
       # agent-bridle-core stops being publishable (a git dep, a path-only
@@ -155,12 +160,14 @@ jobs:
       - name: Test the AppContainer backend (core proofs)
         run: cargo test -p agent-bridle-core --features windows-appcontainer
 
-      # Run the shell ENGINES functionally on Windows (#209). The clippy step
-      # above only COMPILES them; this EXERCISES the in-process brush engine and
-      # the carried-coreutils dispatch/re-exec — neither ran on Windows before
-      # 0.7.0-rc.1. HOOK PARITY: mirrored by `just check-windows`.
-      - name: Run the shell engines on Windows (brush + carried coreutils)
-        run: cargo test -p agent-bridle-tool-shell --features brush,carried-coreutils --test brush_real --test carried_coreutils
+      # Windows has no authenticated Brush private transport in this release.
+      # Prove both halves of the supported behavior: direct Brush/carried use
+      # fails closed, while the facade's default registry selects ShellTool and
+      # advertises its safe-subset schema. HOOK PARITY: `just check-windows`.
+      - name: Verify Windows private-control refusal + safe-shell fallback
+        run: |
+          cargo test -p agent-bridle --all-features default_shell_falls_back_to_safe_subset_when_private_control_is_unsupported
+          cargo test -p agent-bridle-tool-shell --features brush,carried-coreutils --test brush_real --test carried_coreutils
 
       # The launcher's own unit tests: MSVC CommandLineToArgvW quoting (arg-injection
       # surface) and the flag parser. Windows-only crate — only this job builds it.

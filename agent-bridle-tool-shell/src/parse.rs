@@ -11,9 +11,9 @@
 //! [`Arg::Var`] segments); the filesystem read (globbing) and the env read +
 //! allowlist check (variables) are the executor's job.
 //!
-//! Refused **by design** (security, [`Refusal::Dynamic`]): command/arithmetic
-//! substitution `$(…)`, backticks, subshells — the undecidable interiors ADR
-//! 0001 says may never be statically cleared. Refused for now
+//! Refused **by design** (security, [`Refusal::Dynamic`]): command substitution
+//! `$(…)`, arithmetic expansion `$((…))`, backticks, and subshells — the
+//! undecidable interiors ADR 0001 says may never be statically cleared. Refused for now
 //! ([`Refusal::Unsupported`]): a glob in a redirect target, and fd redirections
 //! other than `1>`/`2>`/`0<`/`2>&1` (e.g. `3>`, `1>&2`). Variable-bearing
 //! redirect targets (`> $TMPDIR/out`) and glob+variable words (`$DIR/*.rs`) ARE
@@ -34,8 +34,9 @@ use std::str::Chars;
 pub enum Refusal {
     /// Refused **by design** (security): the construct's interior is dynamic and
     /// cannot be statically confined, so the engine never interprets it
-    /// (command/arithmetic substitution, backticks, subshells). For a full
-    /// shell, use the embedder's unbridled/`--yolo` allowance (ADR 0003 / 0005 D5).
+    /// (command substitution, arithmetic expansion, backticks, subshells). For
+    /// a full shell, use the embedder's unbridled/`--yolo` allowance (ADR 0003 /
+    /// 0005 D5).
     Dynamic(&'static str),
     /// A construct the safe-subset engine will support but **does not yet** in
     /// this increment (mixed/quoted variable expansion, fd-number redirections).
@@ -503,12 +504,22 @@ fn read_word(chars: &mut Peekable<Chars>) -> Result<Arg, Refusal> {
     }
 }
 
-/// Read a variable name after a consumed `$`: `NAME` (bare) or `{NAME}`. `$(` is
-/// command/arithmetic substitution (dynamic, refused); a `$` not followed by a
-/// name/brace is a refused bare `$` (escape as `\$` for a literal dollar).
+/// Read a variable name after a consumed `$`: `NAME` (bare) or `{NAME}`.
+/// Command substitution `$(` and arithmetic expansion `$((` are dynamic and
+/// refused with distinct construct labels; a `$` not followed by a name/brace
+/// is a refused bare `$` (escape as `\$` for a literal dollar).
 fn read_var_name(chars: &mut Peekable<Chars>) -> Result<String, Refusal> {
     let name = match chars.peek() {
-        Some('(') => return Err(Refusal::Dynamic("command/arithmetic substitution `$(`")),
+        Some('(') => {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            let construct = if lookahead.peek() == Some(&'(') {
+                "arithmetic expansion `$((`"
+            } else {
+                "command substitution `$(`"
+            };
+            return Err(Refusal::Dynamic(construct));
+        }
         Some('{') => {
             chars.next(); // consume '{'
             let mut name = String::new();
@@ -763,15 +774,39 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_dynamic_variable_forms_are_refused() {
-        assert!(matches!(classify("echo $1"), Err(Refusal::Unsupported(_)))); // positional/invalid
-        assert!(matches!(classify("echo $"), Err(Refusal::Unsupported(_)))); // bare $
-        assert!(matches!(classify("echo $(id)"), Err(Refusal::Dynamic(_)))); // substitution
-                                                                             // Escaped `$` is a literal dollar, not a variable.
+    fn invalid_variable_forms_are_refused() {
+        // Positional/invalid variable form.
+        assert!(matches!(classify("echo $1"), Err(Refusal::Unsupported(_))));
+        // Bare dollar.
+        assert!(matches!(classify("echo $"), Err(Refusal::Unsupported(_))));
+        // Escaped `$` is a literal dollar, not a variable.
         assert_eq!(
             classify("echo \\$HOME").unwrap(),
             one_stage(vec![lit("echo"), lit("$HOME")])
         );
+    }
+
+    #[test]
+    fn command_substitution_and_arithmetic_expansion_have_distinct_refusals() {
+        for source in ["echo $(id)", r#"echo "$(id)""#] {
+            let refusal = classify(source).expect_err("command substitution must be refused");
+            assert_eq!(
+                refusal,
+                Refusal::Dynamic("command substitution `$(`"),
+                "{source}"
+            );
+            assert_eq!(refusal.construct(), "command substitution `$(`");
+        }
+
+        for source in ["echo $((1 + 2))", r#"echo "$((1 + 2))""#] {
+            let refusal = classify(source).expect_err("arithmetic expansion must be refused");
+            assert_eq!(
+                refusal,
+                Refusal::Dynamic("arithmetic expansion `$((`"),
+                "{source}"
+            );
+            assert_eq!(refusal.construct(), "arithmetic expansion `$((`");
+        }
     }
 
     #[test]

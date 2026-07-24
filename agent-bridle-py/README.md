@@ -27,7 +27,7 @@ grant = {"exec": {"only": ["echo"]}}
 # external program (after the exec leash admits it) and stdout is captured.
 r = agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, grant)
 print(r["exit_code"], repr(r["stdout"]))   # -> 0 'hi\n'
-print(r["sandbox_kind"])                    # -> 'none' (advisory off-Linux; P0)
+print(r["sandbox_kind"])                    # -> 'none' (default wheel enables no native L3 backend)
 
 # DENIED: `rm` is NOT in the granted `exec` scope. The leash refuses to mint
 # the tool's context, so the destructive command never runs — no prompt
@@ -96,5 +96,5 @@ python3 -m venv /tmp/abp-venv
 
 ## License
 
-Apache-2.0. The deferred, optional `brush` engine (#20) is MIT — its notice is
-carried in the workspace `NOTICE` for when it is adopted.
+Apache-2.0. This default wheel carries the safe-subset engine, not the optional
+Brush dependencies; the workspace `NOTICE` covers builds that do carry Brush.

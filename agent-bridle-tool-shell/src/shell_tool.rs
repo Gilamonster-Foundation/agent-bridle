@@ -4,17 +4,13 @@
 //! is the L2 *convenience*: `agent-bridle` is the exec funnel — it parses the
 //! request itself (see [`crate::parse`]), checks the `exec`/`fs` leash, spawns
 //! the program(s) directly, and **refuses the dynamic constructs by design**.
-//! When an L3 backstop will actually confine the run — the Landlock `fs_write`
-//! (and restricted `fs_read`) axes on a capable Linux build (`linux-landlock`),
-//! or the macOS Seatbelt equivalent (`macos-seatbelt`), with a filesystem axis
-//! restricted — the children spawn inside a kernel-enforced boundary (a Landlock
-//! ruleset applied on a dedicated thread, or a `sandbox-exec` profile wrapping
-//! each stage), and `sandbox_kind` reports [`SandboxKind::Landlock`] /
-//! [`SandboxKind::Seatbelt`]; this blocks a *permitted* program's own
-//! out-of-scope reads/writes, which L2 cannot see once it has spawned. Otherwise
-//! the run is honestly *advisory* and `sandbox_kind` is [`SandboxKind::None`] —
-//! never overclaiming (I9). The `exec`/`net` axes (#31/#57) and the Windows
-//! backend (#51) are follow-ups; see ADR 0006/0009 for the per-OS backend design.
+//! When effective caveats engage an available native backend, children spawn
+//! inside that L3 boundary and inherit its scope-shaped filesystem/exec/network
+//! rules. Landlock, Seatbelt, and AppContainer cover different axis shapes; the
+//! result's `sandbox_kind` plus per-axis enforcement report state exactly what
+//! held. When no backend engages, `sandbox_kind` is [`SandboxKind::None`] rather
+//! than overclaiming (I9). A restricted filesystem axis fails closed if it
+//! cannot be kernel-enforced.
 //!
 //! The engine (agent-bridle#34 Track A + #45): a sequence of pipelines joined by
 //! `&&`/`||`/`;`, each pipeline simple commands with quoted arguments,
@@ -105,8 +101,8 @@ pub(crate) struct SpawnCfg {
 
 pub(crate) trait Spawner: Send + Sync {
     /// Run one leash-approved pipeline to completion, capturing its output. The
-    /// effective `caveats` are passed so the real spawner can apply the L3 OS
-    /// sandbox (Landlock) before spawning; the mock ignores them. `env` is the
+    /// effective `caveats` are passed so the real spawner can apply the selected
+    /// L3 OS sandbox before spawning; the mock ignores them. `env` is the
     /// host/operator-supplied environment (the env seam, newt #783): the real
     /// spawner sets these vars on each spawned child (additive over the inherited
     /// ambient env). `env` is structured host input, never model-authored command
@@ -148,9 +144,9 @@ impl Spawner for OsSpawner {
         if let Some((allow_hosts, fenced)) = egress_proxy_plan(caveats, &cfg.sandbox) {
             return run_with_egress_proxy(stages, cwd, &fenced, env, allow_hosts, cfg);
         }
-        // When an OS sandbox (Landlock/Seatbelt) will actually confine this run,
-        // confine it on a dedicated thread before spawning (ADR 0005 L3 / ADR
-        // 0006 D4). Otherwise run directly — no need to spend a thread.
+        // When a native OS sandbox will actually confine this run, apply its
+        // thread- or wrapper-based launch path (ADR 0005 L3 / ADR 0006 D4).
+        // Otherwise run directly — no need to spend a thread.
         if intended_sandbox_kind(caveats, &cfg.sandbox) == SandboxKind::None {
             run_pipeline(stages, cwd, &[], env, cfg.max_output, cfg.output.clone())
         } else {
@@ -263,9 +259,8 @@ fn net_audit_sink(configured: Option<&str>) -> Arc<dyn net_proxy::AuditSink> {
 /// The L3 `SandboxKind` that will actually be enforced for these caveats in this
 /// build, on this host — the value reported in the result envelope (I9 / ADR
 /// 0006 D3). [`effective_sandbox_kind`] is the shared honesty rule: the strongest
-/// available backend's kind when a filesystem axis is restricted (so it confines
-/// something), else `None` — the fs-only ruleset governs nothing, so never
-/// overclaim. The same rule backs the subprocess primitive in core.
+/// available backend's kind when these caveats engage one of its governed axis
+/// shapes, else `None`. The same rule backs the subprocess primitive in core.
 fn intended_sandbox_kind(caveats: &Caveats, sandbox: &Arc<SandboxPolicy>) -> SandboxKind {
     effective_sandbox_kind(best_available_sandbox(sandbox).kind(), caveats)
 }
@@ -276,8 +271,8 @@ fn intended_sandbox_kind(caveats: &Caveats, sandbox: &Arc<SandboxPolicy>) -> San
 /// backend (Landlock) restricts this very thread in `apply` — per-thread,
 /// irreversible, inherited across `fork`/`execve`, so it must run on a throwaway
 /// thread (never the shared blocking pool) immediately before spawning the
-/// children. A wrapper backend (macOS Seatbelt) returns a `sandbox-exec` argv
-/// prefix from `command_prefix`, prepended to every stage so the child is
+/// children. Wrapper backends (Seatbelt/AppContainer) return an argv prefix from
+/// `command_prefix`, prepended to every stage so the child is
 /// spawned already confined. Both are fail-closed (ADR 0006 D4): if confinement
 /// cannot be established the run errors rather than proceeding unconfined.
 fn run_confined(
@@ -463,15 +458,14 @@ impl Tool for ShellTool {
     ) -> ToolResult<serde_json::Value> {
         let parsed = ShellArgs::parse(&args, &self.limits)?;
         // Unbridled (ADR 0018): the operator dropped the L3 mechanism. Report
-        // `None` (no OS sandbox) — the per-axis report then honestly shows each
-        // restricted axis at `advisory` (the L2 interceptor, which still gates the
-        // configured grant below), never `kernel`. Authority is unchanged; only the
-        // mechanism is off. Every envelope discloses `unbridled` (D5).
+        // `None` (no OS sandbox) — the per-axis report then honestly shows the
+        // remaining L2/interceptor or advisory strength, never `kernel`.
+        // Authority is unchanged; only the mechanism is off. Every envelope
+        // discloses `unbridled` (D5).
         let unbridled = is_unbridled();
         // Honest reporting (ADR 0005 D1 / I9 / ADR 0006 D3): report the L3 kind
-        // that will actually be enforced for these caveats on this kernel —
-        // Landlock when `fs_write` is restricted on a capable Linux build, else
-        // None (advisory). `OsSpawner` applies exactly this, fail-closed.
+        // that will actually be enforced for these caveats on this host and
+        // backend. `OsSpawner` applies exactly this decision, fail-closed.
         //
         // On the egress-proxy path (#124, ADR 0016) the run is governed by the
         // loopback-`fenced` caveats — a real Seatbelt kernel boundary — so the
@@ -495,7 +489,14 @@ impl Tool for ShellTool {
         // Resolve to a script (sequence of pipelines), or surface a refusal.
         let mut script = match parsed.script() {
             Ok(s) => s,
-            Err(refusal) => return Ok(refused_envelope(sandbox_kind, enforcement, &refusal)),
+            Err(refusal) => {
+                return Ok(refused_envelope(
+                    sandbox_kind,
+                    enforcement,
+                    &refusal,
+                    parsed.cmd.as_deref(),
+                ))
+            }
         };
 
         // Lower `$VAR` (#46) through the env seam so the RESOLVED value is what
@@ -869,8 +870,9 @@ fn refused_envelope(
     sandbox_kind: SandboxKind,
     enforcement: EnforcementReport,
     refusal: &Refusal,
+    cmd: Option<&str>,
 ) -> serde_json::Value {
-    ToolEnvelope::new(sandbox_kind)
+    let envelope = ToolEnvelope::new(sandbox_kind)
         .with_enforcement(enforcement)
         .with_disclosure(unbridle_disclosure())
         .with_denials(vec![Denial {
@@ -878,7 +880,33 @@ fn refused_envelope(
             target: refusal.construct(),
             reason: refusal.to_string(),
         }])
-        .into_json()
+        .into_json();
+
+    // A dynamic safe-subset refusal is a parser/mechanism boundary, not an
+    // executable denial. When the carried Brush parser is present, attach its
+    // pure source inspection so an embedder can review an exact source string
+    // and a flattened, source-bound inventory before selecting a full-grammar
+    // engine. Inspection performs no expansion or execution; failure simply
+    // retains the legacy fail-closed envelope.
+    #[cfg(feature = "brush")]
+    {
+        let mut envelope = envelope;
+        if matches!(refusal, Refusal::Dynamic(_)) {
+            if let Some(cmd) = cmd {
+                if let Ok(inspection) = crate::inspect_shell(cmd) {
+                    if let Ok(value) = serde_json::to_value(inspection) {
+                        envelope["shell_inspection"] = value;
+                    }
+                }
+            }
+        }
+        envelope
+    }
+    #[cfg(not(feature = "brush"))]
+    {
+        let _ = cmd;
+        envelope
+    }
 }
 
 /// Parsed, validated `shell` arguments.
@@ -1681,6 +1709,79 @@ mod tests {
         assert!(SHELL_SCHEMA["properties"]["timeout_secs"]
             .get("maximum")
             .is_none());
+    }
+
+    /// A safe-subset `$()` refusal carries Brush's parse-only, source-bound
+    /// inventory. Inspection is metadata only: not even the outer `ls` reaches
+    /// the mock spawner.
+    #[cfg(feature = "brush")]
+    #[tokio::test]
+    async fn dynamic_refusal_attaches_non_executing_shell_inspection() {
+        let cmd = r#"ls -1 $(find . -name "*.rs" -type f -exec wc -l {} + 2>/dev/null | sort -nr | head -10)"#;
+        let mock = Arc::new(MockSpawner::default());
+        let out = ShellTool::with_spawner(mock.clone())
+            .invoke(serde_json::json!({"cmd": cmd}), &ctx(Caveats::top()))
+            .await
+            .expect("structured refusal");
+
+        assert_eq!(out["denied"], true);
+        assert_eq!(out["denials"][0]["target"], "command substitution `$(`");
+        assert_eq!(out["shell_inspection"]["source"], cmd);
+        assert_eq!(
+            out["shell_inspection"]["constructs"][0]["kind"],
+            "command_substitution"
+        );
+        assert_eq!(
+            out["shell_inspection"]["constructs"][0]["inspection"]["commands"][0]
+                ["descendant_execs"][0]["program"],
+            "wc"
+        );
+        assert!(
+            calls(&mock).is_empty(),
+            "inspection must not execute any stage: {out}"
+        );
+
+        let arithmetic_cmd = r#"echo "$((1 + 2))""#;
+        let arithmetic = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": arithmetic_cmd}),
+                &ctx(Caveats::top()),
+            )
+            .await
+            .expect("structured arithmetic refusal");
+
+        assert_eq!(
+            arithmetic["denials"][0]["target"],
+            "arithmetic expansion `$((`"
+        );
+        assert_eq!(
+            arithmetic["shell_inspection"]["constructs"][0]["kind"],
+            "arithmetic_expansion"
+        );
+        assert!(
+            calls(&mock).is_empty(),
+            "arithmetic inspection must not execute any stage: {arithmetic}"
+        );
+
+        let runtime_arithmetic = ShellTool::with_spawner(mock.clone())
+            .invoke(
+                serde_json::json!({"cmd": "echo $((runtime_value))"}),
+                &ctx(Caveats::top()),
+            )
+            .await
+            .expect("structured runtime arithmetic refusal");
+        assert_eq!(
+            runtime_arithmetic["denials"][0]["target"],
+            "arithmetic expansion `$((`"
+        );
+        assert!(
+            runtime_arithmetic.get("shell_inspection").is_none(),
+            "an incomplete runtime-state projection must not be attached: {runtime_arithmetic}"
+        );
+        assert!(
+            calls(&mock).is_empty(),
+            "runtime arithmetic inspection must not execute any stage: {runtime_arithmetic}"
+        );
     }
 
     /// A spawner that records every pipeline it runs and returns a canned exit

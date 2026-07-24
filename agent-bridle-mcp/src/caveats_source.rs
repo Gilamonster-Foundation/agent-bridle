@@ -241,8 +241,8 @@ impl GrantedCaveats {
         })
     }
 
-    /// A human-readable, one-line provenance banner for stderr. When the leash
-    /// is the unconfined default, the line is a prominent WARNING.
+    /// A human-readable provenance banner for stderr. Fail-closed and
+    /// explicitly unbridled postures are both reported prominently.
     #[must_use]
     pub fn banner(&self) -> String {
         match &self.source {

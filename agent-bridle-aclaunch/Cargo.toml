@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Windows AppContainer process launcher for agent-bridle (agent-bridle#51, ADR 0009)."
+# Internal companion binary: it ships inside the Windows MCP release archive
+# and is not a separately supported crates.io surface. `ab-netprobe` is a
+# kernel-proof fixture, not an end-user executable.
+publish = false
 # Only meaningful on Windows; on other platforms the binary compiles but exits
 # immediately with an unsupported message. Kept in the workspace so the full
 # `cargo check --workspace --all-features` matrix passes on any host.

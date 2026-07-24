@@ -13,18 +13,26 @@
 //!
 //! - **Linux** — [`LandlockSandbox`] (`linux-landlock`): a real Landlock ruleset
 //!   confining the `fs_write` axis, and `fs_read` when restricted. `restrict_self`
-//!   confines the calling thread (inherited across `fork`/`execve`).
+//!   confines the calling thread (inherited across `fork`/`execve`). Direct
+//!   execute rules narrow `execve` but do not close the loader trampoline, so
+//!   `exec` remains honestly `Interceptor`; ABI-v4 kernels can kernel-deny all
+//!   TCP egress for an empty `net` scope.
 //! - **macOS** — [`SeatbeltSandbox`] (`macos-seatbelt`): an SBPL profile derived
 //!   from the effective [`Caveats`], applied by wrapping the spawned program in
-//!   `sandbox-exec(1)` (no FFI — core forbids `unsafe`). Confines the `fs_write`
-//!   and `fs_read` axes, and kernel-denies **all** network egress when `net` is
-//!   empty (a confinement Landlock cannot provide); `exec` and non-empty `net`
-//!   host allowlists are follow-ups (agent-bridle#31/#57).
+//!   `sandbox-exec(1)` (no FFI — core forbids `unsafe`). Confines both filesystem
+//!   axes, restricted `exec`, and empty or loopback-only `net` scopes. General
+//!   remote-host allowlists use the separately fenced proxy path and remain
+//!   conservatively reported at their userspace strength.
+//! - **Windows** — [`SandboxKind::AppContainer`] (`windows-appcontainer`): a
+//!   process-creation wrapper applies filesystem DACLs, deny-all or loopback-only
+//!   network policy, and the kernel child-process block for `exec: Only([])`.
+//!   Non-empty exec allowlists cannot be expressed without WDAC and stay
+//!   `Interceptor`.
 //!
 //! A backend confines either by restricting the calling thread in [`Sandbox::apply`]
 //! (Landlock) **or** by wrapping the spawned command via
-//! [`Sandbox::command_prefix`] (Seatbelt); a spawn site honors both, so the
-//! mechanism is uniform at the call site.
+//! [`Sandbox::command_prefix`] (Seatbelt/AppContainer); a spawn site honors both,
+//! so the mechanism is uniform at the call site.
 
 use crate::{Caveats, SandboxPolicy, ToolResult};
 use std::sync::Arc;
@@ -72,8 +80,7 @@ pub enum SandboxKind {
 /// An OS-level confinement that can be applied from a set of [`Caveats`].
 ///
 /// Implementations translate the lattice's `fs_read`/`fs_write`/`exec`/`net`
-/// axes into kernel rules (Landlock, namespaces). For P0 only [`NoopSandbox`]
-/// exists.
+/// axes into the kernel rules their native backend can honestly express.
 pub trait Sandbox: Send + Sync {
     /// The kind of confinement this sandbox provides.
     fn kind(&self) -> SandboxKind;
@@ -105,10 +112,10 @@ pub trait Sandbox: Send + Sync {
     }
 }
 
-/// The P0 sandbox: applies nothing and reports [`SandboxKind::None`].
+/// The no-backend sandbox: applies nothing and reports [`SandboxKind::None`].
 ///
-/// This is the honest default until the Landlock ruleset (P3) lands. Tools that
-/// consult `sandbox_kind()` can see that their exec/fs guarantees are advisory.
+/// This is the honest fallback when no compiled native backend is capable or
+/// when the effective caveats engage no axis that the available backend governs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopSandbox;
 
@@ -136,23 +143,23 @@ pub(crate) fn restricts_fs(caveats: &Caveats) -> bool {
         || matches!(caveats.fs_read, crate::Scope::Only(_))
 }
 
-/// `true` if the `exec` axis is actually restricted (`Only(_)`) — the condition
-/// under which an exec-confining backend has an allow-list to enforce. Today only
-/// the macOS Seatbelt backend acts on this: `process-exec*` is a kernel-checked
-/// operation that confines the spawned program's **interior** execs (covering the
-/// loader trampoline that Landlock cannot — ADR 0014), so an `exec:Only` grant
-/// engages Seatbelt even when no fs/net axis is restricted. Landlock's exec axis
-/// stays held (agent-bridle#31/#57), so it does **not** engage on this alone.
+/// `true` if the `exec` axis is actually restricted (`Only(_)`). Seatbelt acts on
+/// every such scope via `process-exec*`, including the spawned program's
+/// interior execs (ADR 0014), so `exec: Only(_)` engages it by itself.
+/// AppContainer separately handles the deny-all subset via
+/// [`exec_fully_denied`]. Landlock narrows direct `execve` when another governed
+/// axis engages it, but its loader-trampoline residual keeps the reported exec
+/// strength at `Interceptor`, so exec restriction alone does not engage it.
 #[must_use]
 pub(crate) fn restricts_exec(caveats: &Caveats) -> bool {
     matches!(caveats.exec, crate::Scope::Only(_))
 }
 
 /// `true` if the `net` axis is restricted to the **empty** set — i.e. *all*
-/// network egress is denied. This is the one network policy SBPL can soundly
-/// express (`(deny network*)`); a non-empty host allowlist filters by socket,
-/// not hostname, so it is **not** expressible and stays advisory (never silently
-/// dropped). Only the macOS Seatbelt backend acts on this today.
+/// network egress is denied. Seatbelt and AppContainer enforce this scope, and a
+/// Landlock ABI-v4 kernel can deny all TCP egress. A general non-empty hostname
+/// allowlist is not directly expressible by those native rules and follows the
+/// separately documented proxy/advisory path.
 #[must_use]
 pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
@@ -368,14 +375,13 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
 
 /// Return the strongest [`Sandbox`] available in this build on this host.
 ///
-/// One `cfg(target_os, feature)` arm per backend, each with a runtime capability
-/// probe (ADR 0006 D2): on Linux with `linux-landlock` and a capable kernel a
-/// [`LandlockSandbox`]; on macOS with `macos-seatbelt` and `sandbox-exec`
-/// present a [`SeatbeltSandbox`]. Otherwise the advisory [`NoopSandbox`] — so a
-/// caller that wants confinement gets the real thing where it exists and an
-/// honest [`SandboxKind::None`] where it does not, rather than silently
-/// overclaiming. Enabling a backend's feature off its target OS compiles nothing
-/// and selects nothing (the arm is `cfg`-gated away).
+/// One `cfg(target_os, feature)` arm per backend (ADR 0006 D2): Landlock probes
+/// kernel support at runtime; Seatbelt probes for `sandbox-exec`; AppContainer
+/// uses its process-launch wrapper on Windows. Otherwise the advisory
+/// [`NoopSandbox`] is selected, so callers get a real native boundary where one
+/// is available and an honest [`SandboxKind::None`] where it is not. Enabling a
+/// backend feature off its target OS compiles and selects no target-specific
+/// implementation.
 pub fn best_available_sandbox(policy: &Arc<SandboxPolicy>) -> Box<dyn Sandbox> {
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
     {
@@ -696,7 +702,8 @@ pub(crate) mod landlock_impl {
     /// restricted `exec` (ADR 0012 D4, already wired). The trampoline-tight close
     /// (narrowed read base + W^X + seccomp `execve`/namespace deny, or a
     /// micro-VM rootfs) is the Tier-2 follow-up (#57 / ADR 0009). When an axis is
-    /// `All` it stays ambient. `net` remains a follow-up (#35).
+    /// `All` it stays ambient. On ABI-v4 kernels an empty `net` scope additionally
+    /// installs a deny-all TCP ruleset; hostname allowlists remain inexpressible.
     ///
     /// `restrict_self` is per-thread and irreversible, and is inherited across
     /// `fork`/`execve`. Callers must therefore call [`Sandbox::apply`] on the
@@ -1802,11 +1809,9 @@ mod tests {
     }
 
     #[test]
-    fn effective_kind_downgrades_to_none_when_no_fs_axis_restricted() {
+    fn effective_kind_downgrades_to_none_when_no_axis_is_restricted() {
         // The honesty rule (I9): a backend that confines nothing must not be
-        // reported. With every axis `All`, even a real backend → None. (For
-        // AppContainer the rule keeps it `None` here regardless — its shell/spawn
-        // launcher is a follow-up, so it is not engaged via this path yet.)
+        // reported. With every axis `All`, even a real backend reports None.
         for available in [
             SandboxKind::Landlock,
             SandboxKind::Seatbelt,

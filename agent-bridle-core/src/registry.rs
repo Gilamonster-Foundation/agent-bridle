@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::gate::DEFAULT_STRENGTH_FLOOR;
 use crate::{
-    CallRequest, Caveats, DischargeProvider, DischargeVerifier, Gate, StepUpPolicy, Tool,
-    ToolError, ToolResult,
+    AxisEnforcement, CallRequest, Caveats, DischargeProvider, DischargeVerifier, Gate,
+    StepUpPolicy, Tool, ToolError, ToolResult,
 };
 
 /// Optional step-up enforcement wired into [`Registry::dispatch`] (ADR 0018 R2 /
@@ -97,12 +98,34 @@ impl Registry {
         args: serde_json::Value,
         granted: &Caveats,
     ) -> ToolResult<serde_json::Value> {
+        self.dispatch_with_strength_floor(name, args, granted, DEFAULT_STRENGTH_FLOOR)
+            .await
+    }
+
+    /// Dispatch `name` with an explicit minimum confinement strength.
+    ///
+    /// This is the strong-principal form of [`Self::dispatch`]. The selected
+    /// floor is stamped into the unforgeable [`crate::ToolContext`] at the
+    /// gate's mint site and follows delegated trusted-worker requests. A
+    /// subprocess boundary then refuses to launch if any restricted axis would
+    /// fall below that floor. This closes the gap between a host's prospective
+    /// enforcement check and the backend actually governing execution.
+    ///
+    /// The ordinary [`Self::dispatch`] remains backwards-compatible and uses
+    /// the default [`AxisEnforcement::Advisory`] floor.
+    pub async fn dispatch_with_strength_floor(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        granted: &Caveats,
+        strength_floor: AxisEnforcement,
+    ) -> ToolResult<serde_json::Value> {
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| ToolError::not_found(name))?;
 
-        let gate = self.gate_for(granted);
+        let gate = self.gate_for(granted, strength_floor);
         let cx = match &self.step_up {
             // Step-up wired in (ADR 0018 R2): run the host-orchestrated ceremony
             // through the gate — a policy-demanded gesture is obtained + verified
@@ -136,8 +159,8 @@ impl Registry {
     /// generation stay in one place. The gate's budget is seeded from the
     /// grant's `max_calls` so a single dispatch's per-call charge interacts
     /// correctly with `AtMost(n)`.
-    fn gate_for(&self, granted: &Caveats) -> Gate {
-        Gate::with_budget(self.generation, granted.max_calls)
+    fn gate_for(&self, granted: &Caveats, strength_floor: AxisEnforcement) -> Gate {
+        Gate::with_budget(self.generation, granted.max_calls).with_strength_floor(strength_floor)
     }
 }
 
@@ -224,6 +247,30 @@ mod tests {
         }
     }
 
+    /// A tool whose only action is to cross a subprocess boundary. The fake
+    /// path must never reach the OS when the requested strength exceeds the
+    /// governing backend.
+    struct SpawnProbeTool;
+    #[async_trait::async_trait]
+    impl Tool for SpawnProbeTool {
+        fn name(&self) -> &str {
+            "spawn_probe"
+        }
+
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            cx: &ToolContext,
+        ) -> ToolResult<serde_json::Value> {
+            crate::ConfinedCommand::new("agent-bridle-strength-floor-must-refuse").spawn(cx)?;
+            panic!("a backend downgrade must be refused before process creation")
+        }
+    }
+
     fn reg() -> Registry {
         Registry::builder().tool(Arc::new(ProbeTool)).build()
     }
@@ -269,6 +316,32 @@ mod tests {
             block_on(r.dispatch("probe", serde_json::json!({ "program": "rm" }), &granted))
                 .unwrap_err();
         assert!(matches!(denied, ToolError::Denied { .. }));
+    }
+
+    #[test]
+    fn explicit_dispatch_strength_floor_refuses_backend_downgrade() {
+        let registry = Registry::builder().tool(Arc::new(SpawnProbeTool)).build();
+        // A non-empty hostname allow-list is advisory for a directly spawned
+        // process on every current host backend. Requiring Kernel must therefore
+        // refuse before the deliberately nonexistent program reaches the OS.
+        let granted = Caveats {
+            net: Scope::only(["example.invalid".to_string()]),
+            ..Caveats::top()
+        };
+        let error = block_on(registry.dispatch_with_strength_floor(
+            "spawn_probe",
+            serde_json::json!({}),
+            &granted,
+            AxisEnforcement::Kernel,
+        ))
+        .unwrap_err();
+        let ToolError::Denied { reason } = error else {
+            panic!("backend downgrade returned the wrong error: {error:?}");
+        };
+        assert!(
+            reason.contains("required strength floor (Kernel)"),
+            "denial must identify the unachievable strength floor: {reason}"
+        );
     }
 
     #[test]

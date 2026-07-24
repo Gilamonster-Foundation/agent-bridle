@@ -1,7 +1,8 @@
 # ADR 0005 — Decouple the shell engine from the boundary: L3 is the boundary, L2 is convenience
 
-- Status: Accepted (ratified 2026-06-24); **extended by ADR 0006** (per-OS L3
-  backend selection + engines as opt-in cargo features)
+- Status: Accepted historical baseline (ratified 2026-06-24); **implementation
+  state superseded by the carried Brush worker and ADRs 0006/0019**. The
+  engine/boundary separation remains operative.
 - Date: 2026-06-24
 - Context: `agent-bridle-tool-shell` (a fail-closed stub today — ADR 0003); the
   brush `CommandInterceptor` (L2) lives on a fork blocked by crates.io's git-dep
@@ -14,6 +15,12 @@
   boundary, not a backstop).
 - Origin: the design discussion following the ADR 0004 review
   (`docs/reviews/2026-06-24-ocap-shell-axis-coverage-review.md`).
+
+> Implementation note (2026-07-24): references below to a shell that is
+> "stubbed today" describe the state when this ADR was ratified. The safe-subset
+> engine shipped, and the reversible D4 alternative is now realized by the
+> publishable `brush-ocap-*` fork in a dedicated, sandboxed worker. ADR 0019 and
+> the current engine documentation describe the live implementation.
 
 ## Question
 
@@ -63,14 +70,14 @@ Implemented directly — no shell interpreter, no fork (#34):
   `fs_read`/`fs_write` check, I6) and wires the fd.
 
 It **structurally refuses** the dynamic constructs — command substitution
-`$(...)`/backticks, `eval`, process substitution `<(...)`/`>(...)`, dynamic
-`$VAR`-as-command, functions, control flow with computed command names. These are
-exactly ADR 0001's *undecidable, opaque ⇒ never-cleared* interiors; refusing them
-is **least authority by construction**, not a missing feature. Net: the bulk of
-real agent usage works while the dynamic attack surface is excluded by
-construction — a *stronger advisory posture* than an in-process hook over full
-bash, which runs those constructs and is blind to a permitted external's
-children.
+`$(...)`/backticks, arithmetic expansion `$((...))`, `eval`, process
+substitution `<(...)`/`>(...)`, dynamic `$VAR`-as-command, functions, and
+control flow with computed command names. These are exactly ADR 0001's
+*undecidable, opaque ⇒ never-cleared* interiors; refusing them is **least
+authority by construction**, not a missing feature. Net: the bulk of real agent
+usage works while the dynamic attack surface is excluded by construction — a
+*stronger advisory posture* than an in-process hook over full bash, which runs
+those constructs and is blind to a permitted external's children.
 
 ### D4 — `brush-bridle-core` is the deferred, **reversible** alternative engine
 

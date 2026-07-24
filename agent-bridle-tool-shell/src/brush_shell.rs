@@ -1,23 +1,25 @@
 //! The carried **brush engine** (agent-bridle#20 / Track 2): a bash-in-Rust
-//! shell run in a dedicated worker, confined by the inherited L3 boundary and
-//! the `CommandInterceptor` L2 leash.
+//! shell run in a dedicated worker behind the L3-aware spawn funnel and the
+//! worker-local `CommandInterceptor` L2 leash.
 //!
 //! Unlike [`HostShellTool`](crate::HostShellTool) — which *refuses* a restricted
 //! `exec`/`net` grant because it cannot bound a real `/bin/sh`'s forked children
-//! — this engine's interceptor fires on every resolved program name and every
-//! opened path *inside* brush (`before_exec` at the single external-spawn funnel,
-//! `before_open` at `Shell::open_file`). So it **serves** restricted `exec`/`fs`
-//! grants and records each denial into the worker response surfaced as
-//! structured `denials` on the envelope.
+//! — this engine's interceptor fires on every resolved program name and path
+//! opened through Brush itself (`before_exec` at Brush's external-spawn funnel,
+//! `before_open` at `Shell::open_file`). It records each denial into the worker
+//! response surfaced as structured `denials` on the envelope. A permitted
+//! external child's own syscalls — including carried-uutils file opens and
+//! delegated descendants such as `find -exec` — do not re-enter those hooks and
+//! rely on the inherited L3 boundary.
 //!
 //! It uses the temporary `brush-ocap-*` fork carrying the upstream hook PR
-//! (reubeno/brush#1184). The worker is born through `SandboxedWorker`, so its
-//! carried commands and descendants inherit L3. The curated builtin set removes
-//! `exec` (the one builtin that spawns outside the `before_exec` funnel — a
-//! proven bypass).
+//! (reubeno/brush#1184). The worker is born through `SandboxedWorker`; when an
+//! effective native backend engages, carried commands and descendants inherit
+//! it. The curated builtin set removes `exec` (the one builtin that spawns
+//! outside the `before_exec` funnel — a proven bypass).
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::{Arc, LazyLock};
@@ -25,7 +27,8 @@ use std::time::Duration;
 
 use agent_bridle_core::{
     default_exec_path, enforcement_report, human_gate, is_unbridled, Disclosure, SandboxPolicy,
-    SandboxedWorker, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    SandboxedWorker, SandboxedWorkerChild, Scope, Tool, ToolContext, ToolEnvelope, ToolError,
+    ToolResult,
 };
 use async_trait::async_trait;
 use brush_builtins::{default_builtins, BuiltinSet};
@@ -35,7 +38,7 @@ use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::variables::ShellVariable;
 use brush_core::{Shell, ShellFd};
 
-use crate::brush_worker::{WorkerRequest, WorkerResponse};
+use crate::brush_worker::{WorkerPayload, WorkerResponse};
 use crate::caveat_interceptor::CaveatInterceptor;
 use crate::output_observer::{drain_capped, output_session, OutputEmitter};
 
@@ -73,16 +76,16 @@ type LeashedExtensions = ShellExtensionsImpl<DefaultErrorFormatter, CaveatInterc
 /// inline literal (three-Cs).
 static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
     Arc::new(
-        serde_json::from_str(include_str!("host_shell.schema.json"))
-            .expect("embedded host_shell.schema.json must be valid JSON"),
+        serde_json::from_str(include_str!("brush_shell.schema.json"))
+            .expect("embedded brush_shell.schema.json must be valid JSON"),
     )
 });
 
 /// The carried brush engine — a [`Tool`] that runs a free-form command string
-/// through a worker-hosted bash-in-Rust shell confined by the L3 boundary and
-/// `CommandInterceptor` leash. Registered under `"shell"` (the ADR 0005 D2
-/// seam), a peer of [`ShellTool`](crate::ShellTool) /
-/// [`HostShellTool`](crate::HostShellTool).
+/// through a worker-hosted bash-in-Rust shell with a worker-local
+/// `CommandInterceptor` leash and any L3 boundary engaged by the effective
+/// caveats. Registered under `"shell"` (the ADR 0005 D2 seam), a peer of
+/// [`ShellTool`](crate::ShellTool) / [`HostShellTool`](crate::HostShellTool).
 #[derive(Clone)]
 pub struct BrushShellTool {
     max_output: usize,
@@ -91,7 +94,6 @@ pub struct BrushShellTool {
     /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
     /// and reported `timed_out:true` with exit 124.
     timeout: Duration,
-    worker_executable: PathBuf,
     sandbox_policy: Arc<SandboxPolicy>,
 }
 
@@ -116,25 +118,17 @@ impl BrushShellTool {
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             timeout: default_timeout(),
-            worker_executable: std::env::current_exe().unwrap_or_default(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
     }
 
     /// Override the wall-clock ceiling (three-Cs: Configuration). A run that
-    /// exceeds `timeout` is stopped — the FIX-2 cancel flag is tripped, and the
-    /// worker's next command is denied terminatingly — and reported
-    /// `timed_out:true` with exit 124.
+    /// exceeds `timeout` has its worker process group terminated on Unix (the
+    /// worker process on other targets) and is reported `timed_out:true` with
+    /// exit 124.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-
-    /// Select a fixed dispatch-capable worker executable.
-    #[must_use]
-    pub fn with_worker_executable(mut self, executable: impl Into<PathBuf>) -> Self {
-        self.worker_executable = executable.into();
         self
     }
 
@@ -239,24 +233,21 @@ impl Tool for BrushShellTool {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let request = WorkerRequest::new(
-            nonce.clone(),
-            cx.caveats().clone(),
-            cx.strength_floor(),
+        let payload = WorkerPayload::new(
             cmd,
             Some(cwd.to_string_lossy().into_owned()),
             path_value,
             env,
             max_output,
         );
-        let confined = SandboxedWorker::brush(self.worker_executable.clone())
+        let confined = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))
-            .spawn(cx, &nonce, &cwd, is_unbridled())?;
+            .spawn(cx, &nonce, &cwd)?;
         let sandbox_kind = confined.sandbox_kind;
         let caveats = cx.caveats().clone();
         let timeout = self.timeout;
         let supervised = tokio::task::spawn_blocking(move || {
-            supervise_worker(confined.child, &request, timeout, max_output)
+            supervise_worker(confined, &payload, timeout, max_output)
         })
         .await
         .map_err(|error| ToolError::Exec(std::io::Error::other(format!("join: {error}"))))??;
@@ -301,20 +292,18 @@ enum Supervised {
 }
 
 fn supervise_worker(
-    mut child: Child,
-    request: &WorkerRequest,
+    mut confined: SandboxedWorkerChild,
+    payload: &WorkerPayload,
     timeout: Duration,
     max_output: usize,
 ) -> ToolResult<Supervised> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ToolError::denied("brush worker stdin was not piped"))?;
-    serde_json::to_writer(&mut stdin, request)
-        .map_err(|error| ToolError::denied(format!("encode brush worker request: {error}")))?;
-    stdin.flush().map_err(ToolError::from)?;
-    drop(stdin);
-
+    let auth_started = std::time::Instant::now();
+    if let Err(error) = confined.send_payload(payload, timeout) {
+        kill_worker_tree(&mut confined.child);
+        let _ = confined.child.wait();
+        return Err(error);
+    }
+    let mut child = confined.child;
     let stdout = child
         .stdout
         .take()
@@ -323,12 +312,13 @@ fn supervise_worker(
         .stderr
         .take()
         .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
+
     let protocol_cap = max_output.saturating_mul(4).saturating_add(1024 * 1024);
     let stdout_reader = std::thread::spawn(move || read_capped(stdout, protocol_cap));
     let stderr_reader =
         std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
 
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = auth_started + timeout;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(ToolError::from)? {
             break Some(status);
@@ -404,10 +394,10 @@ pub(crate) struct Captured {
 /// Drive a brush shell to completion for one command, capturing stdout/stderr
 /// via real OS pipes (an `Arc<Mutex<Vec<u8>>>` will not satisfy brush's fd
 /// `Stream`; pipes are mandatory). The shell is built with the supplied
-/// [`CaveatInterceptor`] so exec/open are confined in-process. IO must be enabled
-/// on the runtime (not just time): `$(...)` sets up real pipes via tokio's IO
-/// driver, and with IO enabled the inner program hits the `before_exec` funnel
-/// (a legible recorded denial) rather than panicking.
+/// [`CaveatInterceptor`] so Brush-originated exec/open operations are gated.
+/// IO must be enabled on the runtime (not just time): `$(...)` sets up real
+/// pipes via tokio's IO driver, and with IO enabled the inner program hits the
+/// `before_exec` funnel (a legible recorded denial) rather than panicking.
 pub(crate) fn run_in_brush(
     cmd: String,
     cwd: Option<String>,
@@ -488,7 +478,7 @@ pub(crate) fn run_in_brush(
                 .map_err(|e| ToolError::Exec(brush_io("build shell", &e)))?;
 
         // Register the carried coreutils shims (issue #206). They re-exec
-        // `<self> --invoke-bundled <name>`, so they resolve in-process ONLY when
+        // `<self> --invoke-bundled <name>`, so they resolve ONLY when
         // the host binary is dispatch-capable (calls `maybe_dispatch()` in main).
         // The re-exec still funnels through the `before_exec` interceptor.
         #[cfg(feature = "carried-coreutils")]
@@ -526,7 +516,7 @@ pub(crate) fn run_in_brush(
         // caller `PATH` (e.g. a venv-prepended one) wins over the exec-scope
         // seed above — matching the host and safe-subset engines. This does NOT
         // widen authority: `before_exec` gates the RESOLVED PROGRAM against the
-        // caveats regardless of `PATH` (host_shell.schema.json). Nothing ambient
+        // caveats regardless of `PATH` (brush_shell.schema.json). Nothing ambient
         // is inherited; only these explicitly-passed vars cross the boundary.
         for (key, val) in &env {
             shell
@@ -534,6 +524,20 @@ pub(crate) fn run_in_brush(
                 .set_global(key, ShellVariable::new(val.clone()))
                 .map_err(|e| ToolError::Exec(brush_io("seed env var", &e)))?;
         }
+
+        // Brush expands PS4 when xtrace is enabled, including a second round of
+        // command substitution when `promptvars` is on. PS4 is not part of the
+        // inspected model command inventory, so allowing model text or imported
+        // env to redefine it would create a hidden execution path:
+        // `PS4='$(hidden-command)'; set -x`. Pin it to a literal readonly value
+        // after every import. Readonly is essential because model text can turn
+        // `promptvars` back on even if an embedder initially disables it.
+        let mut ps4 = ShellVariable::new("+ ");
+        ps4.set_readonly();
+        shell
+            .env_mut()
+            .set_global("PS4", ps4)
+            .map_err(|e| ToolError::Exec(brush_io("pin readonly PS4", &e)))?;
 
         let result = shell.run_dash_c_command(cmd).await.map_err(|e| {
             // FIX 2: the interceptor's `before_command` answers a cancelled
@@ -627,11 +631,36 @@ fn brush_io(ctx: &str, e: &impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(format!("{ctx}: {e}"))
 }
 
-/// FIX 2 cancellation-seam tests. These exercise the private `run_in_brush`
-/// funnel directly (the cancel flag is per-run and, until the timeout wiring in
-/// FIX 3, not reachable through `invoke`), and are real-spawn by nature — brush
-/// runs its shell in-process, there is no mock. Unix-only for the fixed
-/// `/bin/*` external paths that force the `before_exec` funnel.
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn default_schema_describes_brush_without_host_shell_overclaims() {
+        let schema = BrushShellTool::new().schema();
+        let description = schema["properties"]["cmd"]["description"]
+            .as_str()
+            .expect("cmd description");
+        assert!(description.contains("carried Brush shell"), "{description}");
+        assert!(description.contains("exec caveat"), "{description}");
+        assert!(description.contains("enforcement report"), "{description}");
+        assert!(description.contains("sandbox_kind"), "{description}");
+        assert!(!description.contains("/bin/sh -c"), "{description}");
+        assert!(
+            !description.contains("whole process tree inside the kernel"),
+            "{description}"
+        );
+        assert!(
+            !description.contains("Requires exec+net to be unrestricted"),
+            "{description}"
+        );
+    }
+}
+
+/// FIX 2 cancellation-seam tests. These call `run_in_brush` directly in the test
+/// process to exercise its per-run cancellation hook; production timeout
+/// supervision instead terminates the dedicated worker from outside. They are
+/// real-spawn by nature, with no mock. Unix-only for the fixed `/bin/*` external
+/// paths that force the `before_exec` funnel.
 #[cfg(all(test, unix))]
 mod cancel_tests {
     use super::*;
@@ -788,10 +817,9 @@ mod cancel_tests {
     ///
     /// This now holds for the strongest reason: `before_command` fires for the
     /// shim itself, so cancellation no longer depends on the shim's re-exec
-    /// crossing `before_exec`. It stays a REGRESSION GUARD for the in-process
-    /// carried-coreutils work (B1.1) — the denial assertion below still pins
-    /// that a carried util crosses the leash — so do not delete it when making
-    /// carried utils in-process; make it pass.
+    /// crossing `before_exec`. It remains a regression guard for the carried
+    /// re-exec path: the denial assertion below pins that a carried utility
+    /// crosses the leash.
     #[cfg(feature = "carried-coreutils")]
     #[test]
     fn tripping_cancel_stops_a_loop_of_a_carried_coreutil() {
@@ -803,7 +831,7 @@ mod cancel_tests {
             "carried-util",
         );
         // The loop really did reach the admission seam every iteration (rather
-        // than running the util in-process, invisible to the leash).
+        // than bypassing the worker's leash).
         assert!(
             recorded.iter().any(|d| d.kind == DenialKind::Exec),
             "the carried-util loop must register exec-axis denials: {recorded:?}"

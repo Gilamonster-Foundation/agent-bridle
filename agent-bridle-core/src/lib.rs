@@ -75,8 +75,12 @@ pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSand
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
 pub use spawn::{
-    confinement_unenforceable, spawn_confined_subprocess, ConfinedChild, ConfinedCommand,
-    SandboxedWorker, TrustedWorkerKind,
+    confinement_unenforceable, decode_trusted_worker_frame_header, decode_trusted_worker_hello,
+    decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,
+    spawn_confined_subprocess, trusted_worker_frame_digest, ConfinedChild, ConfinedCommand,
+    SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind, TrustedWorkerRequest,
+    TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP, TRUSTED_WORKER_FRAME_HEADER_LEN,
+    TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY, TRUSTED_WORKER_PROTOCOL_VERSION,
 };
 // The async-host confined spawn (tokio pipe handles). Unix-only, feature-gated,
 // so it re-exports only when built — mirroring the OS-sandbox re-exports above.
