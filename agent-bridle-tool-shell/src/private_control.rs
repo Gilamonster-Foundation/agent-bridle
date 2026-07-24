@@ -47,7 +47,7 @@ struct ImageIdentity {
 struct ParentSnapshot {
     ppid: i32,
     peer_pid: i32,
-    image: ImageIdentity,
+    image: ImageIdentityState,
     #[cfg(target_os = "macos")]
     token: nix::sys::socket::audit_token_t,
 }
@@ -58,6 +58,30 @@ struct FrameCredentials {
     pid: i32,
     #[cfg(target_os = "linux")]
     uid: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImageIdentityState {
+    Known(ImageIdentity),
+    Unknown,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn same_image(left: &ImageIdentityState, right: &ImageIdentityState) -> bool {
+    match (left, right) {
+        (ImageIdentityState::Known(a), ImageIdentityState::Known(b)) => a == b,
+        _ => true,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn inspect_image_with_fallback(pid: i32) -> Result<ImageIdentityState, String> {
+    match process_image(pid) {
+        Ok(image) => Ok(ImageIdentityState::Known(image)),
+        Err(error) if error.raw_os_error() == Some(13) => Ok(ImageIdentityState::Unknown),
+        Err(error) => Err(format!("inspect process {pid} image: {error}")),
+    }
 }
 
 /// Receive and authenticate the one core-framed Brush worker request on fd 0.
@@ -362,10 +386,11 @@ fn parent_snapshot(stream: &UnixStream) -> Result<ParentSnapshot, String> {
     #[cfg(target_os = "macos")]
     let peer_pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
         .map_err(|error| format!("read worker-control peer PID: {error}"))?;
+    let image = inspect_image_with_fallback(peer_pid)?;
     Ok(ParentSnapshot {
         ppid,
         peer_pid,
-        image: process_image(peer_pid)?,
+        image,
         #[cfg(target_os = "macos")]
         token: nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken)
             .map_err(|error| format!("read worker-control peer audit token: {error}"))?,
@@ -380,7 +405,10 @@ fn verify_parent(
 ) -> Result<(), String> {
     let pre = pre?;
     let post = post?;
-    if pre != post {
+    if pre.ppid != post.ppid
+        || pre.peer_pid != post.peer_pid
+        || !same_image(&pre.image, &post.image)
+    {
         return Err("worker-control peer identity changed during authentication".to_string());
     }
     if pre.peer_pid != pre.ppid {
@@ -389,8 +417,10 @@ fn verify_parent(
             pre.peer_pid, pre.ppid
         ));
     }
-    if pre.image != current_image()? {
-        return Err("worker-control parent image is not this executable".to_string());
+    if let ImageIdentityState::Known(peer_image) = pre.image {
+        if current_image()? != peer_image {
+            return Err("worker-control parent image is not this executable".to_string());
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -407,10 +437,11 @@ fn verify_parent(
 #[cfg(feature = "carried-coreutils")]
 fn child_snapshot(_stream: &UnixStream, child_pid: u32) -> Result<ParentSnapshot, String> {
     let child_pid = i32::try_from(child_pid).map_err(|_| "child PID does not fit i32")?;
+    let image = inspect_image_with_fallback(child_pid)?;
     Ok(ParentSnapshot {
         ppid: std::process::id() as i32,
         peer_pid: child_pid,
-        image: process_image(child_pid)?,
+        image,
     })
 }
 
@@ -419,10 +450,11 @@ fn child_snapshot(_stream: &UnixStream, child_pid: u32) -> Result<ParentSnapshot
 fn child_snapshot(stream: &UnixStream, _child_pid: u32) -> Result<ParentSnapshot, String> {
     let peer_pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
         .map_err(|error| format!("read carried-child peer PID: {error}"))?;
+    let image = inspect_image_with_fallback(peer_pid)?;
     Ok(ParentSnapshot {
         ppid: std::process::id() as i32,
         peer_pid,
-        image: process_image(peer_pid)?,
+        image,
         token: nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken)
             .map_err(|error| format!("read carried-child peer audit token: {error}"))?,
     })
@@ -439,11 +471,17 @@ fn verify_child(
     let pre = pre?;
     let post = post?;
     let child_pid = i32::try_from(child_pid).map_err(|_| "child PID does not fit i32")?;
-    if pre != post || pre.peer_pid != child_pid {
+    if pre.peer_pid != post.peer_pid
+        || pre.peer_pid != child_pid
+        || pre.ppid != post.ppid
+        || !same_image(&pre.image, &post.image)
+    {
         return Err("carried-child identity changed during authentication".to_string());
     }
-    if pre.image != current_image()? {
-        return Err("carried-child image is not this executable".to_string());
+    if let ImageIdentityState::Known(peer_image) = pre.image {
+        if current_image()? != peer_image {
+            return Err("carried-child image is not this executable".to_string());
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -457,10 +495,9 @@ fn verify_child(
 }
 
 #[cfg(target_os = "linux")]
-fn process_image(pid: i32) -> Result<ImageIdentity, String> {
+fn process_image(pid: i32) -> Result<ImageIdentity, std::io::Error> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(format!("/proc/{pid}/exe"))
-        .map_err(|error| format!("inspect process {pid} image: {error}"))?;
+    let metadata = std::fs::metadata(format!("/proc/{pid}/exe"))?;
     Ok(ImageIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -468,18 +505,16 @@ fn process_image(pid: i32) -> Result<ImageIdentity, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn process_image(pid: i32) -> Result<ImageIdentity, String> {
-    let path = libproc::libproc::proc_pid::pidpath(pid)
-        .map_err(|error| format!("inspect process {pid} image: {error}"))?;
-    let path = std::fs::canonicalize(path)
-        .map_err(|error| format!("canonicalize process {pid} image: {error}"))?;
+fn process_image(pid: i32) -> Result<ImageIdentity, std::io::Error> {
+    let path = libproc::libproc::proc_pid::pidpath(pid).map_err(std::io::Error::other)?;
+    let path = std::fs::canonicalize(path).map_err(std::io::Error::other)?;
     Ok(ImageIdentity { path })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn current_image() -> Result<ImageIdentity, String> {
     let pid = i32::try_from(std::process::id()).map_err(|_| "current PID does not fit i32")?;
-    process_image(pid)
+    process_image(pid).map_err(|error| format!("inspect process {pid} image: {error}"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
