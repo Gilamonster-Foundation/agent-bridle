@@ -256,6 +256,20 @@ mod tests {
         let _k = SandboxKind::None;
     }
 
+    /// The facade forwards the EdDSA WebAuthn verifier feature to core.
+    #[cfg(feature = "verifier-webauthn")]
+    #[test]
+    fn webauthn_verifier_is_reexported() {
+        let _ = WebAuthnVerifier;
+    }
+
+    /// The facade forwards the ES256 WebAuthn verifier feature to core.
+    #[cfg(feature = "verifier-webauthn-es256")]
+    #[test]
+    fn webauthn_es256_verifier_is_reexported() {
+        let _ = WebAuthnEs256Verifier;
+    }
+
     /// The facade exposes parse-only Brush inspection so a host can preflight
     /// dynamic constructs before any shell tool is invoked.
     #[cfg(feature = "brush")]

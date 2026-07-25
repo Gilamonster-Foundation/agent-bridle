@@ -17,7 +17,7 @@ construction.
 - `Gate` + `ToolContext` — mint-token enforcement; no public constructor
 - `Sandbox` — honest `NoopSandbox` fallback plus opt-in native Landlock,
   Seatbelt, and AppContainer process boundaries
-- `step_up` — human-presence step-up (the `attest` outcome): `Gate::evaluate` / `authorize_with_discharge` / `authorize_step_up`, the `DischargeProvider` ceremony seam and `DischargeVerifier` proof check. The production `Ed25519Verifier` is behind the off-by-default `verifier-ed25519` feature (ADR 0007)
+- `step_up` — human-presence step-up (the `attest` outcome): `Gate::evaluate` / `authorize_with_discharge` / `authorize_step_up`, the `DischargeProvider` ceremony seam and `DischargeVerifier` proof check. The production `Ed25519Verifier` is behind the off-by-default `verifier-ed25519` feature; WebAuthn EdDSA and ES256 assertion verifiers are behind `verifier-webauthn` and `verifier-webauthn-es256` (ADR 0007)
 - Deliberately tiny dependency budget (`anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol`); no tokio by default — heavy runtimes live in leaf tool crates. Optional, off-by-default deps include `landlock` (`linux-landlock`) and `ed25519-dalek` (`verifier-ed25519`)
 
 ## Features
@@ -29,6 +29,8 @@ construction.
 | `windows-appcontainer` | off | companion `agent-bridle-aclaunch.exe` | AppContainer filesystem DACLs, deny-all or loopback-only network policy, and exec deny-all |
 | `os-sandbox` | off | target-specific backend deps | convenience feature for every native OS sandbox backend |
 | `verifier-ed25519` | off | `ed25519-dalek` | production `Ed25519Verifier` for step-up discharges |
+| `verifier-webauthn` | off | `ed25519-dalek`, `sha2` | production WebAuthn EdDSA/-8 assertion verifier |
+| `verifier-webauthn-es256` | off | `p256`, `sha2` | production WebAuthn ES256/-7 assertion verifier |
 
 Coverage is scope-shaped and is surfaced per axis. Landlock's loader-trampoline
 residual keeps `exec` at interceptor strength; Seatbelt confines restricted
