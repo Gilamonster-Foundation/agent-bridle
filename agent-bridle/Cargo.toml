@@ -20,6 +20,10 @@ shell = ["dep:agent-bridle-tool-shell"]
 # (e.g. newt's signed-approve verify-at-load) enable it without a direct
 # agent-bridle-core dependency. Off by default per ADR 0007.
 verifier-ed25519 = ["agent-bridle-core/verifier-ed25519"]
+# Forward the EdDSA WebAuthn assertion verifier for passkey consumers.
+verifier-webauthn = ["agent-bridle-core/verifier-webauthn"]
+# Forward the ES256/-7 WebAuthn assertion verifier used by most platform passkeys.
+verifier-webauthn-es256 = ["agent-bridle-core/verifier-webauthn-es256"]
 # The sandboxed-host engine (ADR 0019 / #194): exposes `HostShellTool` — full
 # shell semantics with the guarantee entirely on L3. Complementary to `shell`,
 # not a replacement (ADR 0019 D3), so the embedder selects it at registry

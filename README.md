@@ -182,10 +182,9 @@ The session's granted `Caveats` are sourced in this order (first hit wins):
    `Caveats` serde shape.
 2. **`~/.agent-bridle/config.toml`**, a `[caveats]` table (same field/enum shape
    in TOML).
-3. **Default `Caveats::top()`** — *unconfined*. The server prints a prominent
-   `WARNING: ... running UNCONFINED ...` to stderr in this case, because an
-   unconfined leash defeats the purpose of the bridle. Always set (1) or (2) in
-   production.
+3. **Default: DENY-ALL (fail-closed)** — no grant configured means no authority
+   on any axis. Set (1) or (2) to grant authority; an absent grant never becomes
+   `Caveats::top()`.
 
 The serde shape matches the Rust type exactly — each string axis is either
 `"all"` or `{ "only": [...] }`; `max_calls` is `"unlimited"` or
