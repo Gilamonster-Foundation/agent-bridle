@@ -116,18 +116,36 @@ pub fn peer_cred(fd: RawFd) -> io::Result<(u32, u32)> {
     Ok((cred.uid, cred.gid))
 }
 
+/// Fail-closed peer-credential gate for a **network** connection (#265,
+/// AB-002). A real client on the broker socket always carries an `SO_PEERCRED`
+/// identity, so a credential read *failure* must be rejected — never silently
+/// mapped to `None`, whose [`handle_request`] arm runs the child **without a
+/// privilege drop** (i.e. as the daemon's root euid). Returns the reject
+/// response to send back, or the authenticated `(uid, gid)` to drop to.
+fn network_peer_cred(cred: io::Result<(u32, u32)>) -> Result<(u32, u32), JailResponse> {
+    cred.map_err(|e| JailResponse::Rejected {
+        reason: format!(
+            "peer-credential read failed; refusing to run without an authenticated uid (AB-002): {e}"
+        ),
+    })
+}
+
 /// Handle one client connection: read a request, run policy, write the reply.
 pub fn handle_connection(stream: &mut UnixStream) {
-    let cred = peer_cred(stream.as_raw_fd()).ok();
-    let resp = match read_frame(stream) {
-        Ok(bytes) => match serde_json::from_slice::<JailRequest>(&bytes) {
-            Ok(req) => handle_request(&req, cred),
-            Err(e) => JailResponse::Rejected {
-                reason: format!("malformed request: {e}"),
+    // Establish the peer's authenticated uid FIRST and fail closed if it cannot
+    // be read — a network request never runs with the `None` (no-drop) arm.
+    let resp = match network_peer_cred(peer_cred(stream.as_raw_fd())) {
+        Err(rejected) => rejected,
+        Ok(cred) => match read_frame(stream) {
+            Ok(bytes) => match serde_json::from_slice::<JailRequest>(&bytes) {
+                Ok(req) => handle_request(&req, Some(cred)),
+                Err(e) => JailResponse::Rejected {
+                    reason: format!("malformed request: {e}"),
+                },
             },
-        },
-        Err(e) => JailResponse::Rejected {
-            reason: format!("read error: {e}"),
+            Err(e) => JailResponse::Rejected {
+                reason: format!("read error: {e}"),
+            },
         },
     };
     if let Ok(bytes) = serde_json::to_vec(&resp) {
@@ -176,6 +194,24 @@ mod tests {
             JailResponse::Rejected { reason } => assert!(reason.contains("unconfined"), "{reason}"),
             other => panic!("expected Rejected, got {other:?}"),
         }
+    }
+
+    /// Non-privileged (CI): #265 / AB-002 regression. A peer-credential read
+    /// FAILURE on a network connection must fail closed. Before the fix,
+    /// `handle_connection` did `peer_cred(fd).ok()`, mapping the error to `None`
+    /// — and the `None` arm of `handle_request` runs the jailed child WITHOUT a
+    /// privilege drop, i.e. as the daemon's root euid. It must reject instead.
+    #[test]
+    fn peer_cred_failure_fails_closed_never_runs_as_root() {
+        let err = std::io::Error::other("SO_PEERCRED read failed");
+        match network_peer_cred(Err(err)) {
+            Err(JailResponse::Rejected { reason }) => {
+                assert!(reason.contains("peer-credential"), "{reason}");
+            }
+            other => panic!("expected fail-closed rejection, got {other:?}"),
+        }
+        // A successfully-read credential passes through to the privilege-drop path.
+        assert_eq!(network_peer_cred(Ok((1000, 1000))).ok(), Some((1000, 1000)));
     }
 
     /// Non-privileged (CI): a program outside the `exec` scope is refused before
