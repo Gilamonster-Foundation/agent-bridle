@@ -440,6 +440,64 @@ pub struct LimitsPolicy {
     /// Egress audit sink path (subsumes `BRIDLE_NET_AUDIT`); `None` = off.
     #[serde(default)]
     pub audit_sink: Option<String>,
+    /// AB-004: environment variable names DROPPED before spawning a child,
+    /// regardless of the exec leash. Loader / interpreter / hook vars
+    /// (`LD_PRELOAD`, `PYTHONPATH`, `GIT_SSH_COMMAND`, `BASH_ENV`, …) change what
+    /// an *allowed* program actually executes, so they can never be caller-set.
+    /// Overridable config data (three-Cs).
+    #[serde(default = "default_env_denylist")]
+    pub env_denylist: Vec<String>,
+}
+
+/// The default loader/interpreter/hook environment denylist (AB-004). Each name
+/// here can hijack code execution inside an otherwise-allowed program.
+#[must_use]
+pub fn default_env_denylist() -> Vec<String> {
+    to_vec(&[
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+        "RUBYLIB",
+        "PERL5OPT",
+        "PERL5LIB",
+        "CLASSPATH",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "GIT_SSH_COMMAND",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PROMPT_COMMAND",
+    ])
+}
+
+/// Drop denied loader/hook keys from `env`, returning the surviving map plus the
+/// dropped names (for disclosure). See [`LimitsPolicy::env_denylist`] (AB-004).
+#[must_use]
+pub fn fence_env(
+    env: &std::collections::BTreeMap<String, String>,
+    denylist: &[String],
+) -> (std::collections::BTreeMap<String, String>, Vec<String>) {
+    let denied: std::collections::BTreeSet<&str> = denylist.iter().map(String::as_str).collect();
+    let mut fenced = std::collections::BTreeMap::new();
+    let mut dropped = Vec::new();
+    for (k, v) in env {
+        if denied.contains(k.as_str()) {
+            dropped.push(k.clone());
+        } else {
+            fenced.insert(k.clone(), v.clone());
+        }
+    }
+    (fenced, dropped)
 }
 
 impl Default for LimitsPolicy {
@@ -458,6 +516,7 @@ impl Default for LimitsPolicy {
             proxy_conn_timeout_secs: 30,
             proxy_bind: "127.0.0.1:0".to_string(),
             audit_sink: None,
+            env_denylist: default_env_denylist(),
         }
     }
 }
@@ -555,6 +614,23 @@ pub struct BridleConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AB-004: `fence_env` drops every denied loader/hook key and keeps the rest,
+    /// reporting what it dropped.
+    #[test]
+    fn fence_env_drops_denied_keeps_others() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("LD_PRELOAD".to_string(), "/evil.so".to_string());
+        env.insert("GIT_SSH_COMMAND".to_string(), "evil".to_string());
+        env.insert("SAFE".to_string(), "keep".to_string());
+        let (fenced, dropped) = fence_env(&env, &default_env_denylist());
+        assert!(!fenced.contains_key("LD_PRELOAD"));
+        assert!(!fenced.contains_key("GIT_SSH_COMMAND"));
+        assert_eq!(fenced.get("SAFE").map(String::as_str), Some("keep"));
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.contains(&"LD_PRELOAD".to_string()));
+        assert!(dropped.contains(&"GIT_SSH_COMMAND".to_string()));
+    }
 
     #[test]
     fn mode_defaults_to_bridled() {

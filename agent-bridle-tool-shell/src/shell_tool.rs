@@ -790,7 +790,12 @@ impl Tool for ShellTool {
         };
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
-        let env = parsed.env;
+        // AB-004: strip loader/interpreter/hook vars (LD_PRELOAD, PYTHONPATH,
+        // GIT_SSH_COMMAND, BASH_ENV, …) before they reach ANY engine — they
+        // hijack what an allowed program actually executes, regardless of the
+        // exec leash. Fenced once here so all three engines get a clean env.
+        let (env, _dropped_env) =
+            agent_bridle_core::fence_env(&parsed.env, &self.limits.env_denylist);
         let caveats = cx.caveats().clone();
         let run = tokio::task::spawn_blocking(move || {
             run_script(&*spawner, &script, cwd.as_deref(), &caveats, &env, &cfg)
@@ -1541,6 +1546,17 @@ fn run_pipeline(
         // a Seatbelt `wrap` prefix is present, `sandbox-exec` forwards its own
         // environment to the wrapped program, so setting it here still reaches the
         // confined child.
+        // AB-016: do not inherit the parent's ambient environment — start empty
+        // with a fixed, minimal baseline, then apply only the (already
+        // loader-fenced) caller env. Brings this engine to the env_clear posture
+        // the Brush (`do_not_inherit_env`) and Host (`ConfinedCommand`) engines
+        // already have. Unix-only; the Windows child-env contract is left intact.
+        #[cfg(unix)]
+        {
+            cmd.env_clear();
+            cmd.env("PATH", agent_bridle_core::default_exec_path());
+            cmd.env("LC_ALL", "C");
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }

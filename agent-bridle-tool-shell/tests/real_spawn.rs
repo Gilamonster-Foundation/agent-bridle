@@ -115,6 +115,68 @@ async fn real_timed_out_grandchild_is_killed() {
     let _ = std::fs::remove_file(&marker);
 }
 
+/// #268 / AB-004: loader / interpreter / hook env vars are DROPPED before the
+/// child, regardless of the exec leash — they hijack what an allowed program
+/// actually executes. A non-denied var still passes through.
+#[tokio::test]
+async fn real_loader_hook_env_vars_are_fenced_out() {
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({
+                "program": "env",
+                "env": {
+                    "LD_PRELOAD": "/evil.so",
+                    "PYTHONPATH": "/evil",
+                    "GIT_SSH_COMMAND": "evil",
+                    "BASH_ENV": "/evil",
+                    "NODE_OPTIONS": "--require /evil",
+                    "SAFE_VAR": "keep",
+                },
+            }),
+            &ctx(exec_only(&["env"])),
+        )
+        .await
+        .expect("invoke");
+    let stdout = out["stdout"].as_str().unwrap_or_default();
+    for denied in [
+        "LD_PRELOAD",
+        "PYTHONPATH",
+        "GIT_SSH_COMMAND",
+        "BASH_ENV",
+        "NODE_OPTIONS",
+    ] {
+        assert!(
+            !stdout.contains(denied),
+            "denied loader/hook var {denied} must never reach the child:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("SAFE_VAR=keep"),
+        "a non-denied caller var must still pass through:\n{stdout}"
+    );
+}
+
+/// #268 / AB-016: the child does NOT inherit the parent's ambient environment —
+/// it starts from a fixed minimal baseline plus only the (fenced) caller env.
+#[tokio::test]
+async fn real_ambient_env_is_not_inherited() {
+    // A parent-process (ambient) var not passed as a caller env entry.
+    std::env::set_var("AB016_AMBIENT_SECRET", "leak");
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "env"}),
+            &ctx(exec_only(&["env"])),
+        )
+        .await
+        .expect("invoke");
+    std::env::remove_var("AB016_AMBIENT_SECRET");
+    let stdout = out["stdout"].as_str().unwrap_or_default();
+    assert!(
+        !stdout.contains("AB016_AMBIENT_SECRET"),
+        "ambient parent env must not leak into the confined child:\n{stdout}"
+    );
+}
+
 /// #143 regression: the captured-output cap is config-driven (not a hard-coded
 /// const). A `ShellTool` built with a tiny `max_output_bytes` truncates a chatty
 /// command's stdout at the configured bound and flags it truncated.
