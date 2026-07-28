@@ -33,9 +33,11 @@
 //! - `max_calls`: either `"unlimited"` or `{"at_most": N}`;
 //! - `valid_for_generation`: either `"all"` or `{"only": [N, …]}` (`u64`s).
 //!
-//! Any omitted axis defaults to its **top** (unrestricted). This is exactly the
-//! shape `serde_json::to_value(&Caveats)` produces in Rust, so a grant a Rust
-//! host already holds round-trips straight through.
+//! Any omitted axis defaults to its **bottom** (deny-all) — **fail closed**: a
+//! partial dict grants only the axes it names. A full
+//! `serde_json::to_value(&Caveats)` names every axis, so a grant a Rust host
+//! already holds round-trips exactly; only a hand-written partial dict is
+//! narrowed.
 //!
 //! Interop note: the `agent_mesh.core.Caveats` *pyclass* (agent-mesh PR #18)
 //! exposes a friendlier surface — `fs_read=["/repo"]` / `max_calls=10` /
@@ -45,8 +47,10 @@
 //! omit-the-axis, `10` → `{"at_most": 10}`). Both describe the *same* lattice;
 //! only the JSON spelling differs.
 //!
-//! `caveats=None` runs **UNCONFINED** (`Caveats::top()`) and prints a stderr
-//! WARNING, because an unconfined leash defeats the purpose of the bridle.
+//! `caveats=None` is **deny-all** — nothing is authorized (a missing leash is
+//! not a full leash). To run with full ambient authority you must ask for it
+//! explicitly, e.g. `{"exec": "all", "fs_read": "all", "fs_write": "all",
+//! "net": "all", "max_calls": "unlimited", "valid_for_generation": "all"}`.
 
 #![forbid(unsafe_code)]
 
@@ -105,17 +109,12 @@ fn invoke<'py>(
     // 1. Args: a Python dict → serde_json::Value (an object).
     let args_json = py_dict_to_json(args)?;
 
-    // 2. Caveats: dict → Caveats, or top() (UNCONFINED, with a warning).
+    // 2. Caveats: dict → Caveats, or DENY-ALL when omitted. A missing leash is
+    //    not a full leash (#271 / AB-009): `caveats=None` authorizes nothing.
+    //    Full ambient authority must be asked for explicitly (every axis "all").
     let granted = match caveats {
         Some(c) => caveats_from_py(c)?,
-        None => {
-            eprintln!(
-                "WARNING: agent_bridle.invoke(\"{tool}\", …) was called with \
-                 caveats=None — running UNCONFINED (Caveats::top()), with FULL \
-                 ambient authority. Pass a caveats dict to confine it."
-            );
-            Caveats::top()
-        }
+        None => deny_all(),
     };
 
     // 3. Dispatch through the leash, bridging async → sync on the shared
@@ -210,6 +209,21 @@ fn tool_definitions(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 /// `Caveats` axis-by-axis so a *partial* dict is accepted (serde's derive would
 /// reject one missing a field). This keeps the wheel self-contained: no
 /// `agent_mesh` import needed, while the shape matches it exactly.
+/// The fail-closed default (#271 / AB-009): authorizes nothing on any axis.
+/// Mirrors the MCP frontend's `caveats_source::deny_all`, so both shipped
+/// facades default to deny-all instead of full ambient authority.
+fn deny_all() -> Caveats {
+    use agent_mesh_protocol::{CountBound, Scope};
+    Caveats {
+        fs_read: Scope::none(),
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::AtMost(0),
+        valid_for_generation: Scope::none(),
+    }
+}
+
 fn caveats_from_py(dict: &Bound<'_, PyDict>) -> PyResult<Caveats> {
     use agent_mesh_protocol::{CountBound, Scope};
 
@@ -235,20 +249,20 @@ fn caveats_from_py(dict: &Bound<'_, PyDict>) -> PyResult<Caveats> {
 
     let str_axis = |name: &str| -> PyResult<Scope<String>> {
         match map.get(name) {
-            None => Ok(Scope::top()),
+            None => Ok(Scope::none()),
             Some(v) => parse_str_scope(name, v),
         }
     };
 
     let gen_axis = |name: &str| -> PyResult<Scope<u64>> {
         match map.get(name) {
-            None => Ok(Scope::top()),
+            None => Ok(Scope::none()),
             Some(v) => parse_u64_scope(name, v),
         }
     };
 
     let max_calls = match map.get("max_calls") {
-        None => CountBound::top(),
+        None => CountBound::AtMost(0),
         Some(v) => parse_count_bound(v)?,
     };
 
