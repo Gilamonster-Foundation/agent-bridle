@@ -9,8 +9,9 @@
   enforcement layers*) by stating the *binding contract the layers exist to
   uphold*.
 - Companion prose (the "why", at length): the position paper *The Age of the
-  Confused Deputy* (`knowledge:board/papers/2026-06-18_age-of-the-confused-deputy.md`),
-  `agent-bridle/docs/DESIGN.md`, and
+  Confused Deputy* (`docs/papers/2026-06-18-age-of-the-confused-deputy.md` —
+  published in-repo; previously reachable only in the private knowledge
+  repository), `agent-bridle/docs/DESIGN.md`, and
   `newt-agent/docs/decisions/agentic_object_capability_security.md`.
 
 ## Question
@@ -155,4 +156,4 @@ forbids overclaiming.
     Google DeepMind, 2025.
 
 Full citations and the argument behind every invariant: *The Age of the Confused
-Deputy* (knowledge:board/papers/).
+Deputy* (`docs/papers/2026-06-18-age-of-the-confused-deputy.md`).
