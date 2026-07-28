@@ -121,8 +121,16 @@ fn invoke<'py>(
     //    runtime. `detach` releases the GIL for the (possibly blocking) tool
     //    work so other Python threads can run (pyo3 0.28 renamed the old
     //    `allow_threads` to `detach`).
-    let result =
-        py.detach(|| runtime().block_on(shared_registry().dispatch(tool, args_json, &granted)));
+    //
+    //    `invoke` is a stateless one-shot: each call mints its own ephemeral
+    //    [`Grant`] (agent-bridle#264 / AB-001), so `max_calls` bounds this single
+    //    dispatch — `AtMost(0)` denies, `AtMost(n≥1)` admits the one call. A
+    //    session-scoped budget across many invokes would need a persistent
+    //    handle object; this per-call grant is the correct semantics for a
+    //    stateless function.
+    let registry = shared_registry();
+    let grant = registry.mint_grant(granted);
+    let result = py.detach(|| runtime().block_on(registry.dispatch(tool, args_json, &grant)));
 
     match result {
         Ok(value) => {
