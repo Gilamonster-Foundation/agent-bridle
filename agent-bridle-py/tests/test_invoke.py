@@ -28,8 +28,22 @@ import pytest
 
 import agent_bridle
 
-# A grant that authorizes executing *only* ``echo`` — nothing else.
-ECHO_ONLY = {"exec": {"only": ["echo"]}}
+# A grant that authorizes executing *only* ``echo``. Since an omitted axis now
+# defaults to bottom/deny (#271 / AB-009), the read and call-budget axes echo
+# needs are named explicitly; fs_write and net stay omitted (denied).
+# exec is restricted to echo (the invariant these tests exercise); the other
+# axes are granted unrestricted so the host can actually run — a *restricted*
+# fs/net axis it cannot enforce at the required strength floor would (correctly)
+# refuse to run. Under the old omitted-defaults-to-top behavior these were
+# implicit; deny-all-by-default (#271 / AB-009) makes them explicit.
+ECHO_ONLY = {
+    "exec": {"only": ["echo"]},
+    "fs_read": "all",
+    "fs_write": "all",
+    "net": "all",
+    "max_calls": "unlimited",
+    "valid_for_generation": "all",
+}
 
 
 def test_consumer_contract_is_pinned() -> None:
@@ -177,11 +191,43 @@ def test_unknown_tool_raises_bridle_denied() -> None:
         agent_bridle.invoke("no_such_tool", {}, ECHO_ONLY)
 
 
-def test_caveats_none_runs_unconfined() -> None:
-    """``caveats=None`` runs with full ambient authority (``Caveats::top()``);
-    it must print a stderr UNCONFINED warning (checked via capsys) but still
-    run an otherwise-valid command."""
-    r = agent_bridle.invoke("shell", {"program": "echo", "args": ["unconfined"]})
+def test_caveats_none_is_deny_all() -> None:
+    """#271 / AB-009 regression: ``caveats=None`` authorizes NOTHING (deny-all).
+    A missing leash is not a full leash. Before the fix this ran with full
+    ambient authority (``Caveats::top()``); now an otherwise-valid command is
+    refused because no axis is granted."""
+    with pytest.raises(agent_bridle.BridleDenied):
+        agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]})
+
+
+def test_missing_axis_defaults_to_bottom() -> None:
+    """#271 / AB-009 regression: an OMITTED axis defaults to bottom (deny), not
+    top. ``exec`` grants echo but ``max_calls`` is omitted → ``AtMost(0)`` →
+    budget-denied. Before the fix the omitted axis defaulted to top and echo
+    ran."""
+    with pytest.raises(agent_bridle.BridleDenied):
+        agent_bridle.invoke(
+            "shell",
+            {"program": "echo", "args": ["hi"]},
+            {"exec": {"only": ["echo"]}},
+        )
+
+
+def test_explicit_all_axes_still_runs_unconfined() -> None:
+    """The deliberate escape hatch: full ambient authority is available, but it
+    must be ASKED for explicitly (every axis ``"all"``) rather than defaulted."""
+    r = agent_bridle.invoke(
+        "shell",
+        {"program": "echo", "args": ["unconfined"]},
+        {
+            "exec": "all",
+            "fs_read": "all",
+            "fs_write": "all",
+            "net": "all",
+            "max_calls": "unlimited",
+            "valid_for_generation": "all",
+        },
+    )
     assert r["exit_code"] == 0
     assert "unconfined" in r["stdout"]
 
