@@ -12,13 +12,16 @@
 //!
 //! # async fn demo() -> anyhow::Result<()> {
 //! let reg = registry();
-//! let granted = Caveats {
+//! // Mint one grant from the leash. The grant carries a persistent budget: its
+//! // `max_calls` bound is enforced *across* every dispatch it drives, not reset
+//! // per call (agent-bridle#264).
+//! let grant = reg.mint_grant(Caveats {
 //!     exec: Scope::only(["echo".to_string()]),
 //!     max_calls: CountBound::AtMost(2),
 //!     ..Caveats::top()
-//! };
+//! });
 //! let out = reg
-//!     .dispatch("shell", serde_json::json!({ "program": "echo", "args": ["hi"] }), &granted)
+//!     .dispatch("shell", serde_json::json!({ "program": "echo", "args": ["hi"] }), &grant)
 //!     .await?;
 //! assert_eq!(out["exit_code"], 0);
 //! # Ok(())

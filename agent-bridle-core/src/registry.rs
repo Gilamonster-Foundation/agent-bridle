@@ -7,15 +7,48 @@
 //! referenced by an explicit anchor symbol. We deliberately do **not** use
 //! `inventory` in P0.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::gate::DEFAULT_STRENGTH_FLOOR;
 use crate::{
-    AxisEnforcement, CallRequest, Caveats, DischargeProvider, DischargeVerifier, Gate,
-    StepUpPolicy, Tool, ToolError, ToolResult,
+    AxisEnforcement, CallRequest, Caveats, CountBound, DischargeProvider, DischargeVerifier, Gate,
+    StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
 };
+
+/// An unforgeable, opaque grant identity minted by a [`Registry`]. It keys the
+/// persistent per-grant call-budget ledger (AB-001, #264), so a grant's
+/// `max_calls` is enforced **across** dispatches — not reset every call. Its
+/// constructor is private, so a caller cannot forge one; and every mint yields a
+/// fresh id, so two grants with *equal caveats* get **independent** budgets (the
+/// ledger is keyed by identity, never by serialized caveats).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GrantId(u64);
+
+/// A minted grant: authority ([`Caveats`]) bound to an unforgeable [`GrantId`].
+/// Pass it to [`Registry::dispatch`] and **reuse it across calls** so the call
+/// budget persists — mint it once per session (`Registry::mint_grant`), not per
+/// call. Minting a fresh grant per call gives per-call budget semantics.
+#[derive(Clone, Debug)]
+pub struct Grant {
+    id: GrantId,
+    caveats: Caveats,
+}
+
+impl Grant {
+    /// The authority this grant carries.
+    #[must_use]
+    pub fn caveats(&self) -> &Caveats {
+        &self.caveats
+    }
+
+    /// The grant's opaque, unforgeable identity.
+    #[must_use]
+    pub fn id(&self) -> GrantId {
+        self.id
+    }
+}
 
 /// Optional step-up enforcement wired into [`Registry::dispatch`] (ADR 0018 R2 /
 /// ADR 0007). When present, dispatch runs the gate's step-up ceremony
@@ -51,6 +84,15 @@ pub struct Registry {
     /// generation, nonce)`, so a fresh nonce makes a captured discharge invalid on
     /// any later call. (A host wanting unpredictable nonces runs its own ceremony.)
     step_up_nonce: AtomicU64,
+    /// Monotonic grant-id counter. Core is rng-less (like `step_up_nonce`); the
+    /// private [`GrantId`] constructor is the unforgeability guarantee, and a
+    /// counter gives every mint a distinct id (⇒ independent budgets).
+    grant_counter: AtomicU64,
+    /// AB-001 (#264): the **persistent** per-grant call-budget ledger, keyed by
+    /// the grant's unforgeable id. `None` ⇒ unlimited; `Some(n)` ⇒ n calls
+    /// remaining. Seeded create-on-first-use from the grant's `max_calls`, and
+    /// charged under the lock so concurrent dispatches cannot overspend.
+    ledger: Mutex<HashMap<GrantId, Option<u64>>>,
 }
 
 impl Registry {
@@ -87,18 +129,31 @@ impl Registry {
         self.tools.contains_key(name)
     }
 
-    /// Dispatch `name` with `args`, enforced by the leash.
+    /// Mint a [`Grant`] from `caveats`. **Reuse the returned grant across calls**
+    /// so the `max_calls` budget persists — mint once per session, not per call
+    /// (AB-001, #264). Two grants minted from equal caveats have distinct ids and
+    /// therefore **independent** budgets.
+    #[must_use]
+    pub fn mint_grant(&self, caveats: Caveats) -> Grant {
+        Grant {
+            id: GrantId(self.grant_counter.fetch_add(1, Ordering::Relaxed)),
+            caveats,
+        }
+    }
+
+    /// Dispatch `name` with `args`, enforced by the leash, charging `grant`'s
+    /// persistent call budget.
     ///
-    /// A fresh gate (seeded with the grant's `max_calls` and the registry's
-    /// generation) authorizes the tool, minting the [`crate::ToolContext`] the
-    /// tool needs. If authorization is denied, the tool never runs.
+    /// The `grant` is authorized (minting the [`crate::ToolContext`] the tool
+    /// needs); if authorization is denied, the tool never runs and nothing is
+    /// charged. Reuse the same grant across calls for a cross-dispatch budget.
     pub async fn dispatch(
         &self,
         name: &str,
         args: serde_json::Value,
-        granted: &Caveats,
+        grant: &Grant,
     ) -> ToolResult<serde_json::Value> {
-        self.dispatch_with_strength_floor(name, args, granted, DEFAULT_STRENGTH_FLOOR)
+        self.dispatch_with_strength_floor(name, args, grant, DEFAULT_STRENGTH_FLOOR)
             .await
     }
 
@@ -110,28 +165,62 @@ impl Registry {
     /// subprocess boundary then refuses to launch if any restricted axis would
     /// fall below that floor. This closes the gap between a host's prospective
     /// enforcement check and the backend actually governing execution.
-    ///
-    /// The ordinary [`Self::dispatch`] remains backwards-compatible and uses
-    /// the default [`AxisEnforcement::Advisory`] floor.
     pub async fn dispatch_with_strength_floor(
         &self,
         name: &str,
         args: serde_json::Value,
-        granted: &Caveats,
+        grant: &Grant,
         strength_floor: AxisEnforcement,
     ) -> ToolResult<serde_json::Value> {
         let tool = self
             .tools
             .get(name)
-            .ok_or_else(|| ToolError::not_found(name))?;
+            .ok_or_else(|| ToolError::not_found(name))?
+            .clone();
 
-        let gate = self.gate_for(granted, strength_floor);
-        let cx = match &self.step_up {
-            // Step-up wired in (ADR 0018 R2): run the host-orchestrated ceremony
-            // through the gate — a policy-demanded gesture is obtained + verified
-            // before minting; a refusal is a fail-closed denial (nothing minted or
-            // charged). The gate stays the single mint site. This holds on the
-            // default path and while unbridled (the human gate is orthogonal).
+        // AB-001 (#264): charge the PERSISTENT per-grant budget first. Under the
+        // ledger lock, so concurrent dispatches on one grant cannot overspend.
+        self.charge_grant(grant)?;
+
+        // Authorize (generation / step-up / strength-floor). A pre-invoke error
+        // means the tool never ran, so refund the charge unconditionally.
+        let cx = match self.authorize_grant(tool.as_ref(), grant.caveats(), name, strength_floor) {
+            Ok(cx) => cx,
+            Err(e) => {
+                self.refund_grant(grant);
+                return Err(e);
+            }
+        };
+
+        // Budget is spent only on an *admitted* call. A policy denial — whether
+        // at the gate above or inside the tool when it refuses a specific
+        // argument on authority grounds (`ToolError::Denied`) — performed no
+        // effect, so it costs nothing. A tool that ran and *failed*
+        // (`ToolError::Failed`) or timed out stays charged.
+        let result = tool.invoke(args, &cx).await;
+        if matches!(result, Err(ToolError::Denied { .. })) {
+            self.refund_grant(grant);
+        }
+        result
+    }
+
+    /// Authorize `granted` for `tool` through a fresh gate — plain or via the
+    /// step-up ceremony. The gate carries NO call budget: the persistent budget
+    /// lives in the registry ledger ([`Self::charge_grant`]), so it is enforced
+    /// across dispatches rather than reset on each per-dispatch gate.
+    fn authorize_grant(
+        &self,
+        tool: &dyn Tool,
+        granted: &Caveats,
+        name: &str,
+        strength_floor: AxisEnforcement,
+    ) -> ToolResult<ToolContext> {
+        let gate = Gate::with_budget(self.generation, CountBound::Unlimited)
+            .with_strength_floor(strength_floor);
+        match &self.step_up {
+            // Step-up wired in (ADR 0018 R2): a policy-demanded gesture is
+            // obtained + verified before minting; a refusal is a fail-closed
+            // denial. The gate stays the single mint site.
             Some(su) => {
                 let request = CallRequest::unspecified(name);
                 // Fresh single-use nonce per ceremony (monotonic counter → the
@@ -140,7 +229,7 @@ impl Registry {
                 let n = self.step_up_nonce.fetch_add(1, Ordering::Relaxed);
                 nonce[..8].copy_from_slice(&n.to_le_bytes());
                 let (cx, _attestation) = gate.authorize_step_up(
-                    tool.as_ref(),
+                    tool,
                     granted,
                     &request,
                     &su.policy,
@@ -148,19 +237,42 @@ impl Registry {
                     su.verifier.as_ref(),
                     nonce,
                 )?;
-                cx
+                Ok(cx)
             }
-            None => gate.authorize(tool.as_ref(), granted)?,
-        };
-        tool.invoke(args, &cx).await
+            None => gate.authorize(tool, granted),
+        }
     }
 
-    /// Construct the per-dispatch gate. Factored out so the budget seeding and
-    /// generation stay in one place. The gate's budget is seeded from the
-    /// grant's `max_calls` so a single dispatch's per-call charge interacts
-    /// correctly with `AtMost(n)`.
-    fn gate_for(&self, granted: &Caveats, strength_floor: AxisEnforcement) -> Gate {
-        Gate::with_budget(self.generation, granted.max_calls).with_strength_floor(strength_floor)
+    /// Charge one call against `grant`'s persistent budget, seeding it
+    /// create-on-first-use from the grant's `max_calls`. `Unlimited` never
+    /// exhausts; `AtMost(0)` (or a spent budget) is a fail-closed
+    /// [`ToolError::Budget`]. Held under the ledger lock so concurrent charges
+    /// cannot overspend.
+    fn charge_grant(&self, grant: &Grant) -> ToolResult<()> {
+        let mut ledger = self.ledger.lock().expect("grant ledger mutex poisoned");
+        let remaining = ledger
+            .entry(grant.id)
+            .or_insert_with(|| match grant.caveats.max_calls {
+                CountBound::AtMost(n) => Some(n),
+                CountBound::Unlimited => None,
+            });
+        match remaining {
+            None => Ok(()),
+            Some(0) => Err(ToolError::Budget),
+            Some(n) => {
+                *n -= 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Return a charge that did not result in an admitted call (a denied
+    /// authorize) to `grant`'s budget.
+    fn refund_grant(&self, grant: &Grant) {
+        let mut ledger = self.ledger.lock().expect("grant ledger mutex poisoned");
+        if let Some(Some(n)) = ledger.get_mut(&grant.id) {
+            *n += 1;
+        }
     }
 }
 
@@ -216,6 +328,8 @@ impl RegistryBuilder {
             generation: self.generation,
             step_up: self.step_up,
             step_up_nonce: AtomicU64::new(0),
+            grant_counter: AtomicU64::new(0),
+            ledger: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -297,7 +411,8 @@ mod tests {
     #[test]
     fn dispatch_unknown_tool_is_not_found() {
         let r = reg();
-        let err = block_on(r.dispatch("nope", serde_json::json!({}), &Caveats::top())).unwrap_err();
+        let grant = r.mint_grant(Caveats::top());
+        let err = block_on(r.dispatch("nope", serde_json::json!({}), &grant)).unwrap_err();
         assert!(matches!(err, ToolError::NotFound { .. }));
     }
 
@@ -308,13 +423,13 @@ mod tests {
             exec: Scope::only(["echo".to_string()]),
             ..Caveats::top()
         };
-        let ok = block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &granted))
+        let grant = r.mint_grant(granted);
+        let ok = block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &grant))
             .unwrap();
         assert_eq!(ok["ran"], "echo");
 
-        let denied =
-            block_on(r.dispatch("probe", serde_json::json!({ "program": "rm" }), &granted))
-                .unwrap_err();
+        let denied = block_on(r.dispatch("probe", serde_json::json!({ "program": "rm" }), &grant))
+            .unwrap_err();
         assert!(matches!(denied, ToolError::Denied { .. }));
     }
 
@@ -328,10 +443,11 @@ mod tests {
             net: Scope::only(["example.invalid".to_string()]),
             ..Caveats::top()
         };
+        let grant = registry.mint_grant(granted);
         let error = block_on(registry.dispatch_with_strength_floor(
             "spawn_probe",
             serde_json::json!({}),
-            &granted,
+            &grant,
             AxisEnforcement::Kernel,
         ))
         .unwrap_err();
@@ -344,24 +460,121 @@ mod tests {
         );
     }
 
+    /// AB-001 regression: a `max_calls` bound is enforced *across* dispatches on
+    /// one grant. Before the GrantId ledger, each `dispatch` seeded a fresh gate
+    /// from the grant, so `AtMost(2)` was silently unbounded — the third call
+    /// went through. The registry-owned ledger, keyed by the unforgeable
+    /// `GrantId`, now decrements a single balance per grant.
     #[test]
-    fn dispatch_budget_two_then_denied() {
-        let granted = Caveats {
+    fn dispatch_budget_persists_across_dispatches() {
+        let r = reg();
+        let grant = r.mint_grant(Caveats {
             max_calls: CountBound::AtMost(2),
             ..Caveats::top()
+        });
+        let call =
+            || block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &grant));
+        assert!(call().is_ok(), "first call within budget");
+        assert!(call().is_ok(), "second call exhausts budget");
+        assert!(
+            matches!(call().unwrap_err(), ToolError::Budget),
+            "third call must be denied: the AtMost(2) bound is spent"
+        );
+    }
+
+    /// Two grants minted from *equal* caveats hold *independent* budgets: the
+    /// ledger is keyed by grant identity, not by caveat value. Exhausting one
+    /// grant must not touch the other.
+    #[test]
+    fn two_grants_equal_caveats_have_independent_budgets() {
+        let r = reg();
+        let caveats = Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
         };
-        // Each `dispatch` builds a fresh gate seeded from the grant's bound, so
-        // a single dispatch's per-call charge interacts with AtMost(n). To prove
-        // budget exhaustion *across* calls the persistent budget must live on
-        // one shared gate — so we drive the gate directly here:
-        let gate = Gate::with_budget(0, CountBound::AtMost(2));
-        let tool = ProbeTool;
-        assert!(gate.authorize(&tool, &granted).is_ok());
-        assert!(gate.authorize(&tool, &granted).is_ok());
-        assert!(matches!(
-            gate.authorize(&tool, &granted).unwrap_err(),
-            ToolError::Budget
-        ));
+        let a = r.mint_grant(caveats.clone());
+        let b = r.mint_grant(caveats);
+        let echo =
+            |g: &Grant| block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), g));
+        assert!(echo(&a).is_ok(), "grant A's single call");
+        assert!(
+            matches!(echo(&a).unwrap_err(), ToolError::Budget),
+            "grant A now spent"
+        );
+        // Grant B is untouched by A's exhaustion.
+        assert!(echo(&b).is_ok(), "grant B keeps its own independent budget");
+    }
+
+    /// A dispatch denied at authorization (out-of-scope program) must not spend
+    /// budget: the charge is refunded before the error returns. A later valid
+    /// call still succeeds within the original bound.
+    #[test]
+    fn denied_dispatch_does_not_charge_budget() {
+        let r = reg();
+        let grant = r.mint_grant(Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        let denied = block_on(r.dispatch("probe", serde_json::json!({ "program": "rm" }), &grant))
+            .unwrap_err();
+        assert!(
+            matches!(denied, ToolError::Denied { .. }),
+            "out-of-scope program denied"
+        );
+        // The single-call budget was refunded, so the in-scope call still runs.
+        assert!(
+            block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &grant)).is_ok(),
+            "denied admission must not have consumed the AtMost(1) budget"
+        );
+    }
+
+    /// AB-001 concurrency invariant: many threads racing `dispatch` on ONE grant
+    /// never overspend its `max_calls`. The ledger charge is a check-and-decrement
+    /// held under a single mutex, so *exactly* the budget is admitted — no more
+    /// (overspend), no fewer (a lost decrement) — and the losers fail closed with
+    /// `Budget`. This is the property the per-dispatch gate could not provide.
+    #[test]
+    fn concurrent_dispatches_on_one_grant_never_overspend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const THREADS: usize = 64;
+        const BUDGET: u64 = 20;
+        let r = reg();
+        let grant = r.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(BUDGET),
+            ..Caveats::top()
+        });
+        let admitted = AtomicUsize::new(0);
+        let denied = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    match block_on(r.dispatch(
+                        "probe",
+                        serde_json::json!({ "program": "echo" }),
+                        &grant,
+                    )) {
+                        Ok(_) => {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(ToolError::Budget) => {
+                            denied.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => panic!("unexpected error under concurrency: {e:?}"),
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            admitted.load(Ordering::Relaxed),
+            BUDGET as usize,
+            "exactly the budget is admitted — no overspend, no lost decrement"
+        );
+        assert_eq!(
+            denied.load(Ordering::Relaxed),
+            THREADS - BUDGET as usize,
+            "every over-budget racer fails closed with Budget"
+        );
     }
 
     /// A provider whose ceremony always fails (no authenticator / human declined)
@@ -413,7 +626,8 @@ mod tests {
             ..Caveats::top()
         };
         // The policy demands a passkey for `probe`; the provider refuses → denied.
-        let err = block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &granted))
+        let grant = r.mint_grant(granted);
+        let err = block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &grant))
             .unwrap_err();
         assert!(
             matches!(err, ToolError::Denied { .. }),
@@ -440,12 +654,9 @@ mod tests {
             .step_up(policy, Arc::new(FailingProvider), Arc::new(StubVerifier))
             .build();
         // top() authority does NOT bypass the demanded gesture.
-        let err = block_on(r.dispatch(
-            "probe",
-            serde_json::json!({ "program": "echo" }),
-            &Caveats::top(),
-        ))
-        .unwrap_err();
+        let grant = r.mint_grant(Caveats::top());
+        let err = block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), &grant))
+            .unwrap_err();
         assert!(
             matches!(err, ToolError::Denied { .. }),
             "maximal (top) authority must still owe the step-up gesture: {err:?}"

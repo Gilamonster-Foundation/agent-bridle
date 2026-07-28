@@ -14,7 +14,7 @@
 //! `shutdown`/`exit` lifecycle. `notifications/*` (no `id`) are accepted and
 //! acknowledged silently per JSON-RPC notification semantics.
 
-use agent_bridle::{Caveats, Registry};
+use agent_bridle::{Caveats, Grant, Registry};
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -39,19 +39,26 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 /// jail `MAX_FRAME` knob (agent-bridle#147) so it is data, not a constant.
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
-/// A leashed MCP server: a tool [`Registry`] plus the granted [`Caveats`] every
+/// A leashed MCP server: a tool [`Registry`] plus the session [`Grant`] every
 /// dispatch is confined to.
 pub struct McpServer {
     registry: Registry,
-    granted: Caveats,
+    grant: Grant,
 }
 
 impl McpServer {
     /// Build a server over `registry`, confining every `tools/call` to
     /// `granted`.
+    ///
+    /// The `granted` leash is minted into **one** session [`Grant`] here, so a
+    /// `max_calls` bound governs the whole session's ledger — every `tools/call`
+    /// draws on the same persistent budget (agent-bridle#264 / AB-001). Before
+    /// the grant ledger, each dispatch reset the bound, so `AtMost(n)` was
+    /// silently unbounded across a session.
     #[must_use]
     pub fn new(registry: Registry, granted: Caveats) -> Self {
-        Self { registry, granted }
+        let grant = registry.mint_grant(granted);
+        Self { registry, grant }
     }
 
     /// Run over real stdin/stdout (the production entry point).
@@ -154,7 +161,7 @@ impl McpServer {
         match method {
             "initialize" => Ok(handlers::initialize()),
             "tools/list" => Ok(handlers::tools_list(&self.registry)),
-            "tools/call" => Ok(handlers::tools_call(&self.registry, &self.granted, params).await),
+            "tools/call" => Ok(handlers::tools_call(&self.registry, &self.grant, params).await),
             // Lifecycle: a clean shutdown ack. `exit` is handled in the loop.
             "shutdown" => Ok(Value::Null),
             // Client notifications we accept and ignore (no `id` → no response).

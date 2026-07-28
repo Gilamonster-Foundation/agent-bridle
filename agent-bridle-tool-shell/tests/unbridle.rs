@@ -182,13 +182,14 @@ async fn unbridled_still_owes_step_up_supervised_free() {
         exec: Scope::only(["echo".to_string()]),
         ..Caveats::top()
     };
+    let grant = registry.mint_grant(granted);
     // Unbridled + step-up: the passkey is demanded, the provider refuses ⇒ the
     // shell never runs. Unbridle did not launder the human gate.
     let err = registry
         .dispatch(
             "shell",
             serde_json::json!({"program": "echo", "args": ["hi"]}),
-            &granted,
+            &grant,
         )
         .await
         .unwrap_err();
