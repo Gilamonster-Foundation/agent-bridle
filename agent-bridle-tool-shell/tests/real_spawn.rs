@@ -67,6 +67,54 @@ async fn real_echo_runs_and_captures_stdout() {
     assert!(out.get("denied").is_none());
 }
 
+/// #269 / AB-006: a timed-out child is KILLED and reaped — it must not run to
+/// completion. `sh -c 'sleep 3; touch MARKER'` with a 1s timeout: the envelope
+/// reports a confirmed timeout, and after the child's would-be sleep elapses the
+/// marker never appears (the sleep was SIGKILLed, not merely un-awaited). Before
+/// the fix the detached blocking worker let the child run on and write it.
+#[tokio::test]
+async fn real_timed_out_child_is_killed_and_never_writes_marker() {
+    let marker = unique_temp("ab006-child");
+    let script = format!("sleep 3; touch {}", shell_path(&marker));
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
+            &ctx(exec_only(&["sh"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["timed_out"], true, "must report a confirmed timeout");
+    // Wait well past the child's 3s sleep; a killed child never reaches `touch`.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert!(
+        !marker.exists(),
+        "the timed-out child must be killed, not run to completion (its marker was written)"
+    );
+    let _ = std::fs::remove_file(&marker);
+}
+
+/// #269 / AB-006: the kill reaches a GRANDCHILD, not just the direct child —
+/// process-group SIGKILL takes the whole tree. `sh -c 'sh -c "sleep 3; touch M"'`.
+#[tokio::test]
+async fn real_timed_out_grandchild_is_killed() {
+    let marker = unique_temp("ab006-grandchild");
+    let script = format!("sh -c 'sleep 3; touch {}'", shell_path(&marker));
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
+            &ctx(exec_only(&["sh"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(out["timed_out"], true);
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert!(
+        !marker.exists(),
+        "the timed-out grandchild must be killed via the process group"
+    );
+    let _ = std::fs::remove_file(&marker);
+}
+
 /// #143 regression: the captured-output cap is config-driven (not a hard-coded
 /// const). A `ShellTool` built with a tiny `max_output_bytes` truncates a chatty
 /// command's stdout at the configured bound and flags it truncated.

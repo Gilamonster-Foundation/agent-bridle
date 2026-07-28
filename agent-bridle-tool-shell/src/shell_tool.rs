@@ -29,6 +29,8 @@ use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter, Read};
 #[cfg(windows)]
 use std::io::{Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, LazyLock};
@@ -70,6 +72,10 @@ pub(crate) struct Captured {
     /// after the child has run, so it rides back on the capture and is attached
     /// to the result envelope by the caller. Empty on the common path.
     pub net_denials: Vec<Denial>,
+    /// AB-006 (#269): the run exceeded its timeout and its process group was
+    /// killed + reaped, so nothing outlives the deadline. `true` is a *confirmed*
+    /// termination — not merely "we stopped waiting."
+    pub timed_out: bool,
 }
 
 /// The pipeline-execution seam.
@@ -97,6 +103,10 @@ pub(crate) struct SpawnCfg {
     pub unbridled: bool,
     /// Bounded presentation observer for this invocation (authority-neutral).
     pub output: OutputEmitter,
+    /// Wall-clock ceiling for the run. `run_pipeline` enforces it directly —
+    /// killing + reaping the stage process groups on the deadline (AB-006) —
+    /// so a timed-out child never outlives the call.
+    pub timeout: Duration,
 }
 
 pub(crate) trait Spawner: Send + Sync {
@@ -135,7 +145,15 @@ impl Spawner for OsSpawner {
         // run natively, no OS sandbox and no egress proxy. The L2 grant checks in
         // `invoke` already gated this run (advisory); confinement is off by consent.
         if cfg.unbridled {
-            return run_pipeline(stages, cwd, &[], env, cfg.max_output, cfg.output.clone());
+            return run_pipeline(
+                stages,
+                cwd,
+                &[],
+                env,
+                cfg.max_output,
+                cfg.output.clone(),
+                cfg.timeout,
+            );
         }
         // A general remote-host `net` allow-list that cannot be named in SBPL is
         // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
@@ -148,7 +166,15 @@ impl Spawner for OsSpawner {
         // thread- or wrapper-based launch path (ADR 0005 L3 / ADR 0006 D4).
         // Otherwise run directly — no need to spend a thread.
         if intended_sandbox_kind(caveats, &cfg.sandbox) == SandboxKind::None {
-            run_pipeline(stages, cwd, &[], env, cfg.max_output, cfg.output.clone())
+            run_pipeline(
+                stages,
+                cwd,
+                &[],
+                env,
+                cfg.max_output,
+                cfg.output.clone(),
+                cfg.timeout,
+            )
         } else {
             run_confined(stages, cwd, caveats, env, cfg)
         }
@@ -208,11 +234,20 @@ fn run_with_egress_proxy(
     let max_output = cfg.max_output;
     let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
+    let timeout = cfg.timeout;
     let captured = std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox(&sandbox).apply(&fenced)?;
-            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output, output)
+            run_pipeline(
+                &stages,
+                cwd.as_deref(),
+                &prefix,
+                &env,
+                max_output,
+                output,
+                timeout,
+            )
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -291,11 +326,20 @@ fn run_confined(
     let max_output = cfg.max_output;
     let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
+    let timeout = cfg.timeout;
     std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
             best_available_sandbox(&sandbox).apply(&caveats)?;
-            run_pipeline(&stages, cwd.as_deref(), &prefix, &env, max_output, output)
+            run_pipeline(
+                &stages,
+                cwd.as_deref(),
+                &prefix,
+                &env,
+                max_output,
+                output,
+                timeout,
+            )
         })
         .map_err(ToolError::Exec)?
         .join()
@@ -736,6 +780,7 @@ impl Tool for ShellTool {
             sandbox: Arc::clone(&self.sandbox),
             unbridled,
             output,
+            timeout,
         };
         // Disclosed on every envelope this run returns (ADR 0018 D5/D11 / I11).
         let disclosure = Disclosure {
@@ -750,6 +795,13 @@ impl Tool for ShellTool {
         let run = tokio::task::spawn_blocking(move || {
             run_script(&*spawner, &script, cwd.as_deref(), &caveats, &env, &cfg)
         });
+        // This outer timeout bounds when `invoke` RETURNS. The kill+reap of a
+        // timed-out child is done by `run_pipeline` itself, which enforces the
+        // same deadline internally (AB-006, #269): even if this timeout fires and
+        // detaches the blocking worker, that worker keeps running `run_pipeline`,
+        // which reaches its own deadline and SIGKILLs + reaps the stage process
+        // groups — so nothing runs to completion past the deadline. (Before the
+        // fix `run_pipeline` blocked in `wait()` and the detached child ran on.)
         match tokio::time::timeout(timeout, run).await {
             Ok(joined) => {
                 let captured = joined
@@ -765,7 +817,7 @@ impl Tool for ShellTool {
                     .with_stdout(captured.stdout)
                     .with_stderr(captured.stderr)
                     .with_denials(captured.net_denials)
-                    .with_timed_out(false)
+                    .with_timed_out(captured.timed_out)
                     .into_json();
                 output_guard.finish();
                 Ok(envelope)
@@ -803,6 +855,7 @@ fn run_script(
     let mut stderr_truncated = false;
     // #196: net denials accumulate across every pipeline stage that runs.
     let mut net_denials: Vec<Denial> = Vec::new();
+    let mut timed_out = false;
 
     for item in script {
         let run_it = match item.sep {
@@ -818,6 +871,12 @@ fn run_script(
             stderr_truncated |= captured.stderr_truncated;
             net_denials.extend(captured.net_denials);
             status = captured.exit_code;
+            // A pipeline that hit its deadline was killed + reaped; stop the
+            // script there rather than starting further work past the deadline.
+            if captured.timed_out {
+                timed_out = true;
+                break;
+            }
         }
     }
 
@@ -832,6 +891,7 @@ fn run_script(
         net_denials,
         stdout_truncated,
         stderr_truncated,
+        timed_out,
     })
 }
 
@@ -1415,6 +1475,21 @@ fn expand_stage_argv(stage: &Command, _cwd: Option<&str>) -> Vec<String> {
 /// `wrap` is the OS-sandbox command prefix (macOS Seatbelt's `sandbox-exec -p
 /// <profile>`), prepended to **every** stage so each spawned program is confined;
 /// it is empty for thread-confining (Landlock) and unconfined runs.
+/// Kill a pipeline stage and everything it spawned. Each stage is its own
+/// process-group leader (`process_group(0)` at spawn), so SIGKILL to the group
+/// takes the stage plus any descendants — the child cannot outlive the deadline
+/// by forking. Mirrors `brush_shell::kill_worker_tree`.
+fn kill_pipeline_stage(child: &mut Child) {
+    // The stage was spawned with `process_group(0)`, so it leads a group; killing
+    // the GROUP takes the stage plus every descendant it forked — not just the
+    // direct child. Safe wrapper (the crate is `#![forbid(unsafe_code)]`).
+    #[cfg(unix)]
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+}
+
 fn run_pipeline(
     stages: &[Command],
     cwd: Option<&str>,
@@ -1422,6 +1497,7 @@ fn run_pipeline(
     env: &BTreeMap<String, String>,
     max_output: usize,
     output: OutputEmitter,
+    timeout: Duration,
 ) -> ToolResult<Captured> {
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
@@ -1450,6 +1526,10 @@ fn run_pipeline(
         };
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
+        // Each stage leads its own process group so a timeout can SIGKILL the
+        // whole group — stage plus any descendants (AB-006, #269).
+        #[cfg(unix)]
+        cmd.process_group(0);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -1548,13 +1628,46 @@ fn run_pipeline(
         })
     });
 
-    // Wait all stages; the pipeline's exit code is the last stage's.
+    // Supervise every stage to the deadline (AB-006, #269). Poll with `try_wait`
+    // (the reader threads keep the pipes draining, so no stage blocks on a full
+    // buffer); on the deadline, SIGKILL each stage's process group and reap, so
+    // nothing — child or descendant — outlives the timeout. The pipeline's exit
+    // code is the last stage's.
+    let deadline = std::time::Instant::now() + timeout;
     let mut exit_code = -1;
-    for (i, child) in children.iter_mut().enumerate() {
-        let status = child.wait().map_err(ToolError::Exec)?;
-        if i == last {
-            exit_code = status.code().unwrap_or(-1);
+    let mut timed_out = false;
+    let mut done = vec![false; children.len()];
+    loop {
+        let mut all_done = true;
+        for (i, child) in children.iter_mut().enumerate() {
+            if done[i] {
+                continue;
+            }
+            match child.try_wait().map_err(ToolError::Exec)? {
+                Some(status) => {
+                    done[i] = true;
+                    if i == last {
+                        exit_code = status.code().unwrap_or(-1);
+                    }
+                }
+                None => all_done = false,
+            }
         }
+        if all_done {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            for child in children.iter_mut() {
+                kill_pipeline_stage(child);
+            }
+            // Reap every stage so no zombie/child survives the call.
+            for child in children.iter_mut() {
+                let _ = child.wait();
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
     }
 
     let (stdout, stdout_truncated) =
@@ -1579,6 +1692,7 @@ fn run_pipeline(
         // #196: net denials are attached by run_with_egress_proxy (which owns the
         // proxy handle), not here — a bare pipeline run observes no proxy refusals.
         net_denials: Vec::new(),
+        timed_out,
     })
 }
 
