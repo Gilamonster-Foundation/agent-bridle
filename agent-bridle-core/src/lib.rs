@@ -53,9 +53,9 @@ mod tool;
 mod unbridle;
 
 pub use config::{
-    default_exec_path, BackendToggles, BridleConfig, BridleMode, GatePolicy, HostMatch,
-    LimitsPolicy, NetDefault, NetPolicy, NetRule, NormalizationPolicy, PathList, RootfsPolicy,
-    SandboxPolicy, VmPolicy, WebPolicy,
+    default_env_denylist, default_exec_path, fence_env, BackendToggles, BridleConfig, BridleMode,
+    GatePolicy, HostMatch, LimitsPolicy, NetDefault, NetPolicy, NetRule, NormalizationPolicy,
+    PathList, RootfsPolicy, SandboxPolicy, VmPolicy, WebPolicy,
 };
 pub use context::ToolContext;
 pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
