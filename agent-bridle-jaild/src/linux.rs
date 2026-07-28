@@ -302,17 +302,82 @@ fn read_pt_interp(path: &Path) -> io::Result<Option<PathBuf>> {
 }
 
 /// A unique, freshly created jail-root directory under the temp dir.
+/// 128 bits from the kernel CSPRNG, hex-encoded. jaild is Linux-only and runs as
+/// root, so `/dev/urandom` is always available — no extra dependency.
+fn random_hex() -> io::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Create `path` as a fresh `0700` directory, **exclusively**: `mkdir(2)` fails
+/// with `EEXIST` if the final component already exists — as a directory OR a
+/// symlink — so a precreated/planted object can never be adopted or followed
+/// (AB-008). Distinct from `create_dir_all`, which is idempotent and follows a
+/// final-component symlink.
+fn create_exclusive_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// The root-owned private base holding every jail root. NOT under a
+/// world-writable `/tmp` (the AB-008 symlink/precreation race): a fixed
+/// `/run/agent-bridle-jaild`, created `0700` and **verified** on every use —
+/// it must be a real directory (not a symlink), owned by root, mode exactly
+/// `0700`. Anything else fails closed.
+fn jail_base() -> io::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let base = PathBuf::from("/run/agent-bridle-jaild");
+    match create_exclusive_dir(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // lstat (does NOT follow a symlink) — the base itself must be trustworthy.
+    let md = std::fs::symlink_metadata(&base)?;
+    if md.file_type().is_symlink() || !md.is_dir() {
+        return Err(io::Error::other(format!(
+            "jail base {} is not a real directory (symlink/precreation race?)",
+            base.display()
+        )));
+    }
+    if md.uid() != 0 {
+        return Err(io::Error::other(format!(
+            "jail base {} is not root-owned (uid {})",
+            base.display(),
+            md.uid()
+        )));
+    }
+    if md.permissions().mode() & 0o777 != 0o700 {
+        return Err(io::Error::other(format!(
+            "jail base {} is not mode 0700",
+            base.display()
+        )));
+    }
+    Ok(base)
+}
+
+/// A fresh, crypto-randomly-named `0700` jail root under `base`, created
+/// exclusively so nothing precreated is adopted. Retries on the (astronomically
+/// unlikely) name collision. Factored from [`unique_jail_root`] so the
+/// unpredictability + no-adoption properties are testable without root.
+fn create_jail_root_in(base: &Path) -> io::Result<PathBuf> {
+    for _ in 0..8 {
+        let candidate = base.join(format!("jail-{}", random_hex()?));
+        match create_exclusive_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other(
+        "could not create a unique jail root after 8 attempts",
+    ))
+}
+
 fn unique_jail_root() -> io::Result<PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let mut d = std::env::temp_dir();
-    d.push(format!(
-        "agent-bridle-jail-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&d)?;
-    Ok(d)
+    create_jail_root_in(&jail_base()?)
 }
 
 #[cfg(test)]
@@ -333,6 +398,50 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// #267 / AB-008 (non-privileged, CI): the jail root is crypto-random and
+    /// created EXCLUSIVELY, so a precreated/planted object is never adopted or
+    /// followed. The old code used a predictable
+    /// `/tmp/agent-bridle-jail-<pid>-<counter>` + `create_dir_all` (idempotent,
+    /// symlink-following) — trivially pre-seedable/redirectable.
+    #[test]
+    fn jail_root_is_unpredictable_and_never_adopts_a_planted_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = unique_work("ab008");
+
+        // Unpredictable + fresh + 0700.
+        let a = create_jail_root_in(&base).expect("create jail root a");
+        let b = create_jail_root_in(&base).expect("create jail root b");
+        assert_ne!(
+            a, b,
+            "successive jail roots must be unpredictable, not a counter"
+        );
+        assert_eq!(a.parent(), Some(base.as_path()));
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("jail-"));
+        let mode = std::fs::symlink_metadata(&a).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "jail root must be 0700");
+
+        // Exclusive create never ADOPTS a precreated directory...
+        let planted = base.join("planted");
+        std::fs::create_dir(&planted).unwrap();
+        assert!(
+            create_exclusive_dir(&planted).is_err(),
+            "must refuse (EEXIST) rather than adopt a precreated dir"
+        );
+        // ...and never FOLLOWS a symlink at the final component.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        assert!(
+            create_exclusive_dir(&link).is_err(),
+            "must refuse rather than follow/adopt a symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Non-privileged (CI) path: as a non-root caller, building the jail must fail
