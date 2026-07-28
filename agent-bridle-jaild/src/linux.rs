@@ -34,6 +34,12 @@ struct BindMount {
 /// `PT_INTERP` bind above, whose `!exists()` guard then skips it here.)
 const MERGED_USR_LINKS: &[&str] = &["bin", "sbin", "lib", "lib32", "lib64", "libx32"];
 
+/// Test-only fault seam (#266 / AB-003): when set, the read-only remount branch
+/// behaves as a failed `mount(2)`, letting a privileged test assert the jail
+/// fails closed rather than leaving the path writable.
+#[cfg(test)]
+static FAULT_RO_REMOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn run_jailed<I, S>(
     plan: &RootfsPlan,
     program: &Path,
@@ -168,14 +174,25 @@ where
                     std::ptr::null(),
                 );
                 if rc == 0 && !m.writable {
-                    // Remount read-only (a bind cannot set ro in one step).
-                    libc::mount(
+                    // Remount read-only (a bind cannot set ro in one step). FAIL
+                    // CLOSED (AB-003, #266): a failed RO remount would leave the
+                    // path READ-WRITE — a confinement breach — so report it via
+                    // the errno pipe (like every other syscall here) instead of
+                    // proceeding to exec.
+                    #[cfg(test)]
+                    if FAULT_RO_REMOUNT.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(io::Error::from_raw_os_error(libc::EPERM));
+                    }
+                    let rrc = libc::mount(
                         std::ptr::null(),
                         m.target.as_ptr(),
                         std::ptr::null(),
                         libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
                         std::ptr::null(),
                     );
+                    if rrc != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
             }
             // 5. pivot_root using the new_root == put_old idiom (man 2 pivot_root):
@@ -389,6 +406,59 @@ mod tests {
         assert!(
             sh.is_err(),
             "un-granted /bin/sh must be physically absent in the jail (ENOENT), got {sh:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// #266 / AB-003 (root-only): a failed read-only remount must **fail
+    /// closed** — the child must never exec with a path that was meant to be
+    /// read-only left writable. The test fault seam forces the RO remount to
+    /// fail; before the fix the return value was discarded, so the closure
+    /// proceeded and `run_jailed` returned `Ok`. A regression that drops the
+    /// `return Err` makes this test fail again.
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN; run via scripts/jail-dev.sh"]
+    fn ro_remount_failure_fails_closed() {
+        use std::sync::atomic::Ordering;
+        assert!(is_root(), "run as root via scripts/jail-dev.sh");
+
+        let work = unique_work("ab003");
+        std::fs::write(work.join("hello"), b"hi\n").unwrap();
+        let cav = Caveats {
+            exec: Scope::only(["cat".to_string()]),
+            fs_read: Scope::only([work.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([work.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let plan = build_rootfs_plan(
+            &cav,
+            &RootfsPolicy::default(),
+            &NormalizationPolicy::default(),
+        )
+        .expect("rootfs plan");
+        let cat = plan
+            .entries
+            .iter()
+            .find(|e| !e.is_dir && e.src.file_name().map(|n| n == "cat").unwrap_or(false))
+            .map(|e| e.src.clone())
+            .expect("granted cat must be in the plan");
+        let hello = work.join("hello");
+
+        // Baseline: with no fault, the RO binds remount fine and the jail runs.
+        let ok = run_jailed(&plan, &cat, [hello.as_os_str()]);
+        assert!(
+            ok.is_ok(),
+            "baseline: cat should run in the jail, got {ok:?}"
+        );
+
+        // Fault: force the RO remount to fail — the spawn must fail closed.
+        FAULT_RO_REMOUNT.store(true, Ordering::Relaxed);
+        let faulted = run_jailed(&plan, &cat, [hello.as_os_str()]);
+        FAULT_RO_REMOUNT.store(false, Ordering::Relaxed);
+        assert!(
+            faulted.is_err(),
+            "a failed RO remount must fail closed (never exec with a writable path), got {faulted:?}"
         );
 
         let _ = std::fs::remove_dir_all(&work);
