@@ -62,10 +62,19 @@ axiom core.option.Option.Insts.CoreHashHash.hash
 /-- [core::option::{core::option::Option<T>}::ok_or]:
     Source: '/rustc/library/core/src/option.rs', lines 1334:4-1334:73
     Name pattern: [core::option::{core::option::Option<@T>}::ok_or]
-    Visibility: public -/
+    Visibility: public
+
+    Filled in with the exact `std` semantics (`None ⇒ Err(e)`, `Some(x) ⇒
+    Ok(x)`) instead of leaving it an opaque axiom, so the `verify_envelope`
+    refinement can reduce through the Try-operator chain — and one fewer axiom
+    backs the extracted-code proofs. -/
 @[rust_fun "core::option::{core::option::Option<@T>}::ok_or"]
-axiom core.option.Option.ok_or
-  {T : Type} {E : Type} : Option T → E → Result (core.result.Result T E)
+def core.option.Option.ok_or
+  {T : Type} {E : Type} (o : Option T) (e : E) :
+  Result (core.result.Result T E) :=
+  match o with
+  | none => ok (core.result.Result.Err e)
+  | some x => ok (core.result.Result.Ok x)
 
 /-- [core::option::{core::option::Option<&'_0 T>}::copied]:
     Source: '/rustc/library/core/src/option.rs', lines 2135:4-2137:16
