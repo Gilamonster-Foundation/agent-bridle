@@ -46,4 +46,4 @@ pub use web_fetch::WebFetchTool;
 // dependency; expose them so the host (and the CI presence/unit tests) can
 // exercise the SSRF/allowlist logic directly.
 #[cfg(feature = "web")]
-pub use net_guard::{host_is_explicitly_allowlisted, ip_is_blocked, NetGuardError};
+pub use net_guard::{host_may_reach_private_space, ip_is_blocked, screen_host, NetGuardError};
