@@ -43,21 +43,50 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 ///    ([`ToolContext::check_net`]);
 /// 2. the host is resolved and its addresses are SSRF-screened — private /
 ///    loopback / link-local / unique-local addresses are rejected unless the
-///    host is explicitly named in the `net` allowlist;
+///    host is named in the tool's separate `net_private` opt-in (AB-007, #270);
+///    membership in the `net` reachability allowlist never opens private space;
 /// 3. the connection is **pinned** to a screened address (anti-rebinding);
 /// 4. redirects are followed manually so each `Location` is re-screened, never
 ///    blindly trusted.
 ///
 /// The returned body is **untrusted data**: `{ url, final_url, status, title,
 /// markdown }`, never framed as instructions.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct WebFetchTool;
+#[derive(Debug, Clone)]
+pub struct WebFetchTool {
+    /// Hosts explicitly permitted to resolve into private / loopback /
+    /// link-local / metadata space — the SSRF escape hatch, kept **separate**
+    /// from the `net` reachability allowlist (AB-007, #270). Defaults to
+    /// `Scope::none()`: a public-host `net` grant keeps private-address blocking
+    /// ON. This is deliberately construction-time tool config, not a `net`
+    /// caveat, so naming a public host in a session's `net` grant can never
+    /// implicitly open private space.
+    net_private: Scope<String>,
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl WebFetchTool {
-    /// Construct the tool.
+    /// Construct the tool with private-address resolution **fully blocked**
+    /// (`net_private = Scope::none()`): the fail-closed default.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            net_private: Scope::none(),
+        }
+    }
+
+    /// Construct the tool opting the named hosts into private/loopback/metadata
+    /// resolution — the explicit, separate SSRF escape hatch (AB-007, #270).
+    /// `Scope::only(["127.0.0.1"])` permits exactly that host to reach private
+    /// space; `Scope::All` opts every host in (use with care). The `net`
+    /// reachability allowlist is unaffected and still enforced independently.
+    #[must_use]
+    pub fn with_private_hosts(net_private: Scope<String>) -> Self {
+        Self { net_private }
     }
 }
 
@@ -135,7 +164,8 @@ impl Tool for WebFetchTool {
         let original_url = parsed.url.clone();
 
         let resolver = build_resolver()?;
-        let outcome = fetch_with_leashed_redirects(cx, &resolver, parsed).await?;
+        let outcome =
+            fetch_with_leashed_redirects(cx, &self.net_private, &resolver, parsed).await?;
 
         // Extract the main content as markdown. Fetched bytes are DATA: we run
         // them through readability + HTML->markdown and return them in a
@@ -189,6 +219,7 @@ async fn resolve_host(resolver: &TokioAsyncResolver, host: &str) -> ToolResult<V
 /// hop. Returns the final response body (capped at `max_bytes`).
 async fn fetch_with_leashed_redirects(
     cx: &ToolContext,
+    net_private: &Scope<String>,
     resolver: &TokioAsyncResolver,
     start: FetchArgs,
 ) -> ToolResult<FetchOutcome> {
@@ -208,10 +239,13 @@ async fn fetch_with_leashed_redirects(
         // ToolContext check; it consults the *effective* net caveat.
         cx.check_net(&host)?;
 
-        // (2) Resolve + SSRF-screen against the same effective net scope. A
-        // private/loopback IP is rejected unless the host is explicitly named.
+        // (2) Resolve + SSRF-screen. Reachability is the effective `net` scope;
+        // crossing into private/loopback space requires the host be named in the
+        // separate `net_private` opt-in (AB-007, #270) — the `net` allowlist
+        // alone never opens private space.
         let resolved = resolve_host(resolver, &host).await?;
-        let safe = screen_host(net_scope(cx), &host, &resolved).map_err(net_guard_to_tool)?;
+        let safe =
+            screen_host(net_scope(cx), net_private, &host, &resolved).map_err(net_guard_to_tool)?;
 
         // (3) Pin the connection to a screened IP (anti-DNS-rebinding TOCTOU):
         // reqwest connects to exactly this address rather than re-resolving, so
@@ -477,11 +511,21 @@ mod tests {
     }
 
     #[test]
-    fn loopback_grant_opts_in_127() {
-        // Sanity: the grant we use in integration tests really does opt 127 in.
+    fn net_reachability_does_not_grant_private_space() {
+        // AB-007 (#270): a host on the `net` reachability grant is NOT thereby
+        // opted into private/loopback space. That is a SEPARATE decision on the
+        // `net_private` axis (the tool's config).
         let g = loopback_grant();
-        assert!(crate::net_guard::host_is_explicitly_allowlisted(
-            &g.net,
+        // The grant makes 127.0.0.1 reachable...
+        assert!(matches!(&g.net, Scope::Only(s) if s.contains("127.0.0.1")));
+        // ...but the default private-space opt-in (`none`) grants it nothing,
+        // while an explicit `net_private` naming it does.
+        assert!(!crate::net_guard::host_may_reach_private_space(
+            &Scope::none(),
+            "127.0.0.1"
+        ));
+        assert!(crate::net_guard::host_may_reach_private_space(
+            &Scope::only(["127.0.0.1".to_string()]),
             "127.0.0.1"
         ));
     }
