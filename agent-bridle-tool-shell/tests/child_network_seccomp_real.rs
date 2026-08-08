@@ -53,7 +53,8 @@ fn skip() -> bool {
 /// The child CREATES an AF_INET datagram socket. Under DenyDirect the seccomp
 /// filter EACCES-denies `socket()` → Python raises `PermissionError` → exit 1;
 /// under LandlockOnly the socket is created (Landlock can't filter UDP) → exit 0.
-const PROBE: &str = r#"python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)""#;
+const PROBE: &str =
+    r#"python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)""#;
 
 /// A forked/exec'd descendant probe: the child python re-execs python to attempt
 /// the socket in a grandchild, and propagates its exit code — so a non-zero
