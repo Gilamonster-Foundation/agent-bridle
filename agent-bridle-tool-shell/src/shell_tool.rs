@@ -39,8 +39,8 @@ use std::time::Duration;
 use agent_bridle_core::{
     best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
     human_gate, is_unbridled, Caveats, Denial, DenialKind, Disclosure, EnforcementReport,
-    LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope, ToolError,
-    ToolResult,
+    Invocation, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope,
+    ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -500,6 +500,22 @@ impl Tool for ShellTool {
         args: serde_json::Value,
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
+        self.invoke_accounted(args, cx)
+            .await
+            .map(Invocation::into_value)
+    }
+
+    /// The shell's public contract represents a **pre-execution** leash refusal
+    /// as an in-band `Ok` envelope (`deny`/`refused_envelope`), not a hard
+    /// `Err`. So it reports the typed [`Invocation`] itself — `Denied` for those
+    /// pre-run refusals, `Ran` for any envelope produced after the child spawned
+    /// (success, timeout, or a *mid-run* egress-proxy denial) — so the registry
+    /// charges the call budget correctly without scraping the envelope JSON.
+    async fn invoke_accounted(
+        &self,
+        args: serde_json::Value,
+        cx: &ToolContext,
+    ) -> ToolResult<Invocation> {
         let parsed = ShellArgs::parse(&args, &self.limits)?;
         // Unbridled (ADR 0018): the operator dropped the L3 mechanism. Report
         // `None` (no OS sandbox) — the per-axis report then honestly shows the
@@ -814,6 +830,9 @@ impl Tool for ShellTool {
                 // #196: a run that reached an out-of-allow-list host was refused
                 // by the egress proxy — surface those as structured `net` denials
                 // (sets `denied: true`; empty is a no-op on the common path).
+                // This is a `Ran` outcome even when `net_denials` set `denied:
+                // true`: the child DID spawn, so the call is charged — the typed
+                // outcome is what keeps that distinct from a pre-run refusal.
                 let envelope = ToolEnvelope::new(sandbox_kind)
                     .with_enforcement(enforcement)
                     .with_disclosure(disclosure)
@@ -825,18 +844,21 @@ impl Tool for ShellTool {
                     .with_timed_out(captured.timed_out)
                     .into_json();
                 output_guard.finish();
-                Ok(envelope)
+                Ok(Invocation::Ran(envelope))
             }
             Err(_elapsed) => {
                 // Stop accepting presentation events at the timeout boundary;
-                // the detached blocking worker may still be unwinding.
+                // the detached blocking worker may still be unwinding. A timeout
+                // is a `Ran` outcome — the child launched — so it is charged.
                 drop(output_guard);
-                Ok(ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement)
-                    .with_disclosure(disclosure)
-                    .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
-                    .with_timed_out(true)
-                    .into_json())
+                Ok(Invocation::Ran(
+                    ToolEnvelope::new(sandbox_kind)
+                        .with_enforcement(enforcement)
+                        .with_disclosure(disclosure)
+                        .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
+                        .with_timed_out(true)
+                        .into_json(),
+                ))
             }
         }
     }
@@ -900,23 +922,28 @@ fn run_script(
     })
 }
 
-/// Build a structured `denied` envelope for a leash refusal.
+/// Build a structured `denied` envelope for a leash refusal. Returned as an
+/// [`Invocation::Denied`]: this is a **pre-execution** refusal (nothing ran), so
+/// the registry charges zero calls even though the envelope surfaces to the
+/// caller as an ordinary `Ok` value.
 fn deny(
     sandbox_kind: SandboxKind,
     enforcement: EnforcementReport,
     kind: DenialKind,
     target: &str,
     err: &ToolError,
-) -> serde_json::Value {
-    ToolEnvelope::new(sandbox_kind)
-        .with_enforcement(enforcement)
-        .with_disclosure(unbridle_disclosure())
-        .with_denials(vec![Denial {
-            kind,
-            target: target.to_string(),
-            reason: err.to_string(),
-        }])
-        .into_json()
+) -> Invocation {
+    Invocation::Denied(
+        ToolEnvelope::new(sandbox_kind)
+            .with_enforcement(enforcement)
+            .with_disclosure(unbridle_disclosure())
+            .with_denials(vec![Denial {
+                kind,
+                target: target.to_string(),
+                reason: err.to_string(),
+            }])
+            .into_json(),
+    )
 }
 
 /// The disclosure block stamped on **every** envelope (ADR 0018 D5): reads the
@@ -930,13 +957,15 @@ fn unbridle_disclosure() -> Disclosure {
     }
 }
 
-/// Build a structured `denied` envelope for a parser [`Refusal`].
+/// Build a structured `denied` envelope for a parser [`Refusal`]. Like
+/// [`deny`], this is a **pre-execution** refusal, so it is returned as an
+/// [`Invocation::Denied`] (charges zero calls).
 fn refused_envelope(
     sandbox_kind: SandboxKind,
     enforcement: EnforcementReport,
     refusal: &Refusal,
     cmd: Option<&str>,
-) -> serde_json::Value {
+) -> Invocation {
     let envelope = ToolEnvelope::new(sandbox_kind)
         .with_enforcement(enforcement)
         .with_disclosure(unbridle_disclosure())
@@ -965,12 +994,12 @@ fn refused_envelope(
                 }
             }
         }
-        envelope
+        Invocation::Denied(envelope)
     }
     #[cfg(not(feature = "brush"))]
     {
         let _ = cmd;
-        envelope
+        Invocation::Denied(envelope)
     }
 }
 

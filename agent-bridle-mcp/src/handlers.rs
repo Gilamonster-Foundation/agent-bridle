@@ -269,6 +269,43 @@ mod tests {
         );
     }
 
+    /// AB-001 #309-A regression at the **MCP surface**: an in-band shell denial
+    /// (`Ok(envelope{denied:true})`, surfaced as an MCP `isError`) must not
+    /// consume the grant's `max_calls` budget. With a single-call grant, the
+    /// denied free-form `cmd` must leave the budget intact so a later in-scope
+    /// call still runs. Before the typed `Invocation` accounting this in-band
+    /// denial silently spent the call, and the follow-up would fail with Budget.
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
+    #[tokio::test]
+    async fn mcp_inband_denial_does_not_consume_budget() {
+        use agent_bridle::{CountBound, Scope};
+        let reg = agent_bridle::registry();
+        let grant = reg.mint_grant(Caveats {
+            exec: Scope::only([OK_PROGRAM.to_string()]),
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        // In-band denial (out-of-scope free-form cmd) → MCP isError, cost 0.
+        let denied = tools_call(
+            &reg,
+            &grant,
+            serde_json::json!({ "name": "shell", "arguments": { "cmd": "rm -rf /tmp/x" } }),
+        )
+        .await;
+        assert_eq!(denied["isError"], true, "in-band denial: {denied}");
+        // The single-call budget must be intact: the in-scope call still runs.
+        let ok = tools_call(
+            &reg,
+            &grant,
+            serde_json::json!({ "name": "shell", "arguments": { "program": OK_PROGRAM, "args": ok_args() } }),
+        )
+        .await;
+        assert_ne!(
+            ok["isError"], true,
+            "the in-band denial must not have consumed the AtMost(1) budget: {ok}"
+        );
+    }
+
     #[tokio::test]
     async fn call_unknown_tool_is_in_band_error() {
         let reg = agent_bridle::registry();

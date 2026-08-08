@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::gate::DEFAULT_STRENGTH_FLOOR;
 use crate::{
     AxisEnforcement, CallRequest, Caveats, CountBound, DischargeProvider, DischargeVerifier, Gate,
-    StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
+    Invocation, StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
 };
 
 /// An unforgeable, opaque grant identity minted by a [`Registry`]. It keys the
@@ -192,16 +192,79 @@ impl Registry {
             }
         };
 
-        // Budget is spent only on an *admitted* call. A policy denial — whether
-        // at the gate above or inside the tool when it refuses a specific
-        // argument on authority grounds (`ToolError::Denied`) — performed no
-        // effect, so it costs nothing. A tool that ran and *failed*
-        // (`ToolError::Failed`) or timed out stays charged.
-        let result = tool.invoke(args, &cx).await;
-        if matches!(result, Err(ToolError::Denied { .. })) {
-            self.refund_grant(grant);
+        // Budget is spent only on an *admitted* call that actually RAN. A policy
+        // denial performed no effect, so it costs nothing, in either of its two
+        // shapes — and the Registry learns which from the TYPED outcome, never by
+        // scraping the result JSON (AB-001 review):
+        //   * `Err(ToolError::Denied)` — a hard leash refusal; or
+        //   * `Ok(Invocation::Denied(_))` — a tool (the shell family) whose
+        //     public contract represents a *pre-run* refusal as an in-band `Ok`
+        //     envelope. A *mid-run* denial (e.g. an egress-proxy host refusal on
+        //     a child that DID spawn) is `Invocation::Ran` and stays charged —
+        //     which a `"denied": true` scrape could never distinguish.
+        // A tool that ran and failed (`ToolError::Exec`/`Other`) or timed out
+        // stays charged.
+        match tool.invoke_accounted(args, &cx).await {
+            Ok(outcome) => {
+                if outcome.is_denied() {
+                    self.refund_grant(grant);
+                }
+                Ok(outcome.into_value())
+            }
+            Err(e) => {
+                if matches!(e, ToolError::Denied { .. }) {
+                    self.refund_grant(grant);
+                }
+                Err(e)
+            }
         }
-        result
+    }
+
+    /// Dispatch `name` with `args` as a **stateless one-shot**: enforce
+    /// `caveats.max_calls` for this single call *without* creating a persistent
+    /// ledger entry (AB-001 review, #264). A one-shot has no cross-call budget to
+    /// track, so minting a `Grant` (and leaving its immortal ledger row) would
+    /// leak one `HashMap` entry per call in a long-running embedder. Because no
+    /// grant id is shared, nothing here can race a concurrent dispatch or erase a
+    /// reused session grant's state.
+    ///
+    /// `AtMost(0)` denies (fail-closed); `AtMost(n≥1)` or `Unlimited` admits the
+    /// one call. Accounting for the single call still honors the typed
+    /// [`Invocation`] outcome, but there is no persistent balance to charge.
+    pub async fn dispatch_oneshot(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        caveats: &Caveats,
+    ) -> ToolResult<serde_json::Value> {
+        self.dispatch_oneshot_with_strength_floor(name, args, caveats, DEFAULT_STRENGTH_FLOOR)
+            .await
+    }
+
+    /// [`Self::dispatch_oneshot`] with an explicit minimum enforcement floor.
+    pub async fn dispatch_oneshot_with_strength_floor(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        caveats: &Caveats,
+        strength_floor: AxisEnforcement,
+    ) -> ToolResult<serde_json::Value> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| ToolError::not_found(name))?
+            .clone();
+
+        // The single call's budget, checked inline (no ledger row). One call
+        // never fits in `AtMost(0)`; every other bound admits exactly one.
+        if matches!(caveats.max_calls, CountBound::AtMost(0)) {
+            return Err(ToolError::Budget);
+        }
+
+        let cx = self.authorize_grant(tool.as_ref(), caveats, name, strength_floor)?;
+        tool.invoke_accounted(args, &cx)
+            .await
+            .map(Invocation::into_value)
     }
 
     /// Authorize `granted` for `tool` through a fresh gate — plain or via the
@@ -385,8 +448,63 @@ mod tests {
         }
     }
 
+    /// A tool that drives each typed-outcome shape from its `action` arg so the
+    /// call-budget accounting can be exercised without a real subprocess:
+    ///
+    /// * `ran_ok` → `Ok(Invocation::Ran)` — executed, charge one call.
+    /// * `ran_fail` → `Err(ToolError::Exec)` — executed and failed, charge.
+    /// * `inband_deny` → `Ok(Invocation::Denied)` — a pre-run in-band refusal
+    ///   (the shell family's `deny` shape); charge ZERO.
+    /// * `hard_deny` → `Err(ToolError::Denied)` — hard leash refusal; charge ZERO.
+    struct BudgetProbe;
+    #[async_trait::async_trait]
+    impl Tool for BudgetProbe {
+        fn name(&self) -> &str {
+            "budget_probe"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn invoke(
+            &self,
+            args: serde_json::Value,
+            cx: &ToolContext,
+        ) -> ToolResult<serde_json::Value> {
+            self.invoke_accounted(args, cx)
+                .await
+                .map(Invocation::into_value)
+        }
+        async fn invoke_accounted(
+            &self,
+            args: serde_json::Value,
+            _cx: &ToolContext,
+        ) -> ToolResult<Invocation> {
+            match args["action"].as_str() {
+                Some("ran_fail") => Err(ToolError::Exec(std::io::Error::other("boom"))),
+                Some("hard_deny") => Err(ToolError::denied("hard leash refusal")),
+                // In-band pre-run refusal: `Ok`, but structurally a denial.
+                Some("inband_deny") => {
+                    Ok(Invocation::Denied(serde_json::json!({ "denied": true })))
+                }
+                _ => Ok(Invocation::Ran(serde_json::json!({ "ran": true }))),
+            }
+        }
+    }
+
     fn reg() -> Registry {
         Registry::builder().tool(Arc::new(ProbeTool)).build()
+    }
+
+    fn budget_reg() -> Registry {
+        Registry::builder().tool(Arc::new(BudgetProbe)).build()
+    }
+
+    fn budget_call(r: &Registry, grant: &Grant, action: &str) -> ToolResult<serde_json::Value> {
+        block_on(r.dispatch(
+            "budget_probe",
+            serde_json::json!({ "action": action }),
+            grant,
+        ))
     }
 
     /// Minimal no-dependency `block_on`. `agent-bridle-core` deliberately does
@@ -575,6 +693,195 @@ mod tests {
             THREADS - BUDGET as usize,
             "every over-budget racer fails closed with Budget"
         );
+    }
+
+    /// AB-001 #309-A regression — the headline bug. A tool that signals an
+    /// authority denial **in-band** (`Ok(Invocation::Denied)`, the shell
+    /// family's `deny`/`refused_envelope` shape) must cost ZERO calls, exactly
+    /// like an `Err(ToolError::Denied)`. Before the typed `Invocation` outcome
+    /// the registry only refunded the `Err` shape, so an in-band denial silently
+    /// consumed budget. This test fails on that old code path.
+    #[test]
+    fn inband_denial_does_not_charge_budget() {
+        let r = budget_reg();
+        let grant = r.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        let denied = budget_call(&r, &grant, "inband_deny").unwrap();
+        assert_eq!(
+            denied["denied"], true,
+            "the in-band denial envelope surfaces"
+        );
+        // The AtMost(1) budget must be intact: a real call still runs.
+        assert!(
+            budget_call(&r, &grant, "ran_ok").is_ok(),
+            "an in-band `Ok(Denied)` must not have consumed the single-call budget"
+        );
+    }
+
+    /// A hard `Err(ToolError::Denied)` from inside the tool likewise costs zero.
+    #[test]
+    fn hard_tool_denial_does_not_charge_budget() {
+        let r = budget_reg();
+        let grant = r.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        assert!(matches!(
+            budget_call(&r, &grant, "hard_deny").unwrap_err(),
+            ToolError::Denied { .. }
+        ));
+        assert!(
+            budget_call(&r, &grant, "ran_ok").is_ok(),
+            "a hard tool denial must not have consumed the single-call budget"
+        );
+    }
+
+    /// A gate-level refusal (here: a strength floor the backend cannot meet)
+    /// costs zero calls — the charge is refunded before the error returns, so a
+    /// later admissible call still runs within the original bound.
+    #[test]
+    fn gate_level_denial_does_not_charge_budget() {
+        let r = Registry::builder().tool(Arc::new(SpawnProbeTool)).build();
+        let grant = r.mint_grant(Caveats {
+            net: Scope::only(["example.invalid".to_string()]),
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        // Kernel floor is unmet for a directly-spawned process → refused at
+        // authorization, before invoke.
+        let err = block_on(r.dispatch_with_strength_floor(
+            "spawn_probe",
+            serde_json::json!({}),
+            &grant,
+            AxisEnforcement::Kernel,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }));
+        // Budget intact: the same refusal is reproducible, proving the AtMost(1)
+        // was not spent by the first (denied) admission.
+        assert!(matches!(
+            block_on(r.dispatch_with_strength_floor(
+                "spawn_probe",
+                serde_json::json!({}),
+                &grant,
+                AxisEnforcement::Kernel,
+            ))
+            .unwrap_err(),
+            ToolError::Denied { .. }
+        ));
+    }
+
+    /// A call that actually RAN and then failed (`Err(ToolError::Exec)`) DOES
+    /// consume a call — only pre-run denials are free.
+    #[test]
+    fn ran_but_failed_consumes_budget() {
+        let r = budget_reg();
+        let grant = r.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        assert!(matches!(
+            budget_call(&r, &grant, "ran_fail").unwrap_err(),
+            ToolError::Exec(_)
+        ));
+        assert!(
+            matches!(
+                budget_call(&r, &grant, "ran_ok").unwrap_err(),
+                ToolError::Budget
+            ),
+            "a run that executed and failed still spent the single-call budget"
+        );
+    }
+
+    /// A successful run consumes a call (the ordinary charged path).
+    #[test]
+    fn successful_run_consumes_budget() {
+        let r = budget_reg();
+        let grant = r.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        assert!(budget_call(&r, &grant, "ran_ok").is_ok());
+        assert!(
+            matches!(
+                budget_call(&r, &grant, "ran_ok").unwrap_err(),
+                ToolError::Budget
+            ),
+            "the single admitted call spent the budget"
+        );
+    }
+
+    /// AB-001 #309-B regression: a stateless one-shot dispatch does NOT create a
+    /// persistent ledger row. Before `dispatch_oneshot`, the Python binding
+    /// minted a fresh grant per call, leaking one immortal `HashMap` entry each
+    /// time. Many one-shots must leave the ledger empty.
+    #[test]
+    fn oneshot_dispatch_does_not_grow_ledger() {
+        let r = budget_reg();
+        for _ in 0..1000 {
+            let _ = block_on(r.dispatch_oneshot(
+                "budget_probe",
+                serde_json::json!({ "action": "ran_ok" }),
+                &Caveats::top(),
+            ))
+            .unwrap();
+        }
+        assert_eq!(
+            r.ledger.lock().unwrap().len(),
+            0,
+            "one-shot dispatch must not accumulate per-call ledger rows"
+        );
+    }
+
+    /// A one-shot still enforces `max_calls` for its single call: `AtMost(0)`
+    /// denies fail-closed; `AtMost(1)`/`Unlimited` admit the one call — all
+    /// without a ledger row.
+    #[test]
+    fn oneshot_respects_max_calls_without_ledger() {
+        let r = budget_reg();
+        let zero = block_on(r.dispatch_oneshot(
+            "budget_probe",
+            serde_json::json!({ "action": "ran_ok" }),
+            &Caveats {
+                max_calls: CountBound::AtMost(0),
+                ..Caveats::top()
+            },
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(zero, ToolError::Budget),
+            "AtMost(0) denies one-shot"
+        );
+        assert!(
+            block_on(r.dispatch_oneshot(
+                "budget_probe",
+                serde_json::json!({ "action": "ran_ok" }),
+                &Caveats {
+                    max_calls: CountBound::AtMost(1),
+                    ..Caveats::top()
+                },
+            ))
+            .is_ok(),
+            "AtMost(1) admits the single one-shot call"
+        );
+        assert_eq!(r.ledger.lock().unwrap().len(), 0, "no ledger rows created");
+    }
+
+    /// An in-band one-shot denial surfaces its envelope (and, being a one-shot,
+    /// creates no ledger row regardless of accounting).
+    #[test]
+    fn oneshot_inband_denial_surfaces_envelope() {
+        let r = budget_reg();
+        let out = block_on(r.dispatch_oneshot(
+            "budget_probe",
+            serde_json::json!({ "action": "inband_deny" }),
+            &Caveats::top(),
+        ))
+        .unwrap();
+        assert_eq!(out["denied"], true);
+        assert_eq!(r.ledger.lock().unwrap().len(), 0);
     }
 
     /// A provider whose ceremony always fails (no authenticator / human declined)

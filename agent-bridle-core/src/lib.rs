@@ -96,7 +96,7 @@ pub use step_up::{
     AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
     DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,
 };
-pub use tool::Tool;
+pub use tool::{Invocation, Tool};
 pub use unbridle::{human_gate, is_unbridled, set_human_gate, set_unbridled, HumanGate};
 
 #[cfg(test)]
