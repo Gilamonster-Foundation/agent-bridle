@@ -16,7 +16,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::{AxisEnforcement, Caveats, SandboxKind, Scope, ToolError, ToolResult};
+use crate::{AxisStrengthFloor, Caveats, SandboxKind, Scope, ToolError, ToolResult};
 
 /// Proof that a tool invocation has passed the capability leash, carrying the
 /// least-authority caveats it is permitted to act under.
@@ -33,7 +33,7 @@ pub struct ToolContext {
     // enforcement this principal will accept before a confinement site refuses.
     // Launch-time, immutable from inside (no setter) — a running tool can neither
     // lower it nor raise its own achieved strength (I1/I3/I13).
-    strength_floor: AxisEnforcement,
+    strength_floor: AxisStrengthFloor,
 }
 
 impl ToolContext {
@@ -42,7 +42,7 @@ impl ToolContext {
     pub(crate) fn mint(
         effective: Caveats,
         sandbox_kind: SandboxKind,
-        strength_floor: AxisEnforcement,
+        strength_floor: AxisStrengthFloor,
     ) -> Self {
         Self {
             effective,
@@ -63,12 +63,13 @@ impl ToolContext {
         self.sandbox_kind
     }
 
-    /// The required fence strength (ADR 0012 D3): a confinement site refuses to
-    /// spawn when the *real* backend cannot enforce every restricted axis at or
-    /// above this floor. Default is the permissive [`AxisEnforcement::Advisory`]
-    /// (set on the [`crate::Gate`]); a strong principal raises it to `Kernel`.
+    /// The required **per-axis** fence strength (ADR 0012 D3): a confinement site
+    /// refuses to spawn when the *real* backend cannot enforce a restricted axis
+    /// at or above its floor. Default is [`AxisStrengthFloor::DEFAULT`] (set on
+    /// the [`crate::Gate`]); a confined executor raises it to
+    /// [`AxisStrengthFloor::CONFINED`].
     #[must_use]
-    pub fn strength_floor(&self) -> AxisEnforcement {
+    pub fn strength_floor(&self) -> AxisStrengthFloor {
         self.strength_floor
     }
 

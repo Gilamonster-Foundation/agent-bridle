@@ -37,10 +37,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
-    human_gate, is_unbridled, Caveats, Denial, DenialKind, Disclosure, EnforcementReport,
-    Invocation, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope,
-    ToolError, ToolResult,
+    best_available_sandbox, effective_sandbox_kind, enforcement_report, human_gate, is_unbridled,
+    unenforceable_axis, Caveats, Denial, DenialKind, Disclosure, EnforcementReport, Invocation,
+    LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope, ToolError,
+    ToolResult,
 };
 use async_trait::async_trait;
 
@@ -768,19 +768,17 @@ impl Tool for ShellTool {
         // mechanism is *exactly* what the operator acknowledged (ADR 0018 D1). The
         // L2 grant checks above still ran (advisory), and every axis reports
         // advisory + `disclosure.unbridled` — honest, not silent.
-        if !unbridled && confinement_unenforceable(sandbox_kind, cx.caveats(), cx.strength_floor())
-        {
-            return Ok(deny(
-                sandbox_kind,
-                enforcement,
-                DenialKind::Exec,
-                "confinement",
-                &ToolError::denied(format!(
-                    "a restricted filesystem/exec/net axis cannot be enforced on this host \
-                     at the required strength floor ({:?}); refusing to run unconfined",
-                    cx.strength_floor()
-                )),
-            ));
+        if !unbridled {
+            if let Some(unmet) = unenforceable_axis(cx.caveats(), sandbox_kind, cx.strength_floor())
+            {
+                return Ok(deny(
+                    sandbox_kind,
+                    enforcement,
+                    DenialKind::Exec,
+                    "confinement",
+                    &ToolError::denied(format!("{unmet}; refusing to run unconfined")),
+                ));
+            }
         }
 
         // Run on a blocking thread, bounded by the timeout. On timeout the

@@ -23,8 +23,8 @@ use crate::step_up::{
     DischargeVerifier, StepUpPolicy,
 };
 use crate::{
-    AxisEnforcement, Caveats, CountBound, Sandbox, SandboxKind, Scope, Tool, ToolContext,
-    ToolError, ToolResult,
+    AxisEnforcement, AxisStrengthFloor, Caveats, CountBound, Sandbox, SandboxKind, Scope, Tool,
+    ToolContext, ToolError, ToolResult,
 };
 
 /// The fence-strength floor a gate stamps into every context it mints when the
@@ -59,10 +59,11 @@ pub struct Gate {
     generation: u64,
     /// The OS-level sandbox stamped into every context this gate mints.
     sandbox_kind: SandboxKind,
-    /// The required fence-strength floor stamped into every context (ADR 0012 D3):
-    /// the weakest per-axis enforcement this principal accepts before a
-    /// confinement site fails closed. Defaults to [`DEFAULT_STRENGTH_FLOOR`].
-    strength_floor: AxisEnforcement,
+    /// The required **per-axis** fence-strength floor stamped into every context
+    /// (ADR 0012 D3): the weakest enforcement this principal accepts on each
+    /// authority axis before a confinement site fails closed. Defaults to
+    /// [`AxisStrengthFloor::DEFAULT`] (filesystem kernel, exec/net permissive).
+    strength_floor: AxisStrengthFloor,
     /// Bound challenges already consumed by an accepted [`crate::Discharge`].
     /// Makes every verified human gesture **single-use** (replay-proof): a
     /// discharge re-presented after it first succeeded is denied. Interior-mutable
@@ -80,7 +81,7 @@ impl Gate {
             remaining: None,
             generation,
             sandbox_kind: SandboxKind::None,
-            strength_floor: DEFAULT_STRENGTH_FLOOR,
+            strength_floor: AxisStrengthFloor::DEFAULT,
             consumed: Mutex::new(HashSet::new()),
         }
     }
@@ -98,7 +99,7 @@ impl Gate {
             remaining,
             generation,
             sandbox_kind: SandboxKind::None,
-            strength_floor: DEFAULT_STRENGTH_FLOOR,
+            strength_floor: AxisStrengthFloor::DEFAULT,
             consumed: Mutex::new(HashSet::new()),
         }
     }
@@ -112,16 +113,30 @@ impl Gate {
         self
     }
 
-    /// Set the required fence-strength floor for every context this gate mints
-    /// (ADR 0012 D3) — the weakest per-axis enforcement the principal accepts
-    /// before a confinement site refuses to spawn. A **strong** principal raises
-    /// it to [`AxisEnforcement::Kernel`] (fail closed on any restricted axis the
-    /// real backend cannot kernel-confine); the default is the permissive
-    /// [`AxisEnforcement::Advisory`]. The floor only ever *raises* on delegation
-    /// (it cannot be lowered from inside a running tool — it has no setter on the
-    /// minted [`ToolContext`]).
+    /// Set the required fence-strength floor from a **scalar** enforcement (the
+    /// historic API), bridged to the per-axis form via
+    /// [`AxisStrengthFloor::from_scalar`]: the filesystem axes always require
+    /// Kernel while exec/net take `floor`. A strong principal raising this to
+    /// [`AxisEnforcement::Kernel`] gets Kernel on *every* axis — which over-
+    /// strictly rejects the exec axis on interceptor-exec backends; a confined
+    /// executor should prefer [`Self::with_axis_strength_floor`] with
+    /// [`AxisStrengthFloor::CONFINED`]. The floor only ever *raises* on
+    /// delegation (it has no setter on the minted [`ToolContext`]).
     #[must_use]
     pub fn with_strength_floor(mut self, floor: AxisEnforcement) -> Self {
+        self.strength_floor = AxisStrengthFloor::from_scalar(floor);
+        self
+    }
+
+    /// Set the required **per-axis** fence-strength floor for every context this
+    /// gate mints (ADR 0012 D3). This is the precise form: a confined executor
+    /// passes [`AxisStrengthFloor::CONFINED`] (`fs`/`net` = Kernel, `exec` =
+    /// Interceptor) so a restricted filesystem or network axis that the governing
+    /// backend cannot kernel-confine fails closed, while the exec axis is
+    /// accepted at the interceptor tier. The floor only ever *raises* on
+    /// delegation (no setter on the minted [`ToolContext`]).
+    #[must_use]
+    pub fn with_axis_strength_floor(mut self, floor: AxisStrengthFloor) -> Self {
         self.strength_floor = floor;
         self
     }
@@ -418,21 +433,35 @@ mod tests {
         }
     }
 
-    /// ADR 0012 D3: the fence-strength floor defaults to the permissive
-    /// `Advisory` (non-breaking) and is stamped, immutable, into every context;
-    /// a strong principal raises it via `with_strength_floor`.
+    /// ADR 0012 D3: the per-axis fence-strength floor defaults to
+    /// [`AxisStrengthFloor::DEFAULT`] (filesystem kernel, exec/net permissive)
+    /// and is stamped, immutable, into every context. The scalar
+    /// `with_strength_floor` bridges to the per-axis form; a confined executor
+    /// raises it via `with_axis_strength_floor(AxisStrengthFloor::CONFINED)`.
     #[test]
-    fn strength_floor_defaults_advisory_and_rides_into_the_context() {
+    fn strength_floor_defaults_and_rides_into_the_context() {
         let cx = Gate::new(0)
             .authorize(&top_tool(), &Caveats::top())
             .expect("authorize");
-        assert_eq!(cx.strength_floor(), AxisEnforcement::Advisory);
+        assert_eq!(cx.strength_floor(), AxisStrengthFloor::DEFAULT);
 
+        // Scalar Kernel bridges to Kernel on every axis (the old over-strict form).
         let strong = Gate::new(0)
             .with_strength_floor(AxisEnforcement::Kernel)
             .authorize(&top_tool(), &Caveats::top())
             .expect("authorize");
-        assert_eq!(strong.strength_floor(), AxisEnforcement::Kernel);
+        assert_eq!(
+            strong.strength_floor(),
+            AxisStrengthFloor::from_scalar(AxisEnforcement::Kernel)
+        );
+
+        // The precise confined floor accepts exec at the interceptor tier.
+        let confined = Gate::new(0)
+            .with_axis_strength_floor(AxisStrengthFloor::CONFINED)
+            .authorize(&top_tool(), &Caveats::top())
+            .expect("authorize");
+        assert_eq!(confined.strength_floor(), AxisStrengthFloor::CONFINED);
+        assert_eq!(confined.strength_floor().exec, AxisEnforcement::Interceptor);
     }
 
     #[test]

@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    best_available_sandbox, effective_sandbox_kind, enforcement_report, fence_strength,
-    AxisEnforcement, Caveats, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
+    best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AxisEnforcement,
+    AxisStrengthFloor, Caveats, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
 };
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
@@ -105,7 +105,7 @@ struct TrustedWorkerControl {
     unavailable: (),
     nonce: String,
     caveats: Caveats,
-    strength_floor: AxisEnforcement,
+    strength_floor: AxisStrengthFloor,
 }
 
 impl TrustedWorkerControl {
@@ -202,7 +202,7 @@ impl TrustedWorkerControl {
 }
 
 /// Version of the private trusted-worker authority envelope.
-pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 1;
+pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 2;
 /// Maximum serialized trusted-worker request body.
 pub const TRUSTED_WORKER_MAX_BODY: usize = 1024 * 1024;
 /// Fixed, non-authority prelude used to establish kernel peer metadata.
@@ -227,14 +227,14 @@ pub struct TrustedWorkerRequest<P> {
     version: u8,
     nonce: String,
     caveats: Caveats,
-    strength_floor: AxisEnforcement,
+    strength_floor: AxisStrengthFloor,
     payload: P,
 }
 
 impl<P> TrustedWorkerRequest<P> {
     /// Consume the envelope into its core-authenticated authority and payload.
     #[must_use]
-    pub fn into_parts(self) -> (String, Caveats, AxisEnforcement, P) {
+    pub fn into_parts(self) -> (String, Caveats, AxisStrengthFloor, P) {
         (self.nonce, self.caveats, self.strength_floor, self.payload)
     }
 
@@ -500,15 +500,14 @@ impl ConfinedCommand {
         let reported_kind = effective_sandbox_kind(kind, &effective);
 
         // (2) Fail closed: a restricted axis the governing backend cannot enforce
-        // at the principal's strength floor is a grant we'd be lying about.
-        if confinement_unenforceable(reported_kind, &effective, cx.strength_floor()) {
+        // at the principal's PER-AXIS strength floor is a grant we'd be lying
+        // about. The typed reason names which axis, its required strength, and
+        // the strength actually delivered — never a generic "sandbox unavailable"
+        // when the code already knows the axis.
+        if let Some(unmet) = unenforceable_axis(&effective, reported_kind, cx.strength_floor()) {
             return Err(ToolError::denied(format!(
-                "refusing to spawn {:?}: a restricted filesystem/exec/net axis cannot be \
-                 enforced on a subprocess at the required strength floor ({:?}) by the \
-                 governing sandbox ({:?})",
-                self.program,
-                cx.strength_floor(),
-                reported_kind
+                "refusing to spawn {:?}: {} (governing sandbox: {:?})",
+                self.program, unmet, reported_kind
             )));
         }
 
@@ -1056,15 +1055,12 @@ pub fn confinement_unenforceable(
     caveats: &Caveats,
     floor: AxisEnforcement,
 ) -> bool {
-    let report = enforcement_report(caveats, kind);
-    let below_kernel = |e: Option<AxisEnforcement>| e.is_some_and(|e| e != AxisEnforcement::Kernel);
-    // (1) Filesystem axes: kernel-enforceable, so a restricted-but-not-kernel fs
-    // axis is always unenforceable.
-    if below_kernel(report.fs_write) || below_kernel(report.fs_read) {
-        return true;
-    }
-    // (2) exec/net: refuse only when the strength floor is not met by reality.
-    fence_strength(&report).is_some_and(|s| s < floor)
+    // Back-compat scalar wrapper over the per-axis check: the historic scalar
+    // floor `f` means filesystem=Kernel (always), exec=net=`f`
+    // ([`AxisStrengthFloor::from_scalar`]). A confined executor should call
+    // [`unenforceable_axis`] directly with [`AxisStrengthFloor::CONFINED`] so the
+    // exec axis is accepted at the interceptor tier rather than forced to Kernel.
+    unenforceable_axis(caveats, kind, AxisStrengthFloor::from_scalar(floor)).is_some()
 }
 
 // Async-path proof for `spawn_tokio`: the child's stdio survives the std→tokio
@@ -1272,6 +1268,7 @@ mod tokio_spawn_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enforcement_report;
     use crate::{Gate, Tool};
 
     /// Mint a `ToolContext` the only legitimate way — through the gate.
@@ -1352,7 +1349,7 @@ mod tests {
             stream: client,
             nonce: "core-owned-nonce".to_string(),
             caveats: frozen.clone(),
-            strength_floor: AxisEnforcement::Advisory,
+            strength_floor: AxisStrengthFloor::DEFAULT,
         };
         let mut worker = SandboxedWorkerChild {
             child: process,
@@ -1371,7 +1368,7 @@ mod tests {
         let (nonce, authority, floor, payload) = seen_rx.recv().expect("receive decoded request");
         assert_eq!(nonce, "core-owned-nonce");
         assert_eq!(authority, frozen, "payload must not replace frozen caveats");
-        assert_eq!(floor, AxisEnforcement::Advisory);
+        assert_eq!(floor, AxisStrengthFloor::DEFAULT);
         assert_eq!(payload, forged_payload);
         assert!(
             matches!(
