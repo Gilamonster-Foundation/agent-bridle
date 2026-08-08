@@ -111,6 +111,15 @@ fn run_platform() {
         "restricted_exec_denies_out_of_scope_command_in_worker",
         restricted_exec_denies_out_of_scope_command_in_worker,
     );
+    // The Brush production path installs the DenyDirect seccomp egress floor via
+    // core's ConfinedCommand `Sandbox::apply` (same seam the safe-subset engine
+    // uses). Only meaningful with the Landlock backend + a python3 probe.
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    run_async_case(
+        &runtime,
+        "brush_deny_direct_denies_a_childs_socket",
+        brush_deny_direct_denies_a_childs_socket,
+    );
     run_async_case(
         &runtime,
         "command_substitution_keeps_inner_exec_independently_gated",
@@ -523,6 +532,41 @@ async fn restricted_exec_denies_out_of_scope_command_in_worker() {
     assert!(
         !sentinel.exists(),
         "the denied command must not have run: {out}"
+    );
+}
+
+/// The Brush production path (worker → core `ConfinedCommand` → `Sandbox::apply`)
+/// installs the `ChildNetworkPolicy::DenyDirect` seccomp egress floor: a python3
+/// child in the brush worker cannot create an AF_INET socket under `net: none`.
+/// This proves the BrushShellTool threads `child_network` through the SAME apply
+/// seam the safe-subset engine uses.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+async fn brush_deny_direct_denies_a_childs_socket() {
+    use agent_bridle_core::{landlock_is_supported, ChildNetworkPolicy, SandboxPolicy};
+    if !landlock_is_supported() || !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping brush_deny_direct: needs Landlock + python3");
+        return;
+    }
+    let t = BrushShellTool::new().with_sandbox_policy(Arc::new(SandboxPolicy {
+        child_network: ChildNetworkPolicy::DenyDirect,
+        ..SandboxPolicy::default()
+    }));
+    let caveats = Caveats {
+        exec: Scope::only(["python3".to_string()]),
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+    let cx = Gate::new(0).authorize(&t, &caveats).expect("authorize");
+    let out = t
+        .invoke(
+            serde_json::json!({ "cmd": r#"python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)""# }),
+            &cx,
+        )
+        .await
+        .expect("invoke");
+    assert_ne!(
+        out["exit_code"], 0,
+        "DenyDirect must deny the brush child's AF_INET socket creation: {out}"
     );
 }
 

@@ -571,7 +571,7 @@ pub(crate) mod appcontainer_impl {
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub(crate) mod landlock_impl {
     use super::{Sandbox, SandboxKind};
-    use crate::{Caveats, SandboxPolicy, Scope, ToolError, ToolResult};
+    use crate::{Caveats, ChildNetworkPolicy, SandboxPolicy, Scope, ToolError, ToolResult};
     use landlock::{
         path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
         RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
@@ -837,8 +837,74 @@ pub(crate) mod landlock_impl {
                     "landlock ruleset was not enforced by this kernel",
                 ));
             }
+
+            // ChildNetworkPolicy::DenyDirect — the seccomp socket()-family egress
+            // deny, on THIS confining thread (same thread as `restrict_self`,
+            // inherited across the imminent `fork`/`execve`). Only when net is
+            // already fully denied (a granted net scope leaves it inert), and
+            // fail-closed: a failed install refuses the spawn rather than let the
+            // caller believe UDP/DNS/raw egress is denied when it is not.
+            if self.policy.child_network == ChildNetworkPolicy::DenyDirect && confine_net {
+                install_seccomp_egress_deny()?;
+            }
             Ok(())
         }
+    }
+
+    /// Install the seccomp `socket()`-family egress deny on the CURRENT thread —
+    /// the [`ChildNetworkPolicy::DenyDirect`] leg (`crate::ChildNetworkPolicy`).
+    ///
+    /// Denies `socket()` for the off-box address families (`AF_INET` /
+    /// `AF_INET6` / `AF_PACKET`) with `EACCES`; `AF_UNIX` and every other syscall
+    /// stay allowed. This closes the UDP/DNS/raw/packet egress leg that Landlock's
+    /// TCP-only net rule cannot filter — a child under `net: none` can otherwise
+    /// still create those sockets. `apply_filter` sets `PR_SET_NO_NEW_PRIVS`, so
+    /// it needs no privilege, is irreversible, and is inherited by every
+    /// `fork`/`execve` descendant. `apply_filter` is a safe fn, so core keeps
+    /// `unsafe_code = forbid`. Must run on the confining thread, after
+    /// `restrict_self`, immediately before the spawn.
+    fn install_seccomp_egress_deny() -> ToolResult<()> {
+        use seccompiler::{
+            apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+            SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
+        };
+        use std::collections::BTreeMap;
+
+        let denied =
+            |e: String| ToolError::denied(format!("seccomp egress deny not installed: {e}"));
+
+        // One rule per off-box family, matched on socket()'s `domain` arg (arg 0).
+        let families: [u64; 3] = [
+            libc::AF_INET as u64,
+            libc::AF_INET6 as u64,
+            libc::AF_PACKET as u64,
+        ];
+        let rules: Vec<SeccompRule> = families
+            .into_iter()
+            .map(|fam| {
+                let cond = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, fam)
+                    .map_err(|e| denied(e.to_string()))?;
+                SeccompRule::new(vec![cond]).map_err(|e| denied(e.to_string()))
+            })
+            .collect::<ToolResult<_>>()?;
+
+        let mut per_syscall: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        per_syscall.insert(libc::SYS_socket, rules);
+
+        let filter = SeccompFilter::new(
+            per_syscall,
+            // Default for every other syscall — and for `socket()` with a
+            // non-matched family (e.g. AF_UNIX): allow.
+            SeccompAction::Allow,
+            // A matched off-box `socket()`: fail with EACCES (a clean, catchable
+            // "permission denied" the child sees as an unreachable network).
+            SeccompAction::Errno(libc::EACCES as u32),
+            TargetArch::try_from(std::env::consts::ARCH).map_err(|e| denied(e.to_string()))?,
+        )
+        .map_err(|e| denied(e.to_string()))?;
+
+        let prog: BpfProgram = BpfProgram::try_from(filter).map_err(|e| denied(e.to_string()))?;
+        apply_filter(&prog).map_err(|e| denied(e.to_string()))
     }
 
     /// Resolve the granted `exec` scope to absolute, existing program **files**
@@ -2473,6 +2539,110 @@ mod landlock_kernel_tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── ChildNetworkPolicy::DenyDirect — the seccomp socket()-family egress
+    //    floor. These use safe `std::net` / `std::os::unix::net` (core forbids
+    //    `unsafe`): socket *creation* itself is what the seccomp filter EACCES-
+    //    fails, so a failed `bind`/`connect` at the socket step is the proof.
+    //    They run on throwaway threads (seccomp, like Landlock, is per-thread and
+    //    irreversible). The floor is inherited across fork/exec by kernel
+    //    guarantee — descendant inheritance for the identical filter is proved
+    //    end-to-end on the newt side (net_guard_executor.rs).
+
+    /// DenyDirect under `net: none` denies AF_INET / AF_INET6 socket creation
+    /// (TCP *and* UDP — the UDP/DNS leg Landlock's TCP-only rule misses) while
+    /// AF_UNIX stays creatable (a path-named unix socket is fs-fenced, not a
+    /// seccomp concern).
+    #[test]
+    fn deny_direct_seccomp_blocks_off_box_sockets_allows_af_unix() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let policy = std::sync::Arc::new(crate::SandboxPolicy {
+            child_network: crate::ChildNetworkPolicy::DenyDirect,
+            ..crate::SandboxPolicy::default()
+        });
+        let (udp4, udp6, tcp4, unix_ok) = std::thread::spawn(move || {
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply landlock + seccomp");
+            let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").is_err();
+            let udp6 = std::net::UdpSocket::bind("[::1]:0").is_err();
+            let tcp4 = std::net::TcpStream::connect("127.0.0.1:9").is_err();
+            let unix_ok = std::os::unix::net::UnixDatagram::unbound().is_ok();
+            (udp4, udp6, tcp4, unix_ok)
+        })
+        .join()
+        .unwrap();
+        assert!(udp4, "DenyDirect must deny AF_INET (UDP) socket creation");
+        assert!(udp6, "DenyDirect must deny AF_INET6 (UDP) socket creation");
+        assert!(tcp4, "DenyDirect must deny AF_INET (TCP) socket creation");
+        assert!(
+            unix_ok,
+            "DenyDirect must still allow AF_UNIX socket creation"
+        );
+    }
+
+    /// The control + backward-compat guard: the DEFAULT `LandlockOnly` policy
+    /// leaves AF_INET UDP socket creation OPEN under `net: none` — Landlock's
+    /// TCP-only net rule doesn't cover it. This is exactly the leak DenyDirect
+    /// closes, and proves the default behavior is unchanged.
+    #[test]
+    fn landlock_only_default_leaves_udp_socket_creation_open() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        // Default policy == LandlockOnly.
+        let policy = std::sync::Arc::new(crate::SandboxPolicy::default());
+        let udp_created = std::thread::spawn(move || {
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply landlock");
+            std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            udp_created,
+            "LandlockOnly (default) must leave UDP socket creation open — the leak DenyDirect closes"
+        );
+    }
+
+    /// DenyDirect is inert when the caller GRANTED a net scope (they asked for
+    /// egress): `net_fully_denied` is false, so no seccomp floor is installed and
+    /// socket creation still works.
+    #[test]
+    fn deny_direct_is_inert_when_net_is_granted() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let policy = std::sync::Arc::new(crate::SandboxPolicy {
+            child_network: crate::ChildNetworkPolicy::DenyDirect,
+            ..crate::SandboxPolicy::default()
+        });
+        let udp_created = std::thread::spawn(move || {
+            // net = All (ambient) → a granted net scope; DenyDirect must NOT fire.
+            let cav = Caveats::top();
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply landlock");
+            std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            udp_created,
+            "DenyDirect must be inert when net is granted (caller asked for egress)"
+        );
     }
 }
 

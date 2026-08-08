@@ -22,7 +22,13 @@ default = []
 # loader trampoline remains), and kernel-denies empty-scope TCP on ABI-v4
 # kernels. Without this feature/off-Linux, another native backend may apply or
 # the honest NoopSandbox reports SandboxKind::None. ADR 0001/0011 (L3).
-linux-landlock = ["dep:landlock"]
+# Also pulls `seccompiler` — the safe-API install path for the
+# `ChildNetworkPolicy::DenyDirect` seccomp `socket()`-family egress deny
+# (UDP/DNS/raw — the leg Landlock's TCP-only net rule cannot filter). Installed
+# on the SAME confining thread as the Landlock ruleset, immediately before the
+# spawn, so the child inherits both. `seccompiler::apply_filter` is a safe fn
+# (it internally sets PR_SET_NO_NEW_PRIVS), so core keeps `unsafe_code = forbid`.
+linux-landlock = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 # Real, kernel-enforced Seatbelt profile (macOS only). Enables the
 # `SeatbeltSandbox` (see src/sandbox.rs), which confines a spawned program via
 # the `sandbox-exec(1)` wrapper — no extra dependency and no FFI (core forbids
@@ -102,3 +108,13 @@ tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
 # cfg(all(target_os = "linux", feature = "linux-landlock")).
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4", optional = true }
+# The seccomp `socket()`-family egress deny for `ChildNetworkPolicy::DenyDirect`,
+# gated by `linux-landlock`. `apply_filter` is a SAFE fn (sets no_new_privs +
+# installs the BPF filter internally), so core keeps `unsafe_code = forbid`.
+# Linux-only; enabling the feature off-Linux does not try to build it.
+seccompiler = { version = "0.5", optional = true }
+# Used ONLY for portable syscall/errno/address-family CONSTANTS
+# (`SYS_socket` / `AF_INET*` / `AF_PACKET` / `EACCES`) when building that seccomp
+# filter — no `unsafe` calls, so `unsafe_code = forbid` still holds. Gated with
+# seccompiler under `linux-landlock`.
+libc = { version = "0.2", optional = true }
