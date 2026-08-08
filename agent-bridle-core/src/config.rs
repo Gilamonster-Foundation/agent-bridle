@@ -136,12 +136,45 @@ pub struct BackendToggles {
     pub disable: Vec<String>,
 }
 
+/// How a confined child's *direct* network-socket authority is enforced, beyond
+/// the caveat-driven Landlock TCP rule. A **mechanism** knob (it rides
+/// [`SandboxPolicy`]), never authority (`Caveats`): the caller states the
+/// required floor and the backend owns the enforcement (ADR 0017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChildNetworkPolicy {
+    /// Historical behavior: rely on the caveat-driven Landlock net rule alone.
+    /// An empty `net` scope kernel-denies TCP **connect/bind** on an ABI-v4
+    /// kernel, but Landlock cannot filter UDP, DNS, raw or packet sockets — a
+    /// child under `net: none` can still create them. Backward-compatible
+    /// default, so existing configs and callers are unchanged.
+    #[default]
+    LandlockOnly,
+    /// Additionally install a seccomp `socket()`-family deny (AF_INET / AF_INET6
+    /// / AF_PACKET → `EACCES`) on the confining thread immediately before spawn,
+    /// so the child and every fork/exec descendant cannot create ANY off-box
+    /// socket regardless of protocol — closing the UDP/DNS/raw leg Landlock
+    /// misses. `AF_UNIX` is deliberately still allowed (a path-named unix socket
+    /// is already governed by the fs fence; abstract-namespace unix sockets are a
+    /// bounded residual). Takes effect only when the `net` caveat is already
+    /// deny-all (`net: none`); a granted net scope leaves it inert (the caller
+    /// asked for egress). Requires the `linux-landlock` backend (which pulls the
+    /// safe `seccompiler` install path); on other platforms it is inert, so a
+    /// caller that *requires* it must fail closed via `backends.require_landlock`.
+    DenyDirect,
+}
+
 /// Sandbox path lists + ABI floors (`sandbox.rs` constants).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxPolicy {
     /// Backend enable/require toggles.
     #[serde(default)]
     pub backends: BackendToggles,
+    /// Direct child network-socket confinement beyond the Landlock TCP rule
+    /// ([`ChildNetworkPolicy`]). `#[serde(default)]` so configs written before
+    /// this field existed keep parsing (they get `LandlockOnly`).
+    #[serde(default)]
+    pub child_network: ChildNetworkPolicy,
     /// Read base when `fs_read` restricted (`BASE_READ_PATHS`).
     pub base_read_paths: PathList,
     /// Executable dirs read-allowed only when `exec` is ambient (`BIN_READ_PATHS`).
@@ -220,6 +253,7 @@ impl Default for SandboxPolicy {
         ];
         Self {
             backends: BackendToggles::default(),
+            child_network: ChildNetworkPolicy::default(),
             base_read_paths: PathList::from_defaults(base_read),
             device_sink_paths: default_device_sink_paths(),
             bin_read_paths: PathList::from_defaults(&[
