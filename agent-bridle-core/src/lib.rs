@@ -64,8 +64,8 @@ pub use gate::Gate;
 pub use net_proxy::{start_egress_proxy, ProxyHandle};
 pub use registry::{Grant, GrantId, Registry, RegistryBuilder};
 pub use report::{
-    enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, AxisStrengthFloor,
-    ConfinedAxis, EnforcementReport, UnenforceableAxis,
+    enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinedAxis,
+    EnforcementFloor, EnforcementReport, UnenforceableAxis,
 };
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};

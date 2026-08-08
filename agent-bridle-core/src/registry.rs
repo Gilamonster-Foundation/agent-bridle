@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    AxisEnforcement, AxisStrengthFloor, CallRequest, Caveats, CountBound, DischargeProvider,
-    DischargeVerifier, Gate, Invocation, StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
+    AxisEnforcement, CallRequest, Caveats, CountBound, DischargeProvider, DischargeVerifier,
+    EnforcementFloor, Gate, Invocation, StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
 };
 
 /// An unforgeable, opaque grant identity minted by a [`Registry`]. It keys the
@@ -152,16 +152,16 @@ impl Registry {
         args: serde_json::Value,
         grant: &Grant,
     ) -> ToolResult<serde_json::Value> {
-        self.dispatch_axis(name, args, grant, AxisStrengthFloor::DEFAULT)
+        self.dispatch_axis(name, args, grant, EnforcementFloor::DEFAULT)
             .await
     }
 
     /// Dispatch `name` with an explicit minimum confinement strength (the
     /// **scalar** form: filesystem always Kernel, exec/net take `strength_floor`,
-    /// via [`AxisStrengthFloor::from_scalar`]). A confined executor that wants the
+    /// via [`EnforcementFloor::from_scalar`]). A confined executor that wants the
     /// exec axis accepted at the interceptor tier should call
-    /// [`Self::dispatch_with_axis_strength_floor`] with
-    /// [`AxisStrengthFloor::CONFINED`] instead of a blanket scalar `Kernel`.
+    /// [`Self::dispatch_with_enforcement_floor`] with
+    /// [`EnforcementFloor::CONFINED`] instead of a blanket scalar `Kernel`.
     pub async fn dispatch_with_strength_floor(
         &self,
         name: &str,
@@ -173,7 +173,7 @@ impl Registry {
             name,
             args,
             grant,
-            AxisStrengthFloor::from_scalar(strength_floor),
+            EnforcementFloor::from_scalar(strength_floor),
         )
         .await
     }
@@ -187,12 +187,12 @@ impl Registry {
     /// fall below its per-axis floor — with no fallback to a weaker backend for a
     /// restricted axis. This closes the gap between a host's prospective
     /// enforcement check and the backend actually governing execution.
-    pub async fn dispatch_with_axis_strength_floor(
+    pub async fn dispatch_with_enforcement_floor(
         &self,
         name: &str,
         args: serde_json::Value,
         grant: &Grant,
-        floor: AxisStrengthFloor,
+        floor: EnforcementFloor,
     ) -> ToolResult<serde_json::Value> {
         self.dispatch_axis(name, args, grant, floor).await
     }
@@ -202,7 +202,7 @@ impl Registry {
         name: &str,
         args: serde_json::Value,
         grant: &Grant,
-        floor: AxisStrengthFloor,
+        floor: EnforcementFloor,
     ) -> ToolResult<serde_json::Value> {
         let tool = self
             .tools
@@ -269,13 +269,8 @@ impl Registry {
         args: serde_json::Value,
         caveats: &Caveats,
     ) -> ToolResult<serde_json::Value> {
-        self.dispatch_oneshot_with_axis_strength_floor(
-            name,
-            args,
-            caveats,
-            AxisStrengthFloor::DEFAULT,
-        )
-        .await
+        self.dispatch_oneshot_with_enforcement_floor(name, args, caveats, EnforcementFloor::DEFAULT)
+            .await
     }
 
     /// [`Self::dispatch_oneshot`] with an explicit **scalar** minimum floor
@@ -287,22 +282,22 @@ impl Registry {
         caveats: &Caveats,
         strength_floor: AxisEnforcement,
     ) -> ToolResult<serde_json::Value> {
-        self.dispatch_oneshot_with_axis_strength_floor(
+        self.dispatch_oneshot_with_enforcement_floor(
             name,
             args,
             caveats,
-            AxisStrengthFloor::from_scalar(strength_floor),
+            EnforcementFloor::from_scalar(strength_floor),
         )
         .await
     }
 
     /// [`Self::dispatch_oneshot`] with an explicit **per-axis** minimum floor.
-    pub async fn dispatch_oneshot_with_axis_strength_floor(
+    pub async fn dispatch_oneshot_with_enforcement_floor(
         &self,
         name: &str,
         args: serde_json::Value,
         caveats: &Caveats,
-        floor: AxisStrengthFloor,
+        floor: EnforcementFloor,
     ) -> ToolResult<serde_json::Value> {
         let tool = self
             .tools
@@ -331,10 +326,10 @@ impl Registry {
         tool: &dyn Tool,
         granted: &Caveats,
         name: &str,
-        strength_floor: AxisStrengthFloor,
+        strength_floor: EnforcementFloor,
     ) -> ToolResult<ToolContext> {
         let gate = Gate::with_budget(self.generation, CountBound::Unlimited)
-            .with_axis_strength_floor(strength_floor);
+            .with_enforcement_floor(strength_floor);
         match &self.step_up {
             // Step-up wired in (ADR 0018 R2): a policy-demanded gesture is
             // obtained + verified before minting; a refusal is a fail-closed
@@ -635,7 +630,7 @@ mod tests {
         );
     }
 
-    /// The per-axis dispatch path threads [`AxisStrengthFloor::CONFINED`] to the
+    /// The per-axis dispatch path threads [`EnforcementFloor::CONFINED`] to the
     /// spawn confinement check: a restricted **net** axis with no kernel net
     /// backend refuses (net floor = Kernel), and the refused admission does not
     /// consume the grant's call budget (#309 accounting preserved on this path).
@@ -648,11 +643,11 @@ mod tests {
             ..Caveats::top()
         });
         let call = || {
-            block_on(registry.dispatch_with_axis_strength_floor(
+            block_on(registry.dispatch_with_enforcement_floor(
                 "spawn_probe",
                 serde_json::json!({}),
                 &grant,
-                AxisStrengthFloor::CONFINED,
+                EnforcementFloor::CONFINED,
             ))
         };
         let err = call().unwrap_err();
