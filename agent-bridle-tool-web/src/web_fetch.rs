@@ -51,15 +51,36 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 ///
 /// The returned body is **untrusted data**: `{ url, final_url, status, title,
 /// markdown }`, never framed as instructions.
+///
+/// ## Private-space authority model (AB-007, #270) — immutable ceiling, not
+/// per-Grant attenuable
+///
+/// Permission to resolve into private / loopback / link-local / unique-local /
+/// metadata address space is an **immutable authority ceiling embodied by this
+/// capability object**, fixed at construction ([`WebFetchTool::new`] ⇒
+/// `Scope::none()`, [`WebFetchTool::with_private_hosts`] ⇒ a named set). It is
+/// deliberately **NOT** a [`Caveats`] axis and **NOT** attenuable per
+/// [`Grant`](agent_bridle_core::Grant): a session's `net` grant — however
+/// permissive — can never widen it, because the tool instance's `net_private`
+/// ceiling is the whole authority. This keeps a rare, dangerous escape hatch out
+/// of the per-call authority lattice rather than letting it hide as ambient
+/// tool state that a caller could accidentally rely on being attenuable.
+///
+/// The default registry ([`agent_bridle::registry`]) instantiates this tool with
+/// `WebFetchTool::new()`, so production **defaults to `none`** (private-address
+/// resolution fully blocked). A host that needs to reach private space (e.g. a
+/// local test target) is granted by building a *distinct* tool instance with
+/// [`WebFetchTool::with_private_hosts`] and registering that — an explicit,
+/// auditable, construction-time capability choice, never an ambient default.
 #[derive(Debug, Clone)]
 pub struct WebFetchTool {
     /// Hosts explicitly permitted to resolve into private / loopback /
     /// link-local / metadata space — the SSRF escape hatch, kept **separate**
     /// from the `net` reachability allowlist (AB-007, #270). Defaults to
     /// `Scope::none()`: a public-host `net` grant keeps private-address blocking
-    /// ON. This is deliberately construction-time tool config, not a `net`
-    /// caveat, so naming a public host in a session's `net` grant can never
-    /// implicitly open private space.
+    /// ON. This is an **immutable** construction-time ceiling, not a `net`
+    /// caveat and not per-`Grant` attenuable, so naming a public host in a
+    /// session's `net` grant can never implicitly open private space.
     net_private: Scope<String>,
 }
 
@@ -407,7 +428,40 @@ fn non_empty(s: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_may_reach_private_space;
     use agent_bridle_core::{CountBound, Gate};
+
+    /// AB-007 authority model: the private-space ceiling is immutable and
+    /// **defaults to deny-all**. `new()`/`default()` name no host, so no host may
+    /// resolve into private space; only an explicit `with_private_hosts(...)`
+    /// instance opens it — never a `net` grant. This is a construction-level
+    /// proof that no ambient private-space authority hides in the default tool.
+    #[test]
+    fn private_space_ceiling_defaults_to_deny_all_and_is_construction_time() {
+        for tool in [WebFetchTool::new(), WebFetchTool::default()] {
+            for host in [
+                "127.0.0.1",
+                "169.254.169.254",
+                "internal.svc",
+                "example.com",
+            ] {
+                assert!(
+                    !host_may_reach_private_space(&tool.net_private, host),
+                    "default WebFetchTool must deny private space for {host}"
+                );
+            }
+        }
+        // The explicit escape hatch opens exactly the named host, nothing else.
+        let opted = WebFetchTool::with_private_hosts(Scope::only(["127.0.0.1".to_string()]));
+        assert!(host_may_reach_private_space(
+            &opted.net_private,
+            "127.0.0.1"
+        ));
+        assert!(!host_may_reach_private_space(
+            &opted.net_private,
+            "169.254.169.254"
+        ));
+    }
 
     /// Mint a context for the web tool through the gate, the only legitimate
     /// way.
