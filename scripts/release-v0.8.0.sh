@@ -30,17 +30,20 @@ git fetch origin main
 say "1. Full local gate (must be green)"
 just check
 
-say "2. Package dry-run for every publishable crate (no network writes)"
-for c in "${CRATES[@]}"; do
-  echo "--- dry-run: $c ---"
-  cargo publish -p "$c" --dry-run --locked --all-features
-done
+say "2. Package dry-run for the LEAF crate only (agent-bridle-core)"
+# NOTE: a downstream crate's `--dry-run` cannot resolve `agent-bridle-core@${VERSION}`
+# until core is actually on crates.io (dry-run verifies against the registry, not the
+# workspace path). So only the leaf can be fully dry-run pre-publish; each downstream
+# crate is dry-run *inside* the publish loop, after its deps are on the index.
+cargo publish -p agent-bridle-core --dry-run --locked --all-features
 
 say "3. PUBLISH (irreversible). Ctrl-C now to abort."
 read -r -p "Publish agent-bridle v${VERSION} to crates.io in order? [type 'publish'] " ans
 [ "$ans" = "publish" ] || { echo "aborted"; exit 1; }
 for c in "${CRATES[@]}"; do
-  echo "--- publish: $c ---"
+  # Dry-run first (now resolvable: deps published in prior iterations), then publish.
+  echo "--- dry-run + publish: $c ---"
+  cargo publish -p "$c" --dry-run --locked --all-features
   cargo publish -p "$c" --locked --all-features
   # Let the index settle so the next crate can resolve the just-published dep.
   echo "waiting for crates.io index to expose $c@${VERSION} ..."
