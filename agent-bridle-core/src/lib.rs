@@ -62,7 +62,7 @@ pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use net_proxy::{start_egress_proxy, ProxyHandle};
-pub use registry::{Grant, GrantId, Registry, RegistryBuilder};
+pub use registry::{Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinedAxis,
     ConfinementMechanism, EnforcementFloor, EnforcementReport, UnenforceableAxis,
@@ -97,7 +97,8 @@ pub use step_up::WebAuthnEs256Verifier;
 pub use step_up::WebAuthnVerifier;
 pub use step_up::{
     AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
-    DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,
+    DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, SessionId,
+    StepUpPolicy,
 };
 pub use tool::{Invocation, Tool};
 pub use unbridle::{human_gate, is_unbridled, set_human_gate, set_unbridled, HumanGate};

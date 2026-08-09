@@ -194,13 +194,22 @@ pub(crate) fn authorize_carried_child(
     let after_hello = child_snapshot(&stream, child_pid);
     #[cfg(target_os = "linux")]
     verify_child(pre, after_hello.clone(), hello_credentials, child_pid)?;
+    // macOS: the hello-time kernel identity is MANDATORY. The child blocks on the
+    // challenge read after writing its hello, so it is alive here in the normal
+    // handshake; a `None` (peer already gone) is a fail-closed refusal, never an
+    // authentication — we will not proceed without the intended kernel-identity
+    // proof. (A false refusal is preferable to authenticating without it.)
     #[cfg(target_os = "macos")]
-    verify_child(
-        after_hello.clone(),
-        after_hello.clone(),
-        hello_credentials,
-        child_pid,
-    )?;
+    let hello_identity = {
+        let _ = hello_credentials;
+        let snapshot = after_hello?.ok_or_else(|| {
+            "carried-child peer disconnected before its authenticated hello — refusing \
+             (fail-closed): no kernel-attested identity was captured"
+                .to_string()
+        })?;
+        verify_child_macos(&snapshot, None, child_pid)?;
+        snapshot
+    };
 
     let (reported_pid, challenge) = agent_bridle_core::decode_trusted_worker_hello(&hello)?;
     if reported_pid != child_pid {
@@ -218,7 +227,17 @@ pub(crate) fn authorize_carried_child(
     let mut ack = [0_u8; CARRIED_ACK.len()];
     let ack_credentials = recv_exact_frame(&stream, &mut ack)?;
     let after_ack = child_snapshot(&stream, child_pid);
+    #[cfg(target_os = "linux")]
     verify_child(after_hello, after_ack, ack_credentials, child_pid)?;
+    // macOS: the ACK completed the handshake, so the (already kernel-identified)
+    // child may now legitimately exit — a pipeline stage whose downstream `head`
+    // closed the pipe. A `None` post-ACK re-snapshot (ENOTCONN — peer gone) is
+    // therefore accepted; a still-connected peer must match the hello identity.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = ack_credentials;
+        verify_child_macos(&hello_identity, after_ack?.as_ref(), child_pid)?;
+    }
     if ack != CARRIED_ACK {
         return Err("carried child returned an invalid authentication ACK".to_string());
     }
@@ -445,22 +464,90 @@ fn child_snapshot(_stream: &UnixStream, child_pid: u32) -> Result<ParentSnapshot
     })
 }
 
+/// Snapshot the carried child's kernel-attested identity on macOS.
+///
+/// Returns `Ok(None)` when the peer has already **disconnected** (`ENOTCONN`):
+/// `getsockopt(LOCAL_PEERPID)` reports the most-recent peer *writer* and, once
+/// every fd to the socketpair's child end is closed, fails with `ENOTCONN`
+/// (verified on-device: pre-write it names the socketpair creator; after the
+/// child's hello it names the child; after the child exits it is `ENOTCONN`).
+///
+/// `None` is a *terminal* state the caller may accept ONLY on the post-ACK
+/// re-snapshot — where an authenticated carried utility in a pipeline
+/// legitimately exits the instant a downstream stage (`head -1`) closes the pipe.
+/// The **hello-time** identity is mandatory (see [`authorize_carried_child`]): a
+/// `None` there is a fail-closed refusal, never a pass. Any errno other than
+/// `ENOTCONN` remains a hard failure.
 #[cfg(target_os = "macos")]
 #[cfg(feature = "carried-coreutils")]
-fn child_snapshot(stream: &UnixStream, _child_pid: u32) -> Result<ParentSnapshot, String> {
-    let peer_pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
-        .map_err(|error| format!("read carried-child peer PID: {error}"))?;
+fn child_snapshot(stream: &UnixStream, _child_pid: u32) -> Result<Option<ParentSnapshot>, String> {
+    let peer_pid =
+        match nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid) {
+            Ok(pid) => pid,
+            Err(nix::errno::Errno::ENOTCONN) => return Ok(None),
+            Err(error) => return Err(format!("read carried-child peer PID: {error}")),
+        };
     let image = inspect_image_with_fallback(peer_pid)?;
-    Ok(ParentSnapshot {
+    let token =
+        match nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken) {
+            Ok(token) => token,
+            Err(nix::errno::Errno::ENOTCONN) => return Ok(None),
+            Err(error) => return Err(format!("read carried-child peer audit token: {error}")),
+        };
+    Ok(Some(ParentSnapshot {
         ppid: std::process::id() as i32,
         peer_pid,
         image,
-        token: nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken)
-            .map_err(|error| format!("read carried-child peer audit token: {error}"))?,
-    })
+        token,
+    }))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// macOS carried-child verification.
+///
+/// The `hello` snapshot is the **kernel-attested identity captured immediately
+/// after the child's authenticated hello, and it is mandatory** — a missing
+/// hello-time identity is never treated as success. `reverify` is the OPTIONAL
+/// post-ACK re-snapshot: `None` means the (already authenticated) child exited
+/// after completing the handshake, which is benign (a disconnected peer cannot be
+/// a live impersonator — no process holds the child end to substitute an
+/// identity). A *connected* `reverify` must still match the hello-time identity.
+///
+/// The authority boundary is possession of the private carried socketpair PLUS
+/// the completed hello/challenge/ACK handshake; the kernel PID/image check here
+/// is the defense-in-depth cross-check that the *writer* was the spawned child
+/// (not a grandchild that inherited the fd, and not a user-space-forged reported
+/// PID — the kernel value is authoritative).
+#[cfg(target_os = "macos")]
+#[cfg(feature = "carried-coreutils")]
+fn verify_child_macos(
+    hello: &ParentSnapshot,
+    reverify: Option<&ParentSnapshot>,
+    child_pid: u32,
+) -> Result<(), String> {
+    let child_pid = i32::try_from(child_pid).map_err(|_| "child PID does not fit i32")?;
+    if hello.peer_pid != child_pid {
+        return Err(format!(
+            "carried-child kernel peer PID {} is not the spawned child {child_pid}",
+            hello.peer_pid
+        ));
+    }
+    if let ImageIdentityState::Known(peer_image) = &hello.image {
+        if &current_image()? != peer_image {
+            return Err("carried-child image is not this executable".to_string());
+        }
+    }
+    if let Some(reverify) = reverify {
+        if hello.peer_pid != reverify.peer_pid
+            || hello.ppid != reverify.ppid
+            || !same_image(&hello.image, &reverify.image)
+        {
+            return Err("carried-child identity changed during authentication".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 #[cfg(feature = "carried-coreutils")]
 fn verify_child(
     pre: Result<ParentSnapshot, String>,
@@ -564,5 +651,101 @@ mod tests {
         assert_eq!(received, authority);
         assert_eq!(credentials.pid, std::process::id() as i32);
         assert_eq!(credentials.uid, nix::unistd::getuid().as_raw());
+    }
+}
+
+#[cfg(all(test, target_os = "macos", feature = "carried-coreutils"))]
+mod macos_auth_tests {
+    use super::*;
+
+    /// A real, connected hello-time snapshot for this process (both socketpair
+    /// ends live here, so the kernel peer PID is our own pid).
+    fn live_snapshot() -> (UnixStream, UnixStream, ParentSnapshot) {
+        let (parent, child) = UnixStream::pair().expect("socketpair");
+        // The child end must WRITE first so LOCAL_PEERPID names it.
+        (&child).write_all(b"x").expect("child write");
+        let mut buf = [0_u8; 1];
+        (&parent).read_exact(&mut buf).expect("parent read");
+        let snap = child_snapshot(&parent, std::process::id())
+            .expect("snapshot")
+            .expect("connected peer must snapshot Some");
+        (parent, child, snap)
+    }
+
+    /// Happy path: a connected hello identity that equals the spawned child, with a
+    /// matching connected re-verify, authenticates.
+    #[test]
+    fn direct_child_authenticates() {
+        let (_p, _c, hello) = live_snapshot();
+        verify_child_macos(&hello, Some(&hello), std::process::id()).expect("direct child ok");
+    }
+
+    /// A kernel peer PID that is not the spawned child is rejected — the kernel
+    /// value is authoritative, so a user-space-forged reported PID cannot stand in
+    /// for it (verify_child_macos never consults the self-declared hello bytes).
+    #[test]
+    fn wrong_kernel_pid_is_rejected_even_against_a_forged_report() {
+        let (_p, _c, hello) = live_snapshot();
+        let forged_report = std::process::id() + 4242; // pretend the hello claimed this
+        assert!(
+            verify_child_macos(&hello, None, forged_report).is_err(),
+            "kernel peer PID must be checked against the spawned child, not a report"
+        );
+    }
+
+    /// An identity substitution while the peer is still CONNECTED (a different live
+    /// writer mid-handshake) is rejected.
+    #[test]
+    fn connected_identity_substitution_is_rejected() {
+        let (_p, _c, hello) = live_snapshot();
+        let mut substituted = hello.clone();
+        substituted.peer_pid = hello.peer_pid + 9999;
+        assert!(
+            verify_child_macos(&hello, Some(&substituted), std::process::id()).is_err(),
+            "a connected peer that changed identity must be rejected"
+        );
+    }
+
+    /// A mismatched peer image (where inspectable) is rejected.
+    #[test]
+    fn wrong_image_is_rejected() {
+        let (_p, _c, hello) = live_snapshot();
+        let mut wrong = hello.clone();
+        wrong.image = ImageIdentityState::Known(ImageIdentity {
+            path: std::path::PathBuf::from("/definitely/not/this/executable"),
+        });
+        assert!(
+            verify_child_macos(&wrong, None, std::process::id()).is_err(),
+            "a peer whose image is not this executable must be rejected"
+        );
+    }
+
+    /// Disconnect AFTER a completed handshake: the post-ACK re-snapshot is `None`
+    /// (ENOTCONN — the authenticated child exited), which is accepted.
+    #[test]
+    fn disconnect_after_ack_succeeds() {
+        let (_p, _c, hello) = live_snapshot();
+        verify_child_macos(&hello, None, std::process::id())
+            .expect("a peer that exits after the handshake is tolerated on re-verify");
+    }
+
+    /// Disconnect BEFORE the authenticated hello: the hello-time snapshot is `None`
+    /// (ENOTCONN), which the caller turns into a fail-closed refusal. No kernel
+    /// identity is captured, so authentication must NOT proceed.
+    #[test]
+    fn disconnect_before_hello_snapshots_none_and_refuses() {
+        let (parent, child) = UnixStream::pair().expect("socketpair");
+        (&child).write_all(b"x").expect("child write");
+        let mut buf = [0_u8; 1];
+        (&parent).read_exact(&mut buf).expect("parent read");
+        drop(child); // peer gone before the hello-time snapshot
+        let snap = child_snapshot(&parent, std::process::id()).expect("snapshot call");
+        assert!(
+            snap.is_none(),
+            "a disconnected peer must snapshot None (ENOTCONN)"
+        );
+        // authorize_carried_child converts a None hello into a hard refusal:
+        let refused = snap.ok_or_else(|| "no kernel-attested identity".to_string());
+        assert!(refused.is_err(), "a None hello identity must fail closed");
     }
 }

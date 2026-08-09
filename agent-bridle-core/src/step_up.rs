@@ -33,7 +33,11 @@ use crate::{ToolContext, ToolError};
 
 /// Domain-separation tag mixed into every step-up [`Challenge`]. Bumping the
 /// version invalidates every previously issued challenge.
-const CHALLENGE_DOMAIN: &[u8] = b"agent-bridle/step-up/v1";
+// v2 (v0.8): the bound challenge now includes a per-session `SessionId`, so a
+// discharge is domain-separated by the session that issued it. The version bump
+// is deliberate — any v1 discharge (no session in the preimage) can never match
+// a v2 challenge, which is exactly the cross-lifetime replay we are closing.
+const CHALLENGE_DOMAIN: &[u8] = b"agent-bridle/step-up/v2";
 
 // ── Presence ────────────────────────────────────────────────────────────────
 
@@ -85,20 +89,70 @@ impl ContentId {
     }
 }
 
+/// A per-session identity that domain-separates every step-up [`Challenge`] a
+/// gate issues, so a human gesture proven for one session cannot authenticate a
+/// different one.
+///
+/// **The problem it closes.** Without it, a challenge is `action ‖ generation ‖
+/// nonce`, and the gate's single-use replay guard is an in-memory set. Two
+/// distinct hazards follow: a second live gate never saw the first's discharge,
+/// and a *recreated* gate (process/session restart) starts with an empty guard.
+/// Either way an identical `(action, generation, nonce)` reproduces identical
+/// challenge bytes, so a captured discharge re-verifies. Folding a `SessionId`
+/// into the preimage makes the challenge bytes differ per session, so the old
+/// discharge answers a challenge no live gate is asking — the replay is refused
+/// structurally, not merely because a volatile set happens to remember it.
+///
+/// **Host contract — the identity MUST be lifetime-unique.** The core crate is
+/// deliberately rng-less and clock-less, so the host supplies the 32 bytes. Mint
+/// them **fresh per gate lifetime** from a CSPRNG (or a durable per-session
+/// secret that is never reused across a trust boundary). Reusing the same
+/// `SessionId` in a recreated gate re-opens exactly the replay window this type
+/// exists to close — the domain separation is only as strong as the freshness
+/// of the identity behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId([u8; 32]);
+
+impl SessionId {
+    /// Wrap 32 host-supplied bytes as a session identity. See the type contract:
+    /// these MUST be lifetime-unique (freshly minted per gate), or the replay
+    /// protection they provide is void.
+    #[must_use]
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw 32-byte identity mixed into every challenge this session binds.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// A what-you-see-is-what-you-sign challenge: the content address of
-/// `DOMAIN ‖ action_id ‖ generation ‖ nonce`. The authenticator signs *this*, so
-/// a verified signature proves the human authorized that exact action, in that
-/// causal generation, for that single-use nonce.
+/// `DOMAIN ‖ session ‖ action_id ‖ generation ‖ nonce`. The authenticator signs
+/// *this*, so a verified signature proves the human authorized that exact action,
+/// in that session, in that causal generation, for that single-use nonce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Challenge([u8; 32]);
 
 impl Challenge {
-    /// Bind a challenge to an action's [`ContentId`], a causal `generation`
-    /// (never wall-clock), and a single-use `nonce`.
+    /// Bind a challenge to the issuing [`SessionId`], an action's [`ContentId`],
+    /// a causal `generation` (never wall-clock), and a single-use `nonce`.
+    ///
+    /// The `session` is the first field after the domain tag, so a discharge is
+    /// inseparable from the session that issued its challenge: replaying it into
+    /// any other session recomputes different bytes and is refused.
     #[must_use]
-    pub fn bind(action: &ContentId, generation: u64, nonce: &[u8; 32]) -> Self {
-        let mut buf = Vec::with_capacity(CHALLENGE_DOMAIN.len() + 32 + 8 + 32);
+    pub fn bind(
+        session: &SessionId,
+        action: &ContentId,
+        generation: u64,
+        nonce: &[u8; 32],
+    ) -> Self {
+        let mut buf = Vec::with_capacity(CHALLENGE_DOMAIN.len() + 32 + 32 + 8 + 32);
         buf.extend_from_slice(CHALLENGE_DOMAIN);
+        buf.extend_from_slice(session.as_bytes());
         buf.extend_from_slice(action.as_bytes());
         buf.extend_from_slice(&generation.to_le_bytes());
         buf.extend_from_slice(nonce);
@@ -632,15 +686,18 @@ impl DischargeVerifier for WebAuthnEs256Verifier {
 pub trait DischargeProvider {
     /// Run the ceremony for `request` at `required` strength and return a
     /// [`Discharge`] whose `challenge` answers
-    /// [`Challenge::bind`]`(&request.content_id(), generation, nonce)`.
+    /// [`Challenge::bind`]`(session, &request.content_id(), generation, nonce)`.
     ///
-    /// `generation` and the single-use `nonce` are supplied by the caller (the
-    /// gate) so the produced proof binds to this exact action, generation, and
-    /// nonce — what-you-see-is-what-you-sign. An `Err(reason)` (the human
-    /// declined, no authenticator present, a transport failure) becomes a
+    /// `session`, `generation`, and the single-use `nonce` are supplied by the
+    /// caller (the gate) so the produced proof binds to this exact session,
+    /// action, generation, and nonce — what-you-see-is-what-you-sign. The
+    /// `session` in particular makes the proof inseparable from the gate that
+    /// asked for it, so it cannot be replayed into another. An `Err(reason)` (the
+    /// human declined, no authenticator present, a transport failure) becomes a
     /// fail-closed leash denial; the reason is safe to surface to the agent.
     fn obtain(
         &self,
+        session: &SessionId,
         request: &CallRequest,
         required: &AttestRequirement,
         generation: u64,
@@ -804,16 +861,29 @@ mod tests {
         SigningKey::from_bytes(&[7u8; 32])
     }
 
-    /// Build a discharge by signing the challenge for `request` at `generation`.
+    /// A fixed session identity for the step-up tests. Every gate under test is
+    /// built `.with_session(test_session())` and every discharge is signed for it,
+    /// so the ceremony round-trips; the cross-session *rejection* is proven
+    /// explicitly with a second, distinct id in
+    /// [`a_discharge_bound_to_one_session_is_rejected_by_another`]. Ungated: it
+    /// mints only a `SessionId` (no crypto), and non-verifier gate tests call it
+    /// too, so it must exist under `--no-default-features` as well.
+    fn test_session() -> SessionId {
+        SessionId::new([9u8; 32])
+    }
+
+    /// Build a discharge by signing the challenge for `request` at `generation`,
+    /// bound to `session` (what the gate will recompute against).
     #[cfg(feature = "verifier-ed25519")]
     fn sign_discharge(
+        session: &SessionId,
         key: &SigningKey,
         request: &CallRequest,
         generation: u64,
         nonce: &[u8; 32],
         presence: Presence,
     ) -> Discharge {
-        let challenge = Challenge::bind(&request.content_id(), generation, nonce);
+        let challenge = Challenge::bind(session, &request.content_id(), generation, nonce);
         let sig = key.sign(challenge.as_bytes());
         Discharge {
             presence,
@@ -878,7 +948,7 @@ mod tests {
     /// call — the gate withholds the leash until a proof is presented.
     #[test]
     fn needs_discharge_does_not_mint_or_charge() {
-        let gate = Gate::with_budget(0, CountBound::AtMost(1));
+        let gate = Gate::with_budget(0, CountBound::AtMost(1)).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         // First, an action the policy gates: must return NeedsDischarge.
@@ -905,12 +975,19 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn valid_discharge_mints_and_records() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
         let nonce = [9u8; 32];
-        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let discharge = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Passkey,
+        );
         let attempt = DischargeAttempt {
             nonce,
             discharge: &discharge,
@@ -940,12 +1017,14 @@ mod tests {
     impl DischargeProvider for MockProvider {
         fn obtain(
             &self,
+            session: &SessionId,
             request: &CallRequest,
             _required: &AttestRequirement,
             generation: u64,
             nonce: &[u8; 32],
         ) -> Result<Discharge, String> {
             Ok(sign_discharge(
+                session,
                 &self.key,
                 request,
                 generation,
@@ -963,6 +1042,7 @@ mod tests {
     impl DischargeProvider for FailingProvider {
         fn obtain(
             &self,
+            _session: &SessionId,
             _request: &CallRequest,
             _required: &AttestRequirement,
             _generation: u64,
@@ -978,7 +1058,7 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn provider_obtain_then_authorize_mints_and_records() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let provider = MockProvider {
@@ -1007,7 +1087,7 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn provider_error_fails_closed() {
-        let gate = Gate::with_budget(0, CountBound::AtMost(1));
+        let gate = Gate::with_budget(0, CountBound::AtMost(1)).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let err = gate
@@ -1042,7 +1122,7 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn provider_below_required_presence_is_denied() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let provider = MockProvider {
@@ -1068,7 +1148,7 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn authorize_step_up_without_gesture_degenerates_to_authorize() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let free = NamedTool("free.tool");
         let provider = MockProvider {
@@ -1096,12 +1176,19 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn wrong_challenge_is_denied() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
         // Sign over a different nonce than the one the gate will recompute with.
-        let discharge = sign_discharge(&test_key(), &req, 0, &[1u8; 32], Presence::Passkey);
+        let discharge = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &[1u8; 32],
+            Presence::Passkey,
+        );
         let attempt = DischargeAttempt {
             nonce: [2u8; 32], // gate's nonce differs → expected challenge differs
             discharge: &discharge,
@@ -1118,13 +1205,20 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn presence_too_weak_fails_closed() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
         let nonce = [4u8; 32];
         // Correct challenge, but only Prompt strength.
-        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Prompt);
+        let discharge = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Prompt,
+        );
         let attempt = DischargeAttempt {
             nonce,
             discharge: &discharge,
@@ -1147,14 +1241,21 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn no_authenticator_presence_none_cannot_satisfy_passkey() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
         let nonce = [5u8; 32];
         // Correctly bound challenge (same nonce the gate recomputes with), but
         // the achieved presence is None — the "no authenticator available" case.
-        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::None);
+        let discharge = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::None,
+        );
         let attempt = DischargeAttempt {
             nonce,
             discharge: &discharge,
@@ -1174,14 +1275,21 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn ed25519_verifier_accepts_valid_and_rejects_wrong_challenge() {
-        let gate = Gate::new(0);
+        let gate = Gate::new(0).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
 
         // Accept: a passkey discharge over the gate-recomputed challenge mints.
         let nonce = [21u8; 32];
-        let ok = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let ok = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Passkey,
+        );
         let attempt = DischargeAttempt {
             nonce,
             discharge: &ok,
@@ -1197,7 +1305,14 @@ mod tests {
         );
 
         // Reject: signed over a different nonce than the gate recomputes.
-        let bad = sign_discharge(&test_key(), &req, 0, &[99u8; 32], Presence::Passkey);
+        let bad = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &[99u8; 32],
+            Presence::Passkey,
+        );
         let bad_attempt = DischargeAttempt {
             nonce: [22u8; 32], // gate's nonce differs → expected challenge differs
             discharge: &bad,
@@ -1210,7 +1325,14 @@ mod tests {
 
         // Reject: a Prompt gesture cannot satisfy a Passkey requirement.
         let weak_nonce = [23u8; 32];
-        let weak = sign_discharge(&test_key(), &req, 0, &weak_nonce, Presence::Prompt);
+        let weak = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &weak_nonce,
+            Presence::Prompt,
+        );
         let weak_attempt = DischargeAttempt {
             nonce: weak_nonce,
             discharge: &weak,
@@ -1228,12 +1350,19 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn discharge_is_single_use_replay_is_denied() {
-        let gate = Gate::with_budget(0, CountBound::AtMost(2));
+        let gate = Gate::with_budget(0, CountBound::AtMost(2)).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
         let nonce = [31u8; 32];
-        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let discharge = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Passkey,
+        );
         let attempt = DischargeAttempt {
             nonce,
             discharge: &discharge,
@@ -1260,19 +1389,108 @@ mod tests {
         }
     }
 
+    /// v0.8 cross-lifetime replay defense: a discharge obtained under one
+    /// [`SessionId`] must NOT authenticate a *different* session — even with the
+    /// identical action, generation, and nonce, and even against a gate whose
+    /// single-use `consumed` set has never seen it (as a recreated gate's would
+    /// be empty). The session is folded into the challenge preimage, so the old
+    /// discharge answers a challenge the second gate never asks.
+    ///
+    /// This FAILS on the pre-session code: without a `SessionId` in `bind`, the
+    /// two gates recompute byte-identical challenges and the captured discharge
+    /// verifies — exactly the replay across Registry/process lifetime this closes.
+    #[cfg(feature = "verifier-ed25519")]
+    #[test]
+    fn a_discharge_bound_to_one_session_is_rejected_by_another() {
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+        let nonce = [42u8; 32];
+
+        // Session A issues + accepts a valid discharge.
+        let session_a = SessionId::new([0xAA; 32]);
+        let gate_a = Gate::new(0).with_session(session_a);
+        let discharge = sign_discharge(&session_a, &test_key(), &req, 0, &nonce, Presence::Passkey);
+        let attempt_a = DischargeAttempt {
+            nonce,
+            discharge: &discharge,
+            verifier: &Ed25519Verifier,
+        };
+        gate_a
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt_a)
+            .expect("gate A accepts a discharge for its own session");
+
+        // A distinct session B (a second/recreated gate — fresh, empty consumed
+        // set) is presented the SAME discharge, same action/generation/nonce.
+        let gate_b = Gate::new(0).with_session(SessionId::new([0xBB; 32]));
+        let attempt_b = DischargeAttempt {
+            nonce,
+            discharge: &discharge,
+            verifier: &Ed25519Verifier,
+        };
+        let err = gate_b
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt_b)
+            .expect_err("a discharge from session A must not authenticate session B");
+        assert!(matches!(err, ToolError::Denied { .. }));
+    }
+
+    /// v0.8 fail-closed default: a gate with no [`SessionId`] bound refuses every
+    /// discharge — it cannot domain-separate its challenges, so it must not
+    /// pretend to verify one. The refusal precedes verification and charging.
+    #[cfg(feature = "verifier-ed25519")]
+    #[test]
+    fn an_unsessioned_gate_refuses_every_discharge() {
+        let granted = Caveats::top();
+        let tool = NamedTool("git.push");
+        let req = push_request();
+        let nonce = [7u8; 32];
+        // A perfectly valid discharge for `test_session()` — the point is that the
+        // gate never bound a session, so it cannot accept ANY discharge.
+        let discharge = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Passkey,
+        );
+        let attempt = DischargeAttempt {
+            nonce,
+            discharge: &discharge,
+            verifier: &Ed25519Verifier,
+        };
+        let gate = Gate::new(0); // no .with_session(..)
+        let err = gate
+            .authorize_with_discharge(&tool, &granted, &req, &push_policy(), &attempt)
+            .expect_err("an unsessioned gate must refuse a discharge");
+        match err {
+            ToolError::Denied { reason } => {
+                assert!(reason.contains("session"), "reason was: {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
     /// #63: `freshness_generations: 0` requires the *current* generation — a
     /// discharge bound to an earlier generation is denied (the default
     /// `passkey_recorded()` requirement is freshness 0).
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn freshness_generations_zero_requires_current_generation() {
-        let gate = Gate::new(1); // current generation is 1
+        let gate = Gate::new(1).with_session(test_session()); // current generation is 1
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
         let nonce = [32u8; 32];
         // Signed for generation 0 — one behind the gate, outside a zero window.
-        let stale = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let stale = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Passkey,
+        );
         let attempt = DischargeAttempt {
             nonce,
             discharge: &stale,
@@ -1290,7 +1508,7 @@ mod tests {
     #[cfg(feature = "verifier-ed25519")]
     #[test]
     fn freshness_generations_window_accepts_recent() {
-        let gate = Gate::new(1);
+        let gate = Gate::new(1).with_session(test_session());
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
@@ -1307,7 +1525,14 @@ mod tests {
         );
         let nonce = [33u8; 32];
         // Signed for generation 0; gate at 1, window = 1 → in range.
-        let recent = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let recent = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Passkey,
+        );
         let attempt = DischargeAttempt {
             nonce,
             discharge: &recent,
@@ -1328,13 +1553,21 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let gate = Arc::new(Gate::with_budget(0, CountBound::AtMost(2)));
+        let gate =
+            Arc::new(Gate::with_budget(0, CountBound::AtMost(2)).with_session(test_session()));
         let granted = Caveats::top();
         let tool = NamedTool("git.push");
         let req = push_request();
         let policy = push_policy();
         let nonce = [34u8; 32];
-        let discharge = sign_discharge(&test_key(), &req, 0, &nonce, Presence::Passkey);
+        let discharge = sign_discharge(
+            &test_session(),
+            &test_key(),
+            &req,
+            0,
+            &nonce,
+            Presence::Passkey,
+        );
 
         let (r1, r2) = thread::scope(|s| {
             let h1 = s.spawn(|| {
@@ -1434,7 +1667,12 @@ mod tests {
 
     #[cfg(feature = "verifier-webauthn")]
     fn webauthn_challenge(nonce: u8) -> Challenge {
-        Challenge::bind(&push_request().content_id(), 0, &[nonce; 32])
+        Challenge::bind(
+            &test_session(),
+            &push_request().content_id(),
+            0,
+            &[nonce; 32],
+        )
     }
 
     #[cfg(feature = "verifier-webauthn")]
@@ -1550,6 +1788,7 @@ mod tests {
     #[cfg(feature = "verifier-webauthn-es256")]
     fn es256_challenge(nonce: u8) -> Challenge {
         Challenge::bind(
+            &test_session(),
             &CallRequest::unspecified("es256.test").content_id(),
             0,
             &[nonce; 32],

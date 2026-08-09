@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_bridle_core::{CallRequest, Presence};
+use agent_bridle_core::{CallRequest, Presence, SessionId};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -71,6 +71,11 @@ pub struct AppState {
     pending: Mutex<HashMap<String, Pending>>,
     /// A monotonic generation counter (causal, never wall-clock).
     generation: AtomicU64,
+    /// This gateway lifetime's step-up session identity, minted fresh at
+    /// construction. It domain-separates every challenge this state binds, so a
+    /// discharge captured against one gateway process cannot be replayed against
+    /// a restarted one (the host contract on [`SessionId`]: lifetime-unique).
+    session: SessionId,
     /// The demo flow generator for the Traffic tab.
     flows: Mutex<MockFlows>,
 }
@@ -79,11 +84,17 @@ impl AppState {
     /// A fresh state with the given relying-party id.
     #[must_use]
     pub fn new(rp_id: impl Into<String>) -> Self {
+        // Mint a fresh, unpredictable session per gateway lifetime (the gateway
+        // has an rng; core does not). A new process ⇒ a new session ⇒ old
+        // discharges are bound to a dead session's challenges.
+        let mut session_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut session_bytes);
         Self {
             rp_id: rp_id.into(),
             enrolled: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
+            session: SessionId::new(session_bytes),
             flows: Mutex::new(MockFlows::new()),
         }
     }
@@ -287,7 +298,8 @@ impl AppState {
         );
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let challenge = mock::bind_challenge(&action.content_id(), generation, &nonce);
+        let challenge =
+            mock::bind_challenge(&self.session, &action.content_id(), generation, &nonce);
         let challenge_bytes = *challenge.as_bytes();
 
         let id = hex(&nonce[..8]);

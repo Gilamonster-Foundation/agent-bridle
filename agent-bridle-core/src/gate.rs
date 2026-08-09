@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use crate::step_up::{
     Attestation, CallRequest, Challenge, Decision, DischargeAttempt, DischargeProvider,
-    DischargeVerifier, StepUpPolicy,
+    DischargeVerifier, SessionId, StepUpPolicy,
 };
 use crate::{
     AxisEnforcement, Caveats, CountBound, EnforcementFloor, Sandbox, SandboxKind, Scope, Tool,
@@ -64,10 +64,21 @@ pub struct Gate {
     /// authority axis before a confinement site fails closed. Defaults to
     /// [`EnforcementFloor::DEFAULT`] (filesystem kernel, exec/net permissive).
     strength_floor: EnforcementFloor,
+    /// The session identity every step-up challenge this gate issues is
+    /// domain-separated by (see [`SessionId`]). `None` ⇒ no session is bound, and
+    /// the gate **fails closed**: it refuses every discharge, because it cannot
+    /// prove a gesture belongs to *this* session rather than a replayed one. A
+    /// host that uses step-up MUST bind a lifetime-unique session via
+    /// [`Gate::with_session`]. The in-memory `consumed` set below only enforces
+    /// single-use *within* a lifetime; the session identity is what prevents a
+    /// discharge from crossing into a second (or recreated) gate.
+    session: Option<SessionId>,
     /// Bound challenges already consumed by an accepted [`crate::Discharge`].
     /// Makes every verified human gesture **single-use** (replay-proof): a
     /// discharge re-presented after it first succeeded is denied. Interior-mutable
     /// like the budget so `authorize_with_discharge` keeps `&self`. ADR 0007 D4.
+    /// This guard is per-lifetime (it resets when the gate is recreated); the
+    /// [`SessionId`] is what closes replay *across* lifetimes.
     consumed: Mutex<HashSet<[u8; 32]>>,
 }
 
@@ -82,6 +93,7 @@ impl Gate {
             generation,
             sandbox_kind: SandboxKind::None,
             strength_floor: EnforcementFloor::DEFAULT,
+            session: None,
             consumed: Mutex::new(HashSet::new()),
         }
     }
@@ -100,8 +112,28 @@ impl Gate {
             generation,
             sandbox_kind: SandboxKind::None,
             strength_floor: EnforcementFloor::DEFAULT,
+            session: None,
             consumed: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Bind the [`SessionId`] that domain-separates every step-up challenge this
+    /// gate issues. **Required for any step-up path** — an unbound gate refuses
+    /// every discharge (fail-closed). The host MUST pass a lifetime-unique
+    /// identity (see [`SessionId`]); reusing one across gate lifetimes re-opens
+    /// the cross-lifetime replay window.
+    #[must_use]
+    pub fn with_session(mut self, session: SessionId) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// The session identity this gate binds challenges to, if any. A host uses it
+    /// to construct the *same* challenge the gate will recompute — the human signs
+    /// `Challenge::bind(session, action, generation, nonce)`.
+    #[must_use]
+    pub fn session(&self) -> Option<SessionId> {
+        self.session
     }
 
     /// Record the OS-level sandbox this gate's contexts run under. A tool reads
@@ -305,6 +337,18 @@ impl Gate {
             ));
         }
 
+        // Fail closed on an unbound session (v0.8 cross-lifetime replay defense).
+        // A gesture is only meaningful relative to the session that challenged
+        // for it; with no `SessionId` bound we cannot domain-separate this gate's
+        // challenges from any other's, so we refuse rather than verify against an
+        // ambiguous challenge. Checked before verification/charging, so it costs
+        // no call. A host that gates actions MUST call `Gate::with_session`.
+        let Some(session) = self.session else {
+            return Err(ToolError::denied(
+                "step-up requires a bound session identity; call Gate::with_session",
+            ));
+        };
+
         // Freshness window (ADR 0007 D4): accept a discharge bound to any
         // generation in `[generation - freshness_generations, generation]`.
         // Recompute the bound challenge across the window (newest first) and use
@@ -319,9 +363,11 @@ impl Gate {
         let oldest = self.generation.saturating_sub(window);
         let expected = (oldest..=self.generation)
             .rev()
-            .map(|g| Challenge::bind(&content_id, g, &attempt.nonce))
+            .map(|g| Challenge::bind(&session, &content_id, g, &attempt.nonce))
             .find(|c| c.as_bytes() == &attempt.discharge.challenge)
-            .unwrap_or_else(|| Challenge::bind(&content_id, self.generation, &attempt.nonce));
+            .unwrap_or_else(|| {
+                Challenge::bind(&session, &content_id, self.generation, &attempt.nonce)
+            });
 
         if let Err(reason) = attempt
             .verifier
@@ -393,10 +439,19 @@ impl Gate {
             // No step-up owed: the base authorize is the whole story.
             return self.authorize(tool, granted).map(|cx| (cx, None));
         }
+        // Fail closed on an unbound session before running any ceremony — the
+        // provider needs the session to bind a challenge the gate will accept,
+        // and a gate that cannot domain-separate its challenges must not gate at
+        // all (see `authorize_with_discharge`).
+        let Some(session) = self.session else {
+            return Err(ToolError::denied(
+                "step-up requires a bound session identity; call Gate::with_session",
+            ));
+        };
         // Run the host ceremony. A failure is fail-closed — nothing minted or
         // charged, because we have not reached the mint path yet.
         let discharge = provider
-            .obtain(request, &required, self.generation, &nonce)
+            .obtain(&session, request, &required, self.generation, &nonce)
             .map_err(ToolError::denied)?;
         let attempt = DischargeAttempt {
             nonce,
