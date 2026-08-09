@@ -7,20 +7,28 @@
 //! DNS resolution; the predicates themselves only ever look at an
 //! already-resolved [`IpAddr`] and the granted `net` [`Scope`].
 //!
-//! ## The allowlist *is* the `net` Caveat
+//! ## Two separate axes: *reachability* and *private-space* (AB-007, #270)
 //!
-//! There is no second allowlist. The effective `net` scope a tool runs under
-//! (`granted.meet(required)`, minted into the [`ToolContext`]) is the allowlist:
+//! Host **reachability** and permission to resolve into **private/loopback
+//! space** are distinct authorities, screened against two distinct inputs:
 //!
-//! - `Scope::All` — every host satisfies the host check. SSRF screening still
-//!   applies (an `All` grant does *not* opt every host into reaching private
-//!   space), so a public fetch is fine but `All` cannot reach `127.0.0.1`.
-//! - `Scope::Only({h, ...})` — only the named hosts satisfy the host check, AND
-//!   a host named here is **explicitly opted in** to private-IP space. This is
-//!   the single, intentional escape hatch: name `127.0.0.1` (or an internal
-//!   hostname) in the grant and that host — and only that host — may resolve to
-//!   a private/loopback address. Everything not named stays default-denied and
-//!   SSRF-screened.
+//! - `net: Scope<String>` — the effective `net` caveat (`granted.meet(required)`,
+//!   minted into the [`ToolContext`]). This is the **reachability** allowlist and
+//!   *only* that: `Scope::All` admits any host; `Scope::Only({h, …})` admits the
+//!   named hosts. Being on this list says nothing about private space.
+//! - `net_private: Scope<String>` — a **separate** opt-in list (the web tool's
+//!   config, defaulting to `Scope::none()`). Only a host named here may resolve
+//!   to a private / loopback / link-local / unique-local / metadata address. It
+//!   is the single, explicit SSRF escape hatch — e.g. name `127.0.0.1` or an
+//!   internal hostname to test against it.
+//!
+//! The pre-#270 defect (AB-007): membership in `net` *was* the private-space
+//! opt-in, so every explicitly-allowed **public** host became an implicit
+//! SSRF / private-space grant (a compromised / rebinding / split-horizon DNS
+//! answer of `127.0.0.1`, `10.0.0.0/8`, `169.254.169.254`, `fc00::/7`, … was
+//! accepted because the *hostname* was allowlisted). Now a public-host grant
+//! keeps private-address blocking **enabled**; crossing the public/private
+//! boundary requires the separate `net_private` capability.
 //!
 //! [`Gate`]: agent_bridle_core::Gate
 //! [`ToolContext`]: agent_bridle_core::ToolContext
@@ -39,7 +47,8 @@ pub enum NetGuardError {
         host: String,
     },
     /// The host resolved to a private / loopback / link-local / unique-local
-    /// address and was not explicitly opted in via the allowlist (SSRF block).
+    /// address and was not opted into private space via `net_private` (SSRF
+    /// block).
     PrivateAddress {
         /// The host that resolved to a blocked address.
         host: String,
@@ -61,7 +70,7 @@ impl fmt::Display for NetGuardError {
             }
             Self::PrivateAddress { host, addr } => write!(
                 f,
-                "SSRF block: {host:?} resolved to private/loopback address {addr} (not in the net allowlist)"
+                "SSRF block: {host:?} resolved to private/loopback address {addr} (host is not opted into private-address space via net_private)"
             ),
             Self::NoAddress { host } => write!(f, "host {host:?} did not resolve to any address"),
         }
@@ -70,22 +79,26 @@ impl fmt::Display for NetGuardError {
 
 impl std::error::Error for NetGuardError {}
 
-/// Is `host` *explicitly* named in the granted `net` allowlist?
+/// May `host` resolve into private / loopback / link-local / metadata space?
 ///
-/// This is the opt-in test for private-IP space. Only `Scope::Only` sets count:
-/// an explicit grant of a host (e.g. `"127.0.0.1"` or `"internal.svc"`) opts
-/// *that host* — and no other — into being allowed to resolve to a private or
-/// loopback address. `Scope::All` is **not** an opt-in for private space: it
-/// grants every *public* host, but does not name any host, so it returns
-/// `false` here and private addresses stay blocked under `All`.
+/// This consults the **separate** `net_private` opt-in axis — *never* the `net`
+/// reachability allowlist (AB-007, #270). A host crosses the public/private
+/// boundary only when named here:
 ///
-/// Matching is exact on the host string as it appears in the URL (the same
-/// granularity [`agent_bridle_core::ToolContext::check_net`] uses), so the
-/// allowlist entry and the URL host must agree literally.
+/// - `Scope::none()` (the default) — no host may reach private space; every
+///   resolved private address is SSRF-blocked regardless of the `net` grant.
+/// - `Scope::Only({h, …})` — exactly the named hosts (e.g. `"127.0.0.1"` or
+///   `"internal.svc"`) may resolve to a blocked range.
+/// - `Scope::All` — the deliberate top of *this* axis: every host may reach
+///   private space. Unlike the old conflation, this is only reachable by an
+///   explicit maximal grant on `net_private`; it is never implied by `net`.
+///
+/// Matching is exact on the host string as it appears in the URL, so the
+/// `net_private` entry and the URL host must agree literally.
 #[must_use]
-pub fn host_is_explicitly_allowlisted(net: &Scope<String>, host: &str) -> bool {
-    match net {
-        Scope::All => false,
+pub fn host_may_reach_private_space(net_private: &Scope<String>, host: &str) -> bool {
+    match net_private {
+        Scope::All => true,
         Scope::Only(set) => set.contains(host),
     }
 }
@@ -177,21 +190,24 @@ fn ipv6_is_blocked(ip: Ipv6Addr) -> bool {
     false
 }
 
-/// Screen one host against the granted `net` scope and a set of resolved
-/// addresses, returning the subset of addresses that are safe to connect to.
+/// Screen one host against the granted `net` reachability scope, the separate
+/// `net_private` private-space opt-in, and a set of resolved addresses,
+/// returning the subset of addresses that are safe to connect to.
 ///
 /// This is the single composition point the fetch path calls per hop:
 ///
-/// 1. The host must be permitted by the scope (default-deny host allowlist).
-/// 2. Each resolved address is SSRF-screened. A blocked address is dropped
-///    *unless* the host is explicitly named in the allowlist (the opt-in for
-///    private/loopback space — e.g. a test against `127.0.0.1`).
+/// 1. The host must be permitted by `net` (default-deny reachability allowlist).
+/// 2. Each resolved address is SSRF-screened. A blocked (private/loopback/…)
+///    address is dropped *unless* the host is named in `net_private` — the
+///    separate, explicit opt-in for private space (AB-007, #270). Membership in
+///    `net` alone never opts a host into private space.
 /// 3. At least one address must survive, or the host is refused.
 ///
 /// Returns the surviving addresses (to pin the connection to), or a
 /// [`NetGuardError`] explaining the refusal. Pure: callers do the DNS.
 pub fn screen_host(
     net: &Scope<String>,
+    net_private: &Scope<String>,
     host: &str,
     resolved: &[IpAddr],
 ) -> Result<Vec<IpAddr>, NetGuardError> {
@@ -201,7 +217,7 @@ pub fn screen_host(
         });
     }
 
-    let opted_in = host_is_explicitly_allowlisted(net, host);
+    let opted_in = host_may_reach_private_space(net_private, host);
 
     let mut safe = Vec::new();
     let mut last_blocked = None;
@@ -316,24 +332,39 @@ mod tests {
         )));
     }
 
-    // ── Allowlist membership ────────────────────────────────────────────────
+    // ── Private-space opt-in (net_private), separate from reachability (net) ──
 
     #[test]
-    fn explicit_allowlist_only_matches_named_hosts() {
-        let net = Scope::only(["127.0.0.1".to_string(), "internal.svc".to_string()]);
-        assert!(host_is_explicitly_allowlisted(&net, "127.0.0.1"));
-        assert!(host_is_explicitly_allowlisted(&net, "internal.svc"));
-        assert!(!host_is_explicitly_allowlisted(&net, "evil.test"));
-        assert!(!host_is_explicitly_allowlisted(&net, "example.com"));
+    fn private_optin_only_matches_named_hosts() {
+        let net_private = Scope::only(["127.0.0.1".to_string(), "internal.svc".to_string()]);
+        assert!(host_may_reach_private_space(&net_private, "127.0.0.1"));
+        assert!(host_may_reach_private_space(&net_private, "internal.svc"));
+        assert!(!host_may_reach_private_space(&net_private, "evil.test"));
+        assert!(!host_may_reach_private_space(&net_private, "example.com"));
     }
 
     #[test]
-    fn scope_all_is_not_an_optin_for_private_space() {
-        // `All` grants every public host but names no host, so it does NOT opt
-        // any host into private/loopback space.
-        let net: Scope<String> = Scope::All;
-        assert!(!host_is_explicitly_allowlisted(&net, "127.0.0.1"));
-        assert!(host_is_permitted(&net, "anything.example"));
+    fn net_private_none_blocks_every_host_from_private_space() {
+        // The default: no host may cross into private/loopback space.
+        let net_private: Scope<String> = Scope::none();
+        assert!(!host_may_reach_private_space(&net_private, "127.0.0.1"));
+        assert!(!host_may_reach_private_space(
+            &net_private,
+            "anything.example"
+        ));
+    }
+
+    #[test]
+    fn net_private_all_is_the_deliberate_top_of_that_axis() {
+        // Unlike the old conflation, `All` on `net_private` is an explicit,
+        // maximal opt-in — every host may reach private space. It is NEVER
+        // implied by the `net` reachability grant.
+        let net_private: Scope<String> = Scope::All;
+        assert!(host_may_reach_private_space(&net_private, "127.0.0.1"));
+        assert!(host_may_reach_private_space(
+            &net_private,
+            "anything.example"
+        ));
     }
 
     #[test]
@@ -347,9 +378,10 @@ mod tests {
 
     #[test]
     fn screen_denies_host_not_in_scope() {
-        // Only example.com is granted; 127.0.0.1 host is not even permitted.
+        // Only example.com is reachable; 127.0.0.1 host is not even permitted.
         let net = Scope::only(["example.com".to_string()]);
-        let err = screen_host(&net, "127.0.0.1", &[ipv4(127, 0, 0, 1)]).unwrap_err();
+        let err =
+            screen_host(&net, &Scope::none(), "127.0.0.1", &[ipv4(127, 0, 0, 1)]).unwrap_err();
         assert!(
             matches!(err, NetGuardError::HostNotAllowed { .. }),
             "{err:?}"
@@ -357,11 +389,35 @@ mod tests {
     }
 
     #[test]
-    fn screen_blocks_private_ip_for_permitted_but_not_optedin_host() {
-        // `All` permits the host, but does not opt it into private space, so a
-        // host that resolves to a private IP (DNS-rebinding / SSRF) is blocked.
-        let net: Scope<String> = Scope::All;
-        let err = screen_host(&net, "rebind.evil", &[ipv4(10, 0, 0, 5)]).unwrap_err();
+    fn ab007_allowlisted_public_host_stays_ssrf_blocked() {
+        // THE AB-007 regression. `example.com` is on the `net` reachability
+        // allowlist but NOT on `net_private`. A compromised / rebinding /
+        // split-horizon DNS answer of 127.0.0.1 must STILL be blocked — being
+        // reachable never opts a host into private space. On the pre-#270 code
+        // (opt-in derived from `net` membership) this returned Ok and connected
+        // to loopback.
+        let net = Scope::only(["example.com".to_string()]);
+        let net_private: Scope<String> = Scope::none();
+        let err =
+            screen_host(&net, &net_private, "example.com", &[ipv4(127, 0, 0, 1)]).unwrap_err();
+        assert!(
+            matches!(err, NetGuardError::PrivateAddress { .. }),
+            "an allowlisted public host resolving to loopback must stay denied: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ab007_cloud_metadata_blocked_for_allowlisted_public_host() {
+        // 169.254.169.254 (the cloud-metadata SSRF classic) must stay blocked
+        // for a merely-reachable host.
+        let net = Scope::only(["metadata.example".to_string()]);
+        let err = screen_host(
+            &net,
+            &Scope::none(),
+            "metadata.example",
+            &[ipv4(169, 254, 169, 254)],
+        )
+        .unwrap_err();
         assert!(
             matches!(err, NetGuardError::PrivateAddress { .. }),
             "{err:?}"
@@ -369,22 +425,67 @@ mod tests {
     }
 
     #[test]
-    fn screen_allows_loopback_only_when_host_is_explicitly_allowlisted() {
-        // The deliberate opt-in: naming 127.0.0.1 in the grant lets THAT host
-        // reach loopback (the test/dev escape hatch).
+    fn ab007_allowlisted_public_host_mixed_answer_drops_private_keeps_public() {
+        // Reachable + a mixed public/private answer set: the private address is
+        // dropped (not leaked by the reachability grant) and the public one
+        // survives to pin.
+        let net = Scope::only(["example.com".to_string()]);
+        let safe = screen_host(
+            &net,
+            &Scope::none(),
+            "example.com",
+            &[ipv4(10, 0, 0, 1), ipv4(8, 8, 8, 8)],
+        )
+        .unwrap();
+        assert_eq!(safe, vec![ipv4(8, 8, 8, 8)]);
+    }
+
+    #[test]
+    fn screen_blocks_private_ip_under_all_when_not_optedin() {
+        // `All` reachability, no `net_private`: a host that resolves to a
+        // private IP (DNS-rebinding / SSRF) is blocked.
+        let net: Scope<String> = Scope::All;
+        let err =
+            screen_host(&net, &Scope::none(), "rebind.evil", &[ipv4(10, 0, 0, 5)]).unwrap_err();
+        assert!(
+            matches!(err, NetGuardError::PrivateAddress { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn net_private_optin_allows_loopback_for_the_named_host() {
+        // The deliberate escape hatch now needs BOTH axes: 127.0.0.1 reachable
+        // (net) AND opted into private space (net_private).
         let net = Scope::only(["127.0.0.1".to_string()]);
-        let safe = screen_host(&net, "127.0.0.1", &[ipv4(127, 0, 0, 1)]).unwrap();
+        let net_private = Scope::only(["127.0.0.1".to_string()]);
+        let safe = screen_host(&net, &net_private, "127.0.0.1", &[ipv4(127, 0, 0, 1)]).unwrap();
         assert_eq!(safe, vec![ipv4(127, 0, 0, 1)]);
+    }
+
+    #[test]
+    fn net_private_optin_is_host_specific() {
+        // Opting `ok.internal` into private space does NOT leak to another host
+        // even if that other host is reachable under an `All` net grant.
+        let net: Scope<String> = Scope::All;
+        let net_private = Scope::only(["ok.internal".to_string()]);
+        let err =
+            screen_host(&net, &net_private, "evil.example", &[ipv4(10, 0, 0, 1)]).unwrap_err();
+        assert!(
+            matches!(err, NetGuardError::PrivateAddress { .. }),
+            "a private-space opt-in must not leak to other hosts: {err:?}"
+        );
     }
 
     #[test]
     fn screen_drops_blocked_addrs_keeps_safe_ones() {
         // A host that resolves to both a public and a private address (a common
-        // rebinding shape): under a non-opted-in grant the private one is
+        // rebinding shape): with no `net_private` opt-in the private one is
         // dropped and the public one survives.
         let net: Scope<String> = Scope::All;
         let safe = screen_host(
             &net,
+            &Scope::none(),
             "mixed.example",
             &[ipv4(10, 0, 0, 1), ipv4(8, 8, 8, 8)],
         )
@@ -395,7 +496,7 @@ mod tests {
     #[test]
     fn screen_no_address_errors() {
         let net: Scope<String> = Scope::All;
-        let err = screen_host(&net, "ghost.example", &[]).unwrap_err();
+        let err = screen_host(&net, &Scope::none(), "ghost.example", &[]).unwrap_err();
         assert!(matches!(err, NetGuardError::NoAddress { .. }), "{err:?}");
     }
 }

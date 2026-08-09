@@ -5,10 +5,13 @@
 //! real [`WebFetchTool`] and a real (loopback) HTTP server:
 //!
 //! - a fetch to the mock SUCCEEDS and returns extracted markdown **only** when
-//!   the loopback host is explicitly opted into the `net` allowlist;
+//!   the loopback host is reachable (`net`) AND opted into private space via the
+//!   tool's separate `net_private` config (AB-007, #270);
 //! - the **same** fetch is DENIED when the grant is `net: Only{example.com}`
 //!   (loopback neither permitted nor opted in) — proving both the host
 //!   allowlist *and* the SSRF block;
+//! - naming the loopback host in `net` alone (default tool) does NOT open
+//!   private space — the SSRF screen still denies it (the AB-007 regression);
 //! - a 302 redirect to a disallowed host is DENIED (the redirect target is
 //!   re-screened, never blindly followed).
 
@@ -25,14 +28,21 @@ fn authorize(granted: &Caveats) -> ToolContext {
         .expect("authorize")
 }
 
-/// A grant that explicitly allowlists the loopback host (opting it into
-/// loopback-IP space) with a small call budget.
+/// A grant that makes the loopback host **reachable** (`net`) with a small call
+/// budget. Reachability alone no longer opens private space (AB-007, #270) —
+/// that needs the tool's separate `net_private` opt-in ([`loopback_tool`]).
 fn loopback_grant() -> Caveats {
     Caveats {
         net: Scope::only(["127.0.0.1".to_string()]),
         max_calls: CountBound::AtMost(5),
         ..Caveats::top()
     }
+}
+
+/// The tool configured to opt the loopback host into private-address resolution
+/// — the explicit, separate SSRF escape hatch for local testing (AB-007, #270).
+fn loopback_tool() -> WebFetchTool {
+    WebFetchTool::with_private_hosts(Scope::only(["127.0.0.1".to_string()]))
 }
 
 #[tokio::test]
@@ -53,14 +63,15 @@ async fn loopback_allowlisted_fetch_succeeds_and_returns_markdown() {
         })
         .await;
 
-    // host = 127.0.0.1, explicitly allowlisted -> opted into loopback space.
+    // host = 127.0.0.1: reachable via `net` AND opted into loopback space via
+    // the tool's `net_private` config.
     let cx = authorize(&loopback_grant());
     let url = format!("http://127.0.0.1:{}/article", server.port());
 
-    let out = WebFetchTool::new()
+    let out = loopback_tool()
         .invoke(serde_json::json!({ "url": url }), &cx)
         .await
-        .expect("fetch should succeed for an explicitly-allowlisted loopback host");
+        .expect("fetch should succeed for a reachable, private-opted-in loopback host");
 
     page.assert_async().await;
     assert_eq!(out["status"], 200);
@@ -104,6 +115,41 @@ async fn loopback_denied_when_only_example_com_granted() {
 }
 
 #[tokio::test]
+async fn ab007_net_allowlist_alone_does_not_open_private_space() {
+    // THE AB-007 regression, end-to-end. The grant makes 127.0.0.1 *reachable*
+    // (it is in `net`), but the DEFAULT tool (`WebFetchTool::new()`) opts NO
+    // host into private space (`net_private = none`). So the fetch to the
+    // loopback mock must be SSRF-denied and the server never contacted — even
+    // though the host is on the `net` allowlist. On the pre-#270 code, `net`
+    // membership *was* the private-space opt-in, so this fetch succeeded.
+    let server = MockServer::start_async().await;
+    let unreached = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/article");
+            then.status(200).body("should never be served");
+        })
+        .await;
+
+    let cx = authorize(&loopback_grant()); // 127.0.0.1 reachable via net
+    let url = format!("http://127.0.0.1:{}/article", server.port());
+
+    let err = WebFetchTool::new() // default: net_private = none
+        .invoke(serde_json::json!({ "url": url }), &cx)
+        .await
+        .expect_err("an allowlisted-but-not-private-opted-in loopback host must be SSRF-denied");
+
+    assert!(matches!(err, ToolError::Denied { .. }), "got {err:?}");
+    if let ToolError::Denied { reason } = &err {
+        assert!(
+            reason.contains("SSRF") || reason.contains("private"),
+            "denial must be the private-address screen, got {reason:?}"
+        );
+    }
+    // The screen denied before any request left the process.
+    unreached.assert_calls_async(0).await;
+}
+
+#[tokio::test]
 async fn redirect_to_disallowed_host_is_denied() {
     // The mock returns a 302 whose Location points at a host NOT in the grant.
     // The leash re-screens the redirect target and denies it; the disallowed
@@ -121,7 +167,7 @@ async fn redirect_to_disallowed_host_is_denied() {
     let cx = authorize(&loopback_grant()); // permits 127.0.0.1, NOT evil.*
     let url = format!("http://127.0.0.1:{}/go", server.port());
 
-    let err = WebFetchTool::new()
+    let err = loopback_tool()
         .invoke(serde_json::json!({ "url": url }), &cx)
         .await
         .expect_err("redirect to a disallowed host must be denied");
@@ -159,7 +205,7 @@ async fn redirect_to_allowed_loopback_path_is_followed() {
     let cx = authorize(&loopback_grant());
     let url = format!("http://127.0.0.1:{}/from", server.port());
 
-    let out = WebFetchTool::new()
+    let out = loopback_tool()
         .invoke(serde_json::json!({ "url": url }), &cx)
         .await
         .expect("a redirect within the allowlisted host should be followed");
