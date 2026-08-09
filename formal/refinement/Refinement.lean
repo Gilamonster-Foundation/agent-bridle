@@ -335,4 +335,85 @@ theorem trusted_profile_admits_v1_rejects_tamper :
         = ok false) := by
   native_decide
 
+-- ══ P1 verify_envelope: the fail-closed verification ORDER (PO-8 / audit §12) ══
+-- `verify_envelope` is the 6-step gate: decode → canonical re-encode check →
+-- version → hash/sig/codec admit → signature → cid → domain → unknown-critical.
+-- These theorems discharge its short-circuit fail-closed behavior on the
+-- Charon-EXTRACTED generic function, abstractly over ANY `SignedEnvelopeCodec` /
+-- `CryptoBoundary` trait instances (Aeneas threads them as explicit dictionary
+-- args): a failing gate rejects with its own reason and NO later authority is
+-- consulted. The spec-side analogues live in Tests/SignedObjectContracts.lean
+-- (concrete witnesses); these are the extracted-code refinement.
+
+-- **Gate 1 — undecodable fails closed.** If the codec cannot decode `received`
+-- (`decode = None`), `verify_envelope` rejects with `Undecodable` for EVERY
+-- crypto boundary and trusted profile — nothing downstream (canonicalization,
+-- signature, cid) is even reached. Proven on the extracted generic function by
+-- reducing the `ok_or`/`Try`-branch/`from_residual` chain.
+open signed_object in
+theorem verify_envelope_undecodable_fails_closed
+    {C K Env Uns : Type}
+    (codecInst : SignedEnvelopeCodec C Env Uns) (cryptoInst : CryptoBoundary K)
+    (trusted : TrustedProfile) (envelope_codec : C) (crypto : K)
+    (received : Slice Std.U8)
+    (hdecode : codecInst.decode envelope_codec received = ok none) :
+    verify_envelope codecInst cryptoInst trusted envelope_codec crypto received
+      = ok (core.result.Result.Err VerifyRejection.Undecodable) := by
+  simp only [verify_envelope, TrustedProfile.impl.profile, hdecode,
+    core.option.Option.ok_or, core.result.Result.Insts.CoreOpsTry.branch,
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual,
+    core.convert.FromSame, core.convert.FromSame.from, bind_tc_ok]
+
+-- **Gate 2 — non-canonical envelope fails closed (anti-malleability).** A
+-- decodable envelope whose canonical re-encode does NOT byte-equal `received`
+-- is rejected with `NonCanonicalEnvelope` — BEFORE any version / algorithm /
+-- signature / cid check. This is the "verify against the received bytes, never a
+-- re-encode" law (the malleability defense): a second encoding of the same
+-- logical value that differs in bytes is refused, closing signature-stripping
+-- and re-serialization attacks. Holds for every crypto boundary and profile.
+open signed_object in
+theorem verify_envelope_non_canonical_fails_closed
+    {C K Env Uns : Type}
+    (codecInst : SignedEnvelopeCodec C Env Uns) (cryptoInst : CryptoBoundary K)
+    (trusted : TrustedProfile) (envelope_codec : C) (crypto : K)
+    (received : Slice Std.U8) (val : Env) (v : alloc.vec.Vec Std.U8)
+    (hdecode : codecInst.decode envelope_codec received = ok (some val))
+    (hencode : codecInst.encode envelope_codec val = ok v)
+    (hne : alloc.vec.Vec.Insts.CoreCmpPartialEqShared0Slice.ne Global
+             core.cmp.PartialEqU8 v received = ok true) :
+    verify_envelope codecInst cryptoInst trusted envelope_codec crypto received
+      = ok (core.result.Result.Err VerifyRejection.NonCanonicalEnvelope) := by
+  simp only [verify_envelope, TrustedProfile.impl.profile, hdecode,
+    core.option.Option.ok_or, core.result.Result.Insts.CoreOpsTry.branch,
+    hencode, hne, bind_tc_ok, if_true]
+
+-- **Gate 3 — version mismatch fails closed, PAST the canonical check.** A
+-- decodable, *canonical* envelope (re-encode byte-equals `received`) whose
+-- declared profile version differs from the trusted profile's is rejected with
+-- `VersionMismatch` — before any hash/sig/codec admit or signature check. Unlike
+-- gates 1–2 this reduction threads THROUGH a passing gate (the `ne = false`
+-- canonical branch), showing the refinement follows the accept path too, not
+-- only immediate short-circuits. A profile downgrade cannot smuggle a stale
+-- version past the check.
+open signed_object in
+theorem verify_envelope_version_mismatch_fails_closed
+    {C K Env Uns : Type}
+    (codecInst : SignedEnvelopeCodec C Env Uns) (cryptoInst : CryptoBoundary K)
+    (trusted : TrustedProfile) (envelope_codec : C) (crypto : K)
+    (received : Slice Std.U8) (val : Env) (v : alloc.vec.Vec Std.U8)
+    (unsigned : Uns) (i : Std.U64)
+    (hdecode : codecInst.decode envelope_codec received = ok (some val))
+    (hencode : codecInst.encode envelope_codec val = ok v)
+    (hcanon : alloc.vec.Vec.Insts.CoreCmpPartialEqShared0Slice.ne Global
+                core.cmp.PartialEqU8 v received = ok false)
+    (hunsigned : codecInst.unsigned envelope_codec val = ok unsigned)
+    (hpv : codecInst.profile_version envelope_codec unsigned = ok i)
+    (hver : (i != trusted.profile.version) = true) :
+    verify_envelope codecInst cryptoInst trusted envelope_codec crypto received
+      = ok (core.result.Result.Err VerifyRejection.VersionMismatch) := by
+  simp only [verify_envelope, TrustedProfile.impl.profile, hdecode,
+    core.option.Option.ok_or, core.result.Result.Insts.CoreOpsTry.branch,
+    hencode, hcanon, hunsigned, hpv, hver, bind_tc_ok, if_true, if_false,
+    Bool.false_eq_true]
+
 end CeremonyRefinement
