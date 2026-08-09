@@ -337,6 +337,24 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// [`ConfinedCommand::spawn`] admission-checks `exec`, applies the OS sandbox,
 /// and fails closed when a restricted axis cannot meet its required
 /// enforcement floor.
+///
+/// ## Descriptor inheritance — a KNOWN RESIDUAL (agent-bridle#319)
+///
+/// **Environment** is delegated explicitly (`env_clear` + only granted vars), but
+/// **file descriptors are not**: the child's stdio (fds 0/1/2, including the
+/// trusted-worker control channel which rides in as stdin) is deliberately
+/// delegated, yet this spawn boundary does **not** explicitly close *ambient*
+/// descriptors the parent left open. It relies on the platform CLOEXEC
+/// convention — `std::process::Command` sets `CLOEXEC` on the pipes it creates,
+/// but a descriptor the parent opened with `CLOEXEC` cleared **is inherited** by
+/// the confined child. An already-open descriptor is itself an object
+/// capability, so this is a real residual: descriptor hygiene here is
+/// CLOEXEC-based, **not** explicit close-on-spawn (`close_range`). An explicit
+/// `close_range(3, …)` pre-exec (preserving stdio) requires `unsafe`, which this
+/// crate forbids (`#![forbid(unsafe_code)]`), so the fix belongs in an
+/// unsafe-permitting launcher crate — tracked as agent-bridle#319. A downstream
+/// security contract that requires stronger-than-CLOEXEC descriptor hygiene must
+/// account for this residual (it is not yet provided) rather than assume it.
 #[derive(Debug)]
 pub struct ConfinedCommand {
     program: String,
