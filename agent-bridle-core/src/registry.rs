@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::gate::DEFAULT_STRENGTH_FLOOR;
 use crate::{
     AxisEnforcement, CallRequest, Caveats, CountBound, DischargeProvider, DischargeVerifier, Gate,
-    Invocation, StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
+    Invocation, SessionId, StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
 };
 
 /// The **shared, unforgeable mutable call budget** carried by a [`Grant`]
@@ -103,6 +103,11 @@ struct StepUp {
     policy: StepUpPolicy,
     provider: Arc<dyn DischargeProvider + Send + Sync>,
     verifier: Arc<dyn DischargeVerifier + Send + Sync>,
+    /// The lifetime-unique session identity every dispatched gate binds its
+    /// step-up challenges to (see [`SessionId`]). Supplied by the host when it
+    /// wires step-up, so a discharge obtained under this registry's session
+    /// cannot be replayed into a different registry/session or a recreated one.
+    session: SessionId,
 }
 
 /// A catalog of tools that dispatches through the leash.
@@ -121,9 +126,12 @@ pub struct Registry {
     step_up: Option<StepUp>,
     /// Monotonic single-use nonce counter for the step-up ceremony. Core is
     /// rng-less; a per-registry counter is single-use *across* dispatches, which
-    /// is what anti-replay needs here — the gate binds `challenge(action,
-    /// generation, nonce)`, so a fresh nonce makes a captured discharge invalid on
-    /// any later call. (A host wanting unpredictable nonces runs its own ceremony.)
+    /// is what anti-replay needs *within* a session — the gate binds
+    /// `challenge(session, action, generation, nonce)`, so a fresh nonce makes a
+    /// captured discharge invalid on any later call. The `session` component (see
+    /// [`StepUp`]) additionally invalidates it across *different* sessions and
+    /// recreated registries. (A host wanting unpredictable nonces runs its own
+    /// ceremony.)
     step_up_nonce: AtomicU64,
 }
 
@@ -314,6 +322,10 @@ impl Registry {
             // obtained + verified before minting; a refusal is a fail-closed
             // denial. The gate stays the single mint site.
             Some(su) => {
+                // Bind this registry's session so the gate domain-separates its
+                // step-up challenges — a discharge from another session (or a
+                // recreated registry) cannot answer them (v0.8 replay defense).
+                let gate = gate.with_session(su.session);
                 let request = CallRequest::unspecified(name);
                 // Fresh single-use nonce per ceremony (monotonic counter → the
                 // gate's bound challenge differs each call, defeating replay).
@@ -365,9 +377,15 @@ impl RegistryBuilder {
     /// policy-demanded human gesture is obtained via `provider`, verified by
     /// `verifier`, and required before the tool runs — on the default path and
     /// even while unbridled. Omit to keep today's gesture-free dispatch.
+    ///
+    /// `session` is a **lifetime-unique** [`SessionId`] the host supplies (core
+    /// is rng-less); it domain-separates this registry's step-up challenges so a
+    /// discharge obtained here cannot be replayed into a different registry or a
+    /// recreated one. Mint it fresh per registry lifetime — see [`SessionId`].
     #[must_use]
     pub fn step_up(
         mut self,
+        session: SessionId,
         policy: StepUpPolicy,
         provider: Arc<dyn DischargeProvider + Send + Sync>,
         verifier: Arc<dyn DischargeVerifier + Send + Sync>,
@@ -376,6 +394,7 @@ impl RegistryBuilder {
             policy,
             provider,
             verifier,
+            session,
         });
         self
     }
@@ -951,6 +970,7 @@ mod tests {
     impl crate::DischargeProvider for FailingProvider {
         fn obtain(
             &self,
+            _session: &SessionId,
             _request: &crate::CallRequest,
             _required: &crate::AttestRequirement,
             _generation: u64,
@@ -986,7 +1006,12 @@ mod tests {
         );
         let r = Registry::builder()
             .tool(Arc::new(ProbeTool))
-            .step_up(policy, Arc::new(FailingProvider), Arc::new(StubVerifier))
+            .step_up(
+                SessionId::new([7u8; 32]),
+                policy,
+                Arc::new(FailingProvider),
+                Arc::new(StubVerifier),
+            )
             .build();
         let granted = Caveats {
             exec: Scope::only(["echo".to_string()]),
@@ -1018,7 +1043,12 @@ mod tests {
         );
         let r = Registry::builder()
             .tool(Arc::new(ProbeTool))
-            .step_up(policy, Arc::new(FailingProvider), Arc::new(StubVerifier))
+            .step_up(
+                SessionId::new([7u8; 32]),
+                policy,
+                Arc::new(FailingProvider),
+                Arc::new(StubVerifier),
+            )
             .build();
         // top() authority does NOT bypass the demanded gesture.
         let grant = r.mint_grant(Caveats::top());

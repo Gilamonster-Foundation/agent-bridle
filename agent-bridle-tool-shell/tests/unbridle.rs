@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use agent_bridle_core::{
     set_unbridled, AttestRequirement, CallRequest, Caveats, Challenge, Discharge,
-    DischargeProvider, DischargeVerifier, Gate, Registry, Rule, Scope, StepUpPolicy, Tool,
-    ToolContext, ToolError,
+    DischargeProvider, DischargeVerifier, Gate, Registry, Rule, Scope, SessionId, StepUpPolicy,
+    Tool, ToolContext, ToolError,
 };
 use agent_bridle_tool_shell::ShellTool;
 
@@ -26,6 +26,7 @@ struct FailingProvider;
 impl DischargeProvider for FailingProvider {
     fn obtain(
         &self,
+        _s: &SessionId,
         _r: &CallRequest,
         _req: &AttestRequirement,
         _g: u64,
@@ -175,7 +176,12 @@ async fn unbridled_still_owes_step_up_supervised_free() {
     );
     let registry = Registry::builder()
         .tool(Arc::new(ShellTool::new()))
-        .step_up(policy, Arc::new(FailingProvider), Arc::new(StubVerifier))
+        .step_up(
+            SessionId::new([5u8; 32]),
+            policy,
+            Arc::new(FailingProvider),
+            Arc::new(StubVerifier),
+        )
         .build();
 
     let granted = Caveats {

@@ -9,7 +9,7 @@
 //! the gateway is *untrusted for authority* (§8.3). That honesty is the whole
 //! point of the mock: it demonstrates the relay without pretending to be the gate.
 
-use agent_bridle_core::{Challenge, ContentId, Discharge, Presence};
+use agent_bridle_core::{Challenge, ContentId, Discharge, Presence, SessionId};
 use base64::Engine;
 
 use crate::wire::{Direction, DischargeResponse, Fidelity, LlmFlowRecord, TokenUsage};
@@ -26,11 +26,16 @@ pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Build the 32-byte WYSIWYS challenge for an action, exactly as the real gate
-/// would (`Challenge::bind` over the action's content id, the generation, and a
-/// single-use nonce). Reused, not re-implemented.
+/// would (`Challenge::bind` over the session, the action's content id, the
+/// generation, and a single-use nonce). Reused, not re-implemented.
 #[must_use]
-pub fn bind_challenge(action_id: &ContentId, generation: u64, nonce: &[u8; 32]) -> Challenge {
-    Challenge::bind(action_id, generation, nonce)
+pub fn bind_challenge(
+    session: &SessionId,
+    action_id: &ContentId,
+    generation: u64,
+    nonce: &[u8; 32],
+) -> Challenge {
+    Challenge::bind(session, action_id, generation, nonce)
 }
 
 /// The mock mesh provider. Takes a browser [`DischargeResponse`] and, for an
@@ -245,12 +250,17 @@ mod tests {
 
     #[test]
     fn bind_challenge_reuses_core_and_is_stable() {
+        let session = SessionId::new([1u8; 32]);
         let action = ContentId::of_bytes(b"git.push github.com/org/repo");
         let nonce = [3u8; 32];
-        let c1 = bind_challenge(&action, 5, &nonce);
-        let c2 = bind_challenge(&action, 5, &nonce);
+        let c1 = bind_challenge(&session, &action, 5, &nonce);
+        let c2 = bind_challenge(&session, &action, 5, &nonce);
         assert_eq!(c1.as_bytes(), c2.as_bytes(), "same inputs → same challenge");
-        let c3 = bind_challenge(&action, 6, &nonce);
+        let c3 = bind_challenge(&session, &action, 6, &nonce);
         assert_ne!(c1.as_bytes(), c3.as_bytes(), "generation is bound in");
+        // A different session ⇒ a different challenge (v0.8 domain separation).
+        let other = SessionId::new([2u8; 32]);
+        let c4 = bind_challenge(&other, &action, 5, &nonce);
+        assert_ne!(c1.as_bytes(), c4.as_bytes(), "session is bound in");
     }
 }
