@@ -17,7 +17,61 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Caveats, SandboxKind, Scope};
+use crate::{Caveats, ChildNetworkPolicy, SandboxKind, Scope};
+
+/// The confinement **mechanism** actually governing a spawn: the selected OS
+/// backend PLUS the mechanism configuration that changes what a given backend can
+/// truthfully enforce. Today the only such knob is the child-network policy
+/// ([`ChildNetworkPolicy`]) — the difference between a Landlock TCP-only rule and
+/// the seccomp `DenyDirect` socket-family deny is *material* to the net witness,
+/// so the report must be computed from the mechanism, not the backend kind alone.
+///
+/// A bare [`SandboxKind`] converts in via [`From`] using the **conservative**
+/// default ([`ChildNetworkPolicy::LandlockOnly`]) — the weakest mechanism, so a
+/// caller that has not stated a stronger one can never *over*-claim. A spawn site
+/// that installs a stronger mechanism passes it explicitly (via
+/// [`ConfinementMechanism::new`]) so the report matches the child's real boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfinementMechanism {
+    kind: SandboxKind,
+    child_network: ChildNetworkPolicy,
+}
+
+impl ConfinementMechanism {
+    /// The mechanism governing a spawn: `kind` backend + `child_network` policy.
+    #[must_use]
+    pub fn new(kind: SandboxKind, child_network: ChildNetworkPolicy) -> Self {
+        Self {
+            kind,
+            child_network,
+        }
+    }
+
+    /// A backend with the **conservative** (weakest) child-network mechanism
+    /// ([`ChildNetworkPolicy::LandlockOnly`]). Never over-claims the net axis.
+    #[must_use]
+    pub fn backend(kind: SandboxKind) -> Self {
+        Self::new(kind, ChildNetworkPolicy::LandlockOnly)
+    }
+
+    /// The selected OS backend.
+    #[must_use]
+    pub fn kind(&self) -> SandboxKind {
+        self.kind
+    }
+
+    /// The child-network mechanism policy.
+    #[must_use]
+    pub fn child_network(&self) -> ChildNetworkPolicy {
+        self.child_network
+    }
+}
+
+impl From<SandboxKind> for ConfinementMechanism {
+    fn from(kind: SandboxKind) -> Self {
+        Self::backend(kind)
+    }
+}
 
 /// How a single restricted Caveat axis is actually enforced for a run
 /// (ADR 0004 D1).
@@ -130,10 +184,24 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 ///   AppContainer's deny-all scope. Landlock, AppContainer non-empty allowlists,
 ///   and `None` remain `interceptor`.
 /// - **`net`** — `kernel` for a micro-VM; for empty or loopback-only scopes under
-///   Seatbelt/AppContainer; and for empty TCP scope under Landlock ABI v4.
-///   Other restricted scopes remain honestly `advisory`.
+///   Seatbelt/AppContainer; and — the mechanism-sensitive case — for a Landlock
+///   `net:none` child ONLY when the [`ChildNetworkPolicy::DenyDirect`] seccomp
+///   socket-family deny is installed (which closes UDP/DNS/raw/packet). A Landlock
+///   `net:none` under [`ChildNetworkPolicy::LandlockOnly`] denies only TCP
+///   connect/bind (ABI v4) and leaves the other socket families ambient, so it is
+///   honestly `advisory` — never a complete Kernel network witness.
+///
+/// Accepts a bare [`SandboxKind`] (conservative `LandlockOnly` net mechanism) or
+/// an explicit [`ConfinementMechanism`].
 #[must_use]
-pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> EnforcementReport {
+pub fn enforcement_report(
+    effective: &Caveats,
+    mechanism: impl Into<ConfinementMechanism>,
+) -> EnforcementReport {
+    let ConfinementMechanism {
+        kind: active,
+        child_network,
+    } = mechanism.into();
     // Filesystem axes: kernel when an OS sandbox actually governs them, else the
     // in-process interceptor. Exhaustive over `SandboxKind` so a new backend
     // must decide its mapping rather than silently defaulting.
@@ -213,12 +281,19 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             {
                 AxisEnforcement::Kernel
             }
-            // Landlock V4 (kernel ≥ 6.7) can deny-all TCP when the net scope is
-            // empty (no NetPort rules → deny-by-default). Non-empty host allowlists
-            // are not expressible (port-based, not hostname-based) and stay advisory.
+            // Landlock: a `net:none` child reaches a COMPLETE off-box egress deny
+            // — the property Bridle associates with a Kernel net axis — ONLY under
+            // the `DenyDirect` mechanism, whose seccomp `socket()`-family deny
+            // (AF_INET/AF_INET6/AF_PACKET → EACCES) closes every off-box protocol
+            // and is inherited across fork/exec. The caveat-driven Landlock rule
+            // alone (`LandlockOnly`) denies only TCP connect/bind on ABI v4 and
+            // leaves UDP/DNS/raw/packet ambient — an INCOMPLETE fence, so it is NOT
+            // a Kernel network witness (it falls through to Advisory below). The
+            // witness follows the child-network policy actually installed for THIS
+            // spawn, never the backend kind alone (agent-bridle#1631).
             SandboxKind::Landlock
                 if crate::sandbox::net_fully_denied(effective)
-                    && crate::sandbox::landlock_net_capable() =>
+                    && child_network == ChildNetworkPolicy::DenyDirect =>
             {
                 AxisEnforcement::Kernel
             }
@@ -272,16 +347,77 @@ pub fn fence_strength(report: &EnforcementReport) -> Option<AxisEnforcement> {
 /// trampoline), even though filesystem and network are genuinely kernel-fenced.
 /// [`Self::CONFINED`] therefore requires Kernel for the filesystem and network
 /// axes but accepts Interceptor for exec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # The filesystem axes are structurally pinned to `Kernel`
+///
+/// Every legitimate floor ([`Self::DEFAULT`], [`Self::CONFINED`],
+/// [`Self::from_scalar`], [`Self::uniform`]) requires [`AxisEnforcement::Kernel`]
+/// on both filesystem axes (`uniform` is the sole exception and is documented as
+/// a testing/uniform helper — production callers use the presets). A restricted
+/// filesystem axis must **never** be admitted below a real OS boundary, so a
+/// sub-Kernel `fs_read`/`fs_write` floor is made **unrepresentable** for every
+/// externally constructible/deserializable value:
+///
+/// * the fields are private (`pub(crate)`) — no external struct literal;
+/// * the type carries a **hand-written** [`serde`] impl (NOT derived): the wire
+///   form is only `{exec, net}`, so no serde format (JSON, the trusted-worker
+///   envelope, anything) can select a filesystem floor, and deserialization
+///   always reconstructs `fs_read = fs_write = Kernel`. A payload that smuggles an
+///   `fs_read`/`fs_write` field is **rejected** (`deny_unknown_fields`), never
+///   silently normalized — a downgrade attempt is a hard error.
+///
+/// Read via [`Self::fs_read`] / [`Self::fs_write`] / [`Self::exec`] /
+/// [`Self::net`] (or [`Self::requirement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnforcementFloor {
-    /// Floor for the `fs_read` axis.
-    pub fs_read: AxisEnforcement,
-    /// Floor for the `fs_write` axis.
-    pub fs_write: AxisEnforcement,
+    /// Floor for the `fs_read` axis. Always [`AxisEnforcement::Kernel`] for any
+    /// externally constructed/deserialized value — see the type doc.
+    pub(crate) fs_read: AxisEnforcement,
+    /// Floor for the `fs_write` axis. Always [`AxisEnforcement::Kernel`] for any
+    /// externally constructed/deserialized value — see the type doc.
+    pub(crate) fs_write: AxisEnforcement,
     /// Floor for the `exec` / behavior axis.
-    pub exec: AxisEnforcement,
+    pub(crate) exec: AxisEnforcement,
     /// Floor for the `net` axis.
-    pub net: AxisEnforcement,
+    pub(crate) net: AxisEnforcement,
+}
+
+/// Wire form of [`EnforcementFloor`]: **only** the caller-selectable axes. The
+/// filesystem floors are deliberately absent — never on the wire, so they can
+/// neither be forged weak nor silently normalized. `deny_unknown_fields` turns a
+/// smuggled `fs_read`/`fs_write` (or any stray) field into a hard error.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnforcementFloorWire {
+    exec: AxisEnforcement,
+    net: AxisEnforcement,
+}
+
+impl Serialize for EnforcementFloor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The filesystem floors are invariantly Kernel; omit them so no consumer
+        // can ever observe (or select) a weaker value.
+        EnforcementFloorWire {
+            exec: self.exec,
+            net: self.net,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EnforcementFloor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = EnforcementFloorWire::deserialize(deserializer)?;
+        // The filesystem floors are not caller-selectable: reconstruct the pinned
+        // Kernel invariant (an `fs_*` field would already have been rejected by
+        // `deny_unknown_fields`).
+        Ok(Self {
+            fs_read: AxisEnforcement::Kernel,
+            fs_write: AxisEnforcement::Kernel,
+            exec: wire.exec,
+            net: wire.net,
+        })
+    }
 }
 
 impl EnforcementFloor {
@@ -311,15 +447,47 @@ impl EnforcementFloor {
         net: AxisEnforcement::Kernel,
     };
 
-    /// A uniform floor: the same requirement on every axis.
+    /// A uniform floor: the same requirement on every axis. **Test-only**: it can
+    /// express a sub-Kernel filesystem floor, which no external caller may
+    /// construct (that would break the pinned-Kernel fs invariant — see the type
+    /// doc), so it is not part of the public (or even non-test) surface.
+    /// Production callers use [`Self::DEFAULT`] / [`Self::CONFINED`] /
+    /// [`Self::from_scalar`].
+    #[cfg(test)]
     #[must_use]
-    pub const fn uniform(floor: AxisEnforcement) -> Self {
+    pub(crate) const fn uniform(floor: AxisEnforcement) -> Self {
         Self {
             fs_read: floor,
             fs_write: floor,
             exec: floor,
             net: floor,
         }
+    }
+
+    /// The `fs_read`-axis floor (always [`AxisEnforcement::Kernel`] for an
+    /// externally obtained value — see the type doc).
+    #[must_use]
+    pub fn fs_read(&self) -> AxisEnforcement {
+        self.fs_read
+    }
+
+    /// The `fs_write`-axis floor (always [`AxisEnforcement::Kernel`] for an
+    /// externally obtained value — see the type doc).
+    #[must_use]
+    pub fn fs_write(&self) -> AxisEnforcement {
+        self.fs_write
+    }
+
+    /// The `exec`-axis floor.
+    #[must_use]
+    pub fn exec(&self) -> AxisEnforcement {
+        self.exec
+    }
+
+    /// The `net`-axis floor.
+    #[must_use]
+    pub fn net(&self) -> AxisEnforcement {
+        self.net
     }
 
     /// Bridge the historic **scalar** floor to the per-axis form, exactly
@@ -450,10 +618,10 @@ impl fmt::Display for UnenforceableAxis {
 #[must_use]
 pub fn unenforceable_axis(
     effective: &Caveats,
-    active: SandboxKind,
+    mechanism: impl Into<ConfinementMechanism>,
     floor: EnforcementFloor,
 ) -> Option<UnenforceableAxis> {
-    let report = enforcement_report(effective, active);
+    let report = enforcement_report(effective, mechanism.into());
     unenforceable_axis_in_report(effective, &report, floor)
 }
 
@@ -519,31 +687,99 @@ mod tests {
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
     }
 
-    /// Landlock V4 (kernel ≥ 6.7) kernel-denies ALL TCP when `net` is the empty
-    /// set (deny-all), because we declare `AccessNet` without adding any `NetPort`
-    /// rules — deny-by-default. On pre-V4 kernels the `handle_access` is a BestEffort
-    /// no-op so `net` stays advisory. The test dynamically queries the probe to stay
-    /// correct in both environments (ADR 0013 net-axis Landlock extension, issue #35).
+    /// Blocker 2 (mechanism-aware net witness): a Landlock `net:none` child reaches
+    /// a COMPLETE off-box egress deny — the Kernel net property — ONLY under the
+    /// `DenyDirect` seccomp mechanism. The caveat-driven Landlock rule alone
+    /// (`LandlockOnly`) kernel-denies TCP connect/bind on ABI v4 but leaves
+    /// UDP/DNS/raw/packet ambient, so it is honestly Advisory — NEVER a complete
+    /// Kernel witness, regardless of the ABI probe. The exact over-claim #1631
+    /// flagged; the report now follows the mechanism, not the backend kind.
     #[test]
-    fn landlock_marks_net_kernel_when_net_fully_denied_and_v4_capable() {
-        let net_denied = crate::Caveats {
-            net: crate::Scope::none(),
-            ..crate::Caveats::top()
+    fn landlock_net_none_is_kernel_only_under_deny_direct() {
+        let net_denied = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
         };
-        let r = enforcement_report(&net_denied, SandboxKind::Landlock);
-        let expected = if crate::sandbox::landlock_net_capable() {
-            Some(AxisEnforcement::Kernel)
-        } else {
-            Some(AxisEnforcement::Advisory)
-        };
+        // LandlockOnly (and a bare SandboxKind, which converts conservatively):
+        // TCP-only → incomplete → Advisory, even on an ABI-v4 kernel.
+        for mech in [
+            ConfinementMechanism::new(SandboxKind::Landlock, ChildNetworkPolicy::LandlockOnly),
+            ConfinementMechanism::backend(SandboxKind::Landlock),
+        ] {
+            assert_eq!(
+                enforcement_report(&net_denied, mech).net,
+                Some(AxisEnforcement::Advisory),
+                "TCP-only Landlock net rule must not be reported as a complete Kernel witness",
+            );
+        }
         assert_eq!(
-            r.net, expected,
-            "Landlock net enforcement depends on V4 kernel support"
+            enforcement_report(&net_denied, SandboxKind::Landlock).net,
+            Some(AxisEnforcement::Advisory),
+            "a bare SandboxKind must use the conservative (LandlockOnly) mechanism",
         );
-        // fs is not restricted, so those axes must be absent
+        // DenyDirect: seccomp closes UDP/DNS/raw/packet → net:none is a complete
+        // off-box egress deny → Kernel.
+        assert_eq!(
+            enforcement_report(
+                &net_denied,
+                ConfinementMechanism::new(SandboxKind::Landlock, ChildNetworkPolicy::DenyDirect)
+            )
+            .net,
+            Some(AxisEnforcement::Kernel),
+            "DenyDirect closes the UDP/DNS/raw leg, so net:none is a Kernel egress deny",
+        );
+        // fs is not restricted, so those axes must be absent.
+        let r = enforcement_report(&net_denied, SandboxKind::Landlock);
         assert_eq!(r.fs_read, None);
         assert_eq!(r.fs_write, None);
         assert_eq!(r.exec, None);
+    }
+
+    /// Blocker 2 table (POLICY/UNIT proof — NOT native evidence; real Seatbelt
+    /// enforcement is grounded on-device in `seatbelt_net_evidence.rs`). The net
+    /// witness follows the actual mechanism, each expected value from its true
+    /// semantic capability.
+    #[test]
+    fn net_witness_is_mechanism_aware_across_backends() {
+        let none = || Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let loopback = || Caveats {
+            net: Scope::only(["127.0.0.1".to_string()]),
+            ..Caveats::top()
+        };
+        let remote = || Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+        let ll = |p| ConfinementMechanism::new(SandboxKind::Landlock, p);
+        use AxisEnforcement::{Advisory, Kernel};
+        use ChildNetworkPolicy::{DenyDirect, LandlockOnly};
+        let sb = ConfinementMechanism::backend(SandboxKind::Seatbelt);
+        let noop = ConfinementMechanism::backend(SandboxKind::None);
+
+        let cases: &[(&str, Caveats, ConfinementMechanism, AxisEnforcement)] = &[
+            (
+                "landlock-only + net:none",
+                none(),
+                ll(LandlockOnly),
+                Advisory,
+            ),
+            ("deny-direct + net:none", none(), ll(DenyDirect), Kernel),
+            ("seatbelt + net:none", none(), sb, Kernel),
+            ("seatbelt + loopback-only", loopback(), sb, Kernel),
+            ("seatbelt + remote allowlist", remote(), sb, Advisory),
+            ("noop + net:none", none(), noop, Advisory),
+            ("noop + remote allowlist", remote(), noop, Advisory),
+        ];
+        for (label, caveats, mech, expected) in cases {
+            assert_eq!(
+                enforcement_report(caveats, *mech).net,
+                Some(*expected),
+                "{label}: net witness must match the mechanism's real capability",
+            );
+        }
     }
 
     /// Seatbelt (macOS) governs the fs axes in the kernel like Landlock, **and**
@@ -1195,6 +1431,78 @@ mod tests {
         assert_eq!(k.fs_write, AxisEnforcement::Kernel);
         assert_eq!(k.net, AxisEnforcement::Kernel);
         assert_eq!(k.exec, AxisEnforcement::Kernel);
+    }
+
+    // ── Blocker 1: `fs_read`/`fs_write < Kernel` is unrepresentable via serde ──
+
+    /// A crafted JSON body that tries to smuggle a weak filesystem floor is
+    /// REJECTED (not silently normalized): the fs axes are not wire fields, and
+    /// `deny_unknown_fields` turns the attempt into a hard error. This is the exact
+    /// forge the task calls out.
+    #[test]
+    fn serde_rejects_a_forged_weak_filesystem_floor() {
+        for forged in [
+            r#"{"fs_read":"advisory","fs_write":"advisory","exec":"advisory","net":"advisory"}"#,
+            r#"{"fs_write":"advisory","exec":"kernel","net":"kernel"}"#,
+            r#"{"fs_read":"kernel","exec":"kernel","net":"kernel"}"#, // even a Kernel fs field is unknown
+        ] {
+            assert!(
+                serde_json::from_str::<EnforcementFloor>(forged).is_err(),
+                "a payload carrying an fs_read/fs_write field must be rejected: {forged}",
+            );
+        }
+    }
+
+    /// The valid wire form is only `{exec, net}`; deserialization always
+    /// reconstructs `fs_read = fs_write = Kernel`, so no weak fs floor can emerge
+    /// from any accepted payload.
+    #[test]
+    fn serde_wire_form_reconstructs_kernel_filesystem() {
+        let floor: EnforcementFloor =
+            serde_json::from_str(r#"{"exec":"advisory","net":"advisory"}"#).unwrap();
+        assert_eq!(floor.fs_read(), AxisEnforcement::Kernel);
+        assert_eq!(floor.fs_write(), AxisEnforcement::Kernel);
+        assert_eq!(floor.exec(), AxisEnforcement::Advisory);
+        assert_eq!(floor.net(), AxisEnforcement::Advisory);
+    }
+
+    /// Round-trip through serde is lossless (fs stays Kernel because it is
+    /// invariantly Kernel — dropping it from the wire loses nothing), and the
+    /// serialized form contains no filesystem key.
+    #[test]
+    fn serde_roundtrip_is_lossless_and_omits_filesystem() {
+        for floor in [
+            EnforcementFloor::DEFAULT,
+            EnforcementFloor::CONFINED,
+            EnforcementFloor::from_scalar(AxisEnforcement::Kernel),
+        ] {
+            let json = serde_json::to_string(&floor).unwrap();
+            assert!(
+                !json.contains("fs_read") && !json.contains("fs_write"),
+                "the wire form must not expose a filesystem field: {json}",
+            );
+            let back: EnforcementFloor = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, floor, "round-trip must be lossless");
+            assert_eq!(back.fs_read(), AxisEnforcement::Kernel);
+            assert_eq!(back.fs_write(), AxisEnforcement::Kernel);
+        }
+    }
+
+    /// Every PUBLIC constructor pins both filesystem axes to Kernel — no external
+    /// path (struct literal is impossible via `pub(crate)`; `uniform` is test-only)
+    /// can yield a sub-Kernel fs floor.
+    #[test]
+    fn every_public_floor_constructor_pins_filesystem_to_kernel() {
+        for f in [
+            EnforcementFloor::DEFAULT,
+            EnforcementFloor::CONFINED,
+            EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+            EnforcementFloor::from_scalar(AxisEnforcement::Interceptor),
+            EnforcementFloor::from_scalar(AxisEnforcement::Kernel),
+        ] {
+            assert_eq!(f.fs_read(), AxisEnforcement::Kernel);
+            assert_eq!(f.fs_write(), AxisEnforcement::Kernel);
+        }
     }
 
     /// (8) THE fail-closed guard: a restricted axis whose report carries **no

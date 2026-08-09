@@ -38,9 +38,9 @@ use std::time::Duration;
 
 use agent_bridle_core::{
     best_available_sandbox, effective_sandbox_kind, enforcement_report, human_gate, is_unbridled,
-    unenforceable_axis, Caveats, Denial, DenialKind, Disclosure, EnforcementReport, Invocation,
-    LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope, ToolError,
-    ToolResult,
+    unenforceable_axis, Caveats, ConfinementMechanism, Denial, DenialKind, Disclosure,
+    EnforcementReport, Invocation, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext,
+    ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -544,7 +544,13 @@ impl Tool for ShellTool {
         };
         // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
         // returns carries the per-axis report alongside the coarse sandbox_kind.
-        let enforcement = enforcement_report(cx.caveats(), sandbox_kind);
+        // The mechanism governing this run: reported backend kind + the
+        // child-network policy on `self.sandbox` (the same policy the engine
+        // confines with). The per-axis report and the fail-closed guard below both
+        // read THIS, so neither over-claims the net axis (a Landlock `net:none` is
+        // Kernel only under `DenyDirect`).
+        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox.child_network);
+        let enforcement = enforcement_report(cx.caveats(), mechanism);
 
         // Resolve to a script (sequence of pipelines), or surface a refusal.
         let mut script = match parsed.script() {
@@ -769,8 +775,7 @@ impl Tool for ShellTool {
         // L2 grant checks above still ran (advisory), and every axis reports
         // advisory + `disclosure.unbridled` — honest, not silent.
         if !unbridled {
-            if let Some(unmet) = unenforceable_axis(cx.caveats(), sandbox_kind, cx.strength_floor())
-            {
+            if let Some(unmet) = unenforceable_axis(cx.caveats(), mechanism, cx.strength_floor()) {
                 return Ok(deny(
                     sandbox_kind,
                     enforcement,

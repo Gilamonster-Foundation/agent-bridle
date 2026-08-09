@@ -36,7 +36,8 @@ use std::time::Duration;
 
 use crate::{
     best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AxisEnforcement, Caveats,
-    EnforcementFloor, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
+    ConfinementMechanism, EnforcementFloor, SandboxKind, SandboxPolicy, ToolContext, ToolError,
+    ToolResult,
 };
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
@@ -516,13 +517,21 @@ impl ConfinedCommand {
         // actually applied would otherwise pass a run the path executes
         // unconfined). Also the honest kind reported on the child (I9 / ADR 0006 D3).
         let reported_kind = effective_sandbox_kind(kind, &effective);
+        // The witness the fail-closed check consumes is built from the SAME
+        // mechanism that will govern this child: the reported backend kind AND the
+        // child-network policy carried by `self.sandbox_policy` — the exact policy
+        // `best_available_sandbox` above selected the backend from and that
+        // installs the seccomp `DenyDirect` leg at apply time. So the net witness
+        // (Landlock `net:none` = Kernel only under `DenyDirect`) cannot diverge
+        // from the mechanism actually applied to the spawn.
+        let mechanism = ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network);
 
-        // (2) Fail closed: a restricted axis the governing backend cannot enforce
+        // (2) Fail closed: a restricted axis the governing mechanism cannot enforce
         // at the principal's PER-AXIS strength floor is a grant we'd be lying
         // about. The typed reason names which axis, its required strength, and
         // the strength actually delivered — never a generic "sandbox unavailable"
         // when the code already knows the axis.
-        if let Some(unmet) = unenforceable_axis(&effective, reported_kind, cx.strength_floor()) {
+        if let Some(unmet) = unenforceable_axis(&effective, mechanism, cx.strength_floor()) {
             return Err(ToolError::denied(format!(
                 "refusing to spawn {:?}: {} (governing sandbox: {:?})",
                 self.program, unmet, reported_kind
@@ -1398,6 +1407,52 @@ mod tests {
 
         peer.join().expect("join fake worker");
         let _ = worker.child.wait();
+    }
+
+    /// Blocker 1 (trusted-worker leg): the `strength_floor` in a trusted-worker
+    /// envelope cannot carry a sub-Kernel filesystem floor. A well-formed request
+    /// round-trips with fs pinned Kernel, and a body that injects an `fs_read`/
+    /// `fs_write` field into the floor is REJECTED at decode (not normalized) — a
+    /// forged/downgraded envelope fails closed before any worker acts on it.
+    #[test]
+    fn trusted_worker_decode_cannot_forge_a_weak_filesystem_floor() {
+        let request = TrustedWorkerRequest {
+            version: TRUSTED_WORKER_PROTOCOL_VERSION,
+            nonce: "n".to_string(),
+            caveats: Caveats::top(),
+            strength_floor: EnforcementFloor::CONFINED,
+            payload: serde_json::json!({"cmd": "echo ok"}),
+        };
+        let body = serde_json::to_vec(&request).expect("encode");
+        let text = String::from_utf8(body.clone()).unwrap();
+        // The strength_floor object itself omits the filesystem axes (the envelope's
+        // separate `caveats` field legitimately carries fs_read/fs_write scopes, so
+        // we check the floor object specifically, not the whole body).
+        let floor_obj = &text[text.find("\"strength_floor\":{").unwrap()..];
+        let floor_obj = &floor_obj[..floor_obj.find('}').unwrap()];
+        assert!(
+            !floor_obj.contains("fs_read") && !floor_obj.contains("fs_write"),
+            "the encoded floor must omit the filesystem axes: {floor_obj}",
+        );
+        // A valid body round-trips and reconstructs the pinned Kernel fs floor.
+        let (_, _, floor, _) = decode_trusted_worker_request::<serde_json::Value>(&body)
+            .expect("decode valid")
+            .into_parts();
+        assert_eq!(floor.fs_read(), AxisEnforcement::Kernel);
+        assert_eq!(floor.fs_write(), AxisEnforcement::Kernel);
+        assert_eq!(floor, EnforcementFloor::CONFINED);
+
+        // Inject a weak fs_write field into the floor object; decode must reject it
+        // (deny_unknown_fields), never silently upgrade it to Kernel.
+        let forged = text.replace(
+            "\"strength_floor\":{",
+            "\"strength_floor\":{\"fs_write\":\"advisory\",",
+        );
+        assert_ne!(forged, text, "the injection must actually change the body");
+        assert!(
+            decode_trusted_worker_request::<serde_json::Value>(forged.as_bytes()).is_err(),
+            "a trusted-worker floor carrying a filesystem field must be rejected",
+        );
     }
 
     #[test]
