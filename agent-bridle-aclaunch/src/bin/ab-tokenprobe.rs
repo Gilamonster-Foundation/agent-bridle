@@ -17,8 +17,19 @@ fn main() {
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(out.status.code().unwrap_or(1));
         }
+        "spawn-self" => {
+            print_identity();
+            let exe = std::env::current_exe().expect("current probe executable");
+            let out = std::process::Command::new(exe)
+                .arg("print")
+                .output()
+                .expect("spawn tokenprobe grandchild");
+            print!("{}", String::from_utf8_lossy(&out.stdout));
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(out.status.code().unwrap_or(1));
+        }
         _ => {
-            eprintln!("usage: ab-tokenprobe [print|spawn-cmd]");
+            eprintln!("usage: ab-tokenprobe [print|spawn-cmd|spawn-self]");
             std::process::exit(2);
         }
     }

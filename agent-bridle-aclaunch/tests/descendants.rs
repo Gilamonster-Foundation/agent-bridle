@@ -118,6 +118,22 @@ fn assert_low_integrity_identity(out: &std::process::Output, route: &str) {
     );
 }
 
+fn assert_os_access_denied(out: &std::process::Output, route: &str) {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && text.contains("Access is denied."),
+        "{route} must be OS-policy denied, not command-not-found or a missing test \
+         resource; status={:?} stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+}
+
 #[test]
 fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     if skip_proof_unless_appcontainer() {
@@ -142,6 +158,15 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     let via_cmd = launch(&["--name", &tag("cmd"), "cmd.exe", "/c", "whoami", "/groups"]);
     assert_low_integrity_identity(&via_cmd, "cmd.exe child");
 
+    let via_cmd_grandchild = launch(&[
+        "--name",
+        &tag("cmd-gc"),
+        "cmd.exe",
+        "/c",
+        "cmd.exe /c whoami /groups",
+    ]);
+    assert_low_integrity_identity(&via_cmd_grandchild, "cmd.exe to cmd.exe grandchild");
+
     let powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
     let via_powershell = launch(&[
         "--name",
@@ -152,6 +177,19 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         "whoami /groups",
     ]);
     assert_low_integrity_identity(&via_powershell, "PowerShell child");
+
+    let via_powershell_grandchild = launch(&[
+        "--name",
+        &tag("ps-gc"),
+        powershell,
+        "-NoProfile",
+        "-Command",
+        "cmd.exe /c whoami /groups",
+    ]);
+    assert_low_integrity_identity(
+        &via_powershell_grandchild,
+        "PowerShell to cmd.exe grandchild",
+    );
 
     let helper_grandchild = launch(&[
         "--name",
@@ -165,6 +203,55 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     ]);
     assert_appcontainer_identity(&helper_grandchild, 1, "helper child");
     assert_low_integrity_identity(&helper_grandchild, "helper child to cmd.exe grandchild");
+
+    let helper_to_helper = launch(&[
+        "--name",
+        &tag("helper2"),
+        "--fs-read",
+        &probe_dir_s,
+        "--fs-read",
+        &probe_s,
+        &probe_s,
+        "spawn-self",
+    ]);
+    assert_appcontainer_identity(
+        &helper_to_helper,
+        2,
+        "helper child to tokenprobe grandchild",
+    );
+
+    let cmd_to_helper = launch(&[
+        "--name",
+        &tag("cmd-helper"),
+        "--fs-read",
+        &probe_dir_s,
+        "--fs-read",
+        &probe_s,
+        "cmd.exe",
+        "/c",
+        &probe_s,
+        "print",
+    ]);
+    assert_os_access_denied(&cmd_to_helper, "cmd.exe to staged helper grandchild");
+
+    let ps_command = format!("& '{}' print", probe_s.replace('\'', "''"));
+    let powershell_to_helper = launch(&[
+        "--name",
+        &tag("ps-helper"),
+        "--fs-read",
+        &probe_dir_s,
+        "--fs-read",
+        &probe_s,
+        powershell,
+        "-NoProfile",
+        "-Command",
+        &ps_command,
+    ]);
+    assert_appcontainer_identity(
+        &powershell_to_helper,
+        1,
+        "PowerShell to staged helper grandchild",
+    );
 
     let _ = std::fs::remove_dir_all(&probe_dir);
 }

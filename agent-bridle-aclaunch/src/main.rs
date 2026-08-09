@@ -46,7 +46,7 @@ mod windows {
     use std::ffi::OsStr;
     use std::fs::OpenOptions;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, AsRawSocket};
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
@@ -113,6 +113,11 @@ mod windows {
                 }
             }
         }
+    }
+
+    struct TestSocketCanary {
+        _peer: std::net::TcpStream,
+        _canary: std::net::TcpStream,
     }
 
     /// Null-terminate an `OsStr` as a `Vec<u16>`.
@@ -389,6 +394,7 @@ mod windows {
         pub no_child_process: bool,
         pub test_inheritable_file_handle: Option<String>,
         pub test_inheritable_pipe_handle: bool,
+        pub test_inheritable_socket_handle: bool,
         pub test_force_process_attribute_failure: bool,
         pub fs_read: Vec<String>,
         pub fs_write: Vec<String>,
@@ -410,6 +416,7 @@ mod windows {
         let mut no_child_process = false;
         let mut test_inheritable_file_handle: Option<String> = None;
         let mut test_inheritable_pipe_handle = false;
+        let mut test_inheritable_socket_handle = false;
         let mut test_force_process_attribute_failure = false;
         let mut fs_read: Vec<String> = Vec::new();
         let mut fs_write: Vec<String> = Vec::new();
@@ -428,6 +435,7 @@ mod windows {
                     test_inheritable_file_handle = argv.get(i).cloned();
                 }
                 "--test-inheritable-pipe-handle" => test_inheritable_pipe_handle = true,
+                "--test-inheritable-socket-handle" => test_inheritable_socket_handle = true,
                 "--test-force-process-attribute-failure" => {
                     test_force_process_attribute_failure = true;
                 }
@@ -457,6 +465,7 @@ mod windows {
             no_child_process,
             test_inheritable_file_handle,
             test_inheritable_pipe_handle,
+            test_inheritable_socket_handle,
             test_force_process_attribute_failure,
             fs_read,
             fs_write,
@@ -490,6 +499,7 @@ mod windows {
                 parsed.no_child_process,
                 parsed.test_inheritable_file_handle.as_deref(),
                 parsed.test_inheritable_pipe_handle,
+                parsed.test_inheritable_socket_handle,
                 parsed.test_force_process_attribute_failure,
                 &parsed.fs_read,
                 &parsed.fs_write,
@@ -514,6 +524,7 @@ mod windows {
         no_child_process: bool,
         test_inheritable_file_handle: Option<&str>,
         test_inheritable_pipe_handle: bool,
+        test_inheritable_socket_handle: bool,
         test_force_process_attribute_failure: bool,
         fs_read: &[String],
         fs_write: &[String],
@@ -610,6 +621,49 @@ mod windows {
                 (pipe.write as isize).to_string(),
             );
             Some(pipe)
+        } else {
+            None
+        };
+        let _test_canary_socket = if test_inheritable_socket_handle {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| {
+                eprintln!("agent-bridle-aclaunch: create socket canary listener failed: {error}");
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            });
+            let addr = listener.local_addr().unwrap_or_else(|error| {
+                eprintln!("agent-bridle-aclaunch: read socket canary address failed: {error}");
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            });
+            let peer = std::net::TcpStream::connect(addr).unwrap_or_else(|error| {
+                eprintln!("agent-bridle-aclaunch: connect socket canary peer failed: {error}");
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            });
+            let (canary, _) = listener.accept().unwrap_or_else(|error| {
+                eprintln!("agent-bridle-aclaunch: accept socket canary failed: {error}");
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            });
+            let socket = canary.as_raw_socket() as HANDLE;
+            let ok = SetHandleInformation(socket, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            if ok == 0 {
+                eprintln!(
+                    "agent-bridle-aclaunch: SetHandleInformation(test canary socket) \
+                     failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            }
+            std::env::set_var(
+                "AB_TEST_CANARY_SOCKET_HANDLE",
+                (socket as isize).to_string(),
+            );
+            Some(TestSocketCanary {
+                _peer: peer,
+                _canary: canary,
+            })
         } else {
             None
         };
@@ -929,6 +983,7 @@ mod windows {
                     no_child_process: false,
                     test_inheritable_file_handle: None,
                     test_inheritable_pipe_handle: false,
+                    test_inheritable_socket_handle: false,
                     test_force_process_attribute_failure: false,
                     fs_read: vec![],
                     fs_write: vec![],
@@ -946,6 +1001,7 @@ mod windows {
                 "--net-allow",
                 "--loopback-exemption",
                 "--no-child-process",
+                "--test-inheritable-socket-handle",
                 "--fs-write",
                 "C:/ws",
                 "--fs-read",
@@ -960,6 +1016,7 @@ mod windows {
             assert!(a.net_allow && a.loopback_exemption && a.no_child_process);
             assert_eq!(a.test_inheritable_file_handle, None);
             assert!(!a.test_inheritable_pipe_handle);
+            assert!(a.test_inheritable_socket_handle);
             assert!(!a.test_force_process_attribute_failure);
             assert_eq!(a.fs_write, v(&["C:/ws"]));
             assert_eq!(a.fs_read, v(&["C:/etc", "C:/lib"]));

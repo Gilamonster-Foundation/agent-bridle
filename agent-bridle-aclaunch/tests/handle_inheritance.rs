@@ -49,6 +49,18 @@ fn launch(args: &[&str]) -> std::process::Output {
 }
 
 fn assert_probe_saw_non_delegated_handle(out: &std::process::Output, kind: &str) {
+    if kind == "socket" && out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("SOCKET_WRITE_DENIED") && stderr.contains("kind=socket"),
+            "proof must observe socket HANDLE denial, not a silent no-op; status={:?} \
+             stdout={} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            stderr.trim()
+        );
+        return;
+    }
     if out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -145,6 +157,27 @@ fn inheritable_pipe_handle_is_not_delegated_to_confined_child() {
     ]);
 
     assert_probe_saw_non_delegated_handle(&out, "pipe");
+
+    let _ = std::fs::remove_dir_all(&probe_dir);
+}
+
+#[test]
+fn inheritable_socket_handle_is_not_delegated_to_confined_child() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+
+    let (probe_dir, probe) = stage_probe();
+    let out = launch(&[
+        "--name",
+        &tag("hsocket"),
+        "--test-inheritable-socket-handle",
+        "--fs-read",
+        &probe_dir.to_string_lossy(),
+        &probe.to_string_lossy(),
+    ]);
+
+    assert_probe_saw_non_delegated_handle(&out, "socket");
 
     let _ = std::fs::remove_dir_all(&probe_dir);
 }

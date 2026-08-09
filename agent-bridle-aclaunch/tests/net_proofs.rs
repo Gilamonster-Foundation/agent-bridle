@@ -15,11 +15,12 @@
 //! Windows runner does.
 #![cfg(target_os = "windows")]
 
-use std::io::Write;
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const LAUNCHER: &str = env!("CARGO_BIN_EXE_agent-bridle-aclaunch");
 const NETPROBE: &str = env!("CARGO_BIN_EXE_ab-netprobe");
@@ -94,25 +95,60 @@ fn elevated() -> bool {
         .unwrap_or(false)
 }
 
-/// A loopback TCP listener that accepts one connection (then returns). Returns the
-/// ephemeral port. Runs in the parent (test) process; a confined child can only
-/// reach it if the AppContainer permits loopback.
-fn loopback_listener() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let port = l.local_addr().unwrap().port();
+fn tcp_listener(bind: &str) -> Option<(String, u16, mpsc::Receiver<()>)> {
+    let l = TcpListener::bind(bind).ok()?;
+    let addr = l.local_addr().ok()?;
+    let host = addr.ip().to_string();
+    let port = addr.port();
+    l.set_nonblocking(true)
+        .expect("set TCP listener nonblocking");
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        if let Ok((mut s, _)) = l.accept() {
-            let _ = s.write_all(b"ok");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match l.accept() {
+                Ok((_s, _)) => {
+                    let _ = tx.send(());
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
         }
     });
-    port
+    Some((host, port, rx))
 }
 
-fn udp_loopback_socket(bind: &str) -> Option<UdpSocket> {
+fn udp_socket(bind: &str) -> Option<UdpSocket> {
     let sock = UdpSocket::bind(bind).ok()?;
-    sock.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+    sock.set_read_timeout(Some(Duration::from_millis(500)))
         .expect("set UDP read timeout");
     Some(sock)
+}
+
+fn local_non_loopback_ipv4() -> Option<String> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // UDP connect only asks the routing table which source address would be used;
+    // it sends no packet, so this is not an Internet dependency.
+    sock.connect("8.8.8.8:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    (ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
+}
+
+fn assert_unconfined_tcp_positive_control(host: &str, port: u16, rx: mpsc::Receiver<()>) {
+    let out = Command::new(NETPROBE)
+        .args(["tcp", host, &port.to_string()])
+        .output()
+        .expect("spawn unconfined ab-netprobe tcp");
+    assert!(
+        out.status.success(),
+        "positive control: unconfined TCP probe must connect to live listener; stderr={}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("positive-control TCP listener must observe the connection");
 }
 
 fn assert_unconfined_udp_positive_control(host: &str, sock: &UdpSocket) {
@@ -133,6 +169,68 @@ fn assert_unconfined_udp_positive_control(host: &str, sock: &UdpSocket) {
     assert_eq!(&buf[..n], b"ping");
 }
 
+fn assert_tcp_probe_failed(out: &std::process::Output, route: &str) {
+    assert!(
+        !out.status.success(),
+        "{route}: AppContainer must deny TCP egress; status={:?} stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ab-netprobe: tcp"),
+        "{route}: failed result must come from the TCP proof helper, not a missing \
+         command or unrelated launcher failure; stderr={stderr:?}"
+    );
+}
+
+fn launch_owned(args: &[String]) -> std::process::Output {
+    Command::new(LAUNCHER)
+        .args(args)
+        .current_dir("C:\\Windows")
+        .output()
+        .expect("spawn agent-bridle-aclaunch")
+}
+
+fn confined_tcp_probe(
+    probe_dir: &std::path::Path,
+    probe: &std::path::Path,
+    tag_kind: String,
+    host: &str,
+    port: u16,
+) -> std::process::Output {
+    let mut args = vec!["--name".to_string(), tag_kind];
+    args.extend([
+        "--fs-read".to_string(),
+        probe_dir.to_string_lossy().into_owned(),
+        probe.to_string_lossy().into_owned(),
+        "tcp".to_string(),
+        host.to_string(),
+        port.to_string(),
+    ]);
+    launch_owned(&args)
+}
+
+fn confined_udp_probe(
+    probe_dir: &std::path::Path,
+    probe: &std::path::Path,
+    tag_kind: String,
+    host: &str,
+    port: u16,
+) -> std::process::Output {
+    let mut args = vec!["--name".to_string(), tag_kind];
+    args.extend([
+        "--fs-read".to_string(),
+        probe_dir.to_string_lossy().into_owned(),
+        probe.to_string_lossy().into_owned(),
+        "udp".to_string(),
+        host.to_string(),
+        port.to_string(),
+    ]);
+    launch_owned(&args)
+}
+
 /// deny-all (#133): with no network capability and no loopback exemption, the
 /// AppContainer kernel-blocks even a loopback connection.
 #[test]
@@ -141,23 +239,18 @@ fn net_deny_all_kernel_blocks_loopback_egress() {
         return;
     }
     let (probe_dir, probe) = stage_probe();
-    let port = loopback_listener();
+    let (control_host, control_port, control_rx) =
+        tcp_listener("127.0.0.1:0").expect("bind loopback TCP control listener");
+    assert_unconfined_tcp_positive_control(&control_host, control_port, control_rx);
+
+    let (host, port, rx) = tcp_listener("127.0.0.1:0").expect("bind loopback TCP listener");
 
     // Grant read+execute on the staged probe only (so it can RUN); grant NO network.
-    let out = launch(&[
-        "--name",
-        &tag("net-deny"),
-        "--fs-read",
-        &probe_dir.to_string_lossy(),
-        &probe.to_string_lossy(),
-        "127.0.0.1",
-        &port.to_string(),
-    ]);
+    let out = confined_tcp_probe(&probe_dir, &probe, tag("net-deny"), &host, port);
+    assert_tcp_probe_failed(&out, "TCP loopback deny-all");
     assert!(
-        !out.status.success(),
-        "AppContainer must kernel-block loopback egress with no --net-allow/--loopback-exemption; \
-         probe stderr: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
+        rx.recv_timeout(Duration::from_millis(700)).is_err(),
+        "sandboxed TCP loopback connection must not reach the live listener"
     );
 
     let _ = std::fs::remove_dir_all(&probe_dir);
@@ -172,7 +265,7 @@ fn net_deny_all_kernel_blocks_udp_loopback_egress() {
         return;
     }
     let (probe_dir, probe) = stage_probe();
-    let sock = udp_loopback_socket("127.0.0.1:0").expect("bind IPv4 UDP loopback");
+    let sock = udp_socket("127.0.0.1:0").expect("bind IPv4 UDP loopback");
     assert_unconfined_udp_positive_control("127.0.0.1", &sock);
     let port = sock.local_addr().unwrap().port();
 
@@ -205,7 +298,7 @@ fn net_deny_all_kernel_blocks_ipv6_loopback_egress() {
     if skip_proof_unless_appcontainer() {
         return;
     }
-    let Some(sock) = udp_loopback_socket("[::1]:0") else {
+    let Some(sock) = udp_socket("[::1]:0") else {
         eprintln!("skipping IPv6 UDP loopback proof: ::1 unavailable on this host");
         return;
     };
@@ -228,6 +321,57 @@ fn net_deny_all_kernel_blocks_ipv6_loopback_egress() {
         sock.recv_from(&mut buf).is_err(),
         "confined IPv6 UDP probe must not reach the positive-control listener; status={:?} \
          stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+
+    let _ = std::fs::remove_dir_all(&probe_dir);
+}
+
+#[test]
+fn net_deny_all_kernel_blocks_tcp_to_non_loopback_local_interface() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+    let local_ip = local_non_loopback_ipv4()
+        .expect("proof host must have a non-loopback IPv4 address for off-box direct evidence");
+    let (probe_dir, probe) = stage_probe();
+
+    let (control_host, control_port, control_rx) =
+        tcp_listener(&format!("{local_ip}:0")).expect("bind local-interface TCP control");
+    assert_unconfined_tcp_positive_control(&control_host, control_port, control_rx);
+
+    let (host, port, rx) =
+        tcp_listener(&format!("{local_ip}:0")).expect("bind local-interface TCP");
+    let out = confined_tcp_probe(&probe_dir, &probe, tag("tcp-offbox-deny"), &host, port);
+    assert_tcp_probe_failed(&out, "TCP non-loopback local-interface deny-all");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(700)).is_err(),
+        "sandboxed TCP non-loopback connection must not reach the live listener"
+    );
+
+    let _ = std::fs::remove_dir_all(&probe_dir);
+}
+
+#[test]
+fn net_deny_all_blocks_udp_to_non_loopback_local_interface() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+    let local_ip = local_non_loopback_ipv4()
+        .expect("proof host must have a non-loopback IPv4 address for off-box direct evidence");
+    let (probe_dir, probe) = stage_probe();
+    let sock = udp_socket(&format!("{local_ip}:0")).expect("bind local-interface UDP");
+    assert_unconfined_udp_positive_control(&local_ip, &sock);
+    let port = sock.local_addr().unwrap().port();
+
+    let out = confined_udp_probe(&probe_dir, &probe, tag("udp-offbox-deny"), &local_ip, port);
+    let mut buf = [0_u8; 16];
+    assert!(
+        sock.recv_from(&mut buf).is_err(),
+        "confined UDP non-loopback probe must not reach the positive-control listener; \
+         status={:?} stdout={} stderr={}",
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).trim(),
         String::from_utf8_lossy(&out.stderr).trim()
@@ -262,7 +406,7 @@ fn net_loopback_exemption_permits_loopback() {
         return;
     }
     let (probe_dir, probe) = stage_probe();
-    let port = loopback_listener();
+    let (host, port, rx) = tcp_listener("127.0.0.1:0").expect("bind loopback TCP listener");
 
     let out = launch(&[
         "--name",
@@ -271,7 +415,7 @@ fn net_loopback_exemption_permits_loopback() {
         "--fs-read",
         &probe_dir.to_string_lossy(),
         &probe.to_string_lossy(),
-        "127.0.0.1",
+        &host,
         &port.to_string(),
     ]);
     assert!(
@@ -279,6 +423,8 @@ fn net_loopback_exemption_permits_loopback() {
         "with --loopback-exemption the confined child must reach loopback; probe stderr: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("loopback-exemption proof must reach the live listener");
 
     let _ = std::fs::remove_dir_all(&probe_dir);
 }
