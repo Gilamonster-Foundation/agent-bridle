@@ -7,7 +7,7 @@
 //! referenced by an explicit anchor symbol. We deliberately do **not** use
 //! `inventory` in P0.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,23 +17,70 @@ use crate::{
     Invocation, StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
 };
 
-/// An unforgeable, opaque grant identity minted by a [`Registry`]. It keys the
-/// persistent per-grant call-budget ledger (AB-001, #264), so a grant's
-/// `max_calls` is enforced **across** dispatches — not reset every call. Its
-/// constructor is private, so a caller cannot forge one; and every mint yields a
-/// fresh id, so two grants with *equal caveats* get **independent** budgets (the
-/// ledger is keyed by identity, never by serialized caveats).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct GrantId(u64);
+/// The **shared, unforgeable mutable call budget** carried by a [`Grant`]
+/// (AB-001, #264; issuer-binding hardening for v0.8).
+///
+/// Every clone of a grant shares *this* cell via [`Arc`], and the budget lives
+/// **inside the grant**, not in per-`Registry` state keyed by a forgeable id.
+/// So a grant's `max_calls` **cannot regenerate**: not by cloning the grant, not
+/// by dispatching it through a *different* [`Registry`], and not by recreating a
+/// session — every dispatch decrements the same cell. (The earlier design kept
+/// the budget in a per-Registry `HashMap<GrantId, _>` with create-on-first-use,
+/// so the *same* grant crossing to a second Registry — whose map lacked that id
+/// — silently minted a fresh budget. That regeneration is now impossible.)
+///
+/// `None` ⇒ unlimited; `Some(n)` ⇒ `n` calls remaining. The `Mutex` makes the
+/// check-and-decrement atomic, so concurrent dispatches on one grant cannot
+/// overspend. Its constructor is private, so a caller cannot forge a budget.
+#[derive(Debug)]
+struct GrantBudget {
+    remaining: Mutex<Option<u64>>,
+}
 
-/// A minted grant: authority ([`Caveats`]) bound to an unforgeable [`GrantId`].
-/// Pass it to [`Registry::dispatch`] and **reuse it across calls** so the call
-/// budget persists — mint it once per session (`Registry::mint_grant`), not per
-/// call. Minting a fresh grant per call gives per-call budget semantics.
+impl GrantBudget {
+    fn new(max_calls: CountBound) -> Self {
+        Self {
+            remaining: Mutex::new(match max_calls {
+                CountBound::AtMost(n) => Some(n),
+                CountBound::Unlimited => None,
+            }),
+        }
+    }
+
+    /// Charge one call. `Unlimited` never exhausts; `AtMost(0)` (or a spent
+    /// budget) is a fail-closed [`ToolError::Budget`]. Held under the lock so
+    /// concurrent charges cannot overspend.
+    fn charge(&self) -> ToolResult<()> {
+        let mut remaining = self.remaining.lock().expect("grant budget mutex poisoned");
+        match &mut *remaining {
+            None => Ok(()),
+            Some(0) => Err(ToolError::Budget),
+            Some(n) => {
+                *n -= 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Return a charge that did not result in an admitted call (a pre-run denial).
+    fn refund(&self) {
+        let mut remaining = self.remaining.lock().expect("grant budget mutex poisoned");
+        if let Some(n) = remaining.as_mut() {
+            *n += 1;
+        }
+    }
+}
+
+/// A minted grant: authority ([`Caveats`]) bound to a shared, unforgeable
+/// [`GrantBudget`]. Pass it to [`Registry::dispatch`] and **reuse it across
+/// calls** so the `max_calls` budget persists — mint it once per session
+/// (`Registry::mint_grant`), not per call (a fresh grant per call gives per-call
+/// budget semantics). Cloning a grant shares the *same* budget, and the budget
+/// travels with the grant, so it cannot regenerate across Registries or sessions.
 #[derive(Clone, Debug)]
 pub struct Grant {
-    id: GrantId,
     caveats: Caveats,
+    budget: Arc<GrantBudget>,
 }
 
 impl Grant {
@@ -41,12 +88,6 @@ impl Grant {
     #[must_use]
     pub fn caveats(&self) -> &Caveats {
         &self.caveats
-    }
-
-    /// The grant's opaque, unforgeable identity.
-    #[must_use]
-    pub fn id(&self) -> GrantId {
-        self.id
     }
 }
 
@@ -84,15 +125,6 @@ pub struct Registry {
     /// generation, nonce)`, so a fresh nonce makes a captured discharge invalid on
     /// any later call. (A host wanting unpredictable nonces runs its own ceremony.)
     step_up_nonce: AtomicU64,
-    /// Monotonic grant-id counter. Core is rng-less (like `step_up_nonce`); the
-    /// private [`GrantId`] constructor is the unforgeability guarantee, and a
-    /// counter gives every mint a distinct id (⇒ independent budgets).
-    grant_counter: AtomicU64,
-    /// AB-001 (#264): the **persistent** per-grant call-budget ledger, keyed by
-    /// the grant's unforgeable id. `None` ⇒ unlimited; `Some(n)` ⇒ n calls
-    /// remaining. Seeded create-on-first-use from the grant's `max_calls`, and
-    /// charged under the lock so concurrent dispatches cannot overspend.
-    ledger: Mutex<HashMap<GrantId, Option<u64>>>,
 }
 
 impl Registry {
@@ -131,14 +163,13 @@ impl Registry {
 
     /// Mint a [`Grant`] from `caveats`. **Reuse the returned grant across calls**
     /// so the `max_calls` budget persists — mint once per session, not per call
-    /// (AB-001, #264). Two grants minted from equal caveats have distinct ids and
-    /// therefore **independent** budgets.
+    /// (AB-001, #264). Two grants minted from equal caveats carry **independent**
+    /// budgets (each mint allocates its own [`GrantBudget`] cell); a *clone* of one
+    /// grant shares that grant's budget.
     #[must_use]
     pub fn mint_grant(&self, caveats: Caveats) -> Grant {
-        Grant {
-            id: GrantId(self.grant_counter.fetch_add(1, Ordering::Relaxed)),
-            caveats,
-        }
+        let budget = Arc::new(GrantBudget::new(caveats.max_calls));
+        Grant { caveats, budget }
     }
 
     /// Dispatch `name` with `args`, enforced by the leash, charging `grant`'s
@@ -180,14 +211,14 @@ impl Registry {
 
         // AB-001 (#264): charge the PERSISTENT per-grant budget first. Under the
         // ledger lock, so concurrent dispatches on one grant cannot overspend.
-        self.charge_grant(grant)?;
+        grant.budget.charge()?;
 
         // Authorize (generation / step-up / strength-floor). A pre-invoke error
         // means the tool never ran, so refund the charge unconditionally.
         let cx = match self.authorize_grant(tool.as_ref(), grant.caveats(), name, strength_floor) {
             Ok(cx) => cx,
             Err(e) => {
-                self.refund_grant(grant);
+                grant.budget.refund();
                 return Err(e);
             }
         };
@@ -207,13 +238,13 @@ impl Registry {
         match tool.invoke_accounted(args, &cx).await {
             Ok(outcome) => {
                 if outcome.is_denied() {
-                    self.refund_grant(grant);
+                    grant.budget.refund();
                 }
                 Ok(outcome.into_value())
             }
             Err(e) => {
                 if matches!(e, ToolError::Denied { .. }) {
-                    self.refund_grant(grant);
+                    grant.budget.refund();
                 }
                 Err(e)
             }
@@ -223,10 +254,8 @@ impl Registry {
     /// Dispatch `name` with `args` as a **stateless one-shot**: enforce
     /// `caveats.max_calls` for this single call *without* creating a persistent
     /// ledger entry (AB-001 review, #264). A one-shot has no cross-call budget to
-    /// track, so minting a `Grant` (and leaving its immortal ledger row) would
-    /// leak one `HashMap` entry per call in a long-running embedder. Because no
-    /// grant id is shared, nothing here can race a concurrent dispatch or erase a
-    /// reused session grant's state.
+    /// track. The grant's budget lives in the grant (dropped with the ephemeral
+    /// grant), so there is no per-Registry state to leak, race, or resurrect.
     ///
     /// `AtMost(0)` denies (fail-closed); `AtMost(n≥1)` or `Unlimited` admits the
     /// one call. Accounting for the single call still honors the typed
@@ -305,38 +334,6 @@ impl Registry {
             None => gate.authorize(tool, granted),
         }
     }
-
-    /// Charge one call against `grant`'s persistent budget, seeding it
-    /// create-on-first-use from the grant's `max_calls`. `Unlimited` never
-    /// exhausts; `AtMost(0)` (or a spent budget) is a fail-closed
-    /// [`ToolError::Budget`]. Held under the ledger lock so concurrent charges
-    /// cannot overspend.
-    fn charge_grant(&self, grant: &Grant) -> ToolResult<()> {
-        let mut ledger = self.ledger.lock().expect("grant ledger mutex poisoned");
-        let remaining = ledger
-            .entry(grant.id)
-            .or_insert_with(|| match grant.caveats.max_calls {
-                CountBound::AtMost(n) => Some(n),
-                CountBound::Unlimited => None,
-            });
-        match remaining {
-            None => Ok(()),
-            Some(0) => Err(ToolError::Budget),
-            Some(n) => {
-                *n -= 1;
-                Ok(())
-            }
-        }
-    }
-
-    /// Return a charge that did not result in an admitted call (a denied
-    /// authorize) to `grant`'s budget.
-    fn refund_grant(&self, grant: &Grant) {
-        let mut ledger = self.ledger.lock().expect("grant ledger mutex poisoned");
-        if let Some(Some(n)) = ledger.get_mut(&grant.id) {
-            *n += 1;
-        }
-    }
 }
 
 /// Explicit builder for a [`Registry`]. The supported, DCE-proof registration
@@ -391,8 +388,6 @@ impl RegistryBuilder {
             generation: self.generation,
             step_up: self.step_up,
             step_up_nonce: AtomicU64::new(0),
-            grant_counter: AtomicU64::new(0),
-            ledger: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -813,12 +808,11 @@ mod tests {
         );
     }
 
-    /// AB-001 #309-B regression: a stateless one-shot dispatch does NOT create a
-    /// persistent ledger row. Before `dispatch_oneshot`, the Python binding
-    /// minted a fresh grant per call, leaking one immortal `HashMap` entry each
-    /// time. Many one-shots must leave the ledger empty.
+    /// AB-001 #309-B: a stateless one-shot dispatch keeps **no per-call state**.
+    /// The Registry no longer holds any per-grant ledger (the budget lives in the
+    /// grant), so a leak is structurally impossible — 1000 one-shots just run.
     #[test]
-    fn oneshot_dispatch_does_not_grow_ledger() {
+    fn oneshot_dispatch_keeps_no_per_call_state() {
         let r = budget_reg();
         for _ in 0..1000 {
             let _ = block_on(r.dispatch_oneshot(
@@ -828,18 +822,13 @@ mod tests {
             ))
             .unwrap();
         }
-        assert_eq!(
-            r.ledger.lock().unwrap().len(),
-            0,
-            "one-shot dispatch must not accumulate per-call ledger rows"
-        );
+        // Nothing to assert about the Registry — it carries no per-grant state.
     }
 
     /// A one-shot still enforces `max_calls` for its single call: `AtMost(0)`
-    /// denies fail-closed; `AtMost(1)`/`Unlimited` admit the one call — all
-    /// without a ledger row.
+    /// denies fail-closed; `AtMost(1)`/`Unlimited` admit the one call.
     #[test]
-    fn oneshot_respects_max_calls_without_ledger() {
+    fn oneshot_respects_max_calls() {
         let r = budget_reg();
         let zero = block_on(r.dispatch_oneshot(
             "budget_probe",
@@ -866,11 +855,9 @@ mod tests {
             .is_ok(),
             "AtMost(1) admits the single one-shot call"
         );
-        assert_eq!(r.ledger.lock().unwrap().len(), 0, "no ledger rows created");
     }
 
-    /// An in-band one-shot denial surfaces its envelope (and, being a one-shot,
-    /// creates no ledger row regardless of accounting).
+    /// An in-band one-shot denial surfaces its envelope.
     #[test]
     fn oneshot_inband_denial_surfaces_envelope() {
         let r = budget_reg();
@@ -881,7 +868,80 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(out["denied"], true);
-        assert_eq!(r.ledger.lock().unwrap().len(), 0);
+    }
+
+    // ── Grant issuer/budget binding (v0.8): a grant's budget cannot regenerate ──
+
+    /// A grant CLONE shares the same budget: exhausting the clone exhausts the
+    /// original (the budget is one shared `Arc<GrantBudget>`, not per-value).
+    #[test]
+    fn cloned_grant_shares_one_budget() {
+        let r = budget_reg();
+        let grant = r.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        let clone = grant.clone();
+        // Spend the single call via the CLONE.
+        assert!(budget_call(&r, &clone, "ran_ok").is_ok());
+        // The ORIGINAL is now spent too — the clone did not get its own budget.
+        assert!(
+            matches!(
+                budget_call(&r, &grant, "ran_ok").unwrap_err(),
+                ToolError::Budget
+            ),
+            "a cloned grant must not carry an independent budget"
+        );
+    }
+
+    /// THE issuer-binding fix: a grant minted by Registry A, once spent, **cannot
+    /// regenerate its budget** by being dispatched through a *different* Registry
+    /// B. The budget lives in the grant, so B decrements the SAME cell. Before the
+    /// fix, B's per-Registry ledger (keyed by a per-Registry id counter) had no
+    /// entry for the grant and minted a fresh `max_calls` budget.
+    #[test]
+    fn spent_grant_cannot_regenerate_budget_in_a_second_registry() {
+        let reg_a = budget_reg();
+        let reg_b = budget_reg(); // a distinct Registry — its own id counter, no shared state
+        let grant = reg_a.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        // Spend the single call in Registry A.
+        assert!(budget_call(&reg_a, &grant, "ran_ok").is_ok());
+        assert!(matches!(
+            budget_call(&reg_a, &grant, "ran_ok").unwrap_err(),
+            ToolError::Budget
+        ));
+        // Cross to Registry B with the SAME (spent) grant — must STAY spent.
+        assert!(
+            matches!(
+                budget_call(&reg_b, &grant, "ran_ok").unwrap_err(),
+                ToolError::Budget
+            ),
+            "a spent grant must not regenerate its budget by crossing to another Registry"
+        );
+    }
+
+    /// Recreating the session/Registry does not resurrect a spent grant: the
+    /// spent grant, dispatched through a freshly built Registry, is still spent.
+    #[test]
+    fn recreated_registry_does_not_resurrect_a_spent_grant() {
+        let reg1 = budget_reg();
+        let grant = reg1.mint_grant(Caveats {
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        assert!(budget_call(&reg1, &grant, "ran_ok").is_ok());
+        drop(reg1); // session ends
+        let reg2 = budget_reg(); // "restart" — a brand-new Registry
+        assert!(
+            matches!(
+                budget_call(&reg2, &grant, "ran_ok").unwrap_err(),
+                ToolError::Budget
+            ),
+            "a spent grant carried across a session restart stays spent"
+        );
     }
 
     /// A provider whose ceremony always fails (no authenticator / human declined)
