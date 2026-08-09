@@ -57,18 +57,17 @@ mod windows {
     };
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-        TRUSTEE_W,
+        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+        TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, FreeSid, GetSecurityDescriptorDacl,
-        WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
-        WinCapabilityPrivateNetworkClientServerSid, ACL, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-        SID_AND_ATTRIBUTES,
+        CreateWellKnownSid, FreeSid, WinCapabilityInternetClientServerSid,
+        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid, ACL,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_ATTRIBUTES,
+        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -128,14 +127,12 @@ mod windows {
     /// Grant `ac_sid` the given `access_mask` on `path` (inheriting into subdirs).
     ///
     /// Gets the existing DACL, merges in an `EXPLICIT_ACCESS` ACE for the
-    /// AppContainer SID, and applies the merged DACL.  Returns the old security
-    /// descriptor (caller must `LocalFree` it) on success, or `null` if the
-    /// operation fails (non-fatal: some paths may not be modifiable by this user).
+    /// AppContainer SID, and applies the merged DACL. Returns `true` on success.
     unsafe fn grant_path_access(
         path: &str,
         ac_sid: *mut std::ffi::c_void,
         access_mask: u32,
-    ) -> *mut std::ffi::c_void {
+    ) -> bool {
         let path_w = to_wide(OsStr::new(path));
 
         let mut p_old_dacl: *mut ACL = std::ptr::null_mut();
@@ -152,7 +149,7 @@ mod windows {
             &mut p_sd,
         );
         if err != ERROR_SUCCESS {
-            return std::ptr::null_mut();
+            return false;
         }
 
         let ea = EXPLICIT_ACCESS_W {
@@ -172,7 +169,7 @@ mod windows {
         let err = SetEntriesInAclW(1, &ea, p_old_dacl, &mut p_new_dacl);
         if err != ERROR_SUCCESS {
             LocalFree(p_sd);
-            return std::ptr::null_mut();
+            return false;
         }
 
         let err = SetNamedSecurityInfoW(
@@ -187,41 +184,83 @@ mod windows {
 
         LocalFree(p_new_dacl as *mut _);
 
-        if err != ERROR_SUCCESS {
-            LocalFree(p_sd);
-            std::ptr::null_mut()
-        } else {
-            p_sd
-        }
+        LocalFree(p_sd);
+        err == ERROR_SUCCESS
     }
 
-    /// Restore the DACL saved by `grant_path_access` and free the security descriptor.
-    unsafe fn restore_path_dacl(path: &str, p_sd: *mut std::ffi::c_void) {
-        if p_sd.is_null() {
+    /// Revoke only the explicit ACE for this launcher's AppContainer SID.
+    ///
+    /// Whole-DACL snapshot/restore is unsafe when two launchers overlap on the
+    /// same path: the first cleanup can erase the second live grant, and the
+    /// second cleanup can resurrect the first expired grant. Each profile name
+    /// maps to a unique AppContainer SID, so scoped REVOKE_ACCESS cleanup removes
+    /// only this launcher's ACE.
+    unsafe fn revoke_path_access(path: &str, ac_sid: *mut std::ffi::c_void) {
+        if ac_sid.is_null() {
             return;
         }
         let path_w = to_wide(OsStr::new(path));
-        let mut p_dacl: *mut ACL = std::ptr::null_mut();
-        let mut b_present: i32 = 0;
-        let mut b_defaulted: i32 = 0;
-        GetSecurityDescriptorDacl(p_sd, &mut b_present, &mut p_dacl, &mut b_defaulted);
-        if b_present != 0 {
-            SetNamedSecurityInfoW(
+
+        let mut p_old_dacl: *mut ACL = std::ptr::null_mut();
+        let mut p_sd: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut p_old_dacl,
+            std::ptr::null_mut(),
+            &mut p_sd,
+        );
+        if err != ERROR_SUCCESS {
+            return;
+        }
+
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: 0,
+            grfAccessMode: REVOKE_ACCESS,
+            grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: ac_sid.cast(),
+            },
+        };
+
+        let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
+        let err = SetEntriesInAclW(1, &ea, p_old_dacl, &mut p_new_dacl);
+        if err == ERROR_SUCCESS {
+            let err = SetNamedSecurityInfoW(
                 path_w.as_ptr() as *mut _,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                p_dacl,
+                p_new_dacl,
                 std::ptr::null_mut(),
+            );
+            if err != ERROR_SUCCESS {
+                eprintln!(
+                    "agent-bridle-aclaunch: cleanup could not revoke AppContainer ACE \
+                     from {path:?}: {err}"
+                );
+            }
+            LocalFree(p_new_dacl as *mut _);
+        } else {
+            eprintln!(
+                "agent-bridle-aclaunch: cleanup could not build AppContainer ACE \
+                 revocation for {path:?}: {err}"
             );
         }
         LocalFree(p_sd);
     }
 
-    unsafe fn restore_path_grants(fs_grants: Vec<(String, *mut std::ffi::c_void)>) {
-        for (path, psd) in fs_grants {
-            restore_path_dacl(&path, psd);
+    unsafe fn revoke_path_grants(fs_grants: Vec<String>, ac_sid: *mut std::ffi::c_void) {
+        for path in fs_grants {
+            revoke_path_access(&path, ac_sid);
         }
     }
 
@@ -672,41 +711,41 @@ mod windows {
         //     the requested paths so the sandboxed process can read/write its workspace.
         //     AppContainers are denied user directories by default; without this grant
         //     the child cannot access its working directory.
-        //     We save each path's original security descriptor for cleanup after the child
-        //     exits.  Non-fatal per path — system directories are usually already accessible
-        //     via ALL_APPLICATION_PACKAGES and may not be modifiable by the current user.
-        let mut fs_grants: Vec<(String, *mut std::ffi::c_void)> = Vec::new();
+        //     We track each granted path so cleanup can revoke only this profile
+        //     SID's explicit ACE after the child exits. Whole-DACL snapshot/restore
+        //     is unsafe under overlapping launches on the same resource.
+        let mut fs_grants: Vec<String> = Vec::new();
 
         // Grant read+write for write paths first (superset of read).
         for path in fs_write {
-            let psd = grant_path_access(path, ac_sid, FILE_GENERIC_READ_WRITE_EXECUTE);
-            if psd.is_null() {
+            let granted = grant_path_access(path, ac_sid, FILE_GENERIC_READ_WRITE_EXECUTE);
+            if !granted {
                 eprintln!(
                     "agent-bridle-aclaunch: could not grant write access to {path:?}; \
                      refusing before spawn because the requested fs_write witness is unavailable"
                 );
-                restore_path_grants(fs_grants);
+                revoke_path_grants(fs_grants, ac_sid);
                 do_cleanup(name, ac_sid);
                 std::process::exit(1);
             }
-            fs_grants.push((path.clone(), psd));
+            fs_grants.push(path.clone());
         }
         // Grant read-only for remaining read paths not already granted.
         for path in fs_read {
-            if fs_grants.iter().any(|(p, _)| p == path) {
+            if fs_grants.iter().any(|p| p == path) {
                 continue;
             }
-            let psd = grant_path_access(path, ac_sid, FILE_GENERIC_READ_EXECUTE);
-            if psd.is_null() {
+            let granted = grant_path_access(path, ac_sid, FILE_GENERIC_READ_EXECUTE);
+            if !granted {
                 eprintln!(
                     "agent-bridle-aclaunch: could not grant read access to {path:?}; \
                      refusing before spawn because the requested fs_read witness is unavailable"
                 );
-                restore_path_grants(fs_grants);
+                revoke_path_grants(fs_grants, ac_sid);
                 do_cleanup(name, ac_sid);
                 std::process::exit(1);
             }
-            fs_grants.push((path.clone(), psd));
+            fs_grants.push(path.clone());
         }
 
         // 2b. Loopback exemption (#133, ADR 0016): AppContainers cannot reach the
@@ -763,7 +802,7 @@ mod windows {
                 "agent-bridle-aclaunch: InitializeProcThreadAttributeList failed: {:?}",
                 std::io::Error::last_os_error()
             );
-            restore_path_grants(fs_grants);
+            revoke_path_grants(fs_grants, ac_sid);
             if loopback_exemption {
                 restore_loopback_exemption(loopback_prev, loopback_prev_count);
             }
@@ -776,7 +815,7 @@ mod windows {
                 "agent-bridle-aclaunch: forced process-attribute failure; refusing before spawn"
             );
             DeleteProcThreadAttributeList(attr_list);
-            restore_path_grants(fs_grants);
+            revoke_path_grants(fs_grants, ac_sid);
             if loopback_exemption {
                 restore_loopback_exemption(loopback_prev, loopback_prev_count);
             }
@@ -800,7 +839,7 @@ mod windows {
                 std::io::Error::last_os_error()
             );
             DeleteProcThreadAttributeList(attr_list);
-            restore_path_grants(fs_grants);
+            revoke_path_grants(fs_grants, ac_sid);
             if loopback_exemption {
                 restore_loopback_exemption(loopback_prev, loopback_prev_count);
             }
@@ -829,7 +868,7 @@ mod windows {
                     std::io::Error::last_os_error()
                 );
                 DeleteProcThreadAttributeList(attr_list);
-                restore_path_grants(fs_grants);
+                revoke_path_grants(fs_grants, ac_sid);
                 if loopback_exemption {
                     restore_loopback_exemption(loopback_prev, loopback_prev_count);
                 }
@@ -855,7 +894,7 @@ mod windows {
                     std::io::Error::last_os_error()
                 );
                 DeleteProcThreadAttributeList(attr_list);
-                restore_path_grants(fs_grants);
+                revoke_path_grants(fs_grants, ac_sid);
                 if loopback_exemption {
                     restore_loopback_exemption(loopback_prev, loopback_prev_count);
                 }
@@ -904,7 +943,7 @@ mod windows {
                 "agent-bridle-aclaunch: CreateProcessW({exe:?}) failed: {:?}",
                 std::io::Error::last_os_error()
             );
-            restore_path_grants(fs_grants);
+            revoke_path_grants(fs_grants, ac_sid);
             if loopback_exemption {
                 restore_loopback_exemption(loopback_prev, loopback_prev_count);
             }
@@ -921,8 +960,8 @@ mod windows {
         GetExitCodeProcess(proc_info.hProcess as HANDLE, &mut exit_code);
         CloseHandle(proc_info.hProcess as HANDLE);
 
-        // 7a. Restore fs DACLs we modified before the child was spawned.
-        restore_path_grants(fs_grants);
+        // 7a. Revoke this profile SID's explicit fs ACEs.
+        revoke_path_grants(fs_grants, ac_sid);
 
         // 7b. Restore loopback exemption list if we modified it.
         if loopback_exemption {

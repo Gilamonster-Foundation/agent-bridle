@@ -10,8 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const LAUNCHER: &str = env!("CARGO_BIN_EXE_agent-bridle-aclaunch");
+const FSPROBE: &str = env!("CARGO_BIN_EXE_ab-fsprobe");
 const SECRET: &str = "SECRET_OUTSIDE_MARKER";
 const ORIG: &str = "ORIG";
 const WRITTEN: &str = "WRITTEN_BY_CHILD";
@@ -43,6 +45,25 @@ fn launch(args: &[&str]) -> std::process::Output {
         .current_dir("C:\\Windows")
         .output()
         .expect("spawn agent-bridle-aclaunch")
+}
+
+fn launch_owned(args: Vec<String>) -> std::process::Output {
+    Command::new(LAUNCHER)
+        .args(args)
+        .current_dir("C:\\Windows")
+        .output()
+        .expect("spawn agent-bridle-aclaunch")
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {path:?}");
 }
 
 fn appcontainer_available() -> bool {
@@ -458,4 +479,103 @@ fn concurrent_children_do_not_gain_each_others_workspace_grants() {
 
     let _ = std::fs::remove_dir_all(&left);
     let _ = std::fs::remove_dir_all(&right);
+}
+
+#[test]
+fn overlapping_children_on_same_resource_keep_live_grants_and_cleanup_exactly() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+
+    let workspace = fresh_dir("overlap-same-resource");
+    let a_start = workspace.join("a-start.txt");
+    let a_done = workspace.join("a-done.txt");
+    let b_start = workspace.join("b-start.txt");
+    let b_after_a = workspace.join("b-after-a.txt");
+    let a_resurrected = workspace.join("a-resurrected.txt");
+    let b_resurrected = workspace.join("b-resurrected.txt");
+    let profile_a = tag("overlap-a");
+    let profile_b = tag("overlap-b");
+
+    let mut a = Command::new(LAUNCHER)
+        .args([
+            "--name",
+            &profile_a,
+            "--fs-write",
+            &workspace.to_string_lossy(),
+            FSPROBE,
+            "write-sleep-write",
+            &a_start.to_string_lossy(),
+            "A_START",
+            "1000",
+            &a_done.to_string_lossy(),
+            "A_DONE",
+        ])
+        .current_dir("C:\\Windows")
+        .spawn()
+        .expect("spawn overlapping child A");
+    wait_for_file(&a_start);
+
+    let mut b = Command::new(LAUNCHER)
+        .args([
+            "--name",
+            &profile_b,
+            "--fs-write",
+            &workspace.to_string_lossy(),
+            FSPROBE,
+            "write-sleep-write",
+            &b_start.to_string_lossy(),
+            "B_START",
+            "2500",
+            &b_after_a.to_string_lossy(),
+            "B_AFTER_A",
+        ])
+        .current_dir("C:\\Windows")
+        .spawn()
+        .expect("spawn overlapping child B");
+    wait_for_file(&b_start);
+
+    let a_status = a.wait().expect("wait child A");
+    assert!(a_status.success(), "child A should complete its own writes");
+    let b_status = b.wait().expect("wait child B");
+    assert!(
+        b_status.success(),
+        "child B must keep its still-live grant after child A cleans up"
+    );
+    assert_eq!(std::fs::read_to_string(&a_done).unwrap(), "A_DONE");
+    assert_eq!(std::fs::read_to_string(&b_after_a).unwrap(), "B_AFTER_A");
+
+    let a_after = launch_owned(vec![
+        "--name".to_string(),
+        profile_a,
+        FSPROBE.to_string(),
+        "write".to_string(),
+        a_resurrected.to_string_lossy().into_owned(),
+        "A_RESURRECTED".to_string(),
+    ]);
+    assert!(
+        !a_after.status.success(),
+        "child B cleanup must not resurrect child A's expired grant; stdout={} stderr={}",
+        String::from_utf8_lossy(&a_after.stdout).trim(),
+        String::from_utf8_lossy(&a_after.stderr).trim()
+    );
+    assert!(!a_resurrected.exists());
+
+    let b_after = launch_owned(vec![
+        "--name".to_string(),
+        profile_b,
+        FSPROBE.to_string(),
+        "write".to_string(),
+        b_resurrected.to_string_lossy().into_owned(),
+        "B_RESURRECTED".to_string(),
+    ]);
+    assert!(
+        !b_after.status.success(),
+        "final cleanup must remove child B's expired grant; stdout={} stderr={}",
+        String::from_utf8_lossy(&b_after.stdout).trim(),
+        String::from_utf8_lossy(&b_after.stderr).trim()
+    );
+    assert!(!b_resurrected.exists());
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }

@@ -35,6 +35,11 @@ path = "src/bin/ab-handleprobe.rs"
 name = "ab-tokenprobe"
 path = "src/bin/ab-tokenprobe.rs"
 
+# A tiny filesystem probe used by ACL concurrency proofs.
+[[bin]]
+name = "ab-fsprobe"
+path = "src/bin/ab-fsprobe.rs"
+
 # Windows-only deps: the Win32 API surface for AppContainer + CreateProcessW.
 # Guarded by target triple so cross-compile (Linux host, Windows target) still
 # pulls the right set of features without cargo resolving windows-sys on Linux.

@@ -175,6 +175,12 @@ pub struct SandboxPolicy {
     /// this field existed keep parsing (they get `LandlockOnly`).
     #[serde(default)]
     pub child_network: ChildNetworkPolicy,
+    /// Windows AppContainer launcher provenance: optional absolute path to the
+    /// trusted `agent-bridle-aclaunch.exe` helper. When unset, Windows uses only
+    /// the helper shipped next to the current executable. Ambient `PATH` is never
+    /// a trusted source for this sandbox constructor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appcontainer_launcher_path: Option<String>,
     /// Read base when `fs_read` restricted (`BASE_READ_PATHS`).
     pub base_read_paths: PathList,
     /// Executable dirs read-allowed only when `exec` is ambient (`BIN_READ_PATHS`).
@@ -254,6 +260,7 @@ impl Default for SandboxPolicy {
         Self {
             backends: BackendToggles::default(),
             child_network: ChildNetworkPolicy::default(),
+            appcontainer_launcher_path: None,
             base_read_paths: PathList::from_defaults(base_read),
             device_sink_paths: default_device_sink_paths(),
             bin_read_paths: PathList::from_defaults(&[
@@ -731,6 +738,28 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let back: BridleConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn appcontainer_launcher_path_is_explicit_mechanism_config() {
+        assert_eq!(SandboxPolicy::default().appcontainer_launcher_path, None);
+        let policy = SandboxPolicy {
+            appcontainer_launcher_path: Some(
+                "C:\\Program Files\\Agent Bridle\\agent-bridle-aclaunch.exe".to_string(),
+            ),
+            ..SandboxPolicy::default()
+        };
+
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            json["appcontainer_launcher_path"],
+            "C:\\Program Files\\Agent Bridle\\agent-bridle-aclaunch.exe"
+        );
+        let policy: SandboxPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            policy.appcontainer_launcher_path.as_deref(),
+            Some("C:\\Program Files\\Agent Bridle\\agent-bridle-aclaunch.exe")
+        );
     }
 
     #[test]
