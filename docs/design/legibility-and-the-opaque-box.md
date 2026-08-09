@@ -158,7 +158,14 @@ Read that way, several things line up:
   D2 seam.
 
 Not a proposal to implement today. It is the property we should be able to say
-we are approximating, and by how much.
+we are approximating, and by how much. Concretely, **we do not provide it yet**:
+the current `ConfinedCommand` spawn boundary delegates *environment* explicitly
+but relies on the platform **CLOEXEC convention** for descriptors — it does not
+close ambient file descriptors on spawn, so a descriptor the parent left open
+(CLOEXEC cleared) is inherited by the confined child. That is the exact ambient
+authority this section argues against, tracked as **agent-bridle#319**; the
+target property above is where the spawn boundary should get to, not what it
+ships today.
 
 ## Open questions
 
