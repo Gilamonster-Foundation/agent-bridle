@@ -16,7 +16,7 @@
 #![cfg(target_os = "windows")]
 
 use std::io::Write;
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,6 +108,31 @@ fn loopback_listener() -> u16 {
     port
 }
 
+fn udp_loopback_socket(bind: &str) -> Option<UdpSocket> {
+    let sock = UdpSocket::bind(bind).ok()?;
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .expect("set UDP read timeout");
+    Some(sock)
+}
+
+fn assert_unconfined_udp_positive_control(host: &str, sock: &UdpSocket) {
+    let port = sock.local_addr().unwrap().port();
+    let out = Command::new(NETPROBE)
+        .args(["udp", host, &port.to_string()])
+        .output()
+        .expect("spawn unconfined ab-netprobe udp");
+    assert!(
+        out.status.success(),
+        "positive control: unconfined UDP probe must send to listener; stderr={}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let mut buf = [0_u8; 16];
+    let (n, _) = sock
+        .recv_from(&mut buf)
+        .expect("positive-control UDP listener must receive datagram");
+    assert_eq!(&buf[..n], b"ping");
+}
+
 /// deny-all (#133): with no network capability and no loopback exemption, the
 /// AppContainer kernel-blocks even a loopback connection.
 #[test]
@@ -132,6 +157,79 @@ fn net_deny_all_kernel_blocks_loopback_egress() {
         !out.status.success(),
         "AppContainer must kernel-block loopback egress with no --net-allow/--loopback-exemption; \
          probe stderr: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+
+    let _ = std::fs::remove_dir_all(&probe_dir);
+}
+
+/// deny-all (#133): UDP loopback is denied too. A live parent listener and an
+/// unconfined positive control distinguish AppContainer policy from an absent
+/// server or broken probe.
+#[test]
+fn net_deny_all_kernel_blocks_udp_loopback_egress() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+    let (probe_dir, probe) = stage_probe();
+    let sock = udp_loopback_socket("127.0.0.1:0").expect("bind IPv4 UDP loopback");
+    assert_unconfined_udp_positive_control("127.0.0.1", &sock);
+    let port = sock.local_addr().unwrap().port();
+
+    let out = launch(&[
+        "--name",
+        &tag("udp-deny"),
+        "--fs-read",
+        &probe_dir.to_string_lossy(),
+        &probe.to_string_lossy(),
+        "udp",
+        "127.0.0.1",
+        &port.to_string(),
+    ]);
+    let mut buf = [0_u8; 16];
+    assert!(
+        sock.recv_from(&mut buf).is_err(),
+        "confined UDP probe must not reach the positive-control listener; status={:?} \
+         stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+
+    let _ = std::fs::remove_dir_all(&probe_dir);
+}
+
+/// IPv6 loopback is part of the same deny-all network surface when available.
+#[test]
+fn net_deny_all_kernel_blocks_ipv6_loopback_egress() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+    let Some(sock) = udp_loopback_socket("[::1]:0") else {
+        eprintln!("skipping IPv6 UDP loopback proof: ::1 unavailable on this host");
+        return;
+    };
+    let (probe_dir, probe) = stage_probe();
+    assert_unconfined_udp_positive_control("::1", &sock);
+    let port = sock.local_addr().unwrap().port();
+
+    let out = launch(&[
+        "--name",
+        &tag("udp6-deny"),
+        "--fs-read",
+        &probe_dir.to_string_lossy(),
+        &probe.to_string_lossy(),
+        "udp",
+        "::1",
+        &port.to_string(),
+    ]);
+    let mut buf = [0_u8; 16];
+    assert!(
+        sock.recv_from(&mut buf).is_err(),
+        "confined IPv6 UDP probe must not reach the positive-control listener; status={:?} \
+         stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim(),
         String::from_utf8_lossy(&out.stderr).trim()
     );
 

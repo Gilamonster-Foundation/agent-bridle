@@ -666,6 +666,15 @@ pub(crate) mod appcontainer_impl {
             .map(|p| p.to_string_lossy().into_owned())
     }
 
+    fn require_launcher(launcher: Option<String>) -> ToolResult<String> {
+        launcher.ok_or_else(|| {
+            ToolError::denied(
+                "windows-appcontainer: agent-bridle-aclaunch.exe not found next to the \
+                 current executable or on PATH; cannot confine",
+            )
+        })
+    }
+
     impl Sandbox for AppContainerSandbox {
         fn kind(&self) -> SandboxKind {
             SandboxKind::AppContainer
@@ -701,12 +710,7 @@ pub(crate) mod appcontainer_impl {
             }
 
             // Fail-closed: without the launcher we cannot enforce.
-            let launcher = find_launcher().ok_or_else(|| {
-                ToolError::denied(
-                    "windows-appcontainer: agent-bridle-aclaunch.exe not found next to the \
-                     current executable or on PATH; cannot confine",
-                )
-            })?;
+            let launcher = require_launcher(find_launcher())?;
 
             // Unique container name: PID + monotonic counter (no wall clock).
             let n = SPAWN_N.fetch_add(1, Ordering::Relaxed);
@@ -764,6 +768,27 @@ pub(crate) mod appcontainer_impl {
             }
 
             Ok(prefix)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn missing_launcher_is_a_denial() {
+            let err = require_launcher(None).expect_err("missing launcher must deny");
+            assert!(
+                matches!(err, ToolError::Denied { ref reason } if reason.contains("agent-bridle-aclaunch.exe not found")),
+                "missing AppContainer launcher must be a denial, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn present_launcher_path_is_returned() {
+            let launcher = require_launcher(Some("C:\\tools\\agent-bridle-aclaunch.exe".into()))
+                .expect("present launcher");
+            assert_eq!(launcher, "C:\\tools\\agent-bridle-aclaunch.exe");
         }
     }
 }

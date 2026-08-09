@@ -4,6 +4,8 @@
 # .github/workflows/ci.yml. When editing the lint/format/test steps here,
 # update the push hook AND the CI workflow to match (HOOK PARITY rule).
 
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
 # Default: list recipes.
 default:
     @just --list
@@ -77,24 +79,28 @@ check-refinement:
 # matching the CI job (#74 parity).
 #
 # HOOK PARITY: run by .githooks/pre-push and mirrored by the `check-windows` CI job.
+[windows]
 check-windows:
-    #!/usr/bin/env bash
-    set -uo pipefail
-    case "$(uname -s)" in
-        MINGW*|MSYS*|CYGWIN*|Windows_NT) ;;
-        *) echo "not a Windows host — skipping check-windows (AppContainer backend is Windows-only)"; exit 0 ;;
-    esac
-    set -e
-    cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
-    cargo test -p agent-bridle-core --features windows-appcontainer
+    cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo test -p agent-bridle-core --features windows-appcontainer; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     # Windows has no authenticated Brush private transport in this release:
     # prove the facade selects safe-subset and direct Brush/carried use fails closed.
     # HOOK PARITY: mirrors the Windows private-control step in ci.yml.
-    cargo test -p agent-bridle --all-features default_shell_falls_back_to_safe_subset_when_private_control_is_unsupported
-    cargo test -p agent-bridle-tool-shell --features brush,carried-coreutils --test brush_real --test carried_coreutils
-    cargo test -p agent-bridle-aclaunch --bins
-    BRIDLE_REQUIRE_APPCONTAINER=1 cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1
-    BRIDLE_REQUIRE_APPCONTAINER=1 cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1
+    cargo test -p agent-bridle --all-features default_shell_falls_back_to_safe_subset_when_private_control_is_unsupported; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo test -p agent-bridle-tool-shell --features brush,carried-coreutils --test brush_real --test carried_coreutils; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo test -p agent-bridle-aclaunch --bins; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test handle_inheritance -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fail_closed -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test descendants -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test local_deputy -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test unbridle; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+[unix]
+check-windows:
+    @echo "not a Windows host - skipping check-windows (AppContainer backend is Windows-only)"
 
 # Coverage gate. Uses cargo-llvm-cov if installed; skips gracefully otherwise
 # so the recipe never blocks a machine that lacks the tool. Also skips when
