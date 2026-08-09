@@ -8,7 +8,24 @@
 fn main() {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::{GetHandleInformation, GetLastError};
+    use windows_sys::Win32::Networking::WinSock::{send, WSAGetLastError, SOCKET, SOCKET_ERROR};
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+    if let Ok(raw) = std::env::var("AB_TEST_CANARY_SOCKET_HANDLE") {
+        let value = raw
+            .parse::<usize>()
+            .expect("canary SOCKET value must be a usize");
+        let socket = value as SOCKET;
+        let marker = b"LEAKED_SOCKET_HANDLE\n";
+        let sent = unsafe { send(socket, marker.as_ptr().cast(), marker.len() as i32, 0) };
+        if sent != SOCKET_ERROR {
+            println!("SOCKET_WRITE_SUCCEEDED kind=socket bytes={sent}");
+            std::process::exit(10);
+        }
+        let error = unsafe { WSAGetLastError() };
+        eprintln!("SOCKET_WRITE_DENIED kind=socket wsa_error={error}");
+        return;
+    }
 
     let (kind, raw, marker): (&str, String, &[u8]) =
         if let Ok(raw) = std::env::var("AB_TEST_CANARY_FILE_HANDLE") {
@@ -16,7 +33,10 @@ fn main() {
         } else if let Ok(raw) = std::env::var("AB_TEST_CANARY_PIPE_HANDLE") {
             ("pipe", raw, b"LEAKED_PIPE_HANDLE\n")
         } else {
-            panic!("AB_TEST_CANARY_FILE_HANDLE or AB_TEST_CANARY_PIPE_HANDLE must be set");
+            panic!(
+                "AB_TEST_CANARY_FILE_HANDLE, AB_TEST_CANARY_PIPE_HANDLE, or \
+                 AB_TEST_CANARY_SOCKET_HANDLE must be set"
+            );
         };
     let value = raw
         .parse::<isize>()

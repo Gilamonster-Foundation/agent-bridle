@@ -96,6 +96,7 @@ check-windows:
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test descendants -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test local_deputy -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test windows_appcontainer_contract -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test unbridle; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 [unix]

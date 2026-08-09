@@ -84,6 +84,22 @@ fn cleanup_junction(link: &Path) {
     let _ = std::fs::remove_dir(link);
 }
 
+fn assert_access_denied(out: &std::process::Output, route: &str) {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("Access is denied."),
+        "{route} must fail with an OS access-denied result, not command-not-found or \
+         a missing path; status={:?} stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+}
+
 #[test]
 fn junction_escape_denies_outside_read_and_write() {
     if skip_proof_unless_appcontainer() {
@@ -148,6 +164,131 @@ fn junction_escape_denies_outside_read_and_write() {
     cleanup_junction(&junction);
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn profile_read_and_write_are_denied_by_os_policy() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+
+    let profile = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .expect("Windows proof requires USERPROFILE");
+    let outside = profile.join(format!("ab-fsadv-profile-{}", tag("profile")));
+    std::fs::create_dir_all(&outside).expect("create profile proof dir");
+    let secret = outside.join("secret.txt");
+    let marker = outside.join("marker.txt");
+    std::fs::write(&secret, SECRET).expect("seed profile secret");
+    std::fs::write(&marker, ORIG).expect("seed profile marker");
+    assert_eq!(
+        std::fs::read_to_string(&secret).expect("host profile positive-control read"),
+        SECRET
+    );
+
+    let read = launch(&[
+        "--name",
+        &tag("profile-read"),
+        "cmd.exe",
+        "/c",
+        "type",
+        &secret.to_string_lossy(),
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&read.stdout).contains(SECRET),
+        "profile secret must not leak; stdout={} stderr={}",
+        String::from_utf8_lossy(&read.stdout).trim(),
+        String::from_utf8_lossy(&read.stderr).trim()
+    );
+    assert_access_denied(&read, "profile read");
+
+    let write = launch(&[
+        "--name",
+        &tag("profile-write"),
+        "cmd.exe",
+        "/c",
+        "echo",
+        WRITTEN,
+        ">",
+        &marker.to_string_lossy(),
+    ]);
+    let marker_text = std::fs::read_to_string(&marker).expect("read profile marker");
+    assert!(
+        marker_text.contains(ORIG) && !marker_text.contains(WRITTEN),
+        "profile marker must not be modified; marker={marker_text:?}; stdout={} stderr={}",
+        String::from_utf8_lossy(&write.stdout).trim(),
+        String::from_utf8_lossy(&write.stderr).trim()
+    );
+    assert_access_denied(&write, "profile write");
+
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn parent_normalization_cannot_escape_workspace_to_sibling() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+
+    let root = fresh_dir("normalize-root");
+    let workspace = root.join("workspace");
+    let sibling = root.join("sibling");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&sibling).expect("create sibling");
+    let secret = sibling.join("secret.txt");
+    let marker = sibling.join("marker.txt");
+    std::fs::write(&secret, SECRET).expect("seed sibling secret");
+    std::fs::write(&marker, ORIG).expect("seed sibling marker");
+
+    let via_parent_secret = workspace.join("..").join("sibling").join("secret.txt");
+    let via_parent_marker = workspace.join("..").join("sibling").join("marker.txt");
+    assert_eq!(
+        std::fs::read_to_string(&via_parent_secret)
+            .expect("host positive-control parent-normalized read"),
+        SECRET
+    );
+
+    let read = launch(&[
+        "--name",
+        &tag("norm-read"),
+        "--fs-read",
+        &workspace.to_string_lossy(),
+        "cmd.exe",
+        "/c",
+        "type",
+        &via_parent_secret.to_string_lossy(),
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&read.stdout).contains(SECRET),
+        "AppContainer must deny sibling read through .. normalization; stdout={} stderr={}",
+        String::from_utf8_lossy(&read.stdout).trim(),
+        String::from_utf8_lossy(&read.stderr).trim()
+    );
+    assert_access_denied(&read, "parent-normalized sibling read");
+
+    let write = launch(&[
+        "--name",
+        &tag("norm-write"),
+        "--fs-write",
+        &workspace.to_string_lossy(),
+        "cmd.exe",
+        "/c",
+        "echo",
+        WRITTEN,
+        ">",
+        &via_parent_marker.to_string_lossy(),
+    ]);
+    let marker_text = std::fs::read_to_string(&marker).expect("read sibling marker");
+    assert!(
+        marker_text.contains(ORIG) && !marker_text.contains(WRITTEN),
+        "AppContainer must deny sibling write through .. normalization; marker={marker_text:?}; \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&write.stdout).trim(),
+        String::from_utf8_lossy(&write.stderr).trim()
+    );
+    assert_access_denied(&write, "parent-normalized sibling write");
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
