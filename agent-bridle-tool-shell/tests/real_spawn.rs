@@ -68,30 +68,31 @@ async fn real_echo_runs_and_captures_stdout() {
 }
 
 /// #269 / AB-006: a timed-out child is KILLED and reaped — it must not run to
-/// completion. `sh -c 'sleep 3; touch MARKER'` with a 1s timeout: the envelope
-/// reports a confirmed timeout, and after the child's would-be sleep elapses the
-/// marker never appears (the sleep was SIGKILLed, not merely un-awaited). Before
-/// the fix the detached blocking worker let the child run on and write it.
-// KNOWN macOS gap (agent-bridle#318): under Seatbelt the confined `sh -c 'sleep
-// 3'` child returns immediately (`timed_out: false`) instead of sleeping and
-// being killed at the deadline — the sub-exec of `sleep` does not run on the
-// macOS runner even when it is granted, so this test cannot exercise the
-// timeout-kill there. Ignored on macOS (asserted on Linux, where the AB-006
-// kill+reap mechanism is validated) until a macOS-runner-backed fix removes it.
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "agent-bridle#318: confined sleep child does not run under Seatbelt"
-)]
+/// completion. The script writes a START marker immediately, then `sleep 3`, then
+/// a DONE marker; with a 1s timeout the envelope reports a confirmed timeout,
+/// START exists (a positive control: the child ACTUALLY STARTED — so "DONE
+/// absent" reflects a kill, not a child that never ran), and after the would-be
+/// sleep elapses DONE never appears (the sleep was SIGKILLed, not merely
+/// un-awaited).
+///
+/// Runs under real Seatbelt on macOS too (agent-bridle#318): the START marker is
+/// the on-device fix's proof — the confined `/bin/sh` now runs its body because
+/// its `/bin/bash` interpreter variant is on the `process-exec*` allow-list, so
+/// `sleep` actually executes and can be timed out and killed. Previously the
+/// confined shell died at its own variant re-exec and returned immediately.
 #[tokio::test]
 async fn real_timed_out_child_is_killed_and_never_writes_marker() {
-    let marker = unique_temp("ab006-child");
-    let script = format!("sleep 3; touch {}", shell_path(&marker));
-    // Grant every program the script execs (`sh`, `sleep`, `touch`), not just
-    // `sh`: the script's children are real execs. On Linux the `exec` axis is only
-    // *interceptor* strength (a granted `sh` can exec an un-granted child anyway),
-    // but the complete grant is the honest one and closes a false-green — `touch`
-    // must be granted so the "marker absent" assertion reflects the KILL, not an
-    // exec denial that would mask a kill that failed.
+    let start = unique_temp("ab006-child-start");
+    let done = unique_temp("ab006-child-done");
+    let script = format!(
+        "touch {}; sleep 3; touch {}",
+        shell_path(&start),
+        shell_path(&done)
+    );
+    // Grant every program the script execs (`sh`, `sleep`, `touch`). On macOS the
+    // Seatbelt exec allow-list additionally includes `/bin/bash` (sh's interpreter
+    // variant) automatically — see resolve_exec_targets. `touch` must be granted so
+    // "DONE absent" reflects the KILL, not an exec denial.
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
@@ -100,29 +101,38 @@ async fn real_timed_out_child_is_killed_and_never_writes_marker() {
         .await
         .expect("invoke");
     assert_eq!(out["timed_out"], true, "must report a confirmed timeout");
-    // Wait well past the child's 3s sleep; a killed child never reaches `touch`.
+    // Positive control: the child really started and ran its first line, so the
+    // DONE-absent assertion below cannot be satisfied by a child that never ran
+    // (the exact #318 false-green this guards against).
+    assert!(
+        start.exists(),
+        "the confined child never started (START marker absent) — a fast-return \
+         masquerading as a timeout, not a real kill"
+    );
+    // Wait well past the child's 3s sleep; a killed child never reaches DONE.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     assert!(
-        !marker.exists(),
-        "the timed-out child must be killed, not run to completion (its marker was written)"
+        !done.exists(),
+        "the timed-out child must be killed, not run to completion (its DONE marker appeared)"
     );
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&start);
+    let _ = std::fs::remove_file(&done);
 }
 
 /// #269 / AB-006: the kill reaches a GRANDCHILD, not just the direct child —
-/// process-group SIGKILL takes the whole tree. `sh -c 'sh -c "sleep 3; touch M"'`.
-// Same KNOWN macOS gap as the sibling test (agent-bridle#318): ignored on macOS,
-// asserted on Linux.
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "agent-bridle#318: confined sleep child does not run under Seatbelt"
-)]
+/// process-group SIGKILL takes the whole tree. The outer shell writes START, then
+/// an inner `sh -c 'sleep 3; touch DONE'`; the grandchild's sleep is what the
+/// timeout must kill. START proves the tree actually started (#318 positive
+/// control); DONE must never appear.
 #[tokio::test]
 async fn real_timed_out_grandchild_is_killed() {
-    let marker = unique_temp("ab006-grandchild");
-    let script = format!("sh -c 'sleep 3; touch {}'", shell_path(&marker));
-    // Grant every program the nested script execs (`sh` for the inner shell,
-    // `sleep`, `touch`) — the complete, honest grant; see the sibling test.
+    let start = unique_temp("ab006-grandchild-start");
+    let done = unique_temp("ab006-grandchild-done");
+    let script = format!(
+        "touch {}; sh -c 'sleep 3; touch {}'",
+        shell_path(&start),
+        shell_path(&done)
+    );
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
@@ -131,12 +141,17 @@ async fn real_timed_out_grandchild_is_killed() {
         .await
         .expect("invoke");
     assert_eq!(out["timed_out"], true);
+    assert!(
+        start.exists(),
+        "the confined tree never started (START marker absent) — not a real kill"
+    );
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     assert!(
-        !marker.exists(),
-        "the timed-out grandchild must be killed via the process group"
+        !done.exists(),
+        "the timed-out grandchild must be killed via the process group (DONE appeared)"
     );
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&start);
+    let _ = std::fs::remove_file(&done);
 }
 
 /// #268 / AB-004: loader / interpreter / hook env vars are DROPPED before the
