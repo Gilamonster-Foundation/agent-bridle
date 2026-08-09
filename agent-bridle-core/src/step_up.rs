@@ -865,12 +865,9 @@ mod tests {
     /// built `.with_session(test_session())` and every discharge is signed for it,
     /// so the ceremony round-trips; the cross-session *rejection* is proven
     /// explicitly with a second, distinct id in
-    /// [`a_discharge_bound_to_one_session_is_rejected_by_another`].
-    #[cfg(any(
-        feature = "verifier-ed25519",
-        feature = "verifier-webauthn",
-        feature = "verifier-webauthn-es256"
-    ))]
+    /// [`a_discharge_bound_to_one_session_is_rejected_by_another`]. Ungated: it
+    /// mints only a `SessionId` (no crypto), and non-verifier gate tests call it
+    /// too, so it must exist under `--no-default-features` as well.
     fn test_session() -> SessionId {
         SessionId::new([9u8; 32])
     }
