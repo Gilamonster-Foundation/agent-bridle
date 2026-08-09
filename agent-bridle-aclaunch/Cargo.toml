@@ -24,6 +24,17 @@ path = "src/main.rs"
 name = "ab-netprobe"
 path = "src/bin/ab-netprobe.rs"
 
+# A tiny std-only HANDLE probe used by the AppContainer inherited-handle proof.
+# It is a kernel-proof fixture, not an end-user executable.
+[[bin]]
+name = "ab-handleprobe"
+path = "src/bin/ab-handleprobe.rs"
+
+# A token-identity probe used by descendant containment proofs.
+[[bin]]
+name = "ab-tokenprobe"
+path = "src/bin/ab-tokenprobe.rs"
+
 # Windows-only deps: the Win32 API surface for AppContainer + CreateProcessW.
 # Guarded by target triple so cross-compile (Linux host, Windows target) still
 # pulls the right set of features without cargo resolving windows-sys on Linux.
@@ -34,6 +45,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
+    "Win32_System_Console",
     "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
 ] }

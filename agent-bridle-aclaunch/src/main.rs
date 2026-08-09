@@ -44,9 +44,14 @@ fn main() {
 #[allow(unsafe_code)]
 mod windows {
     use std::ffi::OsStr;
+    use std::fs::OpenOptions;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, TRUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
         NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
     };
@@ -62,14 +67,20 @@ mod windows {
         CreateWellKnownSid, FreeSid, GetSecurityDescriptorDacl,
         WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
         WinCapabilityPrivateNetworkClientServerSid, ACL, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+        DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+        SID_AND_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
         InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
         EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
     };
 
     // PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY = ProcThreadAttributeValue(14, FALSE, TRUE, FALSE)
@@ -81,7 +92,28 @@ mod windows {
     // FILE_GENERIC_READ / FILE_GENERIC_WRITE from the Windows SDK (WinNT.h).
     const FILE_GENERIC_READ: u32 = 0x00120089;
     const FILE_GENERIC_WRITE: u32 = 0x00120116;
-    const FILE_GENERIC_READ_WRITE: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    const FILE_GENERIC_EXECUTE: u32 = 0x001200A0;
+    const FILE_GENERIC_READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    const FILE_GENERIC_READ_WRITE_EXECUTE: u32 =
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+
+    struct TestPipeCanary {
+        read: HANDLE,
+        write: HANDLE,
+    }
+
+    impl Drop for TestPipeCanary {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.read.is_null() && self.read != INVALID_HANDLE_VALUE {
+                    CloseHandle(self.read);
+                }
+                if !self.write.is_null() && self.write != INVALID_HANDLE_VALUE {
+                    CloseHandle(self.write);
+                }
+            }
+        }
+    }
 
     /// Null-terminate an `OsStr` as a `Vec<u16>`.
     fn to_wide(s: &OsStr) -> Vec<u16> {
@@ -180,6 +212,12 @@ mod windows {
             );
         }
         LocalFree(p_sd);
+    }
+
+    unsafe fn restore_path_grants(fs_grants: Vec<(String, *mut std::ffi::c_void)>) {
+        for (path, psd) in fs_grants {
+            restore_path_dacl(&path, psd);
+        }
     }
 
     /// Grant the AppContainer SID loopback network access (#133, ADR 0016).
@@ -315,6 +353,31 @@ mod windows {
         out
     }
 
+    /// Return the launcher stdio handles that are intentionally delegated to the
+    /// child. Each handle is made inheritable so Windows accepts it in
+    /// PROC_THREAD_ATTRIBUTE_HANDLE_LIST; no other inheritable HANDLE is listed.
+    unsafe fn delegated_stdio_handles() -> Vec<HANDLE> {
+        let mut handles = Vec::new();
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = GetStdHandle(id);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let ok = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            if ok == 0 {
+                eprintln!(
+                    "agent-bridle-aclaunch: SetHandleInformation(stdio) failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                std::process::exit(1);
+            }
+            handles.push(handle);
+        }
+        handles.sort_unstable();
+        handles.dedup();
+        handles
+    }
+
     /// A parsed launcher invocation: the confinement knobs plus the exec target.
     /// Kept as a plain value (no Win32 handles) so [`parse_launcher_args`] is a
     /// pure function the unit tests can exercise without spawning anything.
@@ -324,6 +387,9 @@ mod windows {
         pub net_allow: bool,
         pub loopback_exemption: bool,
         pub no_child_process: bool,
+        pub test_inheritable_file_handle: Option<String>,
+        pub test_inheritable_pipe_handle: bool,
+        pub test_force_process_attribute_failure: bool,
         pub fs_read: Vec<String>,
         pub fs_write: Vec<String>,
         pub exe: String,
@@ -342,6 +408,9 @@ mod windows {
         let mut net_allow = false;
         let mut loopback_exemption = false;
         let mut no_child_process = false;
+        let mut test_inheritable_file_handle: Option<String> = None;
+        let mut test_inheritable_pipe_handle = false;
+        let mut test_force_process_attribute_failure = false;
         let mut fs_read: Vec<String> = Vec::new();
         let mut fs_write: Vec<String> = Vec::new();
         let mut i = 0usize;
@@ -354,6 +423,14 @@ mod windows {
                 "--net-allow" => net_allow = true,
                 "--loopback-exemption" => loopback_exemption = true,
                 "--no-child-process" => no_child_process = true,
+                "--test-inheritable-file-handle" => {
+                    i += 1;
+                    test_inheritable_file_handle = argv.get(i).cloned();
+                }
+                "--test-inheritable-pipe-handle" => test_inheritable_pipe_handle = true,
+                "--test-force-process-attribute-failure" => {
+                    test_force_process_attribute_failure = true;
+                }
                 "--fs-read" => {
                     i += 1;
                     if let Some(p) = argv.get(i) {
@@ -378,6 +455,9 @@ mod windows {
             net_allow,
             loopback_exemption,
             no_child_process,
+            test_inheritable_file_handle,
+            test_inheritable_pipe_handle,
+            test_force_process_attribute_failure,
             fs_read,
             fs_write,
             exe: argv[i].clone(),
@@ -408,6 +488,9 @@ mod windows {
                 parsed.net_allow,
                 parsed.loopback_exemption,
                 parsed.no_child_process,
+                parsed.test_inheritable_file_handle.as_deref(),
+                parsed.test_inheritable_pipe_handle,
+                parsed.test_force_process_attribute_failure,
                 &parsed.fs_read,
                 &parsed.fs_write,
                 &parsed.exe,
@@ -429,6 +512,9 @@ mod windows {
         net_allow: bool,
         loopback_exemption: bool,
         no_child_process: bool,
+        test_inheritable_file_handle: Option<&str>,
+        test_inheritable_pipe_handle: bool,
+        test_force_process_attribute_failure: bool,
         fs_read: &[String],
         fs_write: &[String],
         exe: &str,
@@ -462,6 +548,72 @@ mod windows {
             std::process::exit(1);
         }
 
+        // Test-only canary for #319: create a deliberately inheritable launcher
+        // HANDLE. The child receives only its numeric value; whether it can use
+        // the HANDLE depends solely on process creation inheritance policy.
+        let _test_canary_file = if let Some(path) = test_inheritable_file_handle {
+            let file = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "agent-bridle-aclaunch: could not open test canary file {path:?}: {error}"
+                    );
+                    do_cleanup(name, ac_sid);
+                    std::process::exit(1);
+                });
+            let handle = file.as_raw_handle() as HANDLE;
+            let ok = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            if ok == 0 {
+                eprintln!(
+                    "agent-bridle-aclaunch: SetHandleInformation(test canary) failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            }
+            std::env::set_var("AB_TEST_CANARY_FILE_HANDLE", (handle as isize).to_string());
+            Some(file)
+        } else {
+            None
+        };
+        let _test_canary_pipe = if test_inheritable_pipe_handle {
+            let attrs = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: std::ptr::null_mut(),
+                bInheritHandle: 1,
+            };
+            let mut read: HANDLE = std::ptr::null_mut();
+            let mut write: HANDLE = std::ptr::null_mut();
+            let ok = CreatePipe(&mut read, &mut write, &attrs, 0);
+            if ok == 0 {
+                eprintln!(
+                    "agent-bridle-aclaunch: CreatePipe(test canary) failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            }
+            let pipe = TestPipeCanary { read, write };
+            let ok = SetHandleInformation(pipe.read, HANDLE_FLAG_INHERIT, 0);
+            if ok == 0 {
+                eprintln!(
+                    "agent-bridle-aclaunch: SetHandleInformation(test canary pipe read) \
+                     failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            }
+            std::env::set_var(
+                "AB_TEST_CANARY_PIPE_HANDLE",
+                (pipe.write as isize).to_string(),
+            );
+            Some(pipe)
+        } else {
+            None
+        };
+
         // 2a. FS ACL narrowing (#51, ADR 0009): grant the AppContainer SID access to
         //     the requested paths so the sandboxed process can read/write its workspace.
         //     AppContainers are denied user directories by default; without this grant
@@ -473,12 +625,15 @@ mod windows {
 
         // Grant read+write for write paths first (superset of read).
         for path in fs_write {
-            let psd = grant_path_access(path, ac_sid, FILE_GENERIC_READ_WRITE);
+            let psd = grant_path_access(path, ac_sid, FILE_GENERIC_READ_WRITE_EXECUTE);
             if psd.is_null() {
                 eprintln!(
-                    "agent-bridle-aclaunch: could not grant write access to {path:?} \
-                     (non-fatal; path may be inaccessible to the AppContainer)"
+                    "agent-bridle-aclaunch: could not grant write access to {path:?}; \
+                     refusing before spawn because the requested fs_write witness is unavailable"
                 );
+                restore_path_grants(fs_grants);
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
             }
             fs_grants.push((path.clone(), psd));
         }
@@ -487,12 +642,15 @@ mod windows {
             if fs_grants.iter().any(|(p, _)| p == path) {
                 continue;
             }
-            let psd = grant_path_access(path, ac_sid, FILE_GENERIC_READ);
+            let psd = grant_path_access(path, ac_sid, FILE_GENERIC_READ_EXECUTE);
             if psd.is_null() {
                 eprintln!(
-                    "agent-bridle-aclaunch: could not grant read access to {path:?} \
-                     (non-fatal; path may be inaccessible to the AppContainer)"
+                    "agent-bridle-aclaunch: could not grant read access to {path:?}; \
+                     refusing before spawn because the requested fs_read witness is unavailable"
                 );
+                restore_path_grants(fs_grants);
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
             }
             fs_grants.push((path.clone(), psd));
         }
@@ -533,9 +691,12 @@ mod windows {
             Reserved: 0,
         };
 
-        // 4. Attribute list.  Slots: always one for SECURITY_CAPABILITIES;
-        //    one more when --no-child-process applies.
-        let slot_count: u32 = if no_child_process { 2 } else { 1 };
+        // 4. Attribute list. Slots: always one for SECURITY_CAPABILITIES;
+        //    one more for the explicit stdio HANDLE allow-list; and one more
+        //    when --no-child-process applies.
+        let mut delegated_handles = delegated_stdio_handles();
+        let has_handle_list = !delegated_handles.is_empty();
+        let slot_count: u32 = 1 + u32::from(no_child_process) + u32::from(has_handle_list);
         let mut attr_size: usize = 0;
         // First call: get the required buffer size (returns FALSE, that is expected).
         InitializeProcThreadAttributeList(std::ptr::null_mut(), slot_count, 0, &mut attr_size);
@@ -548,6 +709,23 @@ mod windows {
                 "agent-bridle-aclaunch: InitializeProcThreadAttributeList failed: {:?}",
                 std::io::Error::last_os_error()
             );
+            restore_path_grants(fs_grants);
+            if loopback_exemption {
+                restore_loopback_exemption(loopback_prev, loopback_prev_count);
+            }
+            do_cleanup(name, ac_sid);
+            std::process::exit(1);
+        }
+
+        if test_force_process_attribute_failure {
+            eprintln!(
+                "agent-bridle-aclaunch: forced process-attribute failure; refusing before spawn"
+            );
+            DeleteProcThreadAttributeList(attr_list);
+            restore_path_grants(fs_grants);
+            if loopback_exemption {
+                restore_loopback_exemption(loopback_prev, loopback_prev_count);
+            }
             do_cleanup(name, ac_sid);
             std::process::exit(1);
         }
@@ -568,6 +746,10 @@ mod windows {
                 std::io::Error::last_os_error()
             );
             DeleteProcThreadAttributeList(attr_list);
+            restore_path_grants(fs_grants);
+            if loopback_exemption {
+                restore_loopback_exemption(loopback_prev, loopback_prev_count);
+            }
             do_cleanup(name, ac_sid);
             std::process::exit(1);
         }
@@ -593,19 +775,54 @@ mod windows {
                     std::io::Error::last_os_error()
                 );
                 DeleteProcThreadAttributeList(attr_list);
+                restore_path_grants(fs_grants);
+                if loopback_exemption {
+                    restore_loopback_exemption(loopback_prev, loopback_prev_count);
+                }
                 do_cleanup(name, ac_sid);
                 std::process::exit(1);
             }
         }
 
-        // 5. Spawn the child inside the AppContainer.  `bInheritHandles = TRUE`
-        //    so the child receives the launcher's stdin/stdout/stderr (which were
-        //    set up by agent-bridle before spawning the launcher).
+        if has_handle_list {
+            let ok = UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                delegated_handles.as_mut_ptr().cast(),
+                delegated_handles.len() * std::mem::size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if ok == 0 {
+                eprintln!(
+                    "agent-bridle-aclaunch: UpdateProcThreadAttribute(HANDLE_LIST) \
+                     failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                DeleteProcThreadAttributeList(attr_list);
+                restore_path_grants(fs_grants);
+                if loopback_exemption {
+                    restore_loopback_exemption(loopback_prev, loopback_prev_count);
+                }
+                do_cleanup(name, ac_sid);
+                std::process::exit(1);
+            }
+        }
+
+        // 5. Spawn the child inside the AppContainer. Stdio is delegated by the
+        //    HANDLE_LIST above; arbitrary inheritable launcher handles are not.
         let cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         // SAFETY: zero-init is valid for STARTUPINFOW (all pointer fields are
         // allowed to be NULL per Win32 docs when STARTF_USESTDHANDLES is unset).
         let mut startup_info_ex: STARTUPINFOEXW = std::mem::zeroed();
         startup_info_ex.StartupInfo.cb = cb;
+        if has_handle_list {
+            startup_info_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+            startup_info_ex.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+            startup_info_ex.StartupInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+            startup_info_ex.StartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        }
         startup_info_ex.lpAttributeList = attr_list;
 
         let mut cmd_line = build_cmdline(exe, child_args);
@@ -616,7 +833,7 @@ mod windows {
             cmd_line.as_mut_ptr(),        // lpCommandLine: mutable per Win32 docs
             std::ptr::null(),             // lpProcessAttributes
             std::ptr::null(),             // lpThreadAttributes
-            TRUE,                         // bInheritHandles: for stdio pipes
+            has_handle_list as i32,       // bInheritHandles: restricted by HANDLE_LIST
             EXTENDED_STARTUPINFO_PRESENT, // dwCreationFlags: required for attr list
             std::ptr::null(),             // lpEnvironment: inherit from launcher
             std::ptr::null(),             // lpCurrentDirectory: inherit from launcher
@@ -633,6 +850,10 @@ mod windows {
                 "agent-bridle-aclaunch: CreateProcessW({exe:?}) failed: {:?}",
                 std::io::Error::last_os_error()
             );
+            restore_path_grants(fs_grants);
+            if loopback_exemption {
+                restore_loopback_exemption(loopback_prev, loopback_prev_count);
+            }
             do_cleanup(name, ac_sid);
             std::process::exit(1);
         }
@@ -647,9 +868,7 @@ mod windows {
         CloseHandle(proc_info.hProcess as HANDLE);
 
         // 7a. Restore fs DACLs we modified before the child was spawned.
-        for (path, psd) in fs_grants {
-            restore_path_dacl(&path, psd);
-        }
+        restore_path_grants(fs_grants);
 
         // 7b. Restore loopback exemption list if we modified it.
         if loopback_exemption {
@@ -708,6 +927,9 @@ mod windows {
                     net_allow: false,
                     loopback_exemption: false,
                     no_child_process: false,
+                    test_inheritable_file_handle: None,
+                    test_inheritable_pipe_handle: false,
+                    test_force_process_attribute_failure: false,
                     fs_read: vec![],
                     fs_write: vec![],
                     exe: "cmd.exe".to_string(),
@@ -736,6 +958,9 @@ mod windows {
             .expect("parses");
             assert_eq!(a.container_name.as_deref(), Some("ab42"));
             assert!(a.net_allow && a.loopback_exemption && a.no_child_process);
+            assert_eq!(a.test_inheritable_file_handle, None);
+            assert!(!a.test_inheritable_pipe_handle);
+            assert!(!a.test_force_process_attribute_failure);
             assert_eq!(a.fs_write, v(&["C:/ws"]));
             assert_eq!(a.fs_read, v(&["C:/etc", "C:/lib"]));
             assert_eq!(a.exe, "child.exe");
