@@ -21,8 +21,8 @@ use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 
 use agent_bridle_core::{
-    Caveats, ConfinedCommand, Denial, DenialKind, Disclosure, SandboxKind, SandboxPolicy, Scope,
-    Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    Caveats, ConfinedCommand, Denial, DenialKind, Disclosure, Invocation, SandboxKind,
+    SandboxPolicy, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -181,6 +181,21 @@ impl Tool for HostShellTool {
         args: serde_json::Value,
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
+        self.invoke_accounted(args, cx)
+            .await
+            .map(Invocation::into_value)
+    }
+
+    /// Like [`ShellTool`](crate::ShellTool), this engine returns a **pre-run**
+    /// authority refusal (`engine_unavailable`) as an in-band `Ok` envelope, so
+    /// it reports the typed [`Invocation`] itself — `Denied` for the pre-run
+    /// engine-unavailable refusals, `Ran` for the spawned command's envelope —
+    /// so the call budget is charged only for a run that actually happened.
+    async fn invoke_accounted(
+        &self,
+        args: serde_json::Value,
+        cx: &ToolContext,
+    ) -> ToolResult<Invocation> {
         let cmd = args
             .get("cmd")
             .and_then(serde_json::Value::as_str)
@@ -193,10 +208,14 @@ impl Tool for HostShellTool {
         // fail-closed spawn below.
         let caveats: &Caveats = cx.caveats();
         if is_restricted(&caveats.exec) {
-            return Ok(self.engine_unavailable(DenialKind::Exec, "exec"));
+            return Ok(Invocation::Denied(
+                self.engine_unavailable(DenialKind::Exec, "exec"),
+            ));
         }
         if is_restricted(&caveats.net) {
-            return Ok(self.engine_unavailable(DenialKind::Net, "net"));
+            return Ok(Invocation::Denied(
+                self.engine_unavailable(DenialKind::Net, "net"),
+            ));
         }
 
         let mut env: BTreeMap<String, String> = args
@@ -302,7 +321,7 @@ impl Tool for HostShellTool {
             .with_timed_out(false)
             .into_json();
         output_guard.finish();
-        Ok(envelope)
+        Ok(Invocation::Ran(envelope))
     }
 }
 

@@ -121,8 +121,18 @@ fn invoke<'py>(
     //    runtime. `detach` releases the GIL for the (possibly blocking) tool
     //    work so other Python threads can run (pyo3 0.28 renamed the old
     //    `allow_threads` to `detach`).
+    //
+    //    `invoke` is a stateless one-shot, so it dispatches through
+    //    `dispatch_oneshot` (AB-001 review): `max_calls` bounds this single call
+    //    (`AtMost(0)` denies, `AtMost(n≥1)`/`Unlimited` admits the one call)
+    //    WITHOUT minting a persistent per-grant ledger row. Minting a `Grant`
+    //    here would leak one immortal `HashMap` entry into the process-global
+    //    registry on every call; a session-scoped budget across many invokes
+    //    would instead need a persistent handle object, which this stateless
+    //    function deliberately is not.
+    let registry = shared_registry();
     let result =
-        py.detach(|| runtime().block_on(shared_registry().dispatch(tool, args_json, &granted)));
+        py.detach(|| runtime().block_on(registry.dispatch_oneshot(tool, args_json, &granted)));
 
     match result {
         Ok(value) => {

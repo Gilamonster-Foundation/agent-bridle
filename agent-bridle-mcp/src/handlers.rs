@@ -7,7 +7,7 @@
 //! result, NOT a JSON-RPC transport error. The MCP boundary must carry the
 //! denial reason back to the model so the leash is observable end-to-end.
 
-use agent_bridle::{Caveats, Registry, ToolError};
+use agent_bridle::{Grant, Registry, ToolError};
 use serde_json::Value;
 
 use crate::server::PROTOCOL_VERSION;
@@ -53,9 +53,9 @@ pub fn tools_list(registry: &Registry) -> Value {
 }
 
 /// `tools/call` → `{ name, arguments }` → `registry.dispatch(name, args,
-/// &granted)` → MCP content result.
+/// grant)` → MCP content result.
 ///
-/// The whole point: dispatch is confined to `granted`. A leash denial (or any
+/// The whole point: dispatch is confined to the session `grant`. A leash denial (or any
 /// other tool failure) becomes an MCP **tool error** — `{ content: [...],
 /// isError: true }` — carrying the reason, so the model sees *why* it was
 /// refused without the call collapsing into a transport-level fault.
@@ -64,7 +64,7 @@ pub fn tools_list(registry: &Registry) -> Value {
 /// `tools/call` always yields a `result`. Genuinely malformed params (e.g. a
 /// missing/non-string `name`) also come back as an `isError` content result,
 /// because they are a tool-level mistake, not a protocol fault.
-pub async fn tools_call(registry: &Registry, granted: &Caveats, params: Value) -> Value {
+pub async fn tools_call(registry: &Registry, grant: &Grant, params: Value) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return tool_error("missing or non-string `name` in tools/call params");
     };
@@ -73,7 +73,7 @@ pub async fn tools_call(registry: &Registry, granted: &Caveats, params: Value) -
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-    match registry.dispatch(name, arguments, granted).await {
+    match registry.dispatch(name, arguments, grant).await {
         // An Ok result can still carry a STRUCTURED in-band denial: a free-form
         // shell `cmd` that the interceptor refused returns `Ok` with
         // `denied: true` in the envelope (the brush run "succeeded" at the
@@ -145,6 +145,7 @@ fn tool_error(reason: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_bridle::Caveats;
 
     /// The program + args for an in-scope **success** spawn that exists as a real
     /// executable on the host. On Windows `echo` is a `cmd` builtin (there is no
@@ -210,9 +211,10 @@ mod tests {
     #[tokio::test]
     async fn call_in_scope_succeeds() {
         let reg = agent_bridle::registry();
+        let grant = reg.mint_grant(echo_grant());
         let v = tools_call(
             &reg,
-            &echo_grant(),
+            &grant,
             serde_json::json!({ "name": "shell", "arguments": { "program": OK_PROGRAM, "args": ok_args() } }),
         )
         .await;
@@ -227,9 +229,10 @@ mod tests {
         // `rm` is not in the echo-only grant: the exec leash denies it, surfaced
         // as an in-band MCP tool error (isError: true), not a transport fault.
         let reg = agent_bridle::registry();
+        let grant = reg.mint_grant(echo_grant());
         let v = tools_call(
             &reg,
-            &echo_grant(),
+            &grant,
             serde_json::json!({ "name": "shell", "arguments": { "program": "rm", "args": ["-rf", "/tmp/x"] } }),
         )
         .await;
@@ -248,9 +251,10 @@ mod tests {
         // the structured `denied: true` field; the handler turns that into an MCP
         // tool error read from the structured field, not from stderr.
         let reg = agent_bridle::registry();
+        let grant = reg.mint_grant(echo_grant());
         let v = tools_call(
             &reg,
-            &echo_grant(),
+            &grant,
             serde_json::json!({ "name": "shell", "arguments": { "cmd": "rm -rf /tmp/x" } }),
         )
         .await;
@@ -265,12 +269,50 @@ mod tests {
         );
     }
 
+    /// AB-001 #309-A regression at the **MCP surface**: an in-band shell denial
+    /// (`Ok(envelope{denied:true})`, surfaced as an MCP `isError`) must not
+    /// consume the grant's `max_calls` budget. With a single-call grant, the
+    /// denied free-form `cmd` must leave the budget intact so a later in-scope
+    /// call still runs. Before the typed `Invocation` accounting this in-band
+    /// denial silently spent the call, and the follow-up would fail with Budget.
+    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
+    #[tokio::test]
+    async fn mcp_inband_denial_does_not_consume_budget() {
+        use agent_bridle::{CountBound, Scope};
+        let reg = agent_bridle::registry();
+        let grant = reg.mint_grant(Caveats {
+            exec: Scope::only([OK_PROGRAM.to_string()]),
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        // In-band denial (out-of-scope free-form cmd) → MCP isError, cost 0.
+        let denied = tools_call(
+            &reg,
+            &grant,
+            serde_json::json!({ "name": "shell", "arguments": { "cmd": "rm -rf /tmp/x" } }),
+        )
+        .await;
+        assert_eq!(denied["isError"], true, "in-band denial: {denied}");
+        // The single-call budget must be intact: the in-scope call still runs.
+        let ok = tools_call(
+            &reg,
+            &grant,
+            serde_json::json!({ "name": "shell", "arguments": { "program": OK_PROGRAM, "args": ok_args() } }),
+        )
+        .await;
+        assert_ne!(
+            ok["isError"], true,
+            "the in-band denial must not have consumed the AtMost(1) budget: {ok}"
+        );
+    }
+
     #[tokio::test]
     async fn call_unknown_tool_is_in_band_error() {
         let reg = agent_bridle::registry();
+        let grant = reg.mint_grant(Caveats::top());
         let v = tools_call(
             &reg,
-            &Caveats::top(),
+            &grant,
             serde_json::json!({ "name": "no_such_tool", "arguments": {} }),
         )
         .await;
@@ -284,7 +326,8 @@ mod tests {
     #[tokio::test]
     async fn call_missing_name_is_in_band_error() {
         let reg = agent_bridle::registry();
-        let v = tools_call(&reg, &Caveats::top(), serde_json::json!({})).await;
+        let grant = reg.mint_grant(Caveats::top());
+        let v = tools_call(&reg, &grant, serde_json::json!({})).await;
         assert_eq!(v["isError"], true);
     }
 }

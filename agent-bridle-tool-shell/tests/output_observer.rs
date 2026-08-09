@@ -93,13 +93,13 @@ async fn registry_dispatch_observes_only_admitted_captured_output() {
             ShellTool::new().with_output_observer(observer.clone()),
         ))
         .build();
-    let granted = exec_only(&["echo"]);
+    let grant = registry.mint_grant(exec_only(&["echo"]));
 
     let out = registry
         .dispatch(
             "shell",
             serde_json::json!({"program": "echo", "args": ["observed"]}),
-            &granted,
+            &grant,
         )
         .await
         .expect("dispatch admitted echo");
@@ -114,7 +114,7 @@ async fn registry_dispatch_observes_only_admitted_captured_output() {
         .dispatch(
             "shell",
             serde_json::json!({"program": "cat", "args": ["/dev/null"]}),
-            &granted,
+            &grant,
         )
         .await
         .expect("an in-tool leash refusal is a structured envelope");
@@ -142,11 +142,12 @@ async fn observer_is_bounded_by_the_configured_output_cap() {
         ))
         .build();
 
+    let grant = registry.mint_grant(exec_only(&["echo"]));
     let out = registry
         .dispatch(
             "shell",
             serde_json::json!({"program": "echo", "args": ["long-output"]}),
-            &exec_only(&["echo"]),
+            &grant,
         )
         .await
         .expect("dispatch");
@@ -175,11 +176,12 @@ async fn observer_panic_does_not_change_the_tool_result() {
         ))
         .build();
 
+    let grant = registry.mint_grant(exec_only(&["echo"]));
     let out = registry
         .dispatch(
             "shell",
             serde_json::json!({"program": "echo", "args": ["still-runs"]}),
-            &exec_only(&["echo"]),
+            &grant,
         )
         .await
         .expect("observer panic is contained");
@@ -199,18 +201,18 @@ async fn concurrent_dispatches_have_distinct_invocation_ids() {
             ShellTool::new().with_output_observer(observer.clone()),
         ))
         .build();
-    let granted = exec_only(&["echo"]);
+    let grant = registry.mint_grant(exec_only(&["echo"]));
 
     let (alpha, beta) = tokio::join!(
         registry.dispatch(
             "shell",
             serde_json::json!({"program": "echo", "args": ["alpha"]}),
-            &granted,
+            &grant,
         ),
         registry.dispatch(
             "shell",
             serde_json::json!({"program": "echo", "args": ["beta"]}),
-            &granted,
+            &grant,
         )
     );
     alpha.expect("alpha dispatch");

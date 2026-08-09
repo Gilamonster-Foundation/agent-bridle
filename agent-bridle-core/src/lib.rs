@@ -62,7 +62,7 @@ pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use net_proxy::{start_egress_proxy, ProxyHandle};
-pub use registry::{Registry, RegistryBuilder};
+pub use registry::{Grant, GrantId, Registry, RegistryBuilder};
 pub use report::{enforcement_report, fence_strength, AxisEnforcement, EnforcementReport};
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
@@ -96,7 +96,7 @@ pub use step_up::{
     AttestRequirement, Attestation, CallRequest, Challenge, ContentId, Decision, Discharge,
     DischargeAttempt, DischargeProvider, DischargeVerifier, Presence, Rule, StepUpPolicy,
 };
-pub use tool::Tool;
+pub use tool::{Invocation, Tool};
 pub use unbridle::{human_gate, is_unbridled, set_human_gate, set_unbridled, HumanGate};
 
 #[cfg(test)]
