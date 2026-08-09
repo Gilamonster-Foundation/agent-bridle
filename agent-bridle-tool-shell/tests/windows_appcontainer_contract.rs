@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_bridle_core::{Caveats, EnforcementFloor, Gate, Scope, Tool, ToolContext, ToolError};
+use agent_bridle_core::{
+    Caveats, EnforcementFloor, Gate, SandboxPolicy, Scope, Tool, ToolContext, ToolError,
+};
 use agent_bridle_tool_shell::ShellTool;
 
 static N: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +45,13 @@ fn ctx_confined(granted: Caveats) -> ToolContext {
         .expect("authorize")
 }
 
+fn ctx_confined_for(tool: &ShellTool, granted: Caveats) -> ToolContext {
+    Gate::new(0)
+        .with_enforcement_floor(EnforcementFloor::CONFINED)
+        .authorize(tool, &granted)
+        .expect("authorize")
+}
+
 fn newt_contract(workspace: &Path) -> Caveats {
     let ws = workspace.to_string_lossy().into_owned();
     Caveats {
@@ -67,6 +76,45 @@ fn launcher_path() -> PathBuf {
     p
 }
 
+fn sandbox_with_launcher(launcher: &Path) -> SandboxPolicy {
+    SandboxPolicy {
+        appcontainer_launcher_path: Some(launcher.to_string_lossy().into_owned()),
+        ..SandboxPolicy::default()
+    }
+}
+
+fn compile_fake_aclaunch(dir: &Path) -> PathBuf {
+    let source = dir.join("fake_aclaunch.rs");
+    let exe = dir.join("agent-bridle-aclaunch.exe");
+    std::fs::write(
+        &source,
+        r#"
+fn main() {
+    let marker = std::env::var("AB_FAKE_ACLAUNCH_MARKER")
+        .expect("AB_FAKE_ACLAUNCH_MARKER");
+    std::fs::write(marker, "FAKE_LAUNCHER_RAN").expect("write fake marker");
+    std::process::exit(91);
+}
+"#,
+    )
+    .expect("write fake launcher source");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let out = Command::new(rustc)
+        .arg("--edition=2021")
+        .arg(&source)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("spawn rustc for fake launcher");
+    assert!(
+        out.status.success(),
+        "compile fake launcher failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    exe
+}
+
 struct PathGuard {
     old: Option<std::ffi::OsString>,
 }
@@ -89,10 +137,8 @@ impl Drop for PathGuard {
     }
 }
 
-fn prepend_launcher_to_path() -> PathGuard {
-    let launcher = launcher_path();
-    let launcher_dir = launcher.parent().expect("launcher directory");
-    let mut paths = vec![launcher_dir.to_path_buf()];
+fn prepend_to_path(dir: &Path) -> PathGuard {
+    let mut paths = vec![dir.to_path_buf()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
@@ -101,12 +147,13 @@ fn prepend_launcher_to_path() -> PathGuard {
 
 #[tokio::test]
 async fn newt_confined_contract_runs_only_inside_appcontainer() {
-    let _path = prepend_launcher_to_path();
+    let launcher = launcher_path();
+    let tool = ShellTool::new().with_sandbox_policy(sandbox_with_launcher(&launcher));
     let workspace = fresh_dir("admit");
     let marker = workspace.join("marker.txt");
     std::fs::write(&marker, "ORIG").expect("seed marker");
 
-    let out = ShellTool::new()
+    let out = tool
         .invoke(
             serde_json::json!({
                 "program": "cmd.exe",
@@ -114,7 +161,7 @@ async fn newt_confined_contract_runs_only_inside_appcontainer() {
                 "cwd": workspace.to_string_lossy(),
                 "timeout_secs": 5
             }),
-            &ctx_confined(newt_contract(&workspace)),
+            &ctx_confined_for(&tool, newt_contract(&workspace)),
         )
         .await
         .expect("invoke");
@@ -133,6 +180,56 @@ async fn newt_confined_contract_runs_only_inside_appcontainer() {
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn path_shadowed_aclaunch_refuses_before_fake_launcher_or_target_runs() {
+    let fake_dir = fresh_dir("fake-path");
+    let _fake_launcher = compile_fake_aclaunch(&fake_dir);
+    let _path = prepend_to_path(&fake_dir);
+
+    let mut adjacent = std::env::current_exe().expect("current test executable");
+    adjacent.set_file_name("agent-bridle-aclaunch.exe");
+    assert!(
+        !adjacent.exists(),
+        "PATH-shadow proof cannot hide a trusted adjacent launcher at {adjacent:?}"
+    );
+
+    let workspace = fresh_dir("fake-path-workspace");
+    let fake_marker = workspace.join("fake-launcher.txt");
+    let target_marker = workspace.join("target.txt");
+    std::fs::write(&target_marker, "ORIG").expect("seed target marker");
+
+    let err = ShellTool::new()
+        .invoke(
+            serde_json::json!({
+                "program": "cmd.exe",
+                "args": ["/c", "echo", "HOSTILE_STARTED", ">", target_marker.to_string_lossy()],
+                "cwd": workspace.to_string_lossy(),
+                "env": { "AB_FAKE_ACLAUNCH_MARKER": fake_marker.to_string_lossy() },
+                "timeout_secs": 5
+            }),
+            &ctx_confined(newt_contract(&workspace)),
+        )
+        .await
+        .expect_err("ambient PATH aclaunch must deny before spawn");
+
+    assert!(
+        matches!(err, ToolError::Denied { ref reason } if reason.contains("agent-bridle-aclaunch.exe not found")),
+        "PATH-shadowed launcher must be a typed denial, got {err:?}"
+    );
+    assert!(
+        !fake_marker.exists(),
+        "fake PATH launcher must never execute"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_marker).expect("read target marker"),
+        "ORIG",
+        "hostile target must not start through a PATH-shadowed launcher"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&fake_dir);
 }
 
 #[tokio::test]

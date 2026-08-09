@@ -585,8 +585,9 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
 pub fn best_available_sandbox(policy: &Arc<SandboxPolicy>) -> Box<dyn Sandbox> {
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
     {
-        let _ = policy; // AppContainer configures per-process via the launcher.
-        Box::new(appcontainer_impl::AppContainerSandbox::new())
+        Box::new(appcontainer_impl::AppContainerSandbox::new(
+            policy.appcontainer_launcher_path.clone(),
+        ))
     }
 
     #[cfg(not(all(target_os = "windows", feature = "windows-appcontainer")))]
@@ -616,6 +617,7 @@ pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 
 #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
 pub(crate) mod appcontainer_impl {
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
@@ -637,42 +639,75 @@ pub(crate) mod appcontainer_impl {
     ///
     /// Calling [`Sandbox::apply`] directly fails closed: it is never correct to
     /// call `apply` expecting AppContainer confinement on the current thread.
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct AppContainerSandbox;
+    #[derive(Debug, Default, Clone)]
+    pub struct AppContainerSandbox {
+        launcher_path: Option<String>,
+    }
 
     impl AppContainerSandbox {
-        /// Construct the sandbox. (Stateless; confinement is per-process.)
-        pub fn new() -> Self {
-            Self
+        /// Construct the sandbox. Confinement is per-process; the optional path
+        /// pins the trusted launcher when it is not shipped beside the binary.
+        pub fn new(launcher_path: Option<String>) -> Self {
+            Self { launcher_path }
         }
     }
 
-    /// Return the path of `agent-bridle-aclaunch.exe`, searching first next to
-    /// the current executable and then via `PATH`.
-    fn find_launcher() -> Option<String> {
+    /// Return the trusted path of `agent-bridle-aclaunch.exe`: an explicitly
+    /// configured absolute path, or the helper shipped next to the current
+    /// executable. Ambient `PATH` is not a provenance source for AppContainer.
+    fn find_launcher(configured: Option<&str>) -> ToolResult<String> {
         const LAUNCHER: &str = "agent-bridle-aclaunch.exe";
+        let canonical_launcher_path = |path: &Path, source: &str| -> ToolResult<String> {
+            if !path.is_absolute() {
+                return Err(ToolError::denied(format!(
+                    "windows-appcontainer: {source} launcher path {path:?} is not absolute; \
+                     cannot confine"
+                )));
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !file_name.eq_ignore_ascii_case(LAUNCHER) {
+                return Err(ToolError::denied(format!(
+                    "windows-appcontainer: {source} launcher path {path:?} is not named \
+                     {LAUNCHER}; cannot confine"
+                )));
+            }
+            if !path.is_file() {
+                return Err(ToolError::denied(format!(
+                    "windows-appcontainer: {source} launcher {path:?} is not an existing file; \
+                     cannot confine"
+                )));
+            }
+            std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|error| {
+                    ToolError::denied(format!(
+                        "windows-appcontainer: could not canonicalize {source} launcher \
+                         {path:?}: {error}; cannot confine"
+                    ))
+                })
+        };
+
+        if let Some(raw) = configured {
+            if raw.is_empty() {
+                return Err(ToolError::denied(
+                    "windows-appcontainer: configured launcher path is empty; cannot confine",
+                ));
+            }
+            return canonical_launcher_path(Path::new(raw), "configured");
+        }
 
         // Same directory as the current exe — the normal install layout.
         if let Ok(mut p) = std::env::current_exe() {
             p.set_file_name(LAUNCHER);
-            if p.exists() {
-                return Some(p.to_string_lossy().into_owned());
+            if p.is_file() {
+                return canonical_launcher_path(&p, "shipped sibling");
             }
         }
-        // Fall back to PATH.
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join(LAUNCHER))
-            .find(|p| p.exists())
-            .map(|p| p.to_string_lossy().into_owned())
-    }
-
-    fn require_launcher(launcher: Option<String>) -> ToolResult<String> {
-        launcher.ok_or_else(|| {
-            ToolError::denied(
-                "windows-appcontainer: agent-bridle-aclaunch.exe not found next to the \
-                 current executable or on PATH; cannot confine",
-            )
-        })
+        Err(ToolError::denied(
+            "windows-appcontainer: agent-bridle-aclaunch.exe not found next to the \
+             current executable and no configured absolute launcher path was supplied; \
+             PATH is not searched; cannot confine",
+        ))
     }
 
     impl Sandbox for AppContainerSandbox {
@@ -710,7 +745,7 @@ pub(crate) mod appcontainer_impl {
             }
 
             // Fail-closed: without the launcher we cannot enforce.
-            let launcher = require_launcher(find_launcher())?;
+            let launcher = find_launcher(self.launcher_path.as_deref())?;
 
             // Unique container name: PID + monotonic counter (no wall clock).
             let n = SPAWN_N.fetch_add(1, Ordering::Relaxed);
@@ -777,18 +812,21 @@ pub(crate) mod appcontainer_impl {
 
         #[test]
         fn missing_launcher_is_a_denial() {
-            let err = require_launcher(None).expect_err("missing launcher must deny");
+            let err = find_launcher(Some("")).expect_err("empty launcher must deny");
             assert!(
-                matches!(err, ToolError::Denied { ref reason } if reason.contains("agent-bridle-aclaunch.exe not found")),
+                matches!(err, ToolError::Denied { ref reason } if reason.contains("configured launcher path is empty")),
                 "missing AppContainer launcher must be a denial, got {err:?}"
             );
         }
 
         #[test]
-        fn present_launcher_path_is_returned() {
-            let launcher = require_launcher(Some("C:\\tools\\agent-bridle-aclaunch.exe".into()))
-                .expect("present launcher");
-            assert_eq!(launcher, "C:\\tools\\agent-bridle-aclaunch.exe");
+        fn configured_launcher_must_be_absolute() {
+            let err = find_launcher(Some("agent-bridle-aclaunch.exe"))
+                .expect_err("relative configured launcher must deny");
+            assert!(
+                matches!(err, ToolError::Denied { ref reason } if reason.contains("is not absolute")),
+                "relative AppContainer launcher must be a denial, got {err:?}"
+            );
         }
     }
 }
