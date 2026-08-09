@@ -1298,6 +1298,18 @@ mod seatbelt_impl {
             }
             // else: a relative path grant cannot anchor a kernel rule safely — drop.
         }
+        // Apple's `/bin/sh` is a small launcher (a distinct binary from
+        // `/bin/bash`) that re-execs `/bin/bash` as its interpreter *variant* at
+        // startup. That re-exec is itself a kernel-checked `process-exec`, so a
+        // granted `/bin/sh` is UNRUNNABLE under a restricted exec axis unless its
+        // variant `/bin/bash` is also on the allow-list — the child dies at its own
+        // startup re-exec ("Failed to exec /bin/bash as variant for /bin/sh") before
+        // running a single line, so a confined `sh -c '…'` returns immediately
+        // (agent-bridle#318). Granting the variant is faithful to the grant (macOS's
+        // `sh` *is* `bash`), never a widening: it only makes a granted shell run.
+        if out.iter().any(|p| p == "/bin/sh") {
+            canon_file(Path::new("/bin/bash"), &mut out);
+        }
         out.sort();
         out.dedup();
         out
@@ -1658,6 +1670,36 @@ mod seatbelt_impl {
             assert!(
                 prof.contains("(literal \"/usr/bin/true\")"),
                 "bare name must resolve to its trusted-dir absolute path: {prof}"
+            );
+        }
+
+        #[test]
+        fn granting_sh_also_allows_its_bash_variant() {
+            // agent-bridle#318: Apple's `/bin/sh` re-execs `/bin/bash` at startup,
+            // a kernel-checked `process-exec`. A restricted exec grant of `sh`
+            // must therefore also anchor `/bin/bash`, or the confined shell dies
+            // at its own variant re-exec and never runs its body.
+            let cav = Caveats {
+                exec: Scope::only(["sh".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(
+                prof.contains("(literal \"/bin/sh\")"),
+                "the granted shell itself must be allowed: {prof}"
+            );
+            assert!(
+                prof.contains("(literal \"/bin/bash\")"),
+                "sh's /bin/bash interpreter variant must be allowed too (#318): {prof}"
+            );
+            // Control: a non-sh grant does NOT pull in bash.
+            let echo = Caveats {
+                exec: Scope::only(["echo".to_string()]),
+                ..Caveats::top()
+            };
+            assert!(
+                !seatbelt_profile(&echo).contains("/bin/bash"),
+                "granting echo must not add bash",
             );
         }
 
