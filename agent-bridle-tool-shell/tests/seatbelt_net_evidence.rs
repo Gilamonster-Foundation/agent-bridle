@@ -215,10 +215,27 @@ async fn seatbelt_loopback_only_allows_loopback_but_denies_offbox() {
         return;
     }
     let probe = write_probe();
+    // The FULL loopback interface (`localhost` = 127.0.0.1 AND ::1) is an EXACT
+    // Kernel witness — the Seatbelt localhost fence denotes exactly this set.
     let loopback_only = Caveats {
+        net: Scope::only(["localhost".to_string()]),
+        ..Caveats::top()
+    };
+
+    // Scope-fidelity: a SINGLE-address loopback grant (127.0.0.1 only) is the same
+    // coarse kernel fence but strictly narrower than what it permits (::1 is also
+    // allowed), so it is reported honestly BELOW Kernel (advisory) — a CONFINED
+    // floor would refuse it rather than admit an over-broad fence as exact.
+    let single = Caveats {
         net: Scope::only(["127.0.0.1".to_string()]),
         ..Caveats::top()
     };
+    let single_out = run_probe(single, &probe, "tcp", "1.1.1.1:80").await;
+    assert_eq!(single_out["sandbox_kind"], "seatbelt", "{single_out}");
+    assert_eq!(
+        single_out["enforcement"]["net"], "advisory",
+        "a single-address loopback grant widens to the interface → reported below Kernel: {single_out}"
+    );
 
     // (a) loopback to a LIVE listener SUCCEEDS — the ADR 0015 loopback re-allow.
     let (port, handle) = spawn_loopback_tcp();

@@ -9,9 +9,21 @@
 //!
 //! [`enforcement_report`] classifies each **restricted** Caveat axis (`Only(_)`,
 //! not `All`) as one of [`AxisEnforcement`]. It is a pure function of the
-//! effective [`Caveats`] and the active [`SandboxKind`] — no IO. The coarse
-//! `sandbox_kind` stays the **minimum** claim; this report refines it and is
-//! never allowed to describe an `advisory` axis as confined.
+//! effective [`Caveats`] and the governing [`ConfinementMechanism`] (the selected
+//! backend PLUS the mechanism configuration that changes what it can truthfully
+//! enforce — e.g. the child-network policy) — no IO. A bare [`SandboxKind`]
+//! converts in with the conservative default. The coarse `sandbox_kind` stays the
+//! **minimum** claim; this report refines it and is never allowed to describe an
+//! `advisory` axis as confined.
+//!
+//! `Kernel` on an axis means the actual child boundary supplies the **complete
+//! requested authority** for that axis — kernel-enforced *and* no broader than
+//! the Caveat asked for — not merely that a kernel primitive was involved. A
+//! kernel fence that permits MORE than the Caveat (e.g. a single-address loopback
+//! grant widened to the whole interface, or a `/bin/sh` grant that pulls
+//! `/bin/bash`) is reported BELOW Kernel, so a `CONFINED` floor refuses rather
+//! than admit an over-broad fence as an exact witness. Kernel *strength* and
+//! least *authority* are separate obligations (OCAP scope-fidelity).
 
 use std::fmt;
 
@@ -244,6 +256,21 @@ pub fn enforcement_report(
             SandboxKind::AppContainer if crate::sandbox::exec_fully_denied(effective) => {
                 AxisEnforcement::Kernel
             }
+            // Seatbelt exec scope-fidelity (model B, agent-bridle#318/#320): a
+            // `process-exec*` allow-list is an EXACT identity witness only when the
+            // kernel profile permits exactly the granted programs. Apple's
+            // `/bin/sh` re-execs `/bin/bash` at startup (a kernel-checked
+            // process-exec), so a grant of `sh` forces the profile to ALSO permit
+            // `/bin/bash` — a program the Caveat did not name. That is a widened
+            // closure, so the axis is honestly Interceptor, not an exact Kernel
+            // witness (the Newt `CONFINED` floor requires only Interceptor on exec,
+            // so this refuses nothing legitimate). `exec:none` (deny-all) and an
+            // allow-list with no launcher-variant stay exact Kernel.
+            SandboxKind::Seatbelt
+                if crate::sandbox::exec_grant_pulls_launcher_variant(effective) =>
+            {
+                AxisEnforcement::Interceptor
+            }
             SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
                 AxisEnforcement::Kernel
             }
@@ -261,7 +288,7 @@ pub fn enforcement_report(
             // AppContainer floor, ADR 0006). MicroVM: no guest NIC → always Kernel.
             SandboxKind::AppContainer
                 if crate::sandbox::net_fully_denied(effective)
-                    || crate::sandbox::net_loopback_only(effective) =>
+                    || crate::sandbox::net_loopback_full_interface(effective) =>
             {
                 AxisEnforcement::Kernel
             }
@@ -277,7 +304,7 @@ pub fn enforcement_report(
             // net this increment.
             SandboxKind::Seatbelt
                 if crate::sandbox::net_fully_denied(effective)
-                    || crate::sandbox::net_loopback_only(effective) =>
+                    || crate::sandbox::net_loopback_full_interface(effective) =>
             {
                 AxisEnforcement::Kernel
             }
@@ -488,6 +515,21 @@ impl EnforcementFloor {
     #[must_use]
     pub fn net(&self) -> AxisEnforcement {
         self.net
+    }
+
+    /// The pointwise **join** (per-axis max) of two floors — the monotonic layering
+    /// operator: once an axis requires strength S, joining can only keep it at S or
+    /// raise it, never lower it. This is how delegation/configuration layers a
+    /// floor (see [`crate::Gate::with_enforcement_floor`]): a strong principal's
+    /// requirement cannot be silently downgraded by a later, weaker one.
+    #[must_use]
+    pub fn join(self, other: Self) -> Self {
+        Self {
+            fs_read: self.fs_read.max(other.fs_read),
+            fs_write: self.fs_write.max(other.fs_write),
+            exec: self.exec.max(other.exec),
+            net: self.net.max(other.net),
+        }
     }
 
     /// Bridge the historic **scalar** floor to the per-axis form, exactly
@@ -745,7 +787,11 @@ mod tests {
             net: Scope::none(),
             ..Caveats::top()
         };
-        let loopback = || Caveats {
+        let loopback_full = || Caveats {
+            net: Scope::only(["localhost".to_string()]),
+            ..Caveats::top()
+        };
+        let loopback_v4_only = || Caveats {
             net: Scope::only(["127.0.0.1".to_string()]),
             ..Caveats::top()
         };
@@ -768,7 +814,18 @@ mod tests {
             ),
             ("deny-direct + net:none", none(), ll(DenyDirect), Kernel),
             ("seatbelt + net:none", none(), sb, Kernel),
-            ("seatbelt + loopback-only", loopback(), sb, Kernel),
+            (
+                "seatbelt + loopback full interface",
+                loopback_full(),
+                sb,
+                Kernel,
+            ),
+            (
+                "seatbelt + loopback single addr (widens)",
+                loopback_v4_only(),
+                sb,
+                Advisory,
+            ),
             ("seatbelt + remote allowlist", remote(), sb, Advisory),
             ("noop + net:none", none(), noop, Advisory),
             ("noop + remote allowlist", remote(), noop, Advisory),
@@ -899,22 +956,30 @@ mod tests {
         assert_eq!(r.exec, None);
     }
 
-    /// net → Kernel for loopback-only under AppContainer (#133, ADR 0016): the
-    /// container has no internet capability SIDs so off-box egress is kernel-denied;
-    /// the loopback exemption allows 127.0.0.1→proxy. Mirrors Seatbelt's
-    /// loopback-only Kernel claim (ADR 0015).
+    /// Scope-fidelity for AppContainer loopback (Kernel *strength* ≠ least
+    /// *authority*): the container's loopback exemption permits the whole
+    /// interface (127.0.0.1 AND ::1), so it is an EXACT witness only when the
+    /// Caveat denotes the full interface (`localhost`, or both addresses). A
+    /// single-address grant is a widening → reported below Kernel so CONFINED
+    /// refuses.
     #[test]
-    fn appcontainer_marks_net_kernel_for_loopback_only() {
-        for host in ["localhost", "127.0.0.1", "::1"] {
-            let loopback_only = Caveats {
-                net: Scope::only([host.to_string()]),
-                ..Caveats::top()
-            };
-            let r = enforcement_report(&loopback_only, SandboxKind::AppContainer);
+    fn appcontainer_loopback_is_kernel_only_for_the_full_interface() {
+        let full = |hosts: &[&str]| Caveats {
+            net: Scope::only(hosts.iter().map(|h| h.to_string())),
+            ..Caveats::top()
+        };
+        for exact in [vec!["localhost"], vec!["127.0.0.1", "::1"]] {
             assert_eq!(
-                r.net,
+                enforcement_report(&full(&exact), SandboxKind::AppContainer).net,
                 Some(AxisEnforcement::Kernel),
-                "loopback host {host} must be Kernel under AppContainer"
+                "the full loopback interface {exact:?} is an exact Kernel witness"
+            );
+        }
+        for widening in ["127.0.0.1", "::1"] {
+            assert_eq!(
+                enforcement_report(&full(&[widening]), SandboxKind::AppContainer).net,
+                Some(AxisEnforcement::Advisory),
+                "single-address loopback {widening} widens to the interface → not exact Kernel"
             );
         }
     }
@@ -965,14 +1030,26 @@ mod tests {
             .net
         };
 
-        // Empty net (all egress denied) → kernel.
+        // Empty net (all egress denied) → kernel (exact: deny-all == empty scope).
         assert_eq!(net_report(Scope::none()), Some(AxisEnforcement::Kernel));
-        // Loopback-only allowlist (off-box egress kernel-impossible) → kernel.
-        for host in ["localhost", "127.0.0.1", "::1"] {
+        // Loopback-only is Kernel ONLY when the Caveat denotes the full interface
+        // (`localhost`, or both addresses) — the Seatbelt localhost fence allows
+        // 127.0.0.1 AND ::1, so a single address is a widening (scope-fidelity).
+        assert_eq!(
+            net_report(Scope::only(["localhost".to_string()])),
+            Some(AxisEnforcement::Kernel),
+            "the loopback interface token is an exact Kernel witness"
+        );
+        assert_eq!(
+            net_report(Scope::only(["127.0.0.1".to_string(), "::1".to_string()])),
+            Some(AxisEnforcement::Kernel),
+            "naming both loopback addresses is the full interface → Kernel"
+        );
+        for widening in ["127.0.0.1", "::1"] {
             assert_eq!(
-                net_report(Scope::only([host.to_string()])),
-                Some(AxisEnforcement::Kernel),
-                "loopback host {host} must report kernel"
+                net_report(Scope::only([widening.to_string()])),
+                Some(AxisEnforcement::Advisory),
+                "single-address loopback {widening} widens to the interface → below Kernel"
             );
         }
         // A general remote host → advisory (inexpressible in SBPL).
@@ -987,6 +1064,79 @@ mod tests {
                 "example.com".to_string()
             ])),
             Some(AxisEnforcement::Advisory)
+        );
+    }
+
+    /// OCAP scope-fidelity refusal: a single-address loopback Caveat must NOT be
+    /// admitted under a kernel mechanism that silently supplies additional
+    /// addresses. Under CONFINED (net:Kernel), the single-address loopback reports
+    /// Advisory (the fence widens to the whole interface), so the net axis is
+    /// unenforceable → refuse before spawn. The full interface is admitted.
+    #[test]
+    fn single_address_loopback_cannot_be_admitted_under_confined() {
+        let v4_only = Caveats {
+            net: Scope::only(["127.0.0.1".to_string()]),
+            ..Caveats::top()
+        };
+        let unmet = unenforceable_axis(&v4_only, SandboxKind::Seatbelt, EnforcementFloor::CONFINED)
+            .expect("a single-address loopback caveat must refuse under CONFINED (kernel widens)");
+        assert_eq!(unmet.axis, ConfinedAxis::Net);
+        assert_eq!(unmet.required, AxisEnforcement::Kernel);
+        assert_eq!(unmet.actual, Some(AxisEnforcement::Advisory));
+
+        // The full loopback interface IS an exact witness → admitted.
+        let full = Caveats {
+            net: Scope::only(["localhost".to_string()]),
+            ..Caveats::top()
+        };
+        assert!(
+            unenforceable_axis(&full, SandboxKind::Seatbelt, EnforcementFloor::CONFINED).is_none(),
+            "the full loopback interface is an exact Kernel witness → admitted"
+        );
+    }
+
+    /// Model B (exec scope-fidelity): Seatbelt exec is an exact Kernel witness
+    /// only when the profile permits exactly the granted programs. A granted `sh`
+    /// pulls Apple's `/bin/bash` launcher variant into the profile (a program the
+    /// Caveat did not name), so the axis is Interceptor. A no-variant allow-list
+    /// and `exec:none` (deny-all) stay exact Kernel. Under CONFINED (exec floor =
+    /// Interceptor) the `sh` grant is still ADMITTED — Interceptor meets the floor.
+    #[test]
+    fn seatbelt_exec_is_interceptor_when_the_launcher_closure_widens() {
+        let exec = |p: &str| Caveats {
+            exec: Scope::only([p.to_string()]),
+            ..Caveats::top()
+        };
+        for widening in ["sh", "/bin/sh"] {
+            assert_eq!(
+                enforcement_report(&exec(widening), SandboxKind::Seatbelt).exec,
+                Some(AxisEnforcement::Interceptor),
+                "a granted {widening} pulls /bin/bash into the profile → not exact Kernel"
+            );
+        }
+        assert_eq!(
+            enforcement_report(&exec("echo"), SandboxKind::Seatbelt).exec,
+            Some(AxisEnforcement::Kernel),
+            "a no-variant allow-list is an exact identity witness → Kernel"
+        );
+        let deny_all = Caveats {
+            exec: Scope::none(),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            enforcement_report(&deny_all, SandboxKind::Seatbelt).exec,
+            Some(AxisEnforcement::Kernel),
+            "deny-all exec is exact → Kernel"
+        );
+        // The widened `sh` grant is admitted under CONFINED (exec floor Interceptor).
+        assert!(
+            unenforceable_axis(
+                &exec("sh"),
+                SandboxKind::Seatbelt,
+                EnforcementFloor::CONFINED
+            )
+            .is_none(),
+            "Interceptor exec meets the CONFINED exec floor → admitted"
         );
     }
 
@@ -1118,21 +1268,26 @@ mod tests {
     }
 
     /// #114 / ADR 0013 D6 report guard: `exec → kernel` is **identity, not
-    /// behavior**. A granted *interpreter* (`sh`) still earns `exec → kernel`
-    /// under Seatbelt — only un-granted *programs* are excluded — which must not
-    /// be misread as constraining the interpreter's interior (that is governed
-    /// only by the fs/net axes, absent here because they are unrestricted).
+    /// behavior**. A granted *interpreter* that does not pull an implementation
+    /// variant (`python3`) still earns `exec → kernel` under Seatbelt — only
+    /// un-granted *programs* are excluded — which must not be misread as
+    /// constraining the interpreter's interior (that is governed only by the
+    /// fs/net axes, absent here because they are unrestricted).
+    ///
+    /// (Apple's `/bin/sh` is the exception: it re-execs `/bin/bash`, widening the
+    /// closure beyond the Caveat, so a granted `sh` is Interceptor — model B, see
+    /// `seatbelt_exec_is_interceptor_when_the_launcher_closure_widens`.)
     #[test]
     fn exec_kernel_is_identity_not_interpreter_behavior() {
         let interp = Caveats {
-            exec: Scope::only(["sh".to_string()]),
+            exec: Scope::only(["python3".to_string()]),
             ..Caveats::top()
         };
         let r = enforcement_report(&interp, SandboxKind::Seatbelt);
         assert_eq!(
             r.exec,
             Some(AxisEnforcement::Kernel),
-            "a granted interpreter still earns exec→kernel (identity, not behavior)"
+            "a granted non-launcher interpreter still earns exec→kernel (identity, not behavior)"
         );
         // exec→kernel does NOT imply the interior is constrained: fs/net are All
         // (unrestricted) here, so they are absent from the report.
@@ -1166,8 +1321,11 @@ mod tests {
         }
     }
     fn only_exec() -> Caveats {
+        // A non-launcher program: `echo` does not pull an implementation variant,
+        // so Seatbelt's process-exec* fence is an exact identity witness (Kernel).
+        // (A granted `sh` would widen to `/bin/bash` — model B, tested separately.)
         Caveats {
-            exec: Scope::only(["sh".to_string()]),
+            exec: Scope::only(["echo".to_string()]),
             ..Caveats::top()
         }
     }
@@ -1503,6 +1661,77 @@ mod tests {
             assert_eq!(f.fs_read(), AxisEnforcement::Kernel);
             assert_eq!(f.fs_write(), AxisEnforcement::Kernel);
         }
+    }
+
+    /// The **v0.8 Newt `CONFINED` acceptance contract** (release theorem, unit
+    /// layer): effective authority `{fs_read/fs_write restricted, net:none, exec
+    /// allowlist}` under floor `CONFINED {fs Kernel, net Kernel, exec Interceptor}`
+    /// is ADMITTED only where the actual mechanism supplies each restricted axis's
+    /// required strength — and every admission is an *exact* witness (no native
+    /// scope exceeds the Caveat while labelled a strong witness). The macOS
+    /// `net:none` case is grounded end-to-end by the real-Seatbelt suite
+    /// (`tests/seatbelt_net_evidence.rs`); this is the policy/unit half.
+    #[test]
+    fn v0_8_newt_confined_contract_admits_only_with_required_mechanisms() {
+        let contract = Caveats {
+            fs_read: Scope::only(["/ws".to_string()]),
+            fs_write: Scope::only(["/ws".to_string()]),
+            net: Scope::none(),
+            exec: Scope::only(["echo".to_string()]), // no launcher variant → exact
+            ..Caveats::top()
+        };
+        let floor = EnforcementFloor::CONFINED;
+        let admits = |m: ConfinementMechanism| unenforceable_axis(&contract, m, floor).is_none();
+        let refuses_on = |m: ConfinementMechanism, axis: ConfinedAxis| {
+            unenforceable_axis(&contract, m, floor).map(|u| u.axis) == Some(axis)
+        };
+        use ChildNetworkPolicy::{DenyDirect, LandlockOnly};
+        let ll = |p| ConfinementMechanism::new(SandboxKind::Landlock, p);
+
+        // Linux: admits ONLY with the real fs (Landlock) AND net (DenyDirect
+        // seccomp) kernel mechanisms; the caveat-only Landlock net (LandlockOnly)
+        // is an incomplete egress fence → refuse on net.
+        assert!(
+            admits(ll(DenyDirect)),
+            "Landlock fs + DenyDirect net satisfies CONFINED"
+        );
+        assert!(
+            refuses_on(ll(LandlockOnly), ConfinedAxis::Net),
+            "LandlockOnly net:none is incomplete (UDP/DNS/raw ambient) → refuse on net"
+        );
+
+        // macOS: `net:none` is a real Seatbelt kernel witness → admits.
+        assert!(admits(ConfinementMechanism::backend(SandboxKind::Seatbelt)));
+
+        // Windows: AppContainer independently kernel-denies egress (no net SIDs)
+        // and fences fs → admits (exec allowlist is Interceptor, meets the floor).
+        assert!(admits(ConfinementMechanism::backend(
+            SandboxKind::AppContainer
+        )));
+
+        // A missing/weak backend refuses BEFORE any child runs: Noop cannot supply
+        // a kernel fs fence → refuse on fs (the first consequential axis).
+        assert!(
+            refuses_on(
+                ConfinementMechanism::backend(SandboxKind::None),
+                ConfinedAxis::FsRead
+            ),
+            "Noop cannot satisfy the CONFINED contract → fail-closed refusal"
+        );
+
+        // Scope-fidelity: swapping net:none for a single-address loopback (a fence
+        // that widens to the whole interface) must NOT be admitted as exact even
+        // under Seatbelt — a kernel mechanism whose scope exceeds the Caveat is not
+        // a strong witness.
+        let widened = Caveats {
+            net: Scope::only(["127.0.0.1".to_string()]),
+            ..contract.clone()
+        };
+        assert_eq!(
+            unenforceable_axis(&widened, SandboxKind::Seatbelt, floor).map(|u| u.axis),
+            Some(ConfinedAxis::Net),
+            "a single-address loopback widens the fence → not an exact witness → refuse"
+        );
     }
 
     /// (8) THE fail-closed guard: a restricted axis whose report carries **no

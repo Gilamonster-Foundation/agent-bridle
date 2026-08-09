@@ -120,11 +120,16 @@ impl Gate {
     /// [`AxisEnforcement::Kernel`] gets Kernel on *every* axis — which over-
     /// strictly rejects the exec axis on interceptor-exec backends; a confined
     /// executor should prefer [`Self::with_enforcement_floor`] with
-    /// [`EnforcementFloor::CONFINED`]. The floor only ever *raises* on
-    /// delegation (it has no setter on the minted [`ToolContext`]).
+    /// [`EnforcementFloor::CONFINED`].
+    ///
+    /// **Monotonic:** the requested scalar is *joined* (pointwise max) onto the
+    /// gate's current floor, so it can only ever RAISE an axis — a later, weaker
+    /// scalar can never downgrade a strength a stronger principal already required.
     #[must_use]
     pub fn with_strength_floor(mut self, floor: AxisEnforcement) -> Self {
-        self.strength_floor = EnforcementFloor::from_scalar(floor);
+        self.strength_floor = self
+            .strength_floor
+            .join(EnforcementFloor::from_scalar(floor));
         self
     }
 
@@ -133,11 +138,16 @@ impl Gate {
     /// passes [`EnforcementFloor::CONFINED`] (`fs`/`net` = Kernel, `exec` =
     /// Interceptor) so a restricted filesystem or network axis that the governing
     /// backend cannot kernel-confine fails closed, while the exec axis is
-    /// accepted at the interceptor tier. The floor only ever *raises* on
-    /// delegation (no setter on the minted [`ToolContext`]).
+    /// accepted at the interceptor tier.
+    ///
+    /// **Monotonic:** `floor` is *joined* (pointwise max) onto the gate's current
+    /// floor — once an axis requires strength S, this can only keep it at S or
+    /// raise it, never lower it. There is deliberately no delegation API that
+    /// *replaces* (and thus could downgrade) a floor; the minted [`ToolContext`]
+    /// has no setter at all.
     #[must_use]
     pub fn with_enforcement_floor(mut self, floor: EnforcementFloor) -> Self {
-        self.strength_floor = floor;
+        self.strength_floor = self.strength_floor.join(floor);
         self
     }
 
@@ -461,7 +471,48 @@ mod tests {
             .authorize(&top_tool(), &Caveats::top())
             .expect("authorize");
         assert_eq!(confined.strength_floor(), EnforcementFloor::CONFINED);
-        assert_eq!(confined.strength_floor().exec, AxisEnforcement::Interceptor);
+        assert_eq!(
+            confined.strength_floor().exec(),
+            AxisEnforcement::Interceptor
+        );
+    }
+
+    /// Monotonicity (OCAP): a floor only ever RAISES. Layering
+    /// `DEFAULT -> CONFINED -> Advisory-scalar` must stay **at least** CONFINED on
+    /// every axis — a later, weaker floor cannot downgrade a strength a stronger
+    /// principal already required. The ordinary delegation builders JOIN
+    /// (pointwise max); there is no downgrade path.
+    #[test]
+    fn enforcement_floor_layering_is_monotonic() {
+        use AxisEnforcement::{Advisory, Interceptor, Kernel};
+        let cx = Gate::new(0) // starts at DEFAULT {fs:Kernel, exec/net:Advisory}
+            .with_enforcement_floor(EnforcementFloor::CONFINED)
+            .with_strength_floor(Advisory) // from_scalar(Advisory) == DEFAULT — must NOT lower
+            .authorize(&top_tool(), &Caveats::top())
+            .expect("authorize");
+        let floor = cx.strength_floor();
+        assert_eq!(floor.fs_read(), Kernel);
+        assert_eq!(floor.fs_write(), Kernel);
+        assert_eq!(
+            floor.net(),
+            Kernel,
+            "net must stay at the CONFINED Kernel floor"
+        );
+        assert_eq!(
+            floor.exec(),
+            Interceptor,
+            "exec must stay at least the CONFINED Interceptor floor"
+        );
+        assert_eq!(floor, EnforcementFloor::CONFINED);
+
+        // And raising exec further (scalar Kernel) after CONFINED joins upward.
+        let raised = Gate::new(0)
+            .with_enforcement_floor(EnforcementFloor::CONFINED)
+            .with_strength_floor(Kernel) // exec Interceptor -> Kernel (raise)
+            .authorize(&top_tool(), &Caveats::top())
+            .expect("authorize");
+        assert_eq!(raised.strength_floor().exec(), Kernel);
+        assert_eq!(raised.strength_floor().net(), Kernel);
     }
 
     #[test]
