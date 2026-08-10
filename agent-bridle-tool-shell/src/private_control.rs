@@ -228,23 +228,54 @@ pub(crate) fn authorize_carried_child(
     let ack_credentials = recv_exact_frame(&stream, &mut ack)?;
     let after_ack = child_snapshot(&stream, child_pid);
     #[cfg(target_os = "linux")]
-    verify_child(after_hello, after_ack, ack_credentials, child_pid)?;
+    verify_child_after_ack(after_hello, after_ack, ack_credentials, child_pid)?;
     // macOS: the ACK completed the handshake, so the (already kernel-identified)
     // child may now legitimately exit — a pipeline stage whose downstream `head`
-    // closed the pipe. A `None` post-ACK re-snapshot (ENOTCONN — peer gone) is
-    // therefore accepted; a still-connected peer must match the hello identity.
+    // closed the pipe. A gone peer at re-snapshot time — ENOTCONN (`Ok(None)`)
+    // OR a peer pid the process table can no longer image (exited/zombie:
+    // `proc_pidpath` ESRCH — an `Err` here) — is therefore accepted: a gone
+    // peer cannot be a live impersonator, and the mandatory kernel identity was
+    // captured at hello. A still-CONNECTED peer must match the hello identity.
+    // (This re-snapshot is defense-in-depth; the authority boundary is the
+    // private socketpair + the completed hello/challenge/ACK handshake.)
     #[cfg(target_os = "macos")]
     {
         let _ = ack_credentials;
-        verify_child_macos(&hello_identity, after_ack?.as_ref(), child_pid)?;
+        let reverify = tolerate_gone_reverify(after_ack);
+        verify_child_macos(&hello_identity, reverify.as_ref(), child_pid)?;
     }
     if ack != CARRIED_ACK {
         return Err("carried child returned an invalid authentication ACK".to_string());
     }
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|error| format!("close carried authorization direction: {error}"))?;
+    close_authorization_direction(&stream)?;
     Ok(BufReader::new(stream))
+}
+
+/// Map the post-ACK re-snapshot result for re-verification: an `Err` (the peer
+/// pid is exited/zombie and can no longer be imaged — `proc_pidpath` ESRCH) is
+/// the same benign terminal state as the `Ok(None)` disconnect, so both become
+/// `None`. Used ONLY on the post-ACK site; hello-time snapshot errors stay hard.
+#[cfg(target_os = "macos")]
+#[cfg(feature = "carried-coreutils")]
+fn tolerate_gone_reverify(
+    after_ack: Result<Option<ParentSnapshot>, String>,
+) -> Option<ParentSnapshot> {
+    after_ack.unwrap_or(None)
+}
+
+/// Half-close the parent→child authorization direction after a completed
+/// handshake. A [`std::io::ErrorKind::NotConnected`] failure is accepted: the
+/// authenticated child may already have exited and closed its end (a pipeline
+/// stage whose work is done), in which case the write direction is already
+/// down and there is nothing left to close.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "carried-coreutils")]
+fn close_authorization_direction(stream: &UnixStream) -> Result<(), String> {
+    match stream.shutdown(std::net::Shutdown::Write) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+        Err(error) => Err(format!("close carried authorization direction: {error}")),
+    }
 }
 
 /// Child half of carried-utility authentication on its duplex fd 2.
@@ -581,6 +612,43 @@ fn verify_child(
     Ok(())
 }
 
+/// The post-ACK variant of [`verify_child`]. The ACK frame's kernel
+/// `SCM_CREDENTIALS` (captured at receive time) remain the load-bearing check
+/// and are always enforced. The re-snapshot, however, is defense-in-depth
+/// against a live impersonator — and a child whose `/proc/<pid>/exe` can no
+/// longer be inspected (exited or zombie: ENOENT) is not a live anything: a
+/// fast pipeline stage (`head`) legitimately exits the instant its downstream
+/// closes, often before this re-snapshot runs. So a failed post-ACK snapshot is
+/// accepted; a SUCCESSFUL snapshot must still match the hello-time identity.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "carried-coreutils")]
+fn verify_child_after_ack(
+    after_hello: Result<ParentSnapshot, String>,
+    after_ack: Result<ParentSnapshot, String>,
+    frame: FrameCredentials,
+    child_pid: u32,
+) -> Result<(), String> {
+    let hello = after_hello?;
+    let child_pid_i32 = i32::try_from(child_pid).map_err(|_| "child PID does not fit i32")?;
+    if frame.pid != child_pid_i32 || frame.uid != nix::unistd::getuid().as_raw() {
+        return Err("carried-child frame credentials do not match the spawned child".into());
+    }
+    match after_ack {
+        Ok(post) => {
+            if hello.peer_pid != post.peer_pid
+                || hello.ppid != post.ppid
+                || !same_image(&hello.image, &post.image)
+            {
+                return Err("carried-child identity changed during authentication".to_string());
+            }
+        }
+        // The kernel-credentialed ACK completed the handshake; the child has
+        // already exited (benign — see the doc above).
+        Err(_) => {}
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn process_image(pid: i32) -> Result<ImageIdentity, std::io::Error> {
     use std::os::unix::fs::MetadataExt;
@@ -747,5 +815,34 @@ mod macos_auth_tests {
         // authorize_carried_child converts a None hello into a hard refusal:
         let refused = snap.ok_or_else(|| "no kernel-attested identity".to_string());
         assert!(refused.is_err(), "a None hello identity must fail closed");
+    }
+
+    /// #331: closing the authorization direction after the authenticated child
+    /// already exited (its end closed → `ENOTCONN`) is a benign no-op, not an
+    /// authentication failure. Any other shutdown error still refuses.
+    #[test]
+    fn close_authorization_direction_tolerates_a_gone_peer() {
+        let (parent, child) = UnixStream::pair().expect("socketpair");
+        // Live peer: the half-close succeeds normally.
+        close_authorization_direction(&parent).expect("live-peer half-close");
+        drop(child);
+        // Gone peer: macOS reports NotConnected on shutdown of a socket whose
+        // peer closed; the wrapper accepts it (the direction is already down).
+        close_authorization_direction(&parent)
+            .expect("a gone peer must not turn the courtesy half-close into a failure");
+    }
+
+    /// #331: a post-ACK re-snapshot whose image inspection FAILED (the pid is
+    /// exited/zombie — `proc_pidpath` ESRCH) is treated like the disconnected
+    /// case: tolerated on re-verify, because the mandatory identity was captured
+    /// at hello and a gone process cannot be a live impersonator.
+    #[test]
+    fn errored_post_ack_resnapshot_is_tolerated_like_a_disconnect() {
+        let (_p, _c, hello) = live_snapshot();
+        let after_ack: Result<Option<ParentSnapshot>, String> =
+            Err("inspect process 9943 image: No such process".to_string());
+        let reverify = tolerate_gone_reverify(after_ack); // the authorize_carried_child mapping
+        verify_child_macos(&hello, reverify.as_ref(), std::process::id())
+            .expect("an uninspectable (exited) post-ACK peer is benign");
     }
 }
