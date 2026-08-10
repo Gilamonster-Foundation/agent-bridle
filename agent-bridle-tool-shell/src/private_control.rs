@@ -633,18 +633,15 @@ fn verify_child_after_ack(
     if frame.pid != child_pid_i32 || frame.uid != nix::unistd::getuid().as_raw() {
         return Err("carried-child frame credentials do not match the spawned child".into());
     }
-    match after_ack {
-        Ok(post) => {
-            if hello.peer_pid != post.peer_pid
-                || hello.ppid != post.ppid
-                || !same_image(&hello.image, &post.image)
-            {
-                return Err("carried-child identity changed during authentication".to_string());
-            }
+    // An `Err` snapshot is benign here: the kernel-credentialed ACK completed
+    // the handshake and the child has already exited (see the doc above).
+    if let Ok(post) = after_ack {
+        if hello.peer_pid != post.peer_pid
+            || hello.ppid != post.ppid
+            || !same_image(&hello.image, &post.image)
+        {
+            return Err("carried-child identity changed during authentication".to_string());
         }
-        // The kernel-credentialed ACK completed the handshake; the child has
-        // already exited (benign — see the doc above).
-        Err(_) => {}
     }
     Ok(())
 }
