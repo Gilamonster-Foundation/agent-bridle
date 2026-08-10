@@ -42,19 +42,41 @@ use crate::{
 /// material, and agent state are the harness's authority, never the child's).
 const HARNESS_PRIVATE_MARKERS: &[&str] = &[".newt", ".ssh", ".gnupg", ".aws", ".config/gh"];
 
+/// Whether a single path entry reaches one of the harness-private stores — the
+/// one canonical predicate both harness-disjoint checks below share (a per-entry
+/// declaration guard and a whole-closure lattice guard), so there is exactly one
+/// definition of "harness-private" in the crate.
+fn entry_reaches_harness_private(entry: &str) -> bool {
+    HARNESS_PRIVATE_MARKERS
+        .iter()
+        .any(|marker| entry.split('/').any(|segment| segment == *marker) || entry.ends_with(marker))
+}
+
 fn require_harness_disjoint(entry: &str) -> ToolResult<()> {
-    for marker in HARNESS_PRIVATE_MARKERS {
-        if entry
-            .split('/')
-            .any(|segment| segment == *marker || entry.ends_with(marker))
-        {
-            return Err(ToolError::denied(format!(
-                "refusing closure entry {entry:?}: it reaches the harness-private \
-                 store {marker:?} (the runtime closure must be harness-disjoint)"
-            )));
-        }
+    if entry_reaches_harness_private(entry) {
+        return Err(ToolError::denied(format!(
+            "refusing closure entry {entry:?}: it reaches a harness-private store \
+             (the runtime closure must be harness-disjoint)"
+        )));
     }
     Ok(())
+}
+
+/// Whether a resolved-authority runtime closure is disjoint from harness-private
+/// authority on the authority-bearing axes (fs_read / fs_write / exec) — the
+/// whole-closure form of [`require_harness_disjoint`], used by [`AdmittedFence::admit`]
+/// on the backend-declared closure. A `Bounded` axis passes iff no concrete entry
+/// reaches a harness-private store; an `Unbounded`/`Unknown` axis is non-disjoint
+/// by definition (it would authorize everything / cannot be decided) and so fails
+/// closed — a closure may never launder unbounded or undecidable authority.
+pub(crate) fn closure_is_harness_disjoint(closure: &ResolvedAuthority) -> bool {
+    let axis_ok = |scope: &ResolvedScope| match scope {
+        ResolvedScope::Bounded { concrete, .. } => concrete
+            .iter()
+            .all(|entry| !entry_reaches_harness_private(entry)),
+        ResolvedScope::Unbounded | ResolvedScope::Unknown => false,
+    };
+    axis_ok(&closure.fs_read) && axis_ok(&closure.fs_write) && axis_ok(&closure.exec)
 }
 
 /// The explicit, minimal, harness-disjoint authority the harness adds beyond
@@ -92,30 +114,28 @@ impl RuntimeClosure {
     pub fn is_empty(&self) -> bool {
         self.exec.is_empty()
     }
-
-    /// The closure as a resolved-authority operand for the L3 scope check.
-    fn to_resolved(&self) -> ResolvedAuthority {
-        ResolvedAuthority {
-            fs_read: ResolvedScope::empty(),
-            fs_write: ResolvedScope::empty(),
-            exec: ResolvedScope::concrete(self.exec.iter().cloned()),
-            net: ResolvedScope::empty(),
-        }
-    }
 }
 
-/// The pure L3 scope admission for a spawn: is every axis of what the
-/// mechanism will actually be asked to permit (`mechanism_caveats`) within
-/// `delegated ∪ closure`? Factored out of [`AdmittedFence::admit`] so the
-/// refusal is directly testable against a hand-widened mechanism — the exact
-/// bug class the audit found (a widening living only in the mechanism copy).
-pub(crate) fn scope_admission(
-    mechanism_caveats: &Caveats,
-    delegated: &Caveats,
-    closure: &RuntimeClosure,
-) -> AdmissionDecision {
-    let resolved = ResolvedAuthority::from_delegated(mechanism_caveats);
-    admit(&resolved, delegated, &closure.to_resolved())
+/// A backend's **conservative projection** of the caveats it is about to apply:
+/// what the installed native fence actually permits a hostile child
+/// (`resolved`), and the harness-added system substrate that permission
+/// legitimately rests on (`runtime_closure`) — both as resolved-authority
+/// lattice values, computed by the backend from the *same* routines its `apply`
+/// uses (Q2 anti-drift). The L3 bound is `resolved ⊆ delegated ∪ runtime_closure`
+/// computed over these — the **ruleset grain**, not the caveats grain.
+///
+/// This is the operand the #317 audit found missing: admission used to project
+/// the *caveats* (`ResolvedAuthority::from_delegated(mechanism_caveats)`), which
+/// is blind to authority the ruleset installs beyond the grant (e.g. Landlock's
+/// `base_read` loader/library trees). A backend that cannot honestly bound an
+/// axis returns `Unknown` on it here, and admission fails closed (L7).
+#[derive(Debug, Clone)]
+pub struct BackendProjection {
+    /// What the fence actually permits — the conservative upper bound.
+    pub resolved: ResolvedAuthority,
+    /// The harness-added substrate the resolution rests on (loader/base-read/
+    /// device sinks / the resolved program image). Must be harness-disjoint.
+    pub runtime_closure: ResolvedAuthority,
 }
 
 /// The one admitted fence: delegated authority + declared closure + governing
@@ -137,25 +157,38 @@ impl AdmittedFence {
     ///
     /// Derives the mechanism caveats as `delegated ∪ closure` on the exec axis
     /// (a closure entry is inserted only into a restricted `Only(_)` scope — an
-    /// `All` axis already permits it), then refuses unless BOTH hold:
+    /// `All` axis already permits it), asks the backend to `project` what it will
+    /// actually install for those caveats, then refuses unless ALL hold:
     ///
-    /// 1. **L3 scope:** every axis of the derived mechanism caveats is
-    ///    `⊆ delegated ∪ closure` over the resolved lattice ([`admit`]). With
-    ///    the derivation above this holds by construction — the check is kept
-    ///    live so any future derivation change that widens beyond the declared
-    ///    closure refuses instead of shipping (computed, never asserted).
-    /// 2. **L4 strength:** every restricted axis of the *delegated* caveats
-    ///    meets the principal's per-axis floor under the governing mechanism
+    /// 1. **L3 harness-disjoint:** the backend-declared runtime closure touches
+    ///    no harness-private store and no undecidable axis
+    ///    ([`closure_is_harness_disjoint`]).
+    /// 2. **L3 scope (ruleset grain):** the backend's *resolved* authority — the
+    ///    conservative upper bound on what the installed fence permits a hostile
+    ///    child — is `⊆ delegated ∪ runtime_closure` over the resolved lattice
+    ///    ([`admit`]). This is the #317 fix: the operand is the backend's real
+    ///    projection ([`BackendProjection`]), not `from_delegated(mechanism_caveats)`,
+    ///    so authority the ruleset installs beyond the grant (Landlock's
+    ///    `base_read` loader/library trees; a symlinked grant root that resolves
+    ///    `Unknown`) is *seen* and either declared-and-admitted or refused —
+    ///    never silently permitted. Computed, never asserted.
+    /// 3. **L4 strength:** every restricted axis of the *delegated* caveats meets
+    ///    the principal's per-axis floor under the governing mechanism
     ///    ([`unenforceable_axis`]).
     ///
+    /// `project` is called with the derived mechanism caveats and returns the
+    /// backend's [`BackendProjection`]; it is the only place a `Sandbox`
+    /// participates, so this module stays free of any backend dependency.
+    ///
     /// # Errors
-    /// [`ToolError::Denied`] with the axis and relation (scope) or the typed
-    /// unmet-floor reason (strength).
+    /// [`ToolError::Denied`] with the axis and relation (scope), a harness-
+    /// disjointness violation, or the typed unmet-floor reason (strength).
     pub fn admit(
         delegated: &Caveats,
         closure: RuntimeClosure,
         mechanism: ConfinementMechanism,
         floor: EnforcementFloor,
+        project: impl FnOnce(&Caveats) -> BackendProjection,
     ) -> ToolResult<Self> {
         // THE one derivation (L2): delegated ∪ declared closure, exec axis.
         let mut mechanism_caveats = delegated.clone();
@@ -163,15 +196,31 @@ impl AdmittedFence {
             programs.extend(closure.exec.iter().cloned());
         }
 
-        // L3: computed scope bound. By construction this admits today; it is
-        // the live guard that keeps every future mechanism-derivation change
-        // inside `delegated ∪ closure`.
-        match scope_admission(&mechanism_caveats, delegated, &closure) {
+        // The backend's conservative projection of what it will ACTUALLY install
+        // for these mechanism caveats (ruleset grain), plus the harness-added
+        // substrate that projection rests on. Computed from the same routines the
+        // backend's `apply` uses, so projection and fence cannot drift.
+        let projection = project(&mechanism_caveats);
+
+        // L3 (a): the declared runtime closure must be harness-disjoint — it may
+        // rest on system loader/base-read substrate but never the harness's own
+        // stores, and never launder unbounded or undecidable authority.
+        if !closure_is_harness_disjoint(&projection.runtime_closure) {
+            return Err(ToolError::denied(
+                "refusing to spawn: the backend runtime closure reaches harness-private \
+                 authority or an undecidable axis (L3 BOUND: closure must be harness-disjoint)",
+            ));
+        }
+
+        // L3 (b): computed ruleset-grain scope bound — the conservative resolved
+        // authority ⊆ delegated ∪ runtime_closure. Superset/Incomparable/Unknown
+        // refuse fail-closed (L7), independent of enforcement strength.
+        match admit(&projection.resolved, delegated, &projection.runtime_closure) {
             AdmissionDecision::Admit => {}
             AdmissionDecision::Reject(reject) => {
                 return Err(ToolError::denied(format!(
-                    "refusing to spawn: mechanism authority on the {:?} axis is {} the \
-                     delegated grant ∪ declared closure (L3 BOUND)",
+                    "refusing to spawn: backend authority on the {:?} axis is {} the \
+                     delegated grant ∪ declared runtime closure (L3 BOUND)",
                     reject.axis,
                     match reject.relation {
                         ScopeRelation::Superset => "a WIDENING of",
@@ -227,7 +276,7 @@ pub(crate) fn canonical_closure_program(program: &str) -> ToolResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provenance::ConfinedAxis;
+    use crate::provenance::empty_closure;
     use crate::{AxisEnforcement, ChildNetworkPolicy, SandboxKind};
 
     fn exec_only(programs: &[&str]) -> Caveats {
@@ -245,39 +294,108 @@ mod tests {
         ConfinementMechanism::new(SandboxKind::None, ChildNetworkPolicy::LandlockOnly)
     }
 
-    // ── L3: the scope admission catches the audit's bug class ────────────────
+    fn exec_scope(programs: &[&str]) -> ResolvedScope {
+        ResolvedScope::concrete(programs.iter().map(|s| s.to_string()))
+    }
 
-    #[test]
-    fn a_mechanism_widening_not_declared_in_the_closure_is_refused() {
-        // The OLD bug, reconstructed: the mechanism copy silently carries an
-        // executable (the worker) that neither the grant nor any declared
-        // closure names. The scope admission must call it a Superset.
-        let delegated = exec_only(&["/usr/bin/git"]);
-        let mut widened = delegated.clone();
-        if let Scope::Only(p) = &mut widened.exec {
-            p.insert("/opt/worker".into());
-        }
-        match scope_admission(&widened, &delegated, &RuntimeClosure::empty()) {
-            AdmissionDecision::Reject(reject) => {
-                assert_eq!(reject.axis, ConfinedAxis::Exec);
-                assert_eq!(reject.relation, ScopeRelation::Superset);
-            }
-            AdmissionDecision::Admit => panic!("an undeclared widening must refuse"),
+    /// A faithful projector: the fence installs exactly the (derived) caveats and
+    /// declares no substrate — L3 admits by construction, isolating L2/L4.
+    fn identity_projection(caveats: &Caveats) -> BackendProjection {
+        BackendProjection {
+            resolved: ResolvedAuthority::from_delegated(caveats),
+            runtime_closure: empty_closure(),
         }
     }
 
-    #[test]
-    fn the_same_widening_is_admitted_when_the_closure_declares_it() {
-        let delegated = exec_only(&["/usr/bin/git"]);
-        let mut widened = delegated.clone();
-        if let Scope::Only(p) = &mut widened.exec {
-            p.insert("/opt/worker".into());
+    /// A faithful projector that DECLARES a folded trusted-worker exec entry in
+    /// its runtime closure — mirroring a real allowlist backend (the resolved
+    /// program image is both installed and declared).
+    fn worker_projection(worker: &'static str) -> impl Fn(&Caveats) -> BackendProjection {
+        move |caveats: &Caveats| BackendProjection {
+            resolved: ResolvedAuthority::from_delegated(caveats),
+            runtime_closure: ResolvedAuthority {
+                exec: exec_scope(&[worker]),
+                ..empty_closure()
+            },
         }
-        let closure = RuntimeClosure::empty().with_exec("/opt/worker").unwrap();
-        assert!(matches!(
-            scope_admission(&widened, &delegated, &closure),
-            AdmissionDecision::Admit
-        ));
+    }
+
+    // ── L3 (ruleset grain): the PROJECTION catches a widening the caveats hide ─
+
+    #[test]
+    fn a_backend_widening_beyond_the_declared_closure_is_refused() {
+        // The #317 bug class at ruleset grain: the fence resolves to permit a
+        // program (`/opt/extra`) the grant never named and no closure declares.
+        // The conservative projection surfaces it; admission calls it a Superset —
+        // the OLD `from_delegated(mechanism_caveats)` operand was blind to it.
+        let delegated = exec_only(&["/usr/bin/git"]);
+        let project = |caveats: &Caveats| BackendProjection {
+            resolved: ResolvedAuthority {
+                exec: exec_scope(&["/usr/bin/git", "/opt/extra"]),
+                ..ResolvedAuthority::from_delegated(caveats)
+            },
+            runtime_closure: empty_closure(),
+        };
+        let err = AdmittedFence::admit(
+            &delegated,
+            RuntimeClosure::empty(),
+            mechanism_none(),
+            advisory_floor(),
+            project,
+        )
+        .unwrap_err();
+        let ToolError::Denied { reason } = err else {
+            panic!("expected a denial")
+        };
+        assert!(
+            reason.contains("Exec") && reason.contains("WIDENING"),
+            "an undeclared ruleset widening must refuse as a Superset: {reason}"
+        );
+    }
+
+    #[test]
+    fn the_same_widening_is_admitted_when_the_runtime_closure_declares_it() {
+        let delegated = exec_only(&["/usr/bin/git"]);
+        let project = |caveats: &Caveats| BackendProjection {
+            resolved: ResolvedAuthority {
+                exec: exec_scope(&["/usr/bin/git", "/opt/extra"]),
+                ..ResolvedAuthority::from_delegated(caveats)
+            },
+            runtime_closure: ResolvedAuthority {
+                exec: exec_scope(&["/opt/extra"]),
+                ..empty_closure()
+            },
+        };
+        assert!(AdmittedFence::admit(
+            &delegated,
+            RuntimeClosure::empty(),
+            mechanism_none(),
+            advisory_floor(),
+            project,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn an_unknown_resolved_axis_fails_closed_even_under_top_delegation() {
+        // A backend that cannot honestly bound an axis returns Unknown; admission
+        // refuses even under a top delegation (L7) — the live E1/E3 posture.
+        let delegated = Caveats::top();
+        let project = |caveats: &Caveats| BackendProjection {
+            resolved: ResolvedAuthority {
+                net: ResolvedScope::Unknown,
+                ..ResolvedAuthority::from_delegated(caveats)
+            },
+            runtime_closure: empty_closure(),
+        };
+        assert!(AdmittedFence::admit(
+            &delegated,
+            RuntimeClosure::empty(),
+            mechanism_none(),
+            advisory_floor(),
+            project,
+        )
+        .is_err());
     }
 
     // ── L2: one derivation — admit() output IS the applied caveats ───────────
@@ -286,8 +404,14 @@ mod tests {
     fn admitted_mechanism_caveats_are_the_grant_plus_exactly_the_declared_closure() {
         let delegated = exec_only(&["/usr/bin/git"]);
         let closure = RuntimeClosure::empty().with_exec("/opt/worker").unwrap();
-        let admitted =
-            AdmittedFence::admit(&delegated, closure, mechanism_none(), advisory_floor()).unwrap();
+        let admitted = AdmittedFence::admit(
+            &delegated,
+            closure,
+            mechanism_none(),
+            advisory_floor(),
+            worker_projection("/opt/worker"),
+        )
+        .unwrap();
         assert_eq!(
             admitted.mechanism_caveats().exec,
             Scope::only(["/usr/bin/git".to_string(), "/opt/worker".to_string()])
@@ -303,12 +427,18 @@ mod tests {
         // and the derivation must not manufacture a restriction.
         let delegated = Caveats::top();
         let closure = RuntimeClosure::empty().with_exec("/opt/worker").unwrap();
-        let admitted =
-            AdmittedFence::admit(&delegated, closure, mechanism_none(), advisory_floor()).unwrap();
+        let admitted = AdmittedFence::admit(
+            &delegated,
+            closure,
+            mechanism_none(),
+            advisory_floor(),
+            identity_projection,
+        )
+        .unwrap();
         assert_eq!(admitted.mechanism_caveats().exec, Scope::top());
     }
 
-    // ── Harness-disjointness: the closure can never open the harness's stores ─
+    // ── Harness-disjointness: neither door can open the harness's stores ──────
 
     #[test]
     fn a_closure_entry_reaching_a_harness_private_store_is_refused() {
@@ -328,11 +458,52 @@ mod tests {
             .is_ok());
     }
 
+    #[test]
+    fn a_backend_runtime_closure_reaching_a_harness_store_refuses_at_admission() {
+        // The whole-closure guard: even a backend-declared closure (not the exec
+        // ledger) that reaches `.newt` is refused before the scope check.
+        let delegated = exec_only(&["/usr/bin/git"]);
+        let project = |_caveats: &Caveats| BackendProjection {
+            resolved: ResolvedAuthority::from_delegated(&exec_only(&["/usr/bin/git"])),
+            runtime_closure: ResolvedAuthority {
+                fs_read: exec_scope(&["/home/u/.newt/ocap-store"]),
+                ..empty_closure()
+            },
+        };
+        let err = AdmittedFence::admit(
+            &delegated,
+            RuntimeClosure::empty(),
+            mechanism_none(),
+            advisory_floor(),
+            project,
+        )
+        .unwrap_err();
+        let ToolError::Denied { reason } = err else {
+            panic!("expected a denial")
+        };
+        assert!(
+            reason.contains("harness-private"),
+            "a closure reaching the harness store must refuse: {reason}"
+        );
+    }
+
+    #[test]
+    fn closure_is_harness_disjoint_flags_unbounded_and_private() {
+        assert!(closure_is_harness_disjoint(&empty_closure()));
+        let mut private = empty_closure();
+        private.fs_read = exec_scope(&["/home/u/.ssh/id_ed25519"]);
+        assert!(!closure_is_harness_disjoint(&private));
+        let mut unbounded = empty_closure();
+        unbounded.exec = ResolvedScope::Unbounded;
+        assert!(!closure_is_harness_disjoint(&unbounded));
+    }
+
     // ── L4 still enforced through the same admission door ────────────────────
 
     #[test]
     fn the_strength_floor_still_refuses_through_admit() {
-        // A kernel floor under a `None` mechanism must refuse (no backend).
+        // A kernel floor under a `None` mechanism must refuse (no backend). The
+        // projection admits at L3 (identity), isolating the L4 strength refusal.
         let delegated = Caveats {
             fs_read: Scope::only(["/repo".to_string()]),
             ..Caveats::top()
@@ -342,6 +513,7 @@ mod tests {
             RuntimeClosure::empty(),
             mechanism_none(),
             EnforcementFloor::from_scalar(AxisEnforcement::Kernel),
+            identity_projection,
         );
         assert!(err.is_err(), "kernel floor with no backend must refuse");
     }
