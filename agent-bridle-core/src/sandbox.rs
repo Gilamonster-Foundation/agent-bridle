@@ -110,6 +110,34 @@ pub trait Sandbox: Send + Sync {
         let _ = effective;
         Ok(Vec::new())
     }
+
+    /// A **conservative upper bound** on the authority this backend/mechanism
+    /// stack can actually deliver to a *hostile* child, per axis — NOT a
+    /// projection of the rules we intend to install (I15 / INV-BOUND, the grain
+    /// corollary). A known mechanism bypass — `io_uring` egress under `net:none`,
+    /// an ambient Mach network deputy, an executable process image outside the
+    /// exec grant, a symlinked grant root, a DACL that necessarily confers read
+    /// on a write grant — MUST be reflected here as [`ResolvedScope::Unknown`] (or
+    /// a `Superset`/`Unbounded` scope) on the affected axis, so mesh admission
+    /// (`resolved ⊑ delegated ∪ closure`) fails closed. This is the operand the
+    /// spawn-path scope check consumes; it is never `ResolvedAuthority::from_delegated`
+    /// (which merely lifts the caveats verbatim and re-asserts the fidelity the
+    /// audit disputed).
+    ///
+    /// **Fail-closed default:** every axis is `Unknown` (honest ignorance ⇒
+    /// refuse). A backend that has not yet implemented a faithful bound therefore
+    /// refuses any restricted grant rather than silently admitting it — the
+    /// conservative rule applied to the trait itself. Each concrete backend
+    /// overrides this with the authority it can actually be shown to enforce.
+    fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        let _ = effective;
+        crate::ResolvedAuthority {
+            fs_read: crate::ResolvedScope::Unknown,
+            fs_write: crate::ResolvedScope::Unknown,
+            exec: crate::ResolvedScope::Unknown,
+            net: crate::ResolvedScope::Unknown,
+        }
+    }
 }
 
 /// The no-backend sandbox: applies nothing and reports [`SandboxKind::None`].
@@ -128,6 +156,84 @@ impl Sandbox for NoopSandbox {
         // Intentionally a no-op: the advisory default. Real kernel enforcement
         // lives in `LandlockSandbox` (Linux + `linux-landlock`).
         Ok(())
+    }
+
+    fn resolved_authority(&self, _effective: &Caveats) -> crate::ResolvedAuthority {
+        // Noop confines nothing, so it can deliver EVERYTHING on every axis:
+        // the conservative upper bound is `Unbounded`. Any restricted (`Only(_)`)
+        // grant is then a `Superset` of what was delegated ⇒ admission refuses —
+        // a Noop backend can never satisfy a CONFINED contract.
+        crate::ResolvedAuthority {
+            fs_read: crate::ResolvedScope::Unbounded,
+            fs_write: crate::ResolvedScope::Unbounded,
+            exec: crate::ResolvedScope::Unbounded,
+            net: crate::ResolvedScope::Unbounded,
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolved_authority_foundation_tests {
+    //! PR-0 foundation: the conservative-upper-bound contract at the trait level
+    //! (I15 / INV-BOUND). Per-backend faithful bounds land in follow-up slices;
+    //! here we pin that the *defaults* fail closed, so no backend can silently
+    //! admit a restricted grant it has not been shown to enforce.
+    use super::{NoopSandbox, Sandbox, SandboxKind};
+    use crate::{
+        admit, empty_closure, AdmissionDecision, Caveats, ResolvedScope, Scope, ToolResult,
+    };
+
+    fn exec_only(program: &str) -> Caveats {
+        Caveats {
+            exec: Scope::only([program.to_string()]),
+            ..Caveats::top()
+        }
+    }
+
+    #[test]
+    fn unimplemented_backend_default_is_unknown_and_fails_closed() {
+        // A Sandbox that does NOT override resolved_authority inherits the
+        // all-Unknown default, so admission refuses any restricted grant.
+        struct Bare;
+        impl Sandbox for Bare {
+            fn kind(&self) -> SandboxKind {
+                SandboxKind::None
+            }
+            fn apply(&self, _e: &Caveats) -> ToolResult<()> {
+                Ok(())
+            }
+        }
+        let effective = exec_only("git");
+        let resolved = Bare.resolved_authority(&effective);
+        assert_eq!(resolved.exec, ResolvedScope::Unknown);
+        assert!(matches!(
+            admit(&resolved, &effective, &empty_closure()),
+            AdmissionDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn noop_backend_is_unbounded_and_refuses_restricted_grants() {
+        let effective = exec_only("git");
+        let resolved = NoopSandbox.resolved_authority(&effective);
+        assert_eq!(resolved.exec, ResolvedScope::Unbounded);
+        assert!(matches!(
+            admit(&resolved, &effective, &empty_closure()),
+            AdmissionDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn an_unrestricted_grant_admits_even_against_an_unbounded_backend() {
+        // top() is All on every axis; nothing is restricted, so an Unbounded
+        // resolved authority is Subset/Equal of the (unbounded) delegated bound
+        // ⇒ admit. The conservative rule only bites RESTRICTED axes.
+        let effective = Caveats::top();
+        let resolved = NoopSandbox.resolved_authority(&effective);
+        assert!(matches!(
+            admit(&resolved, &effective, &empty_closure()),
+            AdmissionDecision::Admit
+        ));
     }
 }
 
