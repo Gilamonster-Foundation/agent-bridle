@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use crate::{
     best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AdmittedFence,
-    AxisEnforcement, Caveats, ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind,
-    SandboxPolicy, ToolContext, ToolError, ToolResult,
+    AxisEnforcement, BackendProjection, Caveats, ConfinementMechanism, EnforcementFloor,
+    RuntimeClosure, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
 };
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
@@ -543,13 +543,39 @@ impl ConfinedCommand {
         // class), and checks the per-axis strength floor (L4). What it returns
         // is the object the sandbox applies below; nothing is re-derived after
         // admission (L2 non-equivocation).
-        let admitted = AdmittedFence::admit(&effective, closure, mechanism, cx.strength_floor())
-            .map_err(|e| match e {
-                ToolError::Denied { reason } => {
-                    ToolError::denied(format!("{reason} (program: {:?})", self.program))
+        let admitted = AdmittedFence::admit(
+            &effective,
+            closure,
+            mechanism,
+            cx.strength_floor(),
+            |mechanism_caveats| {
+                // The backend's CONSERVATIVE projection of what it will actually
+                // install for these caveats (ruleset grain, Q2 anti-drift: the
+                // same routines `apply` uses) plus the harness-added substrate the
+                // resolution rests on. This is the #317 fix — admission now sees
+                // authority the ruleset installs beyond the grant (Landlock's
+                // `base_read` loader/library trees; a symlinked grant root that
+                // resolves `Unknown`) instead of the caveats-grain blind spot.
+                //
+                // Net stays caveats-grain for THIS slice: the faithful net
+                // projection (ADR-0015 loopback exactness + the E3 io_uring
+                // residual) lands with the io_uring egress floor (PR-1). Wiring the
+                // placeholder net projection here would over-refuse legit loopback
+                // grants, so net admission is byte-identical to prior behaviour.
+                let mut resolved = sandbox.resolved_authority(mechanism_caveats);
+                resolved.net = crate::ResolvedAuthority::from_delegated(mechanism_caveats).net;
+                BackendProjection {
+                    resolved,
+                    runtime_closure: sandbox.runtime_closure(mechanism_caveats),
                 }
-                other => other,
-            })?;
+            },
+        )
+        .map_err(|e| match e {
+            ToolError::Denied { reason } => {
+                ToolError::denied(format!("{reason} (program: {:?})", self.program))
+            }
+            other => other,
+        })?;
         let mechanism_effective = admitted.mechanism_caveats().clone();
 
         // For a wrapper-based backend (Seatbelt/AppContainer) this is the argv
@@ -1577,6 +1603,21 @@ mod tests {
         );
     }
 
+    /// A test projector that admits at L3 by declaring exactly the mechanism's
+    /// (folded) exec authority as its runtime closure — isolating the exec-fold /
+    /// mechanism-caveats behaviour these tests assert from the scope check (these
+    /// mechanisms have no faithful `resolved_authority` on Linux yet, so a real
+    /// projection would fail closed and hide what is under test).
+    fn worker_admitting_projection(mechanism_caveats: &Caveats) -> BackendProjection {
+        BackendProjection {
+            resolved: crate::ResolvedAuthority::from_delegated(mechanism_caveats),
+            runtime_closure: crate::ResolvedAuthority {
+                exec: crate::ResolvedScope::from_scope(&mechanism_caveats.exec),
+                ..crate::provenance::empty_closure()
+            },
+        }
+    }
+
     /// Trusted-worker launch configuration must not erase AppContainer's
     /// deny-all signal. The AppContainer launcher starts the worker itself, then
     /// `--no-child-process` confines what that worker may spawn. This is pure and
@@ -1606,6 +1647,7 @@ mod tests {
                 crate::ChildNetworkPolicy::LandlockOnly,
             ),
             EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+            worker_admitting_projection,
         )
         .expect("AppContainer admission")
         .mechanism_caveats()
@@ -1650,6 +1692,7 @@ mod tests {
                 closure,
                 ConfinementMechanism::new(kind, crate::ChildNetworkPolicy::LandlockOnly),
                 EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+                worker_admitting_projection,
             )
             .expect("allowlist admission")
             .mechanism_caveats()
@@ -1698,12 +1741,13 @@ mod tests {
             eprintln!("skipping env-scrub test: no env(1) found");
             return;
         };
-        // fs_write unrestricted (env(1) writes only to its stdout pipe, not the
-        // filesystem), exec pinned to env.
-        let cx = ctx(Caveats {
-            exec: Scope::only(["env".to_string()]),
-            ..Caveats::top()
-        });
+        // Env scrubbing is a spawn-level `env_clear` — independent of any sandbox
+        // backend. Grant fully-unrestricted caveats so the assertion isolates the
+        // scrub: a restricted axis (e.g. `exec: Only`) under the default Noop
+        // backend now correctly fails closed (the backend cannot bound it), which
+        // is the sibling `restrictive_write_refused_when_no_sandbox_available`
+        // contract and unrelated to what this test checks.
+        let cx = ctx(Caveats::top());
         let spawned = ConfinedCommand::new(env_bin)
             .env("ALLOWED", "yes")
             .stdout(Stdio::piped())

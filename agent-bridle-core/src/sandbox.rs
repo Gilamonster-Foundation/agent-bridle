@@ -145,7 +145,8 @@ pub trait Sandbox: Send + Sync {
     /// runtime substrate (the loader, library/system-data read base, the resolved
     /// image of a granted program, device sinks) but MUST be disjoint from
     /// harness-private authority (secrets, keys, control sockets, the authority/
-    /// provenance store) — see [`closure_is_harness_disjoint`]. The default
+    /// provenance store) — see [`crate::admitted::closure_is_harness_disjoint`],
+    /// the one canonical guard `AdmittedFence::admit` applies. The default
     /// declares nothing (`empty_closure`); each backend overrides with the
     /// substrate it actually adds, so a *legitimate* grant admits as `Subset`
     /// while an undeclared widening still refuses.
@@ -153,46 +154,6 @@ pub trait Sandbox: Send + Sync {
         let _ = effective;
         crate::empty_closure()
     }
-}
-
-/// Path fragments naming harness-private authority a runtime closure must NEVER
-/// declare (readability would let a hostile child impersonate/steer/become the
-/// harness). The runtime-closure rule is `closure ∩ HarnessPrivateAuthority = ∅`
-/// — system runtime/loader/base-image reads are fine; these are not.
-//
-// Consumed by the `scope_admission` gate in the final PR-0 slice (the
-// `resolved_authority`/`runtime_closure` operand swap onto `spawn_authorized`);
-// until then it is exercised only by the conservative-projection tests. Kept as
-// the validated foundation rather than deferred so the invariant is reviewable now.
-#[allow(dead_code)]
-pub(crate) const HARNESS_PRIVATE_AUTHORITY: &[&str] = &[
-    ".newt",      // harness state + OCAP/authority/provenance store
-    ".ssh",       // SSH keys
-    ".gnupg",     // signing keys
-    ".aws",       // provider secrets
-    ".config/gh", // provider token
-];
-
-/// Whether a runtime closure is disjoint from harness-private authority on the
-/// authority-bearing axes (fs_read/fs_write/exec) — the construction-time
-/// invariant. A closure concrete path that reaches a harness-private store fails.
-//
-// Wired into `scope_admission` in the final PR-0 slice; see the note on
-// `HARNESS_PRIVATE_AUTHORITY`.
-#[allow(dead_code)]
-pub(crate) fn closure_is_harness_disjoint(closure: &crate::ResolvedAuthority) -> bool {
-    use crate::ResolvedScope;
-    let axis_ok = |scope: &ResolvedScope| match scope {
-        ResolvedScope::Bounded { concrete, .. } => concrete.iter().all(|entry| {
-            !HARNESS_PRIVATE_AUTHORITY
-                .iter()
-                .any(|marker| entry.split('/').any(|seg| seg == *marker) || entry.ends_with(marker))
-        }),
-        // Unbounded/Unknown closures are never emitted by a backend and would
-        // authorize everything — reject them here as non-disjoint by definition.
-        ResolvedScope::Unbounded | ResolvedScope::Unknown => false,
-    };
-    axis_ok(&closure.fs_read) && axis_ok(&closure.fs_write) && axis_ok(&closure.exec)
 }
 
 /// The no-backend sandbox: applies nothing and reports [`SandboxKind::None`].
@@ -1468,12 +1429,12 @@ pub(crate) mod landlock_impl {
         fn runtime_closure_is_harness_disjoint() {
             let delegated = fs_read_only("/tmp");
             let closure = LandlockSandbox::new().runtime_closure(&delegated);
-            assert!(crate::sandbox::closure_is_harness_disjoint(&closure));
+            assert!(crate::admitted::closure_is_harness_disjoint(&closure));
             let mut bad = closure;
             if let ResolvedScope::Bounded { concrete, .. } = &mut bad.fs_read {
                 concrete.insert("/home/agent/.newt/ocap/state".to_string());
             }
-            assert!(!crate::sandbox::closure_is_harness_disjoint(&bad));
+            assert!(!crate::admitted::closure_is_harness_disjoint(&bad));
         }
     }
 }
