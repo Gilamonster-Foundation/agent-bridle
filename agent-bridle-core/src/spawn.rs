@@ -549,6 +549,23 @@ impl ConfinedCommand {
             mechanism,
             cx.strength_floor(),
             |mechanism_caveats| {
+                // The no-op backend enforces NOTHING, so it has no enforced scope to
+                // bound-check: L3 is vacuous for it (identity projection ⇒ resolved =
+                // delegated ⇒ Equal ⇒ admit). Whether running with no OS confinement
+                // is acceptable is the STRENGTH floor's decision (L4), which still
+                // refuses e.g. a Kernel-floored restriction under Noop. This is what
+                // lets the Brush worker legitimately spawn under Noop + an Advisory OS
+                // floor — brush-ocap provides the in-process confinement; the OS
+                // sandbox is best-effort defense-in-depth, not the mechanism relied
+                // upon. Every backend that ACTUALLY confines (Landlock, and the
+                // wrapper backends once their projections land) gets full L3.
+                if kind == SandboxKind::None {
+                    return BackendProjection {
+                        resolved: crate::ResolvedAuthority::from_delegated(mechanism_caveats),
+                        runtime_closure: crate::empty_closure(),
+                    };
+                }
+
                 // The backend's CONSERVATIVE projection of what it will actually
                 // install for these caveats (ruleset grain, Q2 anti-drift: the
                 // same routines `apply` uses) plus the harness-added substrate the
@@ -1728,6 +1745,56 @@ mod tests {
         );
     }
 
+    /// The no-op backend enforces nothing, so it is EXEMPT from the L3 scope
+    /// check — there is no enforced scope to bound. Whether "no OS confinement"
+    /// is acceptable is the STRENGTH floor's decision (L4). So a restricted EXEC
+    /// grant admits under the default floor (exec floor = Advisory) — the
+    /// Brush-worker-under-Noop lane, where brush-ocap is the real mechanism and
+    /// the OS sandbox is best-effort defense-in-depth — while a restricted
+    /// FS_WRITE grant still refuses (fs floor = Kernel). L3 must not double-refuse
+    /// what L4 already governs; regression guard for the PR-0b ruleset-grain wiring.
+    ///
+    /// Only meaningful when NO OS backend is compiled in (else the selected
+    /// backend is Landlock/Seatbelt/AppContainer, which genuinely enforces the
+    /// restriction and admits/refuses on its own merits) — same gate as
+    /// `restrictive_write_refused_when_no_sandbox_available`.
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "linux-landlock"),
+        all(target_os = "macos", feature = "macos-seatbelt"),
+        all(target_os = "windows", feature = "windows-appcontainer")
+    )))]
+    #[test]
+    fn noop_is_exempt_from_l3_but_l4_still_governs() {
+        let true_bin = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|p| Path::new(p).exists());
+        let Some(true_bin) = true_bin else {
+            eprintln!("skipping: no true(1) found");
+            return;
+        };
+        // Restricted exec + Advisory exec floor (default) ⇒ admits under Noop.
+        let cx = ctx(Caveats {
+            exec: Scope::only([true_bin.to_string()]),
+            ..Caveats::top()
+        });
+        assert!(
+            ConfinedCommand::new(true_bin).spawn(&cx).is_ok(),
+            "restricted exec under Noop with an Advisory exec floor must admit (brush lane)"
+        );
+        // Restricted fs_write + Kernel fs floor (default) ⇒ still refuses (L4).
+        let cx = ctx(Caveats {
+            fs_write: Scope::only(["/tmp/x".to_string()]),
+            ..Caveats::top()
+        });
+        assert!(
+            matches!(
+                ConfinedCommand::new(true_bin).spawn(&cx),
+                Err(ToolError::Denied { .. })
+            ),
+            "restricted fs_write under Noop with a Kernel floor must still refuse (L4)"
+        );
+    }
+
     /// The environment is scrubbed: only granted vars reach the child, nothing
     /// ambient (e.g. the parent's `HOME`) leaks. Uses a piped stdout to read the
     /// child's view of its own environment.
@@ -1741,13 +1808,15 @@ mod tests {
             eprintln!("skipping env-scrub test: no env(1) found");
             return;
         };
-        // Env scrubbing is a spawn-level `env_clear` — independent of any sandbox
-        // backend. Grant fully-unrestricted caveats so the assertion isolates the
-        // scrub: a restricted axis (e.g. `exec: Only`) under the default Noop
-        // backend now correctly fails closed (the backend cannot bound it), which
-        // is the sibling `restrictive_write_refused_when_no_sandbox_available`
-        // contract and unrelated to what this test checks.
-        let cx = ctx(Caveats::top());
+        // fs_write unrestricted (env(1) writes only to its stdout pipe, not the
+        // filesystem), exec pinned to env. Under the default Noop backend this
+        // admits: the no-op backend is exempt from the L3 scope check (it enforces
+        // nothing), and the default exec floor is Advisory, so L4 admits too —
+        // exactly the Brush-worker-under-Noop lane.
+        let cx = ctx(Caveats {
+            exec: Scope::only(["env".to_string()]),
+            ..Caveats::top()
+        });
         let spawned = ConfinedCommand::new(env_bin)
             .env("ALLOWED", "yes")
             .stdout(Stdio::piped())
