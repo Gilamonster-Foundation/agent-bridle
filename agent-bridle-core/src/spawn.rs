@@ -35,9 +35,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AxisEnforcement, Caveats,
-    ConfinementMechanism, EnforcementFloor, SandboxKind, SandboxPolicy, ToolContext, ToolError,
-    ToolResult,
+    best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AdmittedFence,
+    AxisEnforcement, Caveats, ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind,
+    SandboxPolicy, ToolContext, ToolError, ToolResult,
 };
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
@@ -526,32 +526,37 @@ impl ConfinedCommand {
         // from the mechanism actually applied to the spawn.
         let mechanism = ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network);
 
-        // (2) Fail closed: a restricted axis the governing mechanism cannot enforce
-        // at the principal's PER-AXIS strength floor is a grant we'd be lying
-        // about. The typed reason names which axis, its required strength, and
-        // the strength actually delivered — never a generic "sandbox unavailable"
-        // when the code already knows the axis.
-        if let Some(unmet) = unenforceable_axis(&effective, mechanism, cx.strength_floor()) {
-            return Err(ToolError::denied(format!(
-                "refusing to spawn {:?}: {} (governing sandbox: {:?})",
-                self.program, unmet, reported_kind
-            )));
-        }
+        // (2) The declared runtime closure — the ONLY door for authority beyond
+        // the delegated grant. A fixed worker executable is an internal
+        // transition, not authority delegated to the model: allowlist-based
+        // kernel exec policies (Landlock/Seatbelt/rootfs/microVM) need its
+        // exact path declared so the boundary can launch it; AppContainer must
+        // instead preserve exec deny-all so its launcher applies the
+        // child-process block — so it declares nothing. Neither changes the
+        // reported/effective authority.
+        let closure = trusted_worker_closure(kind, authority, &self.program)?;
+
+        // (3) THE admission (L2+L3+L4, one object). `AdmittedFence::admit`
+        // derives the mechanism caveats (delegated ∪ declared closure) exactly
+        // once, computes the L3 scope bound over the resolved-authority lattice
+        // (an undeclared widening refuses as a Superset — the audit's bug
+        // class), and checks the per-axis strength floor (L4). What it returns
+        // is the object the sandbox applies below; nothing is re-derived after
+        // admission (L2 non-equivocation).
+        let admitted = AdmittedFence::admit(&effective, closure, mechanism, cx.strength_floor())
+            .map_err(|e| match e {
+                ToolError::Denied { reason } => {
+                    ToolError::denied(format!("{reason} (program: {:?})", self.program))
+                }
+                other => other,
+            })?;
+        let mechanism_effective = admitted.mechanism_caveats().clone();
 
         // For a wrapper-based backend (Seatbelt/AppContainer) this is the argv
         // prefix that confines the child; empty for thread-confining backends
         // (Landlock, via `apply`) and Noop. Computed here so a fail-closed wrapper
-        // error aborts *before* we spawn the thread.
-        // A fixed worker executable is an internal transition, not authority
-        // delegated to the model. Allowlist-based kernel exec policies need its
-        // exact path to launch it; AppContainer must instead preserve exec
-        // deny-all so its launcher applies the child-process block. Neither
-        // changes the reported/effective authority.
-        let mechanism_effective = if authority == SpawnAuthority::TrustedWorker {
-            trusted_worker_mechanism_caveats(kind, &effective, &self.program)?
-        } else {
-            effective.clone()
-        };
+        // error aborts *before* we spawn the thread. Built from the ADMITTED
+        // caveats — the same object `apply` consumes on the spawn thread.
         let prefix = sandbox.command_prefix(&mechanism_effective)?;
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
@@ -775,45 +780,42 @@ impl SandboxedWorker {
     }
 }
 
-/// Build the mechanism-only caveats for a trusted worker transition.
+/// The declared [`RuntimeClosure`] for a trusted worker transition — the only
+/// door by which the worker's executable reaches the mechanism's allow-list
+/// (it then flows through [`AdmittedFence::admit`]'s scope check like any
+/// other closure entry; nothing widens the mechanism caveats silently).
 ///
 /// Landlock, Seatbelt, and the identity-closing stronger tiers need the fixed
 /// worker executable in their kernel execute allow-list so the boundary can
-/// launch it. AppContainer is different: its launcher creates the worker as the
-/// initial confined process, and `exec: Only([])` must remain empty so
-/// `--no-child-process` is attached to that worker. Adding the worker path there
-/// would silently turn deny-all into a non-empty allow-list, disable the kernel
-/// child-process mitigation, and leave an `exec → Kernel` report overclaiming.
+/// launch it — those declare it. AppContainer is different: its launcher
+/// creates the worker as the initial confined process, and `exec: Only([])`
+/// must remain empty so `--no-child-process` is attached to that worker.
+/// Declaring the worker path there would silently turn deny-all into a
+/// non-empty allow-list, disable the kernel child-process mitigation, and
+/// leave an `exec → Kernel` report overclaiming — so it declares nothing.
 ///
-/// This changes mechanism configuration only; it never alters the effective
+/// A model-selected spawn declares nothing: the closure exists for internal
+/// transitions only, never for authority the model chose.
+///
+/// This shapes mechanism configuration only; it never alters the effective
 /// authority carried by `ToolContext` or the enforcement report.
-fn trusted_worker_mechanism_caveats(
+fn trusted_worker_closure(
     kind: SandboxKind,
-    effective: &Caveats,
+    authority: SpawnAuthority,
     program: &str,
-) -> ToolResult<Caveats> {
+) -> ToolResult<RuntimeClosure> {
+    if authority != SpawnAuthority::TrustedWorker {
+        return Ok(RuntimeClosure::empty());
+    }
     match kind {
         SandboxKind::Landlock
         | SandboxKind::Seatbelt
         | SandboxKind::MinimalRootfs
-        | SandboxKind::MicroVm => caveats_with_trusted_program(effective, program),
-        SandboxKind::AppContainer | SandboxKind::None => Ok(effective.clone()),
+        | SandboxKind::MicroVm => {
+            RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
+        }
+        SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
-}
-
-/// Add the exact trusted worker executable to an execute allow-list used by a
-/// mechanism that must authorize the initial worker launch.
-fn caveats_with_trusted_program(effective: &Caveats, program: &str) -> ToolResult<Caveats> {
-    let canonical = Path::new(program)
-        .canonicalize()
-        .map_err(|error| ToolError::denied(format!("cannot resolve trusted worker: {error}")))?
-        .to_string_lossy()
-        .into_owned();
-    let mut mechanism = effective.clone();
-    if let crate::Scope::Only(programs) = &mut mechanism.exec {
-        programs.insert(canonical);
-    }
-    Ok(mechanism)
 }
 
 #[cfg(target_os = "linux")]
@@ -1586,12 +1588,28 @@ mod tests {
             ..Caveats::top()
         };
 
-        let mechanism = trusted_worker_mechanism_caveats(
+        let closure = trusted_worker_closure(
             SandboxKind::AppContainer,
-            &exec_denied,
+            SpawnAuthority::TrustedWorker,
             "this-path-is-not-used-by-appcontainer",
         )
-        .expect("AppContainer mechanism caveats");
+        .expect("AppContainer trusted-worker closure");
+        assert!(
+            closure.is_empty(),
+            "AppContainer declares no exec closure — its launcher starts the worker"
+        );
+        let mechanism = AdmittedFence::admit(
+            &exec_denied,
+            closure,
+            ConfinementMechanism::new(
+                SandboxKind::AppContainer,
+                crate::ChildNetworkPolicy::LandlockOnly,
+            ),
+            EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+        )
+        .expect("AppContainer admission")
+        .mechanism_caveats()
+        .clone();
 
         assert!(
             crate::sandbox::exec_fully_denied(&mechanism),
@@ -1625,8 +1643,17 @@ mod tests {
             .into_owned();
 
         for kind in [SandboxKind::Landlock, SandboxKind::Seatbelt] {
-            let mechanism = trusted_worker_mechanism_caveats(kind, &exec_denied, &current)
-                .expect("allowlist mechanism caveats");
+            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
+                .expect("allowlist trusted-worker closure");
+            let mechanism = AdmittedFence::admit(
+                &exec_denied,
+                closure,
+                ConfinementMechanism::new(kind, crate::ChildNetworkPolicy::LandlockOnly),
+                EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+            )
+            .expect("allowlist admission")
+            .mechanism_caveats()
+            .clone();
             assert!(
                 matches!(&mechanism.exec, Scope::Only(programs) if programs.contains(&current)),
                 "{kind:?} must authorize the fixed worker executable"

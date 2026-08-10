@@ -40,8 +40,10 @@ pub mod net_proxy;
 // The operator-authz contract (newt-agent #1354): HumanPrincipal /
 // PrincipalBinding / PermissionChallenge / OperatorDecision. Public like
 // `policy` so consumers reach it as `agent_bridle::operator::…`.
+mod admitted;
 pub mod operator;
 pub mod policy;
+mod provenance;
 mod registry;
 mod report;
 #[cfg(target_os = "linux")]
@@ -52,6 +54,7 @@ mod step_up;
 mod tool;
 mod unbridle;
 
+pub use admitted::{AdmittedFence, RuntimeClosure};
 pub use config::{
     default_env_denylist, default_exec_path, fence_env, BackendToggles, BridleConfig, BridleMode,
     ChildNetworkPolicy, GatePolicy, HostMatch, LimitsPolicy, NetDefault, NetPolicy, NetRule,
@@ -62,10 +65,14 @@ pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use net_proxy::{start_egress_proxy, ProxyHandle};
+pub use provenance::{
+    admit, empty_closure, relate, AdmissionDecision, AdmissionReject, ConfinedAxis,
+    ResolvedAuthority, ResolvedScope, ScopeRelation,
+};
 pub use registry::{Grant, Registry, RegistryBuilder};
 pub use report::{
-    enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinedAxis,
-    ConfinementMechanism, EnforcementFloor, EnforcementReport, UnenforceableAxis,
+    enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
+    EnforcementFloor, EnforcementReport, UnenforceableAxis,
 };
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};

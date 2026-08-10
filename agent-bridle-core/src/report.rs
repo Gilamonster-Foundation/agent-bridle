@@ -568,24 +568,21 @@ impl Default for EnforcementFloor {
 }
 
 /// One of the four OS-confinement axes, used to name *which* axis fell below its
-/// floor in an [`UnenforceableAxis`] refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfinedAxis {
-    /// The `fs_read` filesystem axis.
-    FsRead,
-    /// The `fs_write` filesystem axis.
-    FsWrite,
-    /// The `net` network axis.
-    Net,
-    /// The `exec` / behavior axis.
-    Exec,
+/// floor in an [`UnenforceableAxis`] refusal. This is the MESH's axis type
+/// (`agent_mesh_protocol::ConfinedAxis`) — one axis vocabulary across the
+/// strength floor here and the scope admission in [`crate::provenance`].
+pub use agent_mesh_protocol::ConfinedAxis;
+
+/// Bridle-local axis helpers over the mesh's [`ConfinedAxis`] (an extension
+/// trait because the type now lives in `agent_mesh_protocol`).
+trait ConfinedAxisExt {
+    fn restricted_in(self, caveats: &Caveats) -> bool;
+    fn witness_in(self, report: &EnforcementReport) -> Option<AxisEnforcement>;
 }
 
-impl ConfinedAxis {
+impl ConfinedAxisExt for ConfinedAxis {
     /// Whether this axis is **restricted** (`Only(_)`) in `caveats`. An `All`
     /// (unrestricted) axis carries no confinement obligation.
-    #[must_use]
     fn restricted_in(self, caveats: &Caveats) -> bool {
         match self {
             ConfinedAxis::FsRead => is_restricted(&caveats.fs_read),
@@ -597,7 +594,6 @@ impl ConfinedAxis {
 
     /// This axis's witness in `report` (the strength the backend actually
     /// delivered), or `None` if the report carries no entry for it.
-    #[must_use]
     fn witness_in(self, report: &EnforcementReport) -> Option<AxisEnforcement> {
         match self {
             ConfinedAxis::FsRead => report.fs_read,
