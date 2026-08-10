@@ -870,6 +870,59 @@ pub(crate) mod landlock_impl {
         pub fn with_policy(policy: Arc<SandboxPolicy>) -> Self {
             Self { policy }
         }
+
+        // ── Shared root computation (ONE routine for both the applied ruleset and
+        // the resolved-authority projection — Q2 anti-drift: the projection cannot
+        // diverge from the fence because they call the same code). ──────────────
+
+        /// The write roots the ruleset anchors on: the granted write scope plus
+        /// the always-write-openable device sinks (#1220), existing paths only.
+        fn write_roots(&self, effective: &Caveats) -> Vec<String> {
+            let mut roots = scope_roots(&effective.fs_write);
+            roots.extend(self.policy.device_sink_paths.resolve());
+            roots.retain(|p| std::path::Path::new(p).exists());
+            roots
+        }
+
+        /// The read roots the ruleset anchors on when `fs_read` is restricted: the
+        /// granted read scope plus the base-read list plus, per exec-confinement,
+        /// either the resolved granted programs or the bin dirs, existing only.
+        fn read_roots(&self, effective: &Caveats, confine_exec: bool) -> Vec<String> {
+            let mut roots = scope_roots(&effective.fs_read);
+            roots.extend(self.policy.base_read_paths.resolve());
+            if confine_exec {
+                roots.extend(resolve_exec_paths(&effective.exec));
+            } else {
+                roots.extend(self.policy.bin_read_paths.resolve());
+            }
+            roots.retain(|p| std::path::Path::new(p).exists());
+            roots
+        }
+
+        /// The execute roots the ruleset anchors on when `exec` is restricted: the
+        /// resolved granted program files plus the dynamic linker(s), existing only.
+        fn exec_roots(&self, effective: &Caveats) -> Vec<String> {
+            let mut roots = resolve_exec_paths(&effective.exec);
+            roots.extend(self.policy.loader_paths.resolve());
+            roots.retain(|p| std::path::Path::new(p).exists());
+            roots
+        }
+    }
+
+    /// Whether every *grant-derived* root is an already-canonical, non-symlink
+    /// absolute path, so the Landlock rule (whose `PathFd` opens `O_PATH` and
+    /// FOLLOWS a final-component symlink — landlock-0.4.x) anchors on exactly the
+    /// named path and not a wider symlink target. A symlinked or non-canonical
+    /// grant root is NOT object-stable: for 0.8 the resolved authority on that axis
+    /// is `Unknown` ⇒ admission refuses (the E1 fail-closed posture; the same-object
+    /// FD bind that would let us honestly bound an aliased root is the PR-5 follow-up).
+    /// Policy-declared closures (base-read/loader/bin/device) are NOT checked here —
+    /// they are trusted, explicitly-declared runtime closure, not model-named roots.
+    fn grant_roots_are_object_stable(grant_roots: &[String]) -> bool {
+        grant_roots.iter().all(|p| match std::fs::canonicalize(p) {
+            Ok(canon) => canon.to_str() == Some(p.as_str()),
+            Err(_) => false,
+        })
     }
 
     impl Sandbox for LandlockSandbox {
@@ -902,14 +955,13 @@ pub(crate) mod landlock_impl {
                 handled |= AccessFs::Execute;
             }
 
-            let mut write_roots = scope_roots(&effective.fs_write);
             // #1220: the device sinks are always write-openable — a confined
             // git opening `/dev/null` O_RDWR must not be what the jail breaks.
             // (O_RDWR also needs the read right: ambient when `fs_read` is
             // `All`; granted via `base_read_paths` — which lists the same
-            // devices — when confined.)
-            write_roots.extend(self.policy.device_sink_paths.resolve());
-            write_roots.retain(|p| std::path::Path::new(p).exists());
+            // devices — when confined.) Built via the shared routine so the
+            // resolved-authority projection anchors on the identical set.
+            let write_roots = self.write_roots(effective);
             // Build the ruleset: fs axes first (V3 floor), then optionally the
             // net axis (V4+). BestEffort means handle_access silently skips
             // access types the kernel doesn't know — so on pre-6.7 kernels the
@@ -936,20 +988,12 @@ pub(crate) mod landlock_impl {
             let ruleset = if confine_read {
                 // Granted read roots + the loader/library/data base list, so a
                 // permitted binary loads while out-of-scope reads stay denied.
-                let mut read_roots = scope_roots(&effective.fs_read);
-                read_roots.extend(self.policy.base_read_paths.resolve());
-                // The program's own binary must be readable to load. When `exec`
-                // is confined, read-allow ONLY the resolved granted programs — so
-                // the bin dirs stay OUT of the trampoline corpus (`/usr/bin/curl`
-                // unreadable ⇒ not `ld.so`-trampolinable; ADR 0011 D3). When `exec`
-                // is ambient the program is unknown, so the bin dirs are
-                // read-allowed wholesale.
-                if confine_exec {
-                    read_roots.extend(resolve_exec_paths(&effective.exec));
-                } else {
-                    read_roots.extend(self.policy.bin_read_paths.resolve());
-                }
-                read_roots.retain(|p| std::path::Path::new(p).exists());
+                // Granted read roots + the base list + (per exec-confinement) the
+                // resolved granted programs or the bin dirs — via the shared
+                // routine so the resolved-authority projection anchors on the
+                // identical set (ADR 0011 D3: confined-exec keeps bin dirs OUT of
+                // the trampoline corpus).
+                let read_roots = self.read_roots(effective, confine_exec);
                 ruleset
                     .add_rules(path_beneath_rules(&read_roots, read))
                     .map_err(landlock_denied)?
@@ -963,9 +1007,7 @@ pub(crate) mod landlock_impl {
                 // expose `/usr/lib`'s interpreters). A permitted binary still runs
                 // (its own execve + the loader + .so reads), but cannot DIRECTLY
                 // execve a different, un-granted program.
-                let mut exec_roots = resolve_exec_paths(&effective.exec);
-                exec_roots.extend(self.policy.loader_paths.resolve());
-                exec_roots.retain(|p| std::path::Path::new(p).exists());
+                let exec_roots = self.exec_roots(effective);
                 ruleset
                     .add_rules(path_beneath_rules(&exec_roots, AccessFs::Execute))
                     .map_err(landlock_denied)?
@@ -993,6 +1035,74 @@ pub(crate) mod landlock_impl {
                 install_seccomp_egress_deny()?;
             }
             Ok(())
+        }
+
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            use crate::ResolvedScope;
+            use std::collections::BTreeSet;
+
+            let confine_read = matches!(effective.fs_read, Scope::Only(_));
+            let confine_write = matches!(effective.fs_write, Scope::Only(_));
+            let confine_exec = matches!(effective.exec, Scope::Only(_));
+
+            let bounded = |roots: Vec<String>| ResolvedScope::Bounded {
+                concrete: roots.into_iter().collect::<BTreeSet<String>>(),
+                classes: BTreeSet::new(),
+            };
+
+            // fs_read: `All` is ambient (Unbounded). Restricted ⇒ the read roots
+            // the ruleset ACTUALLY anchors on (shared routine) — UNLESS a
+            // grant-derived root is symlinked/non-canonical, in which case the
+            // kernel rule can anchor on a wider target (E1) and we cannot honestly
+            // bound it ⇒ Unknown (refuse; the same-object bind is PR-5).
+            let fs_read = if !confine_read {
+                ResolvedScope::Unbounded
+            } else if !grant_roots_are_object_stable(&scope_roots(&effective.fs_read)) {
+                ResolvedScope::Unknown
+            } else {
+                bounded(self.read_roots(effective, confine_exec))
+            };
+
+            // fs_write is always governed; the grant portion must be object-stable
+            // (same E1 concern) — writable symlink roots are the more dangerous case.
+            let fs_write = if confine_write
+                && !grant_roots_are_object_stable(&scope_roots(&effective.fs_write))
+            {
+                ResolvedScope::Unknown
+            } else if !confine_write {
+                ResolvedScope::Unbounded
+            } else {
+                bounded(self.write_roots(effective))
+            };
+
+            // exec: `resolve_exec_paths` canonicalizes (no grant-symlink issue).
+            // The bound is process-image identity — the resolved programs + the
+            // loader (the direct-execve corpus). The ld.so mmap-exec trampoline is
+            // out of scope for the exec axis by definition (arbitrary-code, not a
+            // process image; a separate future concern), so it is NOT a widening here.
+            let exec = if confine_exec {
+                bounded(self.exec_roots(effective))
+            } else {
+                ResolvedScope::Unbounded
+            };
+
+            // net: Landlock kernel-enforces only `net:none` (a TCP deny), and even
+            // that is bypassable off-box via io_uring UDP (E3), while host allow-
+            // lists are inexpressible. A RESTRICTED net axis therefore cannot be
+            // honestly bounded ⇒ Unknown (refuse) until the io_uring egress floor
+            // lands (PR-1). `All` is ambient (Unbounded), matching an `All` grant.
+            let net = if matches!(effective.net, Scope::All) {
+                ResolvedScope::Unbounded
+            } else {
+                ResolvedScope::Unknown
+            };
+
+            crate::ResolvedAuthority {
+                fs_read,
+                fs_write,
+                exec,
+                net,
+            }
         }
     }
 
@@ -1125,6 +1235,98 @@ pub(crate) mod landlock_impl {
 
     fn landlock_denied(e: impl std::fmt::Display) -> ToolError {
         ToolError::denied(format!("landlock: {e}"))
+    }
+
+    #[cfg(test)]
+    mod resolved_authority_tests {
+        //! Adversarial tests for the Landlock conservative-bound projection: the
+        //! confirmed escapes (E1 symlink root, E3 net:none io_uring) must resolve
+        //! to `Unknown`/`Superset` and refuse through mesh admission — the honest
+        //! upper bound, computed from the SAME routines `apply` uses.
+        use super::*;
+        use crate::{admit, empty_closure, AdmissionDecision, ResolvedScope};
+        use std::os::unix::fs::symlink;
+
+        fn fs_read_only(path: &str) -> Caveats {
+            Caveats {
+                fs_read: Scope::only([path.to_string()]),
+                ..Caveats::top()
+            }
+        }
+
+        /// E1, grounded: `grant_roots_are_object_stable` rejects a symlinked root
+        /// (canonical target ≠ literal) and accepts a real canonical directory.
+        #[test]
+        fn object_stability_flags_symlinked_grant_roots() {
+            let base = std::env::temp_dir().join(format!("ab-e1a-{}", std::process::id()));
+            let real = base.join("real");
+            let link = base.join("link");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&real).unwrap();
+            symlink("/", &link).unwrap();
+            let real_canon = std::fs::canonicalize(&real)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(grant_roots_are_object_stable(&[real_canon]));
+            assert!(!grant_roots_are_object_stable(&[link
+                .to_str()
+                .unwrap()
+                .to_string()]));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// E1 end-to-end: a symlinked read grant (`sub -> /`) resolves `fs_read`
+        /// to `Unknown`, so mesh admission refuses — the whole-tree-read escape
+        /// can never admit.
+        #[test]
+        fn e1_symlinked_read_grant_resolves_unknown_and_refuses() {
+            let base = std::env::temp_dir().join(format!("ab-e1b-{}", std::process::id()));
+            let link = base.join("sub");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            symlink("/", &link).unwrap();
+            let delegated = fs_read_only(link.to_str().unwrap());
+            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            assert_eq!(resolved.fs_read, ResolvedScope::Unknown);
+            assert!(matches!(
+                admit(&resolved, &delegated, &empty_closure()),
+                AdmissionDecision::Reject(_)
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// E3: `net:none` cannot be honestly bounded on Landlock (io_uring UDP
+        /// bypasses the `SYS_socket` seccomp deny), so `resolved.net = Unknown`
+        /// ⇒ refuse, until the io_uring egress floor lands (PR-1).
+        #[test]
+        fn e3_net_none_resolves_unknown_and_refuses() {
+            let delegated = Caveats {
+                net: Scope::only(Vec::<String>::new()),
+                ..Caveats::top()
+            };
+            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            assert_eq!(resolved.net, ResolvedScope::Unknown);
+            assert!(matches!(
+                admit(&resolved, &delegated, &empty_closure()),
+                AdmissionDecision::Reject(_)
+            ));
+        }
+
+        /// The conservative rule only bites RESTRICTED axes: an unrestricted grant
+        /// (`All` everywhere) resolves `Unbounded` and admits.
+        #[test]
+        fn unrestricted_grant_admits() {
+            let delegated = Caveats::top();
+            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            assert_eq!(resolved.net, ResolvedScope::Unbounded);
+            assert_eq!(resolved.fs_read, ResolvedScope::Unbounded);
+            assert!(matches!(
+                admit(&resolved, &delegated, &empty_closure()),
+                AdmissionDecision::Admit
+            ));
+        }
     }
 }
 
