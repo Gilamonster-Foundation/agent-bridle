@@ -42,6 +42,7 @@ pub mod net_proxy;
 // `policy` so consumers reach it as `agent_bridle::operator::…`.
 pub mod operator;
 pub mod policy;
+mod provenance;
 mod registry;
 mod report;
 #[cfg(target_os = "linux")]
@@ -62,6 +63,7 @@ pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
 pub use net_proxy::{start_egress_proxy, ProxyHandle};
+pub use provenance::{admit_scope, relation_admits, ResolvedScope, ScopeRelation};
 pub use registry::{Grant, Registry, RegistryBuilder};
 pub use report::{enforcement_report, fence_strength, AxisEnforcement, EnforcementReport};
 #[cfg(target_os = "linux")]
