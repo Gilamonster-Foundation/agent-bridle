@@ -154,6 +154,57 @@ async fn real_timed_out_grandchild_is_killed() {
     let _ = std::fs::remove_file(&done);
 }
 
+/// Exec-closure scope-fidelity, on real Seatbelt (model B — the #317 review): a
+/// grant of `sh` necessarily pulls `/bin/bash` into the kernel `process-exec*`
+/// allow-list (Apple's `/bin/sh` re-execs `/bin/bash`). This RECORDS the real
+/// authority and asserts the report agrees: from a confined `sh` (exec=Only{sh}),
+/// `/bin/bash` DOES run (it is in the closure — the widening beyond the literal
+/// Caveat), which is exactly why `enforcement.exec` is reported `interceptor`, not
+/// an exact Kernel witness. An un-granted, non-variant program (`/bin/cat`) stays
+/// kernel-denied, so the closure is bounded to {sh, bash}, not opened.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_seatbelt_exec_closure_includes_bash_but_not_unrelated() {
+    use agent_bridle_core::seatbelt_is_supported;
+    if !seatbelt_is_supported() {
+        return;
+    }
+    let bash = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "sh", "args": ["-c", "/bin/bash -c 'echo IN_CLOSURE'"]}),
+            &ctx(exec_only(&["sh"])),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(bash["sandbox_kind"], "seatbelt", "{bash}");
+    assert_eq!(
+        bash["enforcement"]["exec"], "interceptor",
+        "a granted sh pulls /bin/bash → exec is NOT an exact Kernel witness: {bash}"
+    );
+    assert!(
+        bash["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("IN_CLOSURE"),
+        "/bin/bash is in the exec closure of a granted sh (the widening): {bash}"
+    );
+    // An unrelated program stays kernel-denied: the closure is bounded to {sh,bash}.
+    let cat = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "sh", "args": ["-c", "/bin/cat /etc/hosts && echo CATRAN || echo CATDENIED"]}),
+            &ctx(exec_only(&["sh"])),
+        )
+        .await
+        .expect("invoke");
+    assert!(
+        !cat["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("CATRAN"),
+        "an un-granted, non-variant program must stay kernel-denied in the sh closure: {cat}"
+    );
+}
+
 /// #268 / AB-004: loader / interpreter / hook env vars are DROPPED before the
 /// child, regardless of the exec leash — they hijack what an allowed program
 /// actually executes. A non-denied var still passes through.

@@ -98,7 +98,9 @@ fn serve_one() -> Result<WorkerResponse, String> {
     };
     let tool = WorkerTool;
     let cx = Gate::new(generation)
-        .with_strength_floor(strength_floor)
+        // The delegated floor is per-axis (`EnforcementFloor`), re-applied
+        // faithfully so the worker's own confinement matches the supervisor's.
+        .with_enforcement_floor(strength_floor)
         .authorize(&tool, &caveats)
         .map_err(|error| format!("worker authorization failed: {error}"))?;
     run(payload, cx)

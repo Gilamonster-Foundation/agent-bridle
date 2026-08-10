@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::gate::DEFAULT_STRENGTH_FLOOR;
 use crate::{
-    AxisEnforcement, CallRequest, Caveats, CountBound, DischargeProvider, DischargeVerifier, Gate,
-    Invocation, SessionId, StepUpPolicy, Tool, ToolContext, ToolError, ToolResult,
+    AxisEnforcement, CallRequest, Caveats, CountBound, DischargeProvider, DischargeVerifier,
+    EnforcementFloor, Gate, Invocation, SessionId, StepUpPolicy, Tool, ToolContext, ToolError,
+    ToolResult,
 };
 
 /// The **shared, unforgeable mutable call budget** carried by a [`Grant`]
@@ -192,24 +192,57 @@ impl Registry {
         args: serde_json::Value,
         grant: &Grant,
     ) -> ToolResult<serde_json::Value> {
-        self.dispatch_with_strength_floor(name, args, grant, DEFAULT_STRENGTH_FLOOR)
+        self.dispatch_axis(name, args, grant, EnforcementFloor::DEFAULT)
             .await
     }
 
-    /// Dispatch `name` with an explicit minimum confinement strength.
-    ///
-    /// This is the strong-principal form of [`Self::dispatch`]. The selected
-    /// floor is stamped into the unforgeable [`crate::ToolContext`] at the
-    /// gate's mint site and follows delegated trusted-worker requests. A
-    /// subprocess boundary then refuses to launch if any restricted axis would
-    /// fall below that floor. This closes the gap between a host's prospective
-    /// enforcement check and the backend actually governing execution.
+    /// Dispatch `name` with an explicit minimum confinement strength (the
+    /// **scalar** form: filesystem always Kernel, exec/net take `strength_floor`,
+    /// via [`EnforcementFloor::from_scalar`]). A confined executor that wants the
+    /// exec axis accepted at the interceptor tier should call
+    /// [`Self::dispatch_with_enforcement_floor`] with
+    /// [`EnforcementFloor::CONFINED`] instead of a blanket scalar `Kernel`.
     pub async fn dispatch_with_strength_floor(
         &self,
         name: &str,
         args: serde_json::Value,
         grant: &Grant,
         strength_floor: AxisEnforcement,
+    ) -> ToolResult<serde_json::Value> {
+        self.dispatch_axis(
+            name,
+            args,
+            grant,
+            EnforcementFloor::from_scalar(strength_floor),
+        )
+        .await
+    }
+
+    /// Dispatch `name` with an explicit **per-axis** confinement floor.
+    ///
+    /// This is the strong-principal form of [`Self::dispatch`]. The selected
+    /// floor is stamped into the unforgeable [`crate::ToolContext`] at the
+    /// gate's mint site and follows delegated trusted-worker requests. A
+    /// subprocess boundary then refuses to launch if any restricted axis would
+    /// fall below its per-axis floor — with no fallback to a weaker backend for a
+    /// restricted axis. This closes the gap between a host's prospective
+    /// enforcement check and the backend actually governing execution.
+    pub async fn dispatch_with_enforcement_floor(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        grant: &Grant,
+        floor: EnforcementFloor,
+    ) -> ToolResult<serde_json::Value> {
+        self.dispatch_axis(name, args, grant, floor).await
+    }
+
+    async fn dispatch_axis(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        grant: &Grant,
+        floor: EnforcementFloor,
     ) -> ToolResult<serde_json::Value> {
         let tool = self
             .tools
@@ -223,7 +256,7 @@ impl Registry {
 
         // Authorize (generation / step-up / strength-floor). A pre-invoke error
         // means the tool never ran, so refund the charge unconditionally.
-        let cx = match self.authorize_grant(tool.as_ref(), grant.caveats(), name, strength_floor) {
+        let cx = match self.authorize_grant(tool.as_ref(), grant.caveats(), name, floor) {
             Ok(cx) => cx,
             Err(e) => {
                 grant.budget.refund();
@@ -274,17 +307,35 @@ impl Registry {
         args: serde_json::Value,
         caveats: &Caveats,
     ) -> ToolResult<serde_json::Value> {
-        self.dispatch_oneshot_with_strength_floor(name, args, caveats, DEFAULT_STRENGTH_FLOOR)
+        self.dispatch_oneshot_with_enforcement_floor(name, args, caveats, EnforcementFloor::DEFAULT)
             .await
     }
 
-    /// [`Self::dispatch_oneshot`] with an explicit minimum enforcement floor.
+    /// [`Self::dispatch_oneshot`] with an explicit **scalar** minimum floor
+    /// (filesystem always Kernel, exec/net take `strength_floor`).
     pub async fn dispatch_oneshot_with_strength_floor(
         &self,
         name: &str,
         args: serde_json::Value,
         caveats: &Caveats,
         strength_floor: AxisEnforcement,
+    ) -> ToolResult<serde_json::Value> {
+        self.dispatch_oneshot_with_enforcement_floor(
+            name,
+            args,
+            caveats,
+            EnforcementFloor::from_scalar(strength_floor),
+        )
+        .await
+    }
+
+    /// [`Self::dispatch_oneshot`] with an explicit **per-axis** minimum floor.
+    pub async fn dispatch_oneshot_with_enforcement_floor(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        caveats: &Caveats,
+        floor: EnforcementFloor,
     ) -> ToolResult<serde_json::Value> {
         let tool = self
             .tools
@@ -298,7 +349,7 @@ impl Registry {
             return Err(ToolError::Budget);
         }
 
-        let cx = self.authorize_grant(tool.as_ref(), caveats, name, strength_floor)?;
+        let cx = self.authorize_grant(tool.as_ref(), caveats, name, floor)?;
         tool.invoke_accounted(args, &cx)
             .await
             .map(Invocation::into_value)
@@ -313,10 +364,10 @@ impl Registry {
         tool: &dyn Tool,
         granted: &Caveats,
         name: &str,
-        strength_floor: AxisEnforcement,
+        strength_floor: EnforcementFloor,
     ) -> ToolResult<ToolContext> {
         let gate = Gate::with_budget(self.generation, CountBound::Unlimited)
-            .with_strength_floor(strength_floor);
+            .with_enforcement_floor(strength_floor);
         match &self.step_up {
             // Step-up wired in (ADR 0018 R2): a policy-demanded gesture is
             // obtained + verified before minting; a refusal is a fail-closed
@@ -586,10 +637,39 @@ mod tests {
         let ToolError::Denied { reason } = error else {
             panic!("backend downgrade returned the wrong error: {error:?}");
         };
+        // The typed refusal names the axis, its required strength, and what the
+        // backend actually delivers.
         assert!(
-            reason.contains("required strength floor (Kernel)"),
-            "denial must identify the unachievable strength floor: {reason}"
+            reason.contains("Net") && reason.contains("Kernel") && reason.contains("Advisory"),
+            "denial must identify the unenforceable axis and its strengths: {reason}"
         );
+    }
+
+    /// The per-axis dispatch path threads [`EnforcementFloor::CONFINED`] to the
+    /// spawn confinement check: a restricted **net** axis with no kernel net
+    /// backend refuses (net floor = Kernel), and the refused admission does not
+    /// consume the grant's call budget (#309 accounting preserved on this path).
+    #[test]
+    fn dispatch_with_axis_confined_floor_refuses_net_and_refunds() {
+        let registry = Registry::builder().tool(Arc::new(SpawnProbeTool)).build();
+        let grant = registry.mint_grant(Caveats {
+            net: Scope::only(["example.invalid".to_string()]),
+            max_calls: CountBound::AtMost(1),
+            ..Caveats::top()
+        });
+        let call = || {
+            block_on(registry.dispatch_with_enforcement_floor(
+                "spawn_probe",
+                serde_json::json!({}),
+                &grant,
+                EnforcementFloor::CONFINED,
+            ))
+        };
+        let err = call().unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }));
+        // Budget intact (the refusal was pre-spawn): the same refusal reproduces,
+        // proving the AtMost(1) was not spent.
+        assert!(matches!(call().unwrap_err(), ToolError::Denied { .. }));
     }
 
     /// AB-001 regression: a `max_calls` bound is enforced *across* dispatches on

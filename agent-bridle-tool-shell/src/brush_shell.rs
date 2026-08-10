@@ -26,9 +26,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    default_exec_path, enforcement_report, human_gate, is_unbridled, Disclosure, SandboxPolicy,
-    SandboxedWorker, SandboxedWorkerChild, Scope, Tool, ToolContext, ToolEnvelope, ToolError,
-    ToolResult,
+    default_exec_path, enforcement_report, human_gate, is_unbridled, ConfinementMechanism,
+    Disclosure, SandboxPolicy, SandboxedWorker, SandboxedWorkerChild, Scope, Tool, ToolContext,
+    ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 use brush_builtins::{default_builtins, BuiltinSet};
@@ -245,6 +245,11 @@ impl Tool for BrushShellTool {
             .spawn(cx, &nonce, &cwd)?;
         let sandbox_kind = confined.sandbox_kind;
         let caveats = cx.caveats().clone();
+        // The mechanism governing the worker: reported kind + the child-network
+        // policy the worker was spawned under (same `self.sandbox_policy`). Keeps
+        // the reported net witness honest (Landlock `net:none` is Kernel only under
+        // `DenyDirect`), never over-claiming from the kind alone.
+        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network);
         let timeout = self.timeout;
         let supervised = tokio::task::spawn_blocking(move || {
             supervise_worker(confined, &payload, timeout, max_output)
@@ -261,7 +266,7 @@ impl Tool for BrushShellTool {
                 output.emit(crate::ShellOutputStream::Stdout, response.stdout.as_bytes());
                 output.emit(crate::ShellOutputStream::Stderr, response.stderr.as_bytes());
                 let envelope = ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement_report(&caveats, sandbox_kind))
+                    .with_enforcement(enforcement_report(&caveats, mechanism))
                     .with_disclosure(self.disclosure())
                     .with_exit_code(response.exit_code)
                     .with_stdout(response.stdout)
@@ -275,7 +280,7 @@ impl Tool for BrushShellTool {
             Supervised::TimedOut => {
                 drop(output_guard);
                 Ok(ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement_report(&caveats, sandbox_kind))
+                    .with_enforcement(enforcement_report(&caveats, mechanism))
                     .with_disclosure(self.disclosure())
                     .with_exit_code(124)
                     .with_stderr(format!("command timed out after {}s", timeout.as_secs()))

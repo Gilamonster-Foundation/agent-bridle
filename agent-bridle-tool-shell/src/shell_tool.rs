@@ -37,10 +37,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    best_available_sandbox, confinement_unenforceable, effective_sandbox_kind, enforcement_report,
-    human_gate, is_unbridled, Caveats, Denial, DenialKind, Disclosure, EnforcementReport,
-    Invocation, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext, ToolEnvelope,
-    ToolError, ToolResult,
+    best_available_sandbox, effective_sandbox_kind, enforcement_report, human_gate, is_unbridled,
+    unenforceable_axis, Caveats, ConfinementMechanism, Denial, DenialKind, Disclosure,
+    EnforcementReport, Invocation, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext,
+    ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -544,7 +544,13 @@ impl Tool for ShellTool {
         };
         // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
         // returns carries the per-axis report alongside the coarse sandbox_kind.
-        let enforcement = enforcement_report(cx.caveats(), sandbox_kind);
+        // The mechanism governing this run: reported backend kind + the
+        // child-network policy on `self.sandbox` (the same policy the engine
+        // confines with). The per-axis report and the fail-closed guard below both
+        // read THIS, so neither over-claims the net axis (a Landlock `net:none` is
+        // Kernel only under `DenyDirect`).
+        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox.child_network);
+        let enforcement = enforcement_report(cx.caveats(), mechanism);
 
         // Resolve to a script (sequence of pipelines), or surface a refusal.
         let mut script = match parsed.script() {
@@ -768,19 +774,16 @@ impl Tool for ShellTool {
         // mechanism is *exactly* what the operator acknowledged (ADR 0018 D1). The
         // L2 grant checks above still ran (advisory), and every axis reports
         // advisory + `disclosure.unbridled` — honest, not silent.
-        if !unbridled && confinement_unenforceable(sandbox_kind, cx.caveats(), cx.strength_floor())
-        {
-            return Ok(deny(
-                sandbox_kind,
-                enforcement,
-                DenialKind::Exec,
-                "confinement",
-                &ToolError::denied(format!(
-                    "a restricted filesystem/exec/net axis cannot be enforced on this host \
-                     at the required strength floor ({:?}); refusing to run unconfined",
-                    cx.strength_floor()
-                )),
-            ));
+        if !unbridled {
+            if let Some(unmet) = unenforceable_axis(cx.caveats(), mechanism, cx.strength_floor()) {
+                return Ok(deny(
+                    sandbox_kind,
+                    enforcement,
+                    DenialKind::Exec,
+                    "confinement",
+                    &ToolError::denied(format!("{unmet}; refusing to run unconfined")),
+                ));
+            }
         }
 
         // Run on a blocking thread, bounded by the timeout. On timeout the

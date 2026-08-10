@@ -115,7 +115,7 @@ pub struct GatePolicy {
 impl Default for GatePolicy {
     fn default() -> Self {
         Self {
-            default_strength_floor: AxisEnforcement::Advisory,
+            default_strength_floor: crate::gate::DEFAULT_STRENGTH_FLOOR,
             max_freshness_window: 4096,
             step_up: HumanGate::Passkey,
         }

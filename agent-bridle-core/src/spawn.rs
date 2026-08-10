@@ -35,8 +35,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    best_available_sandbox, effective_sandbox_kind, enforcement_report, fence_strength,
-    AxisEnforcement, Caveats, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
+    best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AdmittedFence,
+    AxisEnforcement, Caveats, ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind,
+    SandboxPolicy, ToolContext, ToolError, ToolResult,
 };
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
@@ -105,7 +106,7 @@ struct TrustedWorkerControl {
     unavailable: (),
     nonce: String,
     caveats: Caveats,
-    strength_floor: AxisEnforcement,
+    strength_floor: EnforcementFloor,
 }
 
 impl TrustedWorkerControl {
@@ -202,7 +203,7 @@ impl TrustedWorkerControl {
 }
 
 /// Version of the private trusted-worker authority envelope.
-pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 1;
+pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 2;
 /// Maximum serialized trusted-worker request body.
 pub const TRUSTED_WORKER_MAX_BODY: usize = 1024 * 1024;
 /// Fixed, non-authority prelude used to establish kernel peer metadata.
@@ -227,14 +228,14 @@ pub struct TrustedWorkerRequest<P> {
     version: u8,
     nonce: String,
     caveats: Caveats,
-    strength_floor: AxisEnforcement,
+    strength_floor: EnforcementFloor,
     payload: P,
 }
 
 impl<P> TrustedWorkerRequest<P> {
     /// Consume the envelope into its core-authenticated authority and payload.
     #[must_use]
-    pub fn into_parts(self) -> (String, Caveats, AxisEnforcement, P) {
+    pub fn into_parts(self) -> (String, Caveats, EnforcementFloor, P) {
         (self.nonce, self.caveats, self.strength_floor, self.payload)
     }
 
@@ -337,6 +338,24 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// [`ConfinedCommand::spawn`] admission-checks `exec`, applies the OS sandbox,
 /// and fails closed when a restricted axis cannot meet its required
 /// enforcement floor.
+///
+/// ## Descriptor inheritance — a KNOWN RESIDUAL (agent-bridle#319)
+///
+/// **Environment** is delegated explicitly (`env_clear` + only granted vars), but
+/// **file descriptors are not**: the child's stdio (fds 0/1/2, including the
+/// trusted-worker control channel which rides in as stdin) is deliberately
+/// delegated, yet this spawn boundary does **not** explicitly close *ambient*
+/// descriptors the parent left open. It relies on the platform CLOEXEC
+/// convention — `std::process::Command` sets `CLOEXEC` on the pipes it creates,
+/// but a descriptor the parent opened with `CLOEXEC` cleared **is inherited** by
+/// the confined child. An already-open descriptor is itself an object
+/// capability, so this is a real residual: descriptor hygiene here is
+/// CLOEXEC-based, **not** explicit close-on-spawn (`close_range`). An explicit
+/// `close_range(3, …)` pre-exec (preserving stdio) requires `unsafe`, which this
+/// crate forbids (`#![forbid(unsafe_code)]`), so the fix belongs in an
+/// unsafe-permitting launcher crate — tracked as agent-bridle#319. A downstream
+/// security contract that requires stronger-than-CLOEXEC descriptor hygiene must
+/// account for this residual (it is not yet provided) rather than assume it.
 #[derive(Debug)]
 pub struct ConfinedCommand {
     program: String,
@@ -498,34 +517,46 @@ impl ConfinedCommand {
         // actually applied would otherwise pass a run the path executes
         // unconfined). Also the honest kind reported on the child (I9 / ADR 0006 D3).
         let reported_kind = effective_sandbox_kind(kind, &effective);
+        // The witness the fail-closed check consumes is built from the SAME
+        // mechanism that will govern this child: the reported backend kind AND the
+        // child-network policy carried by `self.sandbox_policy` — the exact policy
+        // `best_available_sandbox` above selected the backend from and that
+        // installs the seccomp `DenyDirect` leg at apply time. So the net witness
+        // (Landlock `net:none` = Kernel only under `DenyDirect`) cannot diverge
+        // from the mechanism actually applied to the spawn.
+        let mechanism = ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network);
 
-        // (2) Fail closed: a restricted axis the governing backend cannot enforce
-        // at the principal's strength floor is a grant we'd be lying about.
-        if confinement_unenforceable(reported_kind, &effective, cx.strength_floor()) {
-            return Err(ToolError::denied(format!(
-                "refusing to spawn {:?}: a restricted filesystem/exec/net axis cannot be \
-                 enforced on a subprocess at the required strength floor ({:?}) by the \
-                 governing sandbox ({:?})",
-                self.program,
-                cx.strength_floor(),
-                reported_kind
-            )));
-        }
+        // (2) The declared runtime closure — the ONLY door for authority beyond
+        // the delegated grant. A fixed worker executable is an internal
+        // transition, not authority delegated to the model: allowlist-based
+        // kernel exec policies (Landlock/Seatbelt/rootfs/microVM) need its
+        // exact path declared so the boundary can launch it; AppContainer must
+        // instead preserve exec deny-all so its launcher applies the
+        // child-process block — so it declares nothing. Neither changes the
+        // reported/effective authority.
+        let closure = trusted_worker_closure(kind, authority, &self.program)?;
+
+        // (3) THE admission (L2+L3+L4, one object). `AdmittedFence::admit`
+        // derives the mechanism caveats (delegated ∪ declared closure) exactly
+        // once, computes the L3 scope bound over the resolved-authority lattice
+        // (an undeclared widening refuses as a Superset — the audit's bug
+        // class), and checks the per-axis strength floor (L4). What it returns
+        // is the object the sandbox applies below; nothing is re-derived after
+        // admission (L2 non-equivocation).
+        let admitted = AdmittedFence::admit(&effective, closure, mechanism, cx.strength_floor())
+            .map_err(|e| match e {
+                ToolError::Denied { reason } => {
+                    ToolError::denied(format!("{reason} (program: {:?})", self.program))
+                }
+                other => other,
+            })?;
+        let mechanism_effective = admitted.mechanism_caveats().clone();
 
         // For a wrapper-based backend (Seatbelt/AppContainer) this is the argv
         // prefix that confines the child; empty for thread-confining backends
         // (Landlock, via `apply`) and Noop. Computed here so a fail-closed wrapper
-        // error aborts *before* we spawn the thread.
-        // A fixed worker executable is an internal transition, not authority
-        // delegated to the model. Allowlist-based kernel exec policies need its
-        // exact path to launch it; AppContainer must instead preserve exec
-        // deny-all so its launcher applies the child-process block. Neither
-        // changes the reported/effective authority.
-        let mechanism_effective = if authority == SpawnAuthority::TrustedWorker {
-            trusted_worker_mechanism_caveats(kind, &effective, &self.program)?
-        } else {
-            effective.clone()
-        };
+        // error aborts *before* we spawn the thread. Built from the ADMITTED
+        // caveats — the same object `apply` consumes on the spawn thread.
         let prefix = sandbox.command_prefix(&mechanism_effective)?;
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
@@ -749,45 +780,42 @@ impl SandboxedWorker {
     }
 }
 
-/// Build the mechanism-only caveats for a trusted worker transition.
+/// The declared [`RuntimeClosure`] for a trusted worker transition — the only
+/// door by which the worker's executable reaches the mechanism's allow-list
+/// (it then flows through [`AdmittedFence::admit`]'s scope check like any
+/// other closure entry; nothing widens the mechanism caveats silently).
 ///
 /// Landlock, Seatbelt, and the identity-closing stronger tiers need the fixed
 /// worker executable in their kernel execute allow-list so the boundary can
-/// launch it. AppContainer is different: its launcher creates the worker as the
-/// initial confined process, and `exec: Only([])` must remain empty so
-/// `--no-child-process` is attached to that worker. Adding the worker path there
-/// would silently turn deny-all into a non-empty allow-list, disable the kernel
-/// child-process mitigation, and leave an `exec → Kernel` report overclaiming.
+/// launch it — those declare it. AppContainer is different: its launcher
+/// creates the worker as the initial confined process, and `exec: Only([])`
+/// must remain empty so `--no-child-process` is attached to that worker.
+/// Declaring the worker path there would silently turn deny-all into a
+/// non-empty allow-list, disable the kernel child-process mitigation, and
+/// leave an `exec → Kernel` report overclaiming — so it declares nothing.
 ///
-/// This changes mechanism configuration only; it never alters the effective
+/// A model-selected spawn declares nothing: the closure exists for internal
+/// transitions only, never for authority the model chose.
+///
+/// This shapes mechanism configuration only; it never alters the effective
 /// authority carried by `ToolContext` or the enforcement report.
-fn trusted_worker_mechanism_caveats(
+fn trusted_worker_closure(
     kind: SandboxKind,
-    effective: &Caveats,
+    authority: SpawnAuthority,
     program: &str,
-) -> ToolResult<Caveats> {
+) -> ToolResult<RuntimeClosure> {
+    if authority != SpawnAuthority::TrustedWorker {
+        return Ok(RuntimeClosure::empty());
+    }
     match kind {
         SandboxKind::Landlock
         | SandboxKind::Seatbelt
         | SandboxKind::MinimalRootfs
-        | SandboxKind::MicroVm => caveats_with_trusted_program(effective, program),
-        SandboxKind::AppContainer | SandboxKind::None => Ok(effective.clone()),
+        | SandboxKind::MicroVm => {
+            RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
+        }
+        SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
-}
-
-/// Add the exact trusted worker executable to an execute allow-list used by a
-/// mechanism that must authorize the initial worker launch.
-fn caveats_with_trusted_program(effective: &Caveats, program: &str) -> ToolResult<Caveats> {
-    let canonical = Path::new(program)
-        .canonicalize()
-        .map_err(|error| ToolError::denied(format!("cannot resolve trusted worker: {error}")))?
-        .to_string_lossy()
-        .into_owned();
-    let mut mechanism = effective.clone();
-    if let crate::Scope::Only(programs) = &mut mechanism.exec {
-        programs.insert(canonical);
-    }
-    Ok(mechanism)
 }
 
 #[cfg(target_os = "linux")]
@@ -1056,15 +1084,12 @@ pub fn confinement_unenforceable(
     caveats: &Caveats,
     floor: AxisEnforcement,
 ) -> bool {
-    let report = enforcement_report(caveats, kind);
-    let below_kernel = |e: Option<AxisEnforcement>| e.is_some_and(|e| e != AxisEnforcement::Kernel);
-    // (1) Filesystem axes: kernel-enforceable, so a restricted-but-not-kernel fs
-    // axis is always unenforceable.
-    if below_kernel(report.fs_write) || below_kernel(report.fs_read) {
-        return true;
-    }
-    // (2) exec/net: refuse only when the strength floor is not met by reality.
-    fence_strength(&report).is_some_and(|s| s < floor)
+    // Back-compat scalar wrapper over the per-axis check: the historic scalar
+    // floor `f` means filesystem=Kernel (always), exec=net=`f`
+    // ([`EnforcementFloor::from_scalar`]). A confined executor should call
+    // [`unenforceable_axis`] directly with [`EnforcementFloor::CONFINED`] so the
+    // exec axis is accepted at the interceptor tier rather than forced to Kernel.
+    unenforceable_axis(caveats, kind, EnforcementFloor::from_scalar(floor)).is_some()
 }
 
 // Async-path proof for `spawn_tokio`: the child's stdio survives the std→tokio
@@ -1272,6 +1297,7 @@ mod tokio_spawn_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enforcement_report;
     use crate::{Gate, Tool};
 
     /// Mint a `ToolContext` the only legitimate way — through the gate.
@@ -1352,7 +1378,7 @@ mod tests {
             stream: client,
             nonce: "core-owned-nonce".to_string(),
             caveats: frozen.clone(),
-            strength_floor: AxisEnforcement::Advisory,
+            strength_floor: EnforcementFloor::DEFAULT,
         };
         let mut worker = SandboxedWorkerChild {
             child: process,
@@ -1371,7 +1397,7 @@ mod tests {
         let (nonce, authority, floor, payload) = seen_rx.recv().expect("receive decoded request");
         assert_eq!(nonce, "core-owned-nonce");
         assert_eq!(authority, frozen, "payload must not replace frozen caveats");
-        assert_eq!(floor, AxisEnforcement::Advisory);
+        assert_eq!(floor, EnforcementFloor::DEFAULT);
         assert_eq!(payload, forged_payload);
         assert!(
             matches!(
@@ -1383,6 +1409,52 @@ mod tests {
 
         peer.join().expect("join fake worker");
         let _ = worker.child.wait();
+    }
+
+    /// Blocker 1 (trusted-worker leg): the `strength_floor` in a trusted-worker
+    /// envelope cannot carry a sub-Kernel filesystem floor. A well-formed request
+    /// round-trips with fs pinned Kernel, and a body that injects an `fs_read`/
+    /// `fs_write` field into the floor is REJECTED at decode (not normalized) — a
+    /// forged/downgraded envelope fails closed before any worker acts on it.
+    #[test]
+    fn trusted_worker_decode_cannot_forge_a_weak_filesystem_floor() {
+        let request = TrustedWorkerRequest {
+            version: TRUSTED_WORKER_PROTOCOL_VERSION,
+            nonce: "n".to_string(),
+            caveats: Caveats::top(),
+            strength_floor: EnforcementFloor::CONFINED,
+            payload: serde_json::json!({"cmd": "echo ok"}),
+        };
+        let body = serde_json::to_vec(&request).expect("encode");
+        let text = String::from_utf8(body.clone()).unwrap();
+        // The strength_floor object itself omits the filesystem axes (the envelope's
+        // separate `caveats` field legitimately carries fs_read/fs_write scopes, so
+        // we check the floor object specifically, not the whole body).
+        let floor_obj = &text[text.find("\"strength_floor\":{").unwrap()..];
+        let floor_obj = &floor_obj[..floor_obj.find('}').unwrap()];
+        assert!(
+            !floor_obj.contains("fs_read") && !floor_obj.contains("fs_write"),
+            "the encoded floor must omit the filesystem axes: {floor_obj}",
+        );
+        // A valid body round-trips and reconstructs the pinned Kernel fs floor.
+        let (_, _, floor, _) = decode_trusted_worker_request::<serde_json::Value>(&body)
+            .expect("decode valid")
+            .into_parts();
+        assert_eq!(floor.fs_read(), AxisEnforcement::Kernel);
+        assert_eq!(floor.fs_write(), AxisEnforcement::Kernel);
+        assert_eq!(floor, EnforcementFloor::CONFINED);
+
+        // Inject a weak fs_write field into the floor object; decode must reject it
+        // (deny_unknown_fields), never silently upgrade it to Kernel.
+        let forged = text.replace(
+            "\"strength_floor\":{",
+            "\"strength_floor\":{\"fs_write\":\"advisory\",",
+        );
+        assert_ne!(forged, text, "the injection must actually change the body");
+        assert!(
+            decode_trusted_worker_request::<serde_json::Value>(forged.as_bytes()).is_err(),
+            "a trusted-worker floor carrying a filesystem field must be rejected",
+        );
     }
 
     #[test]
@@ -1516,12 +1588,28 @@ mod tests {
             ..Caveats::top()
         };
 
-        let mechanism = trusted_worker_mechanism_caveats(
+        let closure = trusted_worker_closure(
             SandboxKind::AppContainer,
-            &exec_denied,
+            SpawnAuthority::TrustedWorker,
             "this-path-is-not-used-by-appcontainer",
         )
-        .expect("AppContainer mechanism caveats");
+        .expect("AppContainer trusted-worker closure");
+        assert!(
+            closure.is_empty(),
+            "AppContainer declares no exec closure — its launcher starts the worker"
+        );
+        let mechanism = AdmittedFence::admit(
+            &exec_denied,
+            closure,
+            ConfinementMechanism::new(
+                SandboxKind::AppContainer,
+                crate::ChildNetworkPolicy::LandlockOnly,
+            ),
+            EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+        )
+        .expect("AppContainer admission")
+        .mechanism_caveats()
+        .clone();
 
         assert!(
             crate::sandbox::exec_fully_denied(&mechanism),
@@ -1555,8 +1643,17 @@ mod tests {
             .into_owned();
 
         for kind in [SandboxKind::Landlock, SandboxKind::Seatbelt] {
-            let mechanism = trusted_worker_mechanism_caveats(kind, &exec_denied, &current)
-                .expect("allowlist mechanism caveats");
+            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
+                .expect("allowlist trusted-worker closure");
+            let mechanism = AdmittedFence::admit(
+                &exec_denied,
+                closure,
+                ConfinementMechanism::new(kind, crate::ChildNetworkPolicy::LandlockOnly),
+                EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+            )
+            .expect("allowlist admission")
+            .mechanism_caveats()
+            .clone();
             assert!(
                 matches!(&mechanism.exec, Scope::Only(programs) if programs.contains(&current)),
                 "{kind:?} must authorize the fixed worker executable"

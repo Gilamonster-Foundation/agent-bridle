@@ -176,6 +176,23 @@ pub(crate) fn exec_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.exec, crate::Scope::Only(s) if s.is_empty())
 }
 
+/// Whether a restricted `exec` grant pulls an **implementation-variant**
+/// executable that the Caveat does not literally name — so the Seatbelt
+/// `process-exec*` profile must permit a program beyond the requested identities
+/// and is therefore NOT an exact Kernel witness of the exec authority.
+///
+/// Today the sole such variant is Apple's `/bin/sh`, a launcher that re-execs
+/// `/bin/bash` at startup (a kernel-checked `process-exec`); a granted `sh`
+/// (bare or `/bin/sh`) forces `/bin/bash` into the allow-list too (see the
+/// macOS `resolve_exec_targets`). Pure and cross-platform (a function of the
+/// Caveat data), so the report classification and the profile builder stay
+/// coupled to the same rule regardless of which platform compiles the profile.
+#[must_use]
+pub(crate) fn exec_grant_pulls_launcher_variant(caveats: &Caveats) -> bool {
+    matches!(&caveats.exec, crate::Scope::Only(s)
+        if s.iter().any(|p| p == "sh" || p == "/bin/sh"))
+}
+
 /// `true` if this kernel supports Landlock TCP network rules (ABI V4, kernel ≥ 6.7).
 /// Always `false` on non-Linux or builds without `linux-landlock`.
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
@@ -217,6 +234,28 @@ pub(crate) const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s)
         if !s.is_empty() && s.iter().all(|h| LOOPBACK_HOSTS.contains(&h.as_str())))
+}
+
+/// `true` iff a loopback-only net scope denotes the **entire** kernel-enforced
+/// loopback interface, so the Seatbelt/AppContainer loopback fence — which always
+/// allows the whole `localhost` interface (`127.0.0.1` **and** `::1`) — is an
+/// **exact** witness of the requested authority rather than a widening.
+///
+/// This is the OCAP scope-fidelity gate (Kernel *strength* ≠ least *authority*):
+/// a single-address grant such as `net = Only({"127.0.0.1"})` asks for v4
+/// loopback ONLY, but the kernel fence also permits `::1` — strictly MORE
+/// authority than the Caveat. Such a scope is NOT an exact Kernel witness and is
+/// reported below Kernel (so a `CONFINED` floor refuses; the coarser fence is
+/// documented BOUNDED, never pretended exact). The full interface is denoted by
+/// `localhost` (the interface token) or by naming BOTH `127.0.0.1` and `::1`;
+/// the egress-proxy fence ([`loopback_fenced_caveats`]) grants the full
+/// [`LOOPBACK_HOSTS`] set and so remains exact.
+#[must_use]
+pub(crate) fn net_loopback_full_interface(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s) if
+        net_loopback_only(caveats)
+            && (s.iter().any(|h| h == "localhost")
+                || (s.iter().any(|h| h == "127.0.0.1") && s.iter().any(|h| h == "::1"))))
 }
 
 /// The granted host set of a **general remote-host** `net` allow-list — the case
