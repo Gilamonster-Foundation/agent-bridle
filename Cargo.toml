@@ -31,7 +31,7 @@ agent-bridle-tool-web = { version = "0.7.15", path = "agent-bridle-tool-web" }
 agent-bridle = { version = "0.7.15", path = "agent-bridle", default-features = false }
 
 # The leash. One canonical authority type, shared across the whole agent line.
-agent-mesh-protocol = "0.6"
+agent-mesh-protocol = "0.6.4"
 
 # Core (lean) deps — these are the ONLY non-mesh deps allowed in core.
 anyhow = "1"
