@@ -28,6 +28,7 @@ truth; the values below are a snapshot for orientation.
 | Charon commit (for Aeneas) | `aeneas/charon-pin` | managed by `make setup-charon` |
 | Lean | `aeneas/backends/lean/lean-toolchain` | `leanprover/lean4:v4.31.0` (elan auto-fetches) |
 | OCaml | Aeneas README | OCaml **5.x** (e.g. `5.3.0`) |
+| TLA+ tools (TLC) | `formal/tla/tla2tools-pin.txt` | tla2tools v1.7.4 (TLC2 2.19), sha256-pinned — `just check-tla` + the `tla` CI job verify the checksum and refuse to run an unpinned jar |
 
 `rustup` and `elan` are version *managers*: they read the pin files and fetch
 the right toolchain per directory. Install the managers; never hand-install a

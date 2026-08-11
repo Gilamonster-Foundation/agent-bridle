@@ -1,0 +1,7 @@
+# TLA+ tools pin (source of truth per docs/TOOLCHAIN.md §0).
+# The security formal gate must NOT download unpinned tooling — verify this
+# checksum before running TLC in CI (see .github/workflows/formal.yml, job "tla").
+version = TLC2 2.19 (08 August 2024, rev 5a47802)
+artifact = tla2tools.jar
+sha256 = 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+source = https://github.com/tlaplus/tlaplus/releases (v1.7.4 tools bundle)

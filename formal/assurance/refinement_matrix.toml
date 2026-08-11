@@ -1,0 +1,124 @@
+# Cross-platform enforcement refinement matrix (Phase 6).
+#
+# For each authority axis × backend, records how the native fence is projected
+# into the portable ResolvedScope lattice, the enforcement primitive, the formal
+# claim it satisfies, the native evidence test, any registered residual, and the
+# exact/bounded/unknown classification.
+#
+# This is GENERATED-DATA intent: the assurance report is meant to read from here
+# rather than from hand-written prose. Do NOT force false symmetry — macOS
+# metadata observability is an ORTHOGONAL residual, NOT content fs_read=Unknown;
+# Windows write-implies-content-read IS a widening on the same content axis and
+# therefore MUST appear in ResolvedAuthority.
+#
+# Grounded in the Phase-0 inventory of agent-bridle main (37fef8d) +
+# agent-mesh-protocol 0.6.4. `class` ∈ {exact, bounded, unknown, verbatim}:
+#   exact    = Bounded equal to the grant (admits as Equal)
+#   bounded  = Bounded, admits as Subset/Equal (may carry an Unknown residual)
+#   unknown  = Unknown ⇒ fail-closed refuse
+#   verbatim = from_delegated placeholder: confines, but does not model the
+#              mechanism's true (possibly wider) authority — I15 Partial
+
+schema_version = "0.1.0"
+production_sha = "37fef8dbef0968c16ddd0f1acb0a4db7ac3ad3ed"
+algebra_crate  = "agent-mesh-protocol@0.6.4"
+
+# ─────────────────────────── fs_read (CONTENT axis) ───────────────────────────
+[fs_read.linux]
+projection    = "LandlockSandbox::resolved_authority (sandbox.rs:1076); All⇒Unbounded, restricted⇒Bounded(read roots ∪ base_read), symlinked root⇒Unknown (E1)"
+primitive     = "Landlock AccessFs::ReadFile|ReadDir, restrict_self"
+formal_claim  = "within/admit (L1..L3); Unknown-on-symlink = L6 fail-closed"
+native_test   = "agent-bridle-tool-shell/tests/real_spawn.rs (read-injection denied)"
+residual      = "E1 symlinked-root widening ⇒ Unknown (same-object bind = PR-5)"
+class         = "bounded"
+
+[fs_read.macos]
+projection    = "SeatbeltSandbox::resolved_authority (sandbox.rs:1690) = from_delegated placeholder"
+primitive     = "SBPL (deny file-read*) + (allow file-read-metadata) + re-allow roots — CONTENT-level deny"
+formal_claim  = "within/admit at caveats grain; faithful projection = PR-2/#337 (not yet)"
+native_test   = "agent-bridle-tool-shell/tests/seatbelt_floor_evidence.rs"
+residual      = "ORTHOGONAL: file-read-metadata observability (stat/traverse, never content) — MUST NOT be modeled as content fs_read=Unknown"
+class         = "verbatim"
+
+[fs_read.windows]
+projection    = "AppContainerSandbox::resolved_authority — main: from_delegated placeholder; #338: fs_read = fs_read ∪ fs_write"
+primitive     = "aclaunch DACL: FILE_GENERIC_READ on --fs-read paths (main.rs:486)"
+formal_claim  = "L4 windows_write_implies_read_widening (premise = the DACL union, ASSUMED)"
+native_test   = "agent-bridle-aclaunch/tests/kernel_proofs.rs (granted readable / ungranted content denied)"
+residual      = "E2: write DACL confers CONTENT read — a widening on THIS axis; must surface in ResolvedAuthority (that is #338)"
+class         = "verbatim"   # becomes `bounded` (union) when #338 lands
+
+# ─────────────────────────────── fs_write ────────────────────────────────────
+[fs_write.linux]
+projection    = "Bounded(write roots); symlinked root⇒Unknown (E1) (sandbox.rs:1104)"
+primitive     = "Landlock AccessFs::from_write + device sinks"
+formal_claim  = "within/admit (L1..L3)"
+native_test   = "real_spawn.rs (child + grandchild write denied outside scope)"
+residual      = "E1 writable-symlink root ⇒ Unknown"
+class         = "bounded"
+
+[fs_write.macos]
+projection    = "from_delegated placeholder"
+primitive     = "SBPL (deny file-write*) + re-allow roots + device sinks"
+formal_claim  = "within/admit at caveats grain"
+native_test   = "seatbelt_floor_evidence.rs (out-of-fence write denied)"
+residual      = "none beyond I15 verbatim"
+class         = "verbatim"
+
+[fs_write.windows]
+projection    = "from_delegated placeholder"
+primitive     = "aclaunch DACL: FILE_GENERIC_READ_WRITE on --fs-write paths (main.rs:474)"
+formal_claim  = "within/admit at caveats grain"
+native_test   = "kernel_proofs.rs (granted writable / ungranted denied)"
+residual      = "none beyond I15 verbatim"
+class         = "verbatim"
+
+# ───────────────────────────────── exec ──────────────────────────────────────
+[exec.linux]
+projection    = "Bounded(resolved program images + loader) (sandbox.rs:1119)"
+primitive     = "Landlock AccessFs::Execute on resolved program files + loader_paths"
+formal_claim  = "within/admit (L1..L3); descendant non-escalation = TLA T5"
+native_test   = "real_spawn.rs (exec closure incl. bash)"
+residual      = "ld.so mmap-exec trampoline ⇒ report strength = interceptor (ADR 0011 D7)"
+class         = "bounded"
+
+[exec.macos]
+projection    = "from_delegated placeholder"
+primitive     = "SBPL (deny process-exec*) + re-allow granted programs — governs interior execs of ALL descendants"
+formal_claim  = "within/admit at caveats grain; TLA T5 descendant non-escalation"
+native_test   = "seatbelt_floor_evidence.rs (sh→bash closure ⇒ interceptor)"
+residual      = "sh→bash closure widening ⇒ interceptor not kernel"
+class         = "verbatim"
+
+[exec.windows]
+projection    = "from_delegated placeholder (deny-all only)"
+primitive     = "PROCESS_CREATION_CHILD_PROCESS_RESTRICTED (--no-child-process)"
+formal_claim  = "TLA T5: grandchild CreateProcess blocked"
+native_test   = "kernel_proofs.rs:222 (gen-2 CreateProcess blocked, non-vacuous control)"
+residual      = "only the empty deny-all subset is a kernel primitive; a non-empty exec allowlist is inexpressible"
+class         = "verbatim"
+
+# ────────────────────────────────── net ──────────────────────────────────────
+[net.linux]
+projection    = "net:none under DenyDirect ⇒ from_scope(none) exact-empty; every other restricted net ⇒ Unknown (sandbox.rs:1135)"
+primitive     = "Landlock ABI-v4 TCP deny + seccomp socket()-family deny + io_uring deny (E3, PR #336, sandbox.rs:1280)"
+formal_claim  = "within/admit (exact); Unknown elsewhere = L6 fail-closed"
+native_test   = "agent-bridle-tool-shell/tests/child_network_seccomp_real.rs (UDP + forked-descendant socket denied)"
+residual      = "net:none under DEFAULT LandlockOnly (io_uring/UDP open) ⇒ Unknown; hostname allowlists inexpressible ⇒ Unknown"
+class         = "exact"      # for net:none/DenyDirect; else unknown
+
+[net.macos]
+projection    = "from_delegated placeholder"
+primitive     = "SBPL (deny network*); loopback-only = deny + re-allow localhost"
+formal_claim  = "within/admit at caveats grain; faithful projection = PR-2/#337 (E4)"
+native_test   = "agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs (UDP, loopback, AF_UNIX deputy)"
+residual      = "E4: mach-lookup/XPC ambient network deputy under net:none (not modeled); host allowlist inexpressible"
+class         = "verbatim"
+
+[net.windows]
+projection    = "from_delegated placeholder"
+primitive     = "AppContainer capability-SID deny-by-default; --net-allow grants INTERNET_* SIDs; --loopback-exemption"
+formal_claim  = "within/admit at caveats grain"
+native_test   = "agent-bridle-aclaunch/tests/net_proofs.rs (deny-all blocks loopback egress)"
+residual      = "general host allowlist inexpressible (deny-by-default only); loopback-exemption needs elevation"
+class         = "verbatim"
