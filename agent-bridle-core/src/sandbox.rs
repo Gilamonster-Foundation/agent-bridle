@@ -1122,13 +1122,22 @@ pub(crate) mod landlock_impl {
                 ResolvedScope::Unbounded
             };
 
-            // net: Landlock kernel-enforces only `net:none` (a TCP deny), and even
-            // that is bypassable off-box via io_uring UDP (E3), while host allow-
-            // lists are inexpressible. A RESTRICTED net axis therefore cannot be
-            // honestly bounded ⇒ Unknown (refuse) until the io_uring egress floor
-            // lands (PR-1). `All` is ambient (Unbounded), matching an `All` grant.
+            // net: `All` is ambient (Unbounded). A RESTRICTED net axis is honestly
+            // BOUNDED only where the child cannot egress at all — `net: none`
+            // (fully denied) under `DenyDirect`, where the seccomp socket()+
+            // io_uring deny (PR-1) closes the io_uring bypass (E3) on top of
+            // Landlock's TCP deny. There the resolved authority is exactly the
+            // empty host set (`from_scope(net:none)` = the bound the grant names,
+            // so admission is Equal). Every other restricted net — a hostname
+            // allow-list Landlock cannot express, or `net: none` under the default
+            // `LandlockOnly` where io_uring stays open — cannot be bounded ⇒
+            // Unknown ⇒ refuse.
             let net = if matches!(effective.net, Scope::All) {
                 ResolvedScope::Unbounded
+            } else if super::net_fully_denied(effective)
+                && self.policy.child_network == ChildNetworkPolicy::DenyDirect
+            {
+                ResolvedScope::from_scope(&effective.net)
             } else {
                 ResolvedScope::Unknown
             };
@@ -1223,11 +1232,22 @@ pub(crate) mod landlock_impl {
     /// `AF_INET6` / `AF_PACKET`) with `EACCES`; `AF_UNIX` and every other syscall
     /// stay allowed. This closes the UDP/DNS/raw/packet egress leg that Landlock's
     /// TCP-only net rule cannot filter — a child under `net: none` can otherwise
-    /// still create those sockets. `apply_filter` sets `PR_SET_NO_NEW_PRIVS`, so
-    /// it needs no privilege, is irreversible, and is inherited by every
-    /// `fork`/`execve` descendant. `apply_filter` is a safe fn, so core keeps
-    /// `unsafe_code = forbid`. Must run on the confining thread, after
-    /// `restrict_self`, immediately before the spawn.
+    /// still create those sockets.
+    ///
+    /// It ALSO denies the `io_uring` family (`io_uring_setup`/`enter`/`register`)
+    /// with `EACCES` (E3, the io_uring egress floor / PR-1): `IORING_OP_SOCKET` +
+    /// `IORING_OP_CONNECT`/`SEND` create and use a socket **without** the
+    /// `socket()` syscall, so a socket()-only filter is bypassable. seccomp
+    /// cannot inspect an io_uring SQE opcode, so the honest close is to deny the
+    /// io_uring setup/enter primitive entirely while net is confined — a child
+    /// that asked for `net: none` does not get an un-mediated async-I/O channel.
+    /// (A child needing io_uring for file I/O under `net: none` falls back to the
+    /// ordinary syscalls; net confidentiality wins the trade.)
+    ///
+    /// `apply_filter` sets `PR_SET_NO_NEW_PRIVS`, so it needs no privilege, is
+    /// irreversible, and is inherited by every `fork`/`execve` descendant.
+    /// `apply_filter` is a safe fn, so core keeps `unsafe_code = forbid`. Must run
+    /// on the confining thread, after `restrict_self`, immediately before the spawn.
     fn install_seccomp_egress_deny() -> ToolResult<()> {
         use seccompiler::{
             apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
@@ -1255,6 +1275,11 @@ pub(crate) mod landlock_impl {
 
         let mut per_syscall: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
         per_syscall.insert(libc::SYS_socket, rules);
+        // Empty rule vec ⇒ the syscall is denied UNCONDITIONALLY (the filter's
+        // match action, EACCES). Closes the io_uring egress bypass of `net: none`.
+        per_syscall.insert(libc::SYS_io_uring_setup, Vec::new());
+        per_syscall.insert(libc::SYS_io_uring_enter, Vec::new());
+        per_syscall.insert(libc::SYS_io_uring_register, Vec::new());
 
         let filter = SeccompFilter::new(
             per_syscall,
@@ -1443,11 +1468,12 @@ pub(crate) mod landlock_impl {
             let _ = std::fs::remove_dir_all(&base);
         }
 
-        /// E3: `net:none` cannot be honestly bounded on Landlock (io_uring UDP
-        /// bypasses the `SYS_socket` seccomp deny), so `resolved.net = Unknown`
-        /// ⇒ refuse, until the io_uring egress floor lands (PR-1).
+        /// E3: under the DEFAULT `LandlockOnly` policy, `net:none` cannot be
+        /// honestly bounded — io_uring UDP bypasses the `SYS_socket` seccomp deny
+        /// and no io_uring floor is installed — so `resolved.net = Unknown` ⇒
+        /// refuse. (The enforced case is `net:none` under `DenyDirect`, below.)
         #[test]
-        fn e3_net_none_resolves_unknown_and_refuses() {
+        fn e3_net_none_under_landlock_only_resolves_unknown_and_refuses() {
             let delegated = Caveats {
                 net: Scope::only(Vec::<String>::new()),
                 ..Caveats::top()
@@ -1458,6 +1484,38 @@ pub(crate) mod landlock_impl {
                 admit(&resolved, &delegated, &empty_closure()),
                 AdmissionDecision::Reject(_)
             ));
+        }
+
+        /// PR-1: `net:none` under `DenyDirect` IS honestly bounded — the seccomp
+        /// socket()+io_uring deny closes the E3 io_uring bypass on top of
+        /// Landlock's TCP deny — so `resolved.net` is the empty host set the grant
+        /// names and admission ADMITS (enforced no-egress). This is what re-enables
+        /// restricted-`net:none` confined operation faithfully.
+        #[test]
+        fn net_none_under_deny_direct_resolves_bounded_and_admits() {
+            use std::sync::Arc;
+            let delegated = Caveats {
+                net: Scope::only(Vec::<String>::new()),
+                ..Caveats::top()
+            };
+            let policy = crate::SandboxPolicy {
+                child_network: crate::ChildNetworkPolicy::DenyDirect,
+                ..crate::SandboxPolicy::default()
+            };
+            let resolved =
+                LandlockSandbox::with_policy(Arc::new(policy)).resolved_authority(&delegated);
+            assert_ne!(
+                resolved.net,
+                ResolvedScope::Unknown,
+                "DenyDirect net:none must be BOUNDED (io_uring closed), not Unknown"
+            );
+            assert!(
+                matches!(
+                    admit(&resolved, &delegated, &empty_closure()),
+                    AdmissionDecision::Admit
+                ),
+                "enforced net:none (DenyDirect) must admit"
+            );
         }
 
         /// The conservative rule only bites RESTRICTED axes: an unrestricted grant
