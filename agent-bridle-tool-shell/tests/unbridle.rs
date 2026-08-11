@@ -9,11 +9,15 @@ use std::sync::Arc;
 
 use agent_bridle_core::{
     set_unbridled, AttestRequirement, CallRequest, Caveats, Challenge, Discharge,
-    DischargeProvider, DischargeVerifier, Gate, Registry, Rule, Scope, SessionId, StepUpPolicy,
-    Tool, ToolContext, ToolError,
+    DischargeProvider, DischargeVerifier, Registry, Rule, Scope, SessionId, StepUpPolicy,
+    ToolError,
 };
 use agent_bridle_tool_shell::ShellTool;
 
+#[cfg(any(unix, all(target_os = "windows", feature = "windows-appcontainer")))]
+use agent_bridle_core::{Gate, Tool, ToolContext};
+
+#[cfg(any(unix, all(target_os = "windows", feature = "windows-appcontainer")))]
 fn ctx(granted: Caveats) -> ToolContext {
     Gate::new(0)
         .authorize(&ShellTool::new(), &granted)

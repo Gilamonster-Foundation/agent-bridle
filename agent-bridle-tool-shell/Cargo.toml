@@ -116,5 +116,5 @@ nix = { version = "0.31.3", features = ["fs", "process", "socket", "uio", "user"
 libproc = { version = "0.14.11", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 serde_json = { workspace = true }

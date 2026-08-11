@@ -16,8 +16,10 @@ use agent_bridle_core::{
     Caveats, EnforcementFloor, Gate, SandboxPolicy, Scope, Tool, ToolContext, ToolError,
 };
 use agent_bridle_tool_shell::ShellTool;
+use tokio::sync::Mutex;
 
 static N: AtomicU64 = AtomicU64::new(0);
+static PATH_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn tag(kind: &str) -> String {
     format!(
@@ -184,6 +186,7 @@ async fn newt_confined_contract_runs_only_inside_appcontainer() {
 
 #[tokio::test]
 async fn path_shadowed_aclaunch_refuses_before_fake_launcher_or_target_runs() {
+    let _path_test = PATH_TEST_LOCK.lock().await;
     let fake_dir = fresh_dir("fake-path");
     let _fake_launcher = compile_fake_aclaunch(&fake_dir);
     let _path = prepend_to_path(&fake_dir);
@@ -234,6 +237,7 @@ async fn path_shadowed_aclaunch_refuses_before_fake_launcher_or_target_runs() {
 
 #[tokio::test]
 async fn missing_aclaunch_refuses_newt_confined_contract_before_spawn() {
+    let _path_test = PATH_TEST_LOCK.lock().await;
     let mut empty_path = std::env::temp_dir();
     empty_path.push(format!("ab-empty-path-{}", tag("missing")));
     std::fs::create_dir_all(&empty_path).expect("create empty PATH dir");

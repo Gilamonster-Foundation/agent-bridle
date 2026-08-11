@@ -37,6 +37,21 @@ use agent_bridle_core::{
 };
 use agent_bridle_tool_shell::ShellTool;
 
+#[cfg(not(windows))]
+const GRANTED_PROGRAM: &str = "echo";
+#[cfg(windows)]
+const GRANTED_PROGRAM: &str = "cmd";
+
+#[cfg(not(windows))]
+fn granted_args() -> serde_json::Value {
+    serde_json::json!(["hi"])
+}
+
+#[cfg(windows)]
+fn granted_args() -> serde_json::Value {
+    serde_json::json!(["/c", "echo hi"])
+}
+
 fn ctx(granted: Caveats) -> ToolContext {
     Gate::new(0)
         .authorize(&ShellTool::new(), &granted)
@@ -59,22 +74,23 @@ async fn autonomous_discloses_human_gate_off_but_keeps_the_l2_grant() {
     set_unbridled();
     set_human_gate(HumanGate::None); // the distinct second ack → Autonomous
 
-    // A restricted grant: only `echo` is permitted, even in the loudest posture.
+    // A restricted grant: only the platform's echo route is permitted, even in
+    // the loudest posture. Windows `echo` is a cmd builtin, not an executable.
     let granted = Caveats {
-        exec: Scope::only(["echo".to_string()]),
+        exec: Scope::only([GRANTED_PROGRAM.to_string()]),
         ..Caveats::top()
     };
 
     // The granted program runs native and discloses the Autonomous posture.
     let out = ShellTool::new()
         .invoke(
-            serde_json::json!({"program": "echo", "args": ["hi"]}),
+            serde_json::json!({"program": GRANTED_PROGRAM, "args": granted_args()}),
             &ctx(granted.clone()),
         )
         .await
         .expect("invoke");
     assert_eq!(out["exit_code"], 0, "granted program runs: {out}");
-    assert_eq!(out["stdout"], "hi\n", "{out}");
+    assert_eq!(out["stdout"].as_str().map(str::trim), Some("hi"), "{out}");
     assert_eq!(
         out["sandbox_kind"], "none",
         "unbridled ⇒ no OS sandbox: {out}"
