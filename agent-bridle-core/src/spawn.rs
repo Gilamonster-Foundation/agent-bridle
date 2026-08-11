@@ -549,40 +549,43 @@ impl ConfinedCommand {
             mechanism,
             cx.strength_floor(),
             |mechanism_caveats| {
-                // The no-op backend enforces NOTHING, so it has no enforced scope to
-                // bound-check: L3 is vacuous for it (identity projection ⇒ resolved =
-                // delegated ⇒ Equal ⇒ admit). Whether running with no OS confinement
-                // is acceptable is the STRENGTH floor's decision (L4), which still
-                // refuses e.g. a Kernel-floored restriction under Noop. This is what
-                // lets the Brush worker legitimately spawn under Noop + an Advisory OS
-                // floor — brush-ocap provides the in-process confinement; the OS
-                // sandbox is best-effort defense-in-depth, not the mechanism relied
-                // upon. Every backend that ACTUALLY confines (Landlock, and the
-                // wrapper backends once their projections land) gets full L3.
-                if kind == SandboxKind::None {
+                // Mechanism selection for the projection: the authority a spawn is
+                // bounded by is EITHER the OS sandbox OR, for a trusted worker, the
+                // in-process brush-ocap engine (a VERIFIED interceptor that bounds
+                // exec/fs/net — `DenialKind::Exec`/`Open`/`Net`). A trusted worker's
+                // bounding mechanism is brush-ocap, so its conservative projection
+                // is the delegated grant itself (brush-ocap admits exactly the
+                // grant, at Interceptor strength; the OS sandbox underneath is
+                // defense-in-depth). This exemption is keyed on the TRUSTED-WORKER
+                // route, NOT on `SandboxKind::None`: an arbitrary Noop spawn is
+                // bounded by NOTHING and must fall through to the backend
+                // projection below (Noop ⇒ Unbounded ⇒ refuse a restricted axis).
+                if authority == SpawnAuthority::TrustedWorker {
+                    // brush-ocap bounds the child to the DELEGATED grant itself —
+                    // NOT `mechanism_caveats`, which folds the trusted-worker binary
+                    // into the exec axis for the OS layer only. Projecting the
+                    // delegated grant keeps that OS-layer fold from reading as a
+                    // widening (resolved.exec ⊋ delegated.exec) under this mechanism.
                     return BackendProjection {
-                        resolved: crate::ResolvedAuthority::from_delegated(mechanism_caveats),
+                        resolved: crate::ResolvedAuthority::from_delegated(&effective),
                         runtime_closure: crate::empty_closure(),
                     };
                 }
 
                 // The backend's CONSERVATIVE projection of what it will actually
-                // install for these caveats (ruleset grain, Q2 anti-drift: the
-                // same routines `apply` uses) plus the harness-added substrate the
-                // resolution rests on. This is the #317 fix — admission now sees
-                // authority the ruleset installs beyond the grant (Landlock's
-                // `base_read` loader/library trees; a symlinked grant root that
-                // resolves `Unknown`) instead of the caveats-grain blind spot.
-                //
-                // Net stays caveats-grain for THIS slice: the faithful net
-                // projection (ADR-0015 loopback exactness + the E3 io_uring
-                // residual) lands with the io_uring egress floor (PR-1). Wiring the
-                // placeholder net projection here would over-refuse legit loopback
-                // grants, so net admission is byte-identical to prior behaviour.
-                let mut resolved = sandbox.resolved_authority(mechanism_caveats);
-                resolved.net = crate::ResolvedAuthority::from_delegated(mechanism_caveats).net;
+                // install for these caveats (ruleset grain; the shared root-set
+                // derivation cannot independently drift from `apply`) plus the
+                // harness-added substrate the resolution rests on. This is the #317
+                // fix — admission now sees authority the ruleset installs beyond the
+                // grant (Landlock's `base_read` loader/library trees; a symlinked
+                // grant root that resolves `Unknown`) instead of the caveats-grain
+                // blind spot. A backend that enforces nothing (Noop ⇒ all-Unbounded)
+                // refuses a restricted axis here; the net axis resolves `Unknown`
+                // for a restricted grant (E3 io_uring — not yet provable) and so
+                // fails closed until the io_uring egress floor lands (PR-1). No
+                // caveats-grain net override: `resolved` is the honest projection.
                 BackendProjection {
-                    resolved,
+                    resolved: sandbox.resolved_authority(mechanism_caveats),
                     runtime_closure: sandbox.runtime_closure(mechanism_caveats),
                 }
             },
@@ -1249,20 +1252,20 @@ mod tokio_spawn_tests {
 
     // ── #257: spawn_tokio's egress-proxy wiring ─────────────────────────────
 
-    /// Where the loopback fence is NOT emittable (any host whose backend does
-    /// not engage for the fenced caveats — e.g. Linux/Landlock, which cannot
-    /// address-fence), a remote-host `net` grant spawns with NO proxy: inert,
-    /// advisory-net, exactly the pre-#257 behavior (the ADR 0015 posture —
-    /// never a proxy the child can walk around).
+    /// A remote-host `net` grant whose backend CANNOT address-fence it (e.g.
+    /// Linux/Landlock) can no longer spawn "inert / advisory-net". That was the
+    /// pre-#257 / ADR-0015 register-and-proceed posture; the conservative net
+    /// projection (review #1) RETIRES it: the net axis resolves `Unknown` (E3
+    /// io_uring not yet proven closed), so admission FAILS CLOSED until the
+    /// io_uring egress floor lands (PR-1). Where the loopback fence WOULD engage
+    /// (Seatbelt), the premise doesn't hold, so skip.
     #[tokio::test]
-    async fn remote_net_grant_without_fence_backend_spawns_inert() {
+    async fn remote_net_grant_without_fence_backend_refuses() {
         let caveats = Caveats {
             exec: Scope::only(["true".to_string()]),
             net: Scope::only(["api.example.com".to_string()]),
             ..Caveats::top()
         };
-        // Only meaningful where the fence would NOT engage; on a Seatbelt host
-        // this test's premise doesn't hold, so skip there.
         let plan_engages = crate::egress_proxy_plan(
             &caveats,
             &std::sync::Arc::new(crate::SandboxPolicy::default()),
@@ -1273,13 +1276,11 @@ mod tokio_spawn_tests {
             return;
         }
         let cx = ctx(caveats);
-        let child = ConfinedCommand::new("true")
-            .spawn_tokio(&cx)
-            .expect("inert path spawns as before");
-        assert!(!child.egress_proxied(), "no fence backend → no proxy");
-        assert!(child.refused_hosts().is_empty());
-        // Reap deterministically (kill-on-drop covers it regardless).
-        drop(child);
+        let result = ConfinedCommand::new("true").spawn_tokio(&cx);
+        assert!(
+            matches!(result, Err(ToolError::Denied { .. })),
+            "an un-bound-able remote net grant must fail closed (E3, until PR-1), not spawn inert"
+        );
     }
 
     /// The engage path — INTEGRATION tier (real Seatbelt + real subprocess +
@@ -1747,16 +1748,17 @@ mod tests {
 
     /// The no-op backend enforces nothing, so it is EXEMPT from the L3 scope
     /// check — there is no enforced scope to bound. Whether "no OS confinement"
-    /// is acceptable is the STRENGTH floor's decision (L4). So a restricted EXEC
-    /// grant admits under the default floor (exec floor = Advisory) — the
-    /// Brush-worker-under-Noop lane, where brush-ocap is the real mechanism and
-    /// the OS sandbox is best-effort defense-in-depth — while a restricted
-    /// FS_WRITE grant still refuses (fs floor = Kernel). L3 must not double-refuse
-    /// what L4 already governs; regression guard for the PR-0b ruleset-grain wiring.
+    /// NEGATIVE guard (review #2): an ARBITRARY (model-selected) spawn under the
+    /// no-op backend with restricted authority must REFUSE — it is bounded by no
+    /// mechanism at all. The brush-ocap identity projection is keyed on the
+    /// TRUSTED-WORKER route (`SpawnAuthority::TrustedWorker`), NOT on
+    /// `SandboxKind::None`, so a model-selected Noop spawn cannot borrow that
+    /// exemption merely because the brush worker path exists. A restricted EXEC
+    /// grant refuses (Noop resolves `Unbounded` ⊋ the grant) even under the
+    /// Advisory default floor; a restricted FS_WRITE refuses too (also L4/Kernel).
     ///
     /// Only meaningful when NO OS backend is compiled in (else the selected
-    /// backend is Landlock/Seatbelt/AppContainer, which genuinely enforces the
-    /// restriction and admits/refuses on its own merits) — same gate as
+    /// backend genuinely enforces) — same gate as
     /// `restrictive_write_refused_when_no_sandbox_available`.
     #[cfg(not(any(
         all(target_os = "linux", feature = "linux-landlock"),
@@ -1764,7 +1766,7 @@ mod tests {
         all(target_os = "windows", feature = "windows-appcontainer")
     )))]
     #[test]
-    fn noop_is_exempt_from_l3_but_l4_still_governs() {
+    fn an_arbitrary_noop_spawn_with_restricted_authority_refuses() {
         let true_bin = ["/usr/bin/true", "/bin/true"]
             .into_iter()
             .find(|p| Path::new(p).exists());
@@ -1772,16 +1774,20 @@ mod tests {
             eprintln!("skipping: no true(1) found");
             return;
         };
-        // Restricted exec + Advisory exec floor (default) ⇒ admits under Noop.
+        // Restricted exec, Advisory exec floor — L4 would admit, but L3 refuses
+        // because Noop bounds nothing (model-selected ⇒ no brush-ocap exemption).
         let cx = ctx(Caveats {
             exec: Scope::only([true_bin.to_string()]),
             ..Caveats::top()
         });
         assert!(
-            ConfinedCommand::new(true_bin).spawn(&cx).is_ok(),
-            "restricted exec under Noop with an Advisory exec floor must admit (brush lane)"
+            matches!(
+                ConfinedCommand::new(true_bin).spawn(&cx),
+                Err(ToolError::Denied { .. })
+            ),
+            "a model-selected restricted-exec spawn under Noop must refuse (no mechanism)"
         );
-        // Restricted fs_write + Kernel fs floor (default) ⇒ still refuses (L4).
+        // Restricted fs_write, Kernel fs floor — refuses on both L3 and L4.
         let cx = ctx(Caveats {
             fs_write: Scope::only(["/tmp/x".to_string()]),
             ..Caveats::top()
@@ -1791,7 +1797,7 @@ mod tests {
                 ConfinedCommand::new(true_bin).spawn(&cx),
                 Err(ToolError::Denied { .. })
             ),
-            "restricted fs_write under Noop with a Kernel floor must still refuse (L4)"
+            "a model-selected restricted-fs_write spawn under Noop must refuse"
         );
     }
 
@@ -1808,15 +1814,12 @@ mod tests {
             eprintln!("skipping env-scrub test: no env(1) found");
             return;
         };
-        // fs_write unrestricted (env(1) writes only to its stdout pipe, not the
-        // filesystem), exec pinned to env. Under the default Noop backend this
-        // admits: the no-op backend is exempt from the L3 scope check (it enforces
-        // nothing), and the default exec floor is Advisory, so L4 admits too —
-        // exactly the Brush-worker-under-Noop lane.
-        let cx = ctx(Caveats {
-            exec: Scope::only(["env".to_string()]),
-            ..Caveats::top()
-        });
+        // Env scrubbing is a spawn-level `env_clear`, independent of any sandbox.
+        // Grant fully-unrestricted caveats so the assertion isolates the scrub: a
+        // model-selected restricted axis (e.g. `exec: Only`) under the default Noop
+        // backend now correctly REFUSES (Noop bounds nothing; the brush-ocap
+        // exemption is trusted-worker-only), which is unrelated to what this checks.
+        let cx = ctx(Caveats::top());
         let spawned = ConfinedCommand::new(env_bin)
             .env("ALLOWED", "yes")
             .stdout(Stdio::piped())
