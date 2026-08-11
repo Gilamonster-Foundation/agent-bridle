@@ -632,18 +632,73 @@ pub(crate) mod appcontainer_impl {
             SandboxKind::AppContainer
         }
 
-        /// Caveats-grain admission placeholder. AppContainer DOES confine (via the
-        /// aclaunch DACL), but its FAITHFUL ruleset-grain projection — notably E2,
-        /// where a write-grant DACL necessarily confers read — is not written yet;
-        /// it lands with the Windows mechanism PR (E2 / PR-4). Until then this
-        /// backend keeps its pre-#317 caveats-grain admission (`from_delegated`),
-        /// so PR-0b neither regresses Windows confined operation nor claims a bound
-        /// AppContainer has not proven (I15 stays Partial for Windows). This is
-        /// deliberately NOT the fail-closed trait default, which resolves every
-        /// axis `Unknown` and would refuse every AppContainer spawn — even an
-        /// unrestricted grant.
+        /// Faithful ruleset-grain projection of the AppContainer + DACL fence
+        /// (#317 INV-BOUND / E2). Derived from the SAME grants `command_prefix`
+        /// emits and the `agent-bridle-aclaunch` DACL actually installs — NEVER
+        /// `from_delegated`, which would merely re-assert the requested caveats the
+        /// #317 audit disputed. DECLARED ≠ RESOLVED ≠ APPLIED: this is the RESOLVED
+        /// bound, and it must never claim narrower authority than the ACL applies.
+        ///
+        /// **fs — E2 (write ⇒ read):** `agent-bridle-aclaunch` grants every
+        /// `--fs-write` path `FILE_GENERIC_READ_WRITE` (`main.rs`: `READ | WRITE`,
+        /// "a superset of read") with subtree inherit and no DENY ACE — there is no
+        /// write-only ACE — so a write-granted path is kernel-**readable**. The
+        /// faithful resolved READ authority is therefore `fs_read ∪ fs_write`, never
+        /// the requested read scope alone. When `fs_write ⊄ fs_read` this union is a
+        /// `Superset` of the delegated read bound, so `admit` refuses fail-closed —
+        /// the leak becomes a refusal, not a silent widening. (Native-proven on real
+        /// Windows: a write-only-granted dir is readable by the AppContainer child;
+        /// an ungranted neighbour is `Access is denied`.)
+        ///
+        /// **exec:** AppContainer bounds exec ONLY via the deny-all child-process
+        /// block (`--no-child-process`, engaged iff exec is fully denied) → `∅`. A
+        /// NON-empty allowlist is not kernel-bounded — the child may `CreateProcess`
+        /// any image; enforcing the allowlist is the harness leash's Interceptor
+        /// job, not the container's — so it is `Unknown` ⇒ `admit` refuses a
+        /// restricted-exec-as-Kernel contract. `All` → `Unbounded` (honest: no exec
+        /// bound). Never let a non-empty allowlist masquerade as kernel-enforced.
+        ///
+        /// **net:** deny-by-default (no `INTERNET_CLIENT` capability) → `∅`;
+        /// `--net-allow` (full client capability) → `Unbounded`; the loopback
+        /// exemption is all-or-nothing (it grants the WHOLE loopback interface —
+        /// `127.0.0.0/8` + `::1`, every port — not a requested subset), so union a
+        /// `loopback-exemption` class to REVEAL that widening; a specific remote-host
+        /// allowlist AppContainer cannot faithfully bound → `Unknown` ⇒ refuse.
         fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
-            crate::ResolvedAuthority::from_delegated(effective)
+            use crate::ResolvedScope as Rs;
+            // fs: mirror the aclaunch DACL — a write ACE (FILE_GENERIC_READ_WRITE)
+            // confers read, so the resolved read scope unions the write scope.
+            let fs_read =
+                Rs::from_scope(&effective.fs_read).union(&Rs::from_scope(&effective.fs_write));
+            let fs_write = Rs::from_scope(&effective.fs_write);
+            // exec: bounded ONLY by the deny-all child-process block; any non-empty
+            // allowlist is Unknown (Interceptor, not a kernel bound).
+            let exec = if exec_fully_denied(effective) {
+                Rs::from_scope(&effective.exec) // ∅ — no child process may be created
+            } else {
+                match &effective.exec {
+                    Scope::All => Rs::Unbounded,
+                    Scope::Only(_) => Rs::Unknown,
+                }
+            };
+            // net: deny-by-default ⇒ ∅; loopback exemption widens to the whole
+            // interface (reveal via a class); remote-host allowlist ⇒ Unknown.
+            let net = if net_fully_denied(effective) {
+                Rs::from_scope(&effective.net) // ∅ — no INTERNET_CLIENT capability
+            } else if net_loopback_only(effective) {
+                Rs::from_scope(&effective.net).union(&Rs::class("appcontainer-loopback-exemption"))
+            } else {
+                match &effective.net {
+                    Scope::All => Rs::Unbounded,
+                    Scope::Only(_) => Rs::Unknown,
+                }
+            };
+            crate::ResolvedAuthority {
+                fs_read,
+                fs_write,
+                exec,
+                net,
+            }
         }
 
         /// No-op: AppContainer confinement is applied at process creation via the
@@ -740,6 +795,133 @@ pub(crate) mod appcontainer_impl {
 
             Ok(prefix)
         }
+    }
+}
+
+/// E2 adversarial regression: the AppContainer faithful projection + mesh
+/// admission fail CLOSED on unrepresentable narrowing (`fs_write ⇒ read`, exec/net
+/// honesty). Proves DECLARED ≠ RESOLVED — the resolved authority reveals the DACL
+/// widening and admission refuses it, rather than re-asserting the delegated grant.
+#[cfg(all(test, target_os = "windows", feature = "windows-appcontainer"))]
+mod appcontainer_resolved_authority_tests {
+    use super::appcontainer_impl::AppContainerSandbox;
+    use super::Sandbox;
+    use crate::{
+        admit, empty_closure, AdmissionDecision, Caveats, ConfinedAxis, ResolvedScope, Scope,
+        ScopeRelation,
+    };
+
+    /// exec + net fully denied so those axes admit (`∅ ⊆ ∅`); the fs axes are the
+    /// variable under test.
+    fn fs_probe(read: &[&str], write: &[&str]) -> Caveats {
+        Caveats {
+            fs_read: Scope::only(read.iter().map(|s| (*s).to_string())),
+            fs_write: Scope::only(write.iter().map(|s| (*s).to_string())),
+            exec: Scope::only(std::iter::empty::<String>()),
+            net: Scope::only(std::iter::empty::<String>()),
+            ..Caveats::top()
+        }
+    }
+
+    fn decide(caveats: &Caveats) -> AdmissionDecision {
+        let resolved = AppContainerSandbox::new().resolved_authority(caveats);
+        admit(&resolved, caveats, &empty_closure())
+    }
+
+    /// THE E2 fail-closed case: a write-granted path NOT in the read scope is
+    /// kernel-readable (the aclaunch DACL grants `FILE_GENERIC_READ_WRITE`), so the
+    /// resolved read authority is a Superset of the requested read → REFUSE.
+    #[test]
+    fn write_only_path_widens_read_and_refuses() {
+        let c = fs_probe(&["C:/repo"], &["C:/dropbox"]); // fs_write ⊄ fs_read
+        match decide(&c) {
+            AdmissionDecision::Reject(r) => {
+                assert_eq!(r.axis, ConfinedAxis::FsRead, "the read axis is the widened one");
+                assert_eq!(
+                    r.relation,
+                    ScopeRelation::Superset,
+                    "read is widened by the write grant, not incomparable/unknown"
+                );
+            }
+            AdmissionDecision::Admit => panic!(
+                "fs_write ⊄ fs_read must refuse: the write ACE confers read the grant did not authorize"
+            ),
+        }
+        // The projection itself must reveal the widening (never == the delegated read).
+        let resolved = AppContainerSandbox::new().resolved_authority(&c);
+        assert_ne!(
+            resolved.fs_read,
+            ResolvedScope::from_scope(&c.fs_read),
+            "resolved read must fold in the write scope, not re-assert the requested read"
+        );
+    }
+
+    /// Positive control: `fs_write ⊆ fs_read` → resolved read == requested read → ADMIT.
+    #[test]
+    fn write_subset_of_read_admits() {
+        let c = fs_probe(&["C:/repo", "C:/work"], &["C:/work"]); // fs_write ⊆ fs_read
+        assert_eq!(
+            decide(&c),
+            AdmissionDecision::Admit,
+            "a write scope inside the read scope adds no new read authority"
+        );
+    }
+
+    /// exec: a NON-empty allowlist is not kernel-bounded by AppContainer → `Unknown`
+    /// → REFUSE (never let a restricted-exec config read as kernel-enforced).
+    #[test]
+    fn nonempty_exec_allowlist_refuses_as_unknown() {
+        let c = Caveats {
+            exec: Scope::only(["cmd".to_string()]),
+            ..Caveats::top() // other axes unrestricted ⇒ admit; exec is the refuser
+        };
+        match decide(&c) {
+            AdmissionDecision::Reject(r) => {
+                assert_eq!(r.axis, ConfinedAxis::Exec);
+                assert_eq!(r.relation, ScopeRelation::Unknown);
+            }
+            AdmissionDecision::Admit => {
+                panic!("a restricted exec allowlist must not admit as AppContainer-enforced")
+            }
+        }
+    }
+
+    /// exec fully denied (`--no-child-process`) IS kernel-bounded → ADMIT.
+    #[test]
+    fn exec_deny_all_admits() {
+        let c = Caveats {
+            exec: Scope::only(std::iter::empty::<String>()),
+            ..Caveats::top()
+        };
+        assert_eq!(decide(&c), AdmissionDecision::Admit);
+    }
+
+    /// net: a remote-host allowlist AppContainer cannot bound → `Unknown` → REFUSE.
+    #[test]
+    fn remote_host_net_allowlist_refuses_as_unknown() {
+        let c = Caveats {
+            net: Scope::only(["api.example.com:443".to_string()]),
+            ..Caveats::top()
+        };
+        match decide(&c) {
+            AdmissionDecision::Reject(r) => {
+                assert_eq!(r.axis, ConfinedAxis::Net);
+                assert_eq!(r.relation, ScopeRelation::Unknown);
+            }
+            AdmissionDecision::Admit => {
+                panic!("a remote-host net allowlist must not admit as AppContainer-bounded")
+            }
+        }
+    }
+
+    /// net fully denied (deny-by-default, no `INTERNET_CLIENT` capability) → ADMIT.
+    #[test]
+    fn net_deny_all_admits() {
+        let c = Caveats {
+            net: Scope::only(std::iter::empty::<String>()),
+            ..Caveats::top()
+        };
+        assert_eq!(decide(&c), AdmissionDecision::Admit);
     }
 }
 
