@@ -887,7 +887,7 @@ mod appcontainer_resolved_authority_tests {
     }
 
     fn decide(caveats: &Caveats) -> AdmissionDecision {
-        let resolved = AppContainerSandbox::new().resolved_authority(caveats);
+        let resolved = AppContainerSandbox::new(None).resolved_authority(caveats);
         admit(&resolved, caveats, &empty_closure())
     }
 
@@ -911,7 +911,7 @@ mod appcontainer_resolved_authority_tests {
             ),
         }
         // The projection itself must reveal the widening (never == the delegated read).
-        let resolved = AppContainerSandbox::new().resolved_authority(&c);
+        let resolved = AppContainerSandbox::new(None).resolved_authority(&c);
         assert_ne!(
             resolved.fs_read,
             ResolvedScope::from_scope(&c.fs_read),
