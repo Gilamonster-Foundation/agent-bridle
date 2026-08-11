@@ -2128,4 +2128,56 @@ mod seatbelt_child_tests {
             "a restricted exec axis is kernel-confined by process-exec* (ADR 0014)"
         );
     }
+
+    /// E4 evidence C — DESCENDANT INHERITANCE (≥2 generations) through the REAL
+    /// Bridle spawn path. The Seatbelt boundary is inherited by every descendant,
+    /// so a GRANDCHILD the confined child forks under `net: none` also cannot
+    /// egress. A `sh -c 'sh -c "curl …"'` reaches curl at generation 2; its egress
+    /// must be kernel-denied (curl exit 7), while a benign grandchild succeeds
+    /// (positive control — the profile parsed and only egress is denied).
+    #[test]
+    fn net_none_boundary_is_inherited_by_a_grandchild() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        if !std::path::Path::new("/usr/bin/curl").exists() {
+            eprintln!("skipping: no curl(1)");
+            return;
+        }
+        // net:none plus exec allowing the shells + curl the grandchild needs.
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            exec: Scope::only([
+                "/bin/sh".to_string(),
+                "/usr/bin/curl".to_string(),
+                "/usr/bin/true".to_string(),
+            ]),
+            ..Caveats::top()
+        });
+
+        // Positive control: a benign generation-2 process runs.
+        let ok = ConfinedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("/bin/sh -c /usr/bin/true")
+            .spawn(&cx)
+            .expect("spawn benign grandchild")
+            .child
+            .wait()
+            .expect("wait");
+        assert!(ok.success(), "a benign generation-2 descendant must run");
+
+        // The grandchild's egress is kernel-denied (inherited net:none): curl to a
+        // literal IP exits 7 (socket denied), not 0.
+        let mut escaped = ConfinedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("/bin/sh -c '/usr/bin/curl -sS --max-time 5 http://1.1.1.1/'")
+            .spawn(&cx)
+            .expect("spawn egressing grandchild");
+        let status = escaped.child.wait().expect("wait");
+        assert!(
+            !status.success(),
+            "a generation-2 descendant must inherit the net:none boundary (egress denied)"
+        );
+    }
 }

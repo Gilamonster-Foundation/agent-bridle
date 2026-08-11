@@ -2005,6 +2005,19 @@ mod seatbelt_impl {
                 }
             };
 
+            // NOTE (registered residual — coordinator ruling pending, board
+            // 2026-08-11 E4 note): the profile bounds fs_read CONTENT to the grant
+            // (proven: `cat` of an out-of-scope file is kernel-denied), but it also
+            // emits an unqualified `(allow file-read-metadata)` so a confined
+            // program can traverse firmlink ancestors (`/tmp`→`/private/tmp`). That
+            // metadata allow lets a hostile child `stat` any path (existence/size),
+            // whole-fs — a metadata disclosure ORTHOGONAL to the fs_read *content*
+            // axis this projection bounds. The brief asks whether unqualified
+            // metadata should force fs_read⇒Unknown (⇒ refuse ALL macOS read
+            // confinement) or the profile be narrowed to granted-root traversal
+            // ancestors only. That is a central fence-semantics decision, reported
+            // (not guessed) — this projection bounds the content axis and records
+            // the metadata leak as the residual, pending the ruling.
             let fs_read = if !confine_read {
                 ResolvedScope::Unbounded
             } else if !grant_leaf_object_stable(&effective.fs_read) {
