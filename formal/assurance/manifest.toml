@@ -1,0 +1,140 @@
+# Assurance manifest (Phase 7) — security claims as GENERATED DATA, not prose.
+#
+# Each [[claim]] links a security property to the artifacts that establish it:
+#   lean_theorem   — a theorem in the formal/ Lake project (axiom-audited)
+#   tla_invariant  — an invariant in a formal/tla spec, + the cfg that checks it
+#   rust_test      — a #[test] proving model≈production semantics
+#   native_test    — the hostile-child test proving OS≈production (per platform)
+#   evidence_cid   — content-address of the native evidence artifact, via the
+#                    EXISTING ceremony CID machinery. That layer is HELD (not yet
+#                    wired to a concrete hash — see assumptions.md ASM-CID), so
+#                    these read "held:phase1d" until Phase-1d freezes the vectors.
+#   status         — proved | partial | held
+#
+# validate.sh checks every reference here RESOLVES (theorem name present in Lean
+# source, invariant + cfg present, rust test present, native test file present).
+# A dangling reference fails the assurance gate.
+
+schema_version = "0.1.0"
+production_sha = "37fef8dbef0968c16ddd0f1acb0a4db7ac3ad3ed"
+algebra_crate  = "agent-mesh-protocol@0.6.4"
+
+# ── The headline Windows E2 claim (seed of this work) ────────────────────────
+[[claim]]
+id            = "WIN-E2-WRITE-READ"
+platform      = "windows"
+statement     = "Under the AppContainer projection (resolved.fs_read = delegated.fs_read ∪ delegated.fs_write), a config whose write paths are not a subset of its read paths is a read-axis widening and an exact/narrow admission MUST refuse it."
+lean_theorem  = ["Ceremony.Assurance.windows_write_implies_read_widening", "Ceremony.Assurance.windows_unrepresentable_narrowing_rejected"]
+tla_invariant = ["T3_AppliedWithinClaim@AuthorityLifecycle_AppliedExceedsClaim.cfg"]
+rust_test     = ["windows_write_without_read_triggers_widening_and_is_rejected", "windows_write_subset_of_read_admits", "windows_union_membership_is_exact"]
+native_test   = ["agent-bridle-aclaunch/tests/kernel_proofs.rs"]
+evidence_cid  = "held:phase1d"
+impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"  # PR #338 head, MERGED to main @ ef74ee2
+premise       = "ASM-WIN-DACL: LANDED ON MAIN, NOT RC-CERTIFIED. The aclaunch DACL grants content read on every write path (main.rs:476, FILE_GENERIC_READ_WRITE); the native DACL proof (kernel_proofs.rs::fs_write_grant_confers_read_e2 + icacls AppContainer-SID mask (R,W)) landed on main via #338 (@ ef74ee2 / 523038d) under strict BRIDLE_REQUIRE_APPCONTAINER. But ef74ee2 is NOT the frozen RC SHA, and release doctrine forbids counting ancestor-SHA evidence as final RC evidence — so for RELEASE this premise is PENDING until it re-runs on BRIDLE_RC_SHA. Model half proved (Lean); OS-refinement half awaits RC-SHA evidence."
+status        = "partial"   # model PROVED; native probe landed on main, RC-SHA re-certification pending
+
+# ── #323 env-isolation controls (both directions) ────────────────────────────
+[[claim]]
+id            = "WIN-E2-ENV-NO-AMBIENT"
+platform      = "windows"
+statement     = "A parent secret that was not explicitly delegated never reaches the confined child's environment."
+lean_theorem  = []
+tla_invariant = ["T6_EnvDelegation@AuthorityLifecycle_AmbientEnv.cfg"]
+rust_test     = []
+native_test   = ["agent-bridle-tool-shell/tests/windows_env_isolation.rs", "agent-bridle-tool-shell/tests/windows_appcontainer_env.rs"]
+evidence_cid  = "held:phase1d"
+impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"
+premise       = "none — model theorem is unconditional; native test proves the OS refinement"
+status        = "partial"   # native env test landed on main (#338 merged); RC-SHA certification pending
+
+[[claim]]
+id            = "ENV-DELEGATION-SURVIVES"
+platform      = "all"
+statement     = "An explicitly delegated env var reaches the executed child (delegation is not over-scrubbed)."
+lean_theorem  = []
+tla_invariant = ["T6_EnvDelegation@AuthorityLifecycle_faithful.cfg"]
+rust_test     = []
+native_test   = ["agent-bridle-tool-shell/tests/real_spawn.rs"]
+evidence_cid  = "held:phase1d"
+premise       = "none"
+status        = "partial"
+
+# ── Portable authority-algebra claims (platform-neutral core) ────────────────
+[[claim]]
+id            = "ADMIT-NO-SILENT-WIDENING"
+platform      = "all"
+statement     = "Admission accepts a fence iff resolved ⊆ delegated ∪ closure on every axis; any widening (Superset) is refused."
+lean_theorem  = ["Ceremony.Assurance.admission_sound", "Ceremony.Assurance.no_silent_widening", "Ceremony.Assurance.widening_refused"]
+tla_invariant = ["T2_NoSilentWiden@AuthorityLifecycle_SilentWiden.cfg", "T3_AppliedWithinClaim@AuthorityLifecycle_AppliedExceedsClaim.cfg"]
+rust_test     = ["admit_admits_within_and_rejects_widening", "relate_orientation_matches_within", "union_expands_and_absorbs"]
+native_test   = []
+premise       = "none"
+status        = "proved"
+
+[[claim]]
+id            = "UNKNOWN-FAILS-CLOSED"
+platform      = "all"
+statement     = "An Unknown enforcement result (or Unknown runtime closure) can never satisfy admission — the fail-closed floor (L6/L7/T4)."
+lean_theorem  = ["Ceremony.Assurance.unknown_never_admissible", "Ceremony.Assurance.unknown_closure_never_admissible"]
+tla_invariant = ["T4_UnknownNotStrong@AuthorityLifecycle_UnknownAdmit.cfg"]
+rust_test     = ["unknown_fails_closed"]
+native_test   = []
+premise       = "none"
+status        = "proved"
+
+[[claim]]
+id            = "RUNTIME-CLOSURE-VISIBLE"
+platform      = "all"
+statement     = "Authority the harness adds must appear in the closure (widen the bound visibly); it cannot be laundered as 'runtime' and hidden from resolution (L5/T2)."
+lean_theorem  = ["Ceremony.Assurance.runtime_closure_not_hidden"]
+tla_invariant = ["T2_NoSilentWiden@AuthorityLifecycle_SilentWiden.cfg"]
+rust_test     = ["runtime_closure_is_the_only_way_extra_authority_admits"]
+native_test   = []
+premise       = "none"
+status        = "proved"
+
+[[claim]]
+id            = "NO-EXEC-BEFORE-ADMIT"
+platform      = "all"
+statement     = "A confinement-requiring execution cannot reach Executed unless admission succeeded (T1)."
+lean_theorem  = []
+tla_invariant = ["T1_NoExecBeforeAdmit@AuthorityLifecycle_ExecBeforeAdmit.cfg"]
+rust_test     = []
+native_test   = []
+premise       = "none"
+status        = "proved"
+
+[[claim]]
+id            = "DESCENDANT-NON-ESCALATION"
+platform      = "all"
+statement     = "A confined child and grandchild cannot hold authority beyond the applied fence (T5)."
+lean_theorem  = []
+tla_invariant = ["T5_DescendantNonEscalation@AuthorityLifecycle_DescendantEscalate.cfg"]
+rust_test     = []
+native_test   = ["agent-bridle-tool-shell/tests/real_spawn.rs", "agent-bridle-aclaunch/tests/kernel_proofs.rs"]
+premise       = "ASM-INHERIT: seccomp/Landlock/Seatbelt/AppContainer actually preserve the boundary across a native grandchild (per platform). Empirically established, not proved."
+status        = "partial"
+
+[[claim]]
+id            = "PROVENANCE-CONTINUITY"
+platform      = "all"
+statement     = "Evidence attests the applied fence it claims (matching CID); no silent substitution of an unrelated object across authority-bearing handoffs (T7)."
+lean_theorem  = []
+tla_invariant = ["T7_ProvenanceContinuity@AuthorityLifecycle_SubstituteEvidence.cfg"]
+rust_test     = []
+native_test   = []
+evidence_cid  = "held:phase1d"
+premise       = "ASM-CID: modeled with Cid(x)=x (injective, uninterpreted). The runtime chain does NOT yet attach content CIDs (held in the ceremony P1 layer) — so this is a MODEL property, not a wired runtime guarantee."
+status        = "held"
+
+# ── L3 non-equivocation (pre-existing spec, folded into the assurance surface) ─
+[[claim]]
+id            = "FENCE-NON-EQUIVOCATION"
+platform      = "all"
+statement     = "The fence applied to the child is the one admission analyzed (same CID) — no re-derivation between admit and apply (L2/L3, #317)."
+lean_theorem  = []
+tla_invariant = ["Inv@EnforcementFence_NonEquivocation_oneFence.cfg", "Inv@EnforcementFence_NonEquivocation_separateDerivation.cfg"]
+rust_test     = []
+native_test   = []
+premise       = "none"
+status        = "proved"

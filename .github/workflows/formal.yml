@@ -1,8 +1,9 @@
 # Ceremony Suite formal proof gate.
 #
 # HOOK PARITY: `just check-formal` and `.githooks/pre-push` run the same
-# `lake build` plus `lake exe formalGate` locally. Keep all three in sync when
-# the proof command changes.
+# `lake build` plus `lake exe formalGate` locally; `just check-tla` and the same
+# hook run the `tla` job's TLC driver + assurance validation. Keep all in sync
+# when the proof commands change.
 #
 # `lake build` also elaborates AxiomAudit (F-233-06): a `Lean.collectAxioms`
 # sweep that fails the build if any security theorem depends on a postulate
@@ -52,3 +53,38 @@ jobs:
         shell: bash
         run: |
           "$HOME/.elan/bin/lake" exe formalGate
+
+  tla:
+    name: TLA+ authority lifecycle + assurance manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      # Pinned tooling only (see formal/tla/tla2tools-pin.txt). Download the exact
+      # release, then VERIFY the sha256 before executing — security CI must not run
+      # unpinned formal tooling.
+      - name: Fetch + verify tla2tools (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          WANT="$(grep -oE 'sha256 = [0-9a-f]+' formal/tla/tla2tools-pin.txt | awk '{print $3}')"
+          curl -fsSL -o /tmp/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          GOT="$(sha256sum /tmp/tla2tools.jar | cut -d' ' -f1)"
+          if [ "$WANT" != "$GOT" ]; then
+            echo "tla2tools checksum mismatch: want $WANT got $GOT"; exit 1
+          fi
+          echo "TLA2TOOLS_JAR=/tmp/tla2tools.jar" >> "$GITHUB_ENV"
+      - name: Model-check T1..T7 (faithful holds; every bug cfg is a counterexample)
+        shell: bash
+        run: ./formal/tla/run-authority-lifecycle.sh
+      - name: Validate the assurance manifest references resolve
+        shell: bash
+        run: ./formal/assurance/validate.sh
+      - name: Certification gate self-test (rejects false certification)
+        shell: bash
+        run: ./formal/assurance/validate_selftest.sh

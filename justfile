@@ -50,6 +50,31 @@ check-formal:
     set -e
     ( cd formal && "$LAKE" build && "$LAKE" exe formalGate )
 
+# TLA+ authority-lifecycle gate + assurance-manifest validation. Model-checks
+# formal/tla/AuthorityLifecycle.tla (T1..T7): the faithful cfg must hold []Inv and
+# every bug cfg must yield a counterexample; then validates that every reference in
+# formal/assurance/manifest.toml resolves. Skips gracefully if tla2tools is absent.
+# The jar is CHECKSUM-PINNED (formal/tla/tla2tools-pin.txt) — security CI must not
+# run unpinned formal tooling.
+# HOOK PARITY: run by .githooks/pre-push and mirrored by the `tla` job in
+# .github/workflows/formal.yml.
+check-tla:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    JAR="${TLA2TOOLS_JAR:-$HOME/opt/tla2tools/tla2tools.jar}"
+    if [ ! -f "$JAR" ]; then
+        echo "tla2tools.jar not found — skipping TLA gate (see formal/tla/tla2tools-pin.txt)"; exit 0
+    fi
+    WANT="$(grep -oE 'sha256 = [0-9a-f]+' formal/tla/tla2tools-pin.txt | awk '{print $3}')"
+    GOT="$(sha256sum "$JAR" | cut -d' ' -f1)"
+    if [ "$WANT" != "$GOT" ]; then
+        echo "tla2tools.jar checksum mismatch (want $WANT, got $GOT) — refusing unpinned tooling"; exit 1
+    fi
+    set -e
+    ./formal/tla/run-authority-lifecycle.sh
+    ./formal/assurance/validate.sh
+    ./formal/assurance/validate_selftest.sh
+
 # Tier-3 REFINEMENT gate (HEAVY — pulls the Aeneas Lean backend + mathlib).
 # Proves the Charon/Aeneas-EXTRACTED Rust of agent-bridle-ceremony satisfies the
 # Authority.lean laws (formal/refinement/). Deliberately NOT in the mandatory

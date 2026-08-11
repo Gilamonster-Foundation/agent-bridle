@@ -29,4 +29,7 @@ just py-test
 echo "[pre-push] running Tier-3 formal proof gate (Lean; skips gracefully if lake absent)"
 just check-formal
 
+echo "[pre-push] running TLA+ authority-lifecycle gate + assurance validation (skips if tla2tools absent)"
+just check-tla
+
 echo "[pre-push] OK"
