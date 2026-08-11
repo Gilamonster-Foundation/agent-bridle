@@ -35,10 +35,21 @@ fn exec_only(names: &[&str]) -> Caveats {
 /// not reach the confined child. Stands in for a leaked `OPENAI_API_KEY`.
 #[tokio::test]
 async fn windows_ambient_env_is_not_inherited() {
+    // Proves the #323 contract in one confined run:
+    //   child_env == minimal_platform_baseline ∪ explicitly_delegated_env
+    // (NOT ambient_parent_env ∪ delegated_env).
+    //
+    // A parent-only ambient secret (stands in for a leaked `OPENAI_API_KEY`) that
+    // is NOT delegated, and an explicitly delegated var that IS.
     std::env::set_var("AB323_AMBIENT_SECRET", "leak");
     let out = ShellTool::new()
         .invoke(
-            serde_json::json!({"program": "cmd", "args": ["/c", "set"]}),
+            serde_json::json!({
+                "program": "cmd",
+                "args": ["/c", "set"],
+                // The ONLY authority the child should receive beyond the baseline.
+                "env": { "AB323_GRANTED": "allowed" },
+            }),
             &ctx(exec_only(&["cmd"])),
         )
         .await
@@ -46,14 +57,21 @@ async fn windows_ambient_env_is_not_inherited() {
     std::env::remove_var("AB323_AMBIENT_SECRET");
     let stdout = out["stdout"].as_str().unwrap_or_default();
     // Non-vacuity: the child actually RAN and printed its environment (the fixed
-    // Windows baseline includes `SystemRoot`), so "secret absent" reflects a real
-    // env_clear, not a child that failed to spawn and produced no output.
+    // Windows baseline includes `SystemRoot`), so the assertions below reflect a
+    // real env_clear, not a child that failed to spawn and produced no output.
     assert!(
         stdout.contains("SystemRoot="),
         "positive control: `cmd /c set` must have run and printed the baseline env:\n{stdout}"
     );
+    // Negative: the ambient parent secret must NOT reach the confined child.
     assert!(
         !stdout.contains("AB323_AMBIENT_SECRET"),
         "ambient parent env must not leak into the confined Windows child:\n{stdout}"
+    );
+    // Positive control (#323 §1B): the explicitly delegated var MUST reach the
+    // child — env isolation must not break the legitimate delegation path.
+    assert!(
+        stdout.contains("AB323_GRANTED=allowed"),
+        "an explicitly delegated env var must still pass through to the child:\n{stdout}"
     );
 }
