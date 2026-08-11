@@ -48,9 +48,16 @@ const HARNESS_PRIVATE_MARKERS: &[&str] = &[".newt", ".ssh", ".gnupg", ".aws", ".
 /// object-identity check on a closure root's *canonical* form), so there is
 /// exactly one definition of "harness-private" in the crate.
 pub(crate) fn entry_reaches_harness_private(entry: &str) -> bool {
+    // Treat each marker as a path-COMPONENT SEQUENCE, so a MULTI-segment marker
+    // like `.config/gh` matches a path INSIDE it (`…/.config/gh/hosts.yml`) — a
+    // per-segment match misses that (found by the PR-0b final adversarial pass).
+    // Padding with separators keeps the match on component boundaries, so a
+    // sibling like `/opt/newt-tools` does NOT match `.newt` and `/home/u/.sshfoo`
+    // does NOT match `.ssh`.
+    let padded = format!("/{}/", entry.trim_matches('/'));
     HARNESS_PRIVATE_MARKERS
         .iter()
-        .any(|marker| entry.split('/').any(|segment| segment == *marker) || entry.ends_with(marker))
+        .any(|marker| padded.contains(&format!("/{}/", marker.trim_matches('/'))))
 }
 
 fn require_harness_disjoint(entry: &str) -> ToolResult<()> {
@@ -500,6 +507,23 @@ mod tests {
         let mut unbounded = empty_closure();
         unbounded.exec = ResolvedScope::Unbounded;
         assert!(!closure_is_harness_disjoint(&unbounded));
+    }
+
+    #[test]
+    fn harness_private_matcher_handles_multi_segment_markers_on_boundaries() {
+        // A MULTI-segment marker (`.config/gh`) must match a path INSIDE it — a
+        // per-segment check missed this (found by the PR-0b final adversarial pass).
+        assert!(entry_reaches_harness_private(
+            "/home/u/.config/gh/hosts.yml"
+        ));
+        assert!(entry_reaches_harness_private("/home/u/.config/gh"));
+        // Single-segment markers still match on component boundaries.
+        assert!(entry_reaches_harness_private("/home/u/.ssh/id_ed25519"));
+        assert!(entry_reaches_harness_private("/home/u/.newt/ocap"));
+        // …and do NOT false-positive on a mere prefix/sibling.
+        assert!(!entry_reaches_harness_private("/opt/newt-tools/worker"));
+        assert!(!entry_reaches_harness_private("/home/u/.sshfoo/x"));
+        assert!(!entry_reaches_harness_private("/home/u/.config/ghi/x"));
     }
 
     // ── L4 still enforced through the same admission door ────────────────────
