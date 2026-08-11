@@ -284,3 +284,142 @@ fn exec_deny_all_kernel_blocks_child_process_creation() {
     let _ = std::fs::remove_dir_all(&control);
     let _ = std::fs::remove_dir_all(&restricted);
 }
+
+/// **E2 — write ⇒ read (the resolved-authority ground truth).** A path granted ONLY
+/// `--fs-write` (never `--fs-read`) is kernel-READABLE by the confined child, because
+/// `agent-bridle-aclaunch` grants it `FILE_GENERIC_READ_WRITE` (`main.rs`:
+/// `READ | WRITE`) — there is NO write-only ACE. This is the applied-ACL truth behind
+/// `AppContainerSandbox::resolved_authority`'s `fs_read = fs_read ∪ fs_write`
+/// projection: since the DACL confers read on a write grant, `fs_write ⊄ fs_read`
+/// must refuse. Proves MODEL == APPLIED (not model == our assumptions) and records
+/// the granted DACL (the child dumps `icacls`). Ungranted neighbour stays read-denied.
+#[test]
+fn fs_write_grant_confers_read_e2() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+    let granted = fresh_dir("e2-wgrant");
+    let neighbor = fresh_dir("e2-neighbor");
+    let g_file = granted.join("g.txt");
+    let n_file = neighbor.join("n.txt");
+    const GRANTED_CONTENT: &str = "E2_WRITE_GRANTED_IS_READABLE";
+    const NEIGHBOR_CONTENT: &str = "E2_NEIGHBOR_MUST_STAY_DENIED";
+    std::fs::write(&g_file, GRANTED_CONTENT).expect("seed granted");
+    std::fs::write(&n_file, NEIGHBOR_CONTENT).expect("seed neighbor");
+
+    // The confined child READS the write-ONLY-granted file and dumps the DACL it is
+    // under (`icacls` records the applied ACE/mask — the write⇒read mechanism).
+    let read = launch(&[
+        "--name",
+        &tag("e2r"),
+        "--fs-write",
+        &granted.to_string_lossy(),
+        "cmd.exe",
+        "/c",
+        "type",
+        &g_file.to_string_lossy(),
+        "&",
+        "icacls",
+        &granted.to_string_lossy(),
+    ]);
+    let stdout = String::from_utf8_lossy(&read.stdout);
+    // Record the applied DACL in the evidence log (behaviour below is the hard gate).
+    eprintln!(
+        "E2 applied DACL on the --fs-write dir, read from inside the AppContainer:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(GRANTED_CONTENT),
+        "E2: a --fs-write-ONLY path must be kernel-READABLE by the child (the DACL grants \
+         FILE_GENERIC_READ_WRITE); got {stdout:?}; launcher stderr: {}",
+        String::from_utf8_lossy(&read.stderr).trim()
+    );
+
+    // The ungranted neighbour (file EXISTS) must be read-DENIED — Access-denied, not
+    // missing-file — so the resolved read authority is the grant, never the whole disk.
+    let deny = launch(&[
+        "--name",
+        &tag("e2d"),
+        "--fs-write",
+        &granted.to_string_lossy(),
+        "cmd.exe",
+        "/c",
+        "type",
+        &n_file.to_string_lossy(),
+    ]);
+    let denied_out = String::from_utf8_lossy(&deny.stdout);
+    assert!(
+        !denied_out.contains(NEIGHBOR_CONTENT),
+        "an ungranted neighbour must stay kernel-denied for READ; it leaked: {denied_out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&granted);
+    let _ = std::fs::remove_dir_all(&neighbor);
+}
+
+/// **§6 descendant confinement (≥2 generations).** An AppContainer child that spawns
+/// a GRANDCHILD keeps the second generation inside the SAME authority boundary: the
+/// grandchild inherits the AppContainer token (security IDENTITY, not PID), so it can
+/// read a granted path but CANNOT read an ungranted one. Exec is NOT denied here — the
+/// grandchild really runs (proven by a positive control) — so this tests authority
+/// INHERITANCE down the process tree, not a child-process block.
+#[test]
+fn descendant_grandchild_inherits_the_authority_boundary() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+    let granted = fresh_dir("desc-grant");
+    let secret = fresh_dir("desc-secret");
+    let g_marker = granted.join("gm.txt");
+    let s_file = secret.join("s.txt");
+    const GRANDCHILD_READ_OK: &str = "GRANDCHILD_READ_GRANTED_OK";
+    const SECRET_MUST_NOT_LEAK: &str = "SECRET_GRANDCHILD_MUST_NOT_READ";
+    std::fs::write(&g_marker, GRANDCHILD_READ_OK).expect("seed granted marker");
+    std::fs::write(&s_file, SECRET_MUST_NOT_LEAK).expect("seed secret");
+
+    // Control + non-vacuity: a GRANDCHILD (`cmd` → `cmd`) reads the GRANTED marker.
+    // Its output proves the second generation actually RAN and that granted authority
+    // follows the tree ≥2 deep — so the escape assertion below is not vacuous.
+    let control = launch(&[
+        "--name",
+        &tag("desc-ok"),
+        "--fs-write",
+        &granted.to_string_lossy(),
+        "cmd.exe",
+        "/c",
+        "cmd.exe",
+        "/c",
+        "type",
+        &g_marker.to_string_lossy(),
+    ]);
+    let control_out = String::from_utf8_lossy(&control.stdout);
+    assert!(
+        control_out.contains(GRANDCHILD_READ_OK),
+        "control: the grandchild (2nd generation) must actually RUN and read a granted file \
+         — else the escape assertion is vacuous; got {control_out:?}; stderr {}",
+        String::from_utf8_lossy(&control.stderr).trim()
+    );
+
+    // Escape attempt: the GRANDCHILD reads an UNGRANTED secret — it must be
+    // kernel-denied, proving a descendant cannot widen its authority.
+    let escape = launch(&[
+        "--name",
+        &tag("desc-esc"),
+        "--fs-write",
+        &granted.to_string_lossy(),
+        "cmd.exe",
+        "/c",
+        "cmd.exe",
+        "/c",
+        "type",
+        &s_file.to_string_lossy(),
+    ]);
+    let escape_out = String::from_utf8_lossy(&escape.stdout);
+    assert!(
+        !escape_out.contains(SECRET_MUST_NOT_LEAK),
+        "descendant escape: a grandchild read an UNGRANTED secret — the AppContainer authority \
+         boundary must follow the process tree ≥2 generations; got {escape_out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&granted);
+    let _ = std::fs::remove_dir_all(&secret);
+}
