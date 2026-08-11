@@ -619,9 +619,13 @@ mod tests {
     #[test]
     fn explicit_dispatch_strength_floor_refuses_backend_downgrade() {
         let registry = Registry::builder().tool(Arc::new(SpawnProbeTool)).build();
-        // A non-empty hostname allow-list is advisory for a directly spawned
-        // process on every current host backend. Requiring Kernel must therefore
-        // refuse before the deliberately nonexistent program reaches the OS.
+        // A non-empty hostname allow-list cannot be BOUNDED by any current host
+        // backend (Landlock/Seatbelt express no hostname net rules), so the
+        // conservative projection resolves the net axis to `Unknown`/`Unbounded`
+        // and admission refuses at the SCOPE bound (L3) — reached before, and
+        // strictly stronger than, the strength-floor downgrade. Either way a Kernel
+        // net floor over an un-bound-able net grant must refuse before the
+        // deliberately nonexistent program reaches the OS.
         let granted = Caveats {
             net: Scope::only(["example.invalid".to_string()]),
             ..Caveats::top()
@@ -637,11 +641,11 @@ mod tests {
         let ToolError::Denied { reason } = error else {
             panic!("backend downgrade returned the wrong error: {error:?}");
         };
-        // The typed refusal names the axis, its required strength, and what the
-        // backend actually delivers.
+        // The typed refusal names the unenforceable net axis (whether via the L3
+        // scope bound — the net axis cannot be bounded — or the L4 strength floor).
         assert!(
-            reason.contains("Net") && reason.contains("Kernel") && reason.contains("Advisory"),
-            "denial must identify the unenforceable axis and its strengths: {reason}"
+            reason.contains("Net"),
+            "denial must identify the unenforceable net axis: {reason}"
         );
     }
 

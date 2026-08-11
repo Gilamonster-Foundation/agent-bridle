@@ -145,7 +145,8 @@ pub trait Sandbox: Send + Sync {
     /// runtime substrate (the loader, library/system-data read base, the resolved
     /// image of a granted program, device sinks) but MUST be disjoint from
     /// harness-private authority (secrets, keys, control sockets, the authority/
-    /// provenance store) — see [`closure_is_harness_disjoint`]. The default
+    /// provenance store) — see [`crate::admitted::closure_is_harness_disjoint`],
+    /// the one canonical guard `AdmittedFence::admit` applies. The default
     /// declares nothing (`empty_closure`); each backend overrides with the
     /// substrate it actually adds, so a *legitimate* grant admits as `Subset`
     /// while an undeclared widening still refuses.
@@ -153,46 +154,6 @@ pub trait Sandbox: Send + Sync {
         let _ = effective;
         crate::empty_closure()
     }
-}
-
-/// Path fragments naming harness-private authority a runtime closure must NEVER
-/// declare (readability would let a hostile child impersonate/steer/become the
-/// harness). The runtime-closure rule is `closure ∩ HarnessPrivateAuthority = ∅`
-/// — system runtime/loader/base-image reads are fine; these are not.
-//
-// Consumed by the `scope_admission` gate in the final PR-0 slice (the
-// `resolved_authority`/`runtime_closure` operand swap onto `spawn_authorized`);
-// until then it is exercised only by the conservative-projection tests. Kept as
-// the validated foundation rather than deferred so the invariant is reviewable now.
-#[allow(dead_code)]
-pub(crate) const HARNESS_PRIVATE_AUTHORITY: &[&str] = &[
-    ".newt",      // harness state + OCAP/authority/provenance store
-    ".ssh",       // SSH keys
-    ".gnupg",     // signing keys
-    ".aws",       // provider secrets
-    ".config/gh", // provider token
-];
-
-/// Whether a runtime closure is disjoint from harness-private authority on the
-/// authority-bearing axes (fs_read/fs_write/exec) — the construction-time
-/// invariant. A closure concrete path that reaches a harness-private store fails.
-//
-// Wired into `scope_admission` in the final PR-0 slice; see the note on
-// `HARNESS_PRIVATE_AUTHORITY`.
-#[allow(dead_code)]
-pub(crate) fn closure_is_harness_disjoint(closure: &crate::ResolvedAuthority) -> bool {
-    use crate::ResolvedScope;
-    let axis_ok = |scope: &ResolvedScope| match scope {
-        ResolvedScope::Bounded { concrete, .. } => concrete.iter().all(|entry| {
-            !HARNESS_PRIVATE_AUTHORITY
-                .iter()
-                .any(|marker| entry.split('/').any(|seg| seg == *marker) || entry.ends_with(marker))
-        }),
-        // Unbounded/Unknown closures are never emitted by a backend and would
-        // authorize everything — reject them here as non-disjoint by definition.
-        ResolvedScope::Unbounded | ResolvedScope::Unknown => false,
-    };
-    axis_ok(&closure.fs_read) && axis_ok(&closure.fs_write) && axis_ok(&closure.exec)
 }
 
 /// The no-backend sandbox: applies nothing and reports [`SandboxKind::None`].
@@ -669,6 +630,20 @@ pub(crate) mod appcontainer_impl {
     impl Sandbox for AppContainerSandbox {
         fn kind(&self) -> SandboxKind {
             SandboxKind::AppContainer
+        }
+
+        /// Caveats-grain admission placeholder. AppContainer DOES confine (via the
+        /// aclaunch DACL), but its FAITHFUL ruleset-grain projection — notably E2,
+        /// where a write-grant DACL necessarily confers read — is not written yet;
+        /// it lands with the Windows mechanism PR (E2 / PR-4). Until then this
+        /// backend keeps its pre-#317 caveats-grain admission (`from_delegated`),
+        /// so PR-0b neither regresses Windows confined operation nor claims a bound
+        /// AppContainer has not proven (I15 stays Partial for Windows). This is
+        /// deliberately NOT the fail-closed trait default, which resolves every
+        /// axis `Unknown` and would refuse every AppContainer spawn — even an
+        /// unrestricted grant.
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            crate::ResolvedAuthority::from_delegated(effective)
         }
 
         /// No-op: AppContainer confinement is applied at process creation via the
@@ -1180,6 +1155,37 @@ pub(crate) mod landlock_impl {
                 classes: BTreeSet::new(),
             };
 
+            // OBJECT-IDENTITY harness-disjointness (review #3): a benign-looking
+            // closure pathname can itself SYMLINK/alias into a harness-private
+            // store, so we check each root's RESOLVED (canonical) object identity —
+            // not only its lexical form — against the harness-private markers. Any
+            // root whose canonical identity reaches harness-private authority
+            // compromises the whole axis ⇒ `Unknown` ⇒ admission fails closed
+            // (`closure_is_harness_disjoint` rejects `Unknown`, L3/L7). Benign
+            // system aliases (`/lib`→`/usr/lib`, the loader) pass: their canonical
+            // identity is not harness-private. (The blanket "any non-canonical
+            // closure root refuses" posture is deferred to the same-object-FD
+            // binding, PR-5; here we refuse only closure roots that actually
+            // resolve INTO harness-private state.)
+            let harness_safe_bounded = |s: BTreeSet<String>| -> ResolvedScope {
+                let reaches_private = s.iter().any(|entry| {
+                    crate::admitted::entry_reaches_harness_private(entry)
+                        || std::fs::canonicalize(entry)
+                            .ok()
+                            .and_then(|canon| {
+                                canon
+                                    .to_str()
+                                    .map(crate::admitted::entry_reaches_harness_private)
+                            })
+                            .unwrap_or(false)
+                });
+                if reaches_private {
+                    ResolvedScope::Unknown
+                } else {
+                    bounded(s)
+                }
+            };
+
             // fs_read additions the ruleset makes BEYOND the granted read scope:
             // the base-read list (loader/lib/system-data) + (confined-exec ? the
             // resolved granted program images : the bin dirs). System runtime
@@ -1202,9 +1208,9 @@ pub(crate) mod landlock_impl {
             };
 
             crate::ResolvedAuthority {
-                fs_read: bounded(existing(read_add)),
-                fs_write: bounded(existing(self.policy.device_sink_paths.resolve())),
-                exec: bounded(exec_add),
+                fs_read: harness_safe_bounded(existing(read_add)),
+                fs_write: harness_safe_bounded(existing(self.policy.device_sink_paths.resolve())),
+                exec: harness_safe_bounded(exec_add),
                 net: ResolvedScope::empty(),
             }
         }
@@ -1381,6 +1387,42 @@ pub(crate) mod landlock_impl {
             let _ = std::fs::remove_dir_all(&base);
         }
 
+        /// #3 object-identity: a benign-LOOKING closure root that SYMLINKS into a
+        /// harness-private store (`.newt`) poisons the axis → `Unknown` → admission
+        /// refuses (`closure_is_harness_disjoint` rejects `Unknown`). A benign
+        /// system alias whose canonical identity is NOT harness-private stays
+        /// admissible — the default policy's merged-`/usr` loader/lib symlinks
+        /// (e.g. `/lib`→`/usr/lib` on this host) must remain disjoint, proving we
+        /// refuse on resolved OBJECT IDENTITY, not on the mere presence of a symlink.
+        #[test]
+        fn a_closure_root_resolving_into_harness_private_poisons_the_axis() {
+            use std::sync::Arc;
+            let dir = std::env::temp_dir().join(format!("ab-obj-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".newt/ocap")).unwrap();
+            let link = dir.join("innocent-substrate");
+            symlink(dir.join(".newt/ocap"), &link).unwrap();
+            let policy = crate::SandboxPolicy {
+                base_read_paths: crate::PathList::from_defaults(&[link.to_str().unwrap()]),
+                ..crate::SandboxPolicy::default()
+            };
+            let closure = LandlockSandbox::with_policy(Arc::new(policy))
+                .runtime_closure(&fs_read_only("/tmp"));
+            assert_eq!(
+                closure.fs_read,
+                ResolvedScope::Unknown,
+                "a closure root whose canonical identity reaches .newt must poison the axis"
+            );
+            assert!(!crate::admitted::closure_is_harness_disjoint(&closure));
+            // The default policy (benign merged-/usr symlinks) stays disjoint.
+            let benign = LandlockSandbox::new().runtime_closure(&fs_read_only("/tmp"));
+            assert!(
+                crate::admitted::closure_is_harness_disjoint(&benign),
+                "benign system aliases (loader/lib) must remain harness-disjoint"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// E1 end-to-end: a symlinked read grant (`sub -> /`) resolves `fs_read`
         /// to `Unknown`, so mesh admission refuses — the whole-tree-read escape
         /// can never admit.
@@ -1468,12 +1510,12 @@ pub(crate) mod landlock_impl {
         fn runtime_closure_is_harness_disjoint() {
             let delegated = fs_read_only("/tmp");
             let closure = LandlockSandbox::new().runtime_closure(&delegated);
-            assert!(crate::sandbox::closure_is_harness_disjoint(&closure));
+            assert!(crate::admitted::closure_is_harness_disjoint(&closure));
             let mut bad = closure;
             if let ResolvedScope::Bounded { concrete, .. } = &mut bad.fs_read {
                 concrete.insert("/home/agent/.newt/ocap/state".to_string());
             }
-            assert!(!crate::sandbox::closure_is_harness_disjoint(&bad));
+            assert!(!crate::admitted::closure_is_harness_disjoint(&bad));
         }
     }
 }
@@ -1575,6 +1617,20 @@ mod seatbelt_impl {
     impl Sandbox for SeatbeltSandbox {
         fn kind(&self) -> SandboxKind {
             SandboxKind::Seatbelt
+        }
+
+        /// Caveats-grain admission placeholder. Seatbelt DOES confine (via the
+        /// generated SBPL profile), but its FAITHFUL ruleset-grain projection —
+        /// notably E4, the mach-lookup/XPC ambient-deputy egress under `net:none`
+        /// — is not written yet; it lands with the macOS mechanism PR (E4 / PR-2).
+        /// Until then this backend keeps its pre-#317 caveats-grain admission
+        /// (`from_delegated`), so PR-0b neither regresses macOS confined operation
+        /// nor claims a bound Seatbelt has not proven (I15 stays Partial for
+        /// macOS). Deliberately NOT the fail-closed trait default, which resolves
+        /// every axis `Unknown` and would refuse every Seatbelt spawn — even an
+        /// unrestricted grant.
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            crate::ResolvedAuthority::from_delegated(effective)
         }
 
         fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
