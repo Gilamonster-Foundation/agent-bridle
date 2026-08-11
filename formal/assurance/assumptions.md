@@ -48,7 +48,7 @@ is SKIPPED (unsupported host) it establishes **nothing** (see the honesty note).
 
 | ID | Assumption | Discharged by | Status |
 |---|---|---|---|
-| **ASM-WIN-DACL** | The aclaunch AppContainer DACL grants **content read** on every `--fs-write` path (`FILE_GENERIC_READ_WRITE`, main.rs:474) — i.e. the projection premise of P3 actually holds on Windows. | `agent-bridle-aclaunch/tests/kernel_proofs.rs` (write-only path is readable) | pending #338 native probe |
+| **ASM-WIN-DACL** | The aclaunch AppContainer DACL grants **content read** on every `--fs-write` path (`FILE_GENERIC_READ_WRITE`, main.rs:476) — i.e. the projection premise of P3 actually holds on Windows. | `agent-bridle-aclaunch/tests/kernel_proofs.rs::fs_write_grant_confers_read_e2` (write-only path readable; icacls records the AppContainer SID mask `(R,W)`) | **established** (#338 merged @ ef74ee2, native probe under strict `BRIDLE_REQUIRE_APPCONTAINER`) |
 | **ASM-WIN-ENV** | On Windows the ambient parent environment is cleared before `aclaunch`, so an undelegated secret does not reach the child (#323). | `agent-bridle-tool-shell/tests/windows_env_isolation.rs` (passes on real Windows 11) | established (#338 branch) |
 | **ASM-INHERIT** | seccomp / Landlock / Seatbelt / AppContainer actually preserve the confinement boundary across a real **gen-2** grandchild. | linux `real_spawn.rs` + `child_network_seccomp_real.rs`; win `kernel_proofs.rs:222`; macOS `process-exec*` (child-grain) | linux+win established; macOS gen-2 partial |
 | **ASM-SECCOMP-IOURING** | The seccomp floor denies the io_uring primitive so `net:none` is not bypassable off-box (E3). | `child_network_seccomp_real.rs` (needs an explicit io_uring probe — see the E3 review) | **residual: probe not yet landed** |

@@ -29,9 +29,9 @@ tla_invariant = ["T3_AppliedWithinClaim@AuthorityLifecycle_AppliedExceedsClaim.c
 rust_test     = ["windows_write_without_read_triggers_widening_and_is_rejected", "windows_write_subset_of_read_admits", "windows_union_membership_is_exact"]
 native_test   = ["agent-bridle-aclaunch/tests/kernel_proofs.rs"]
 evidence_cid  = "held:phase1d"
-impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"  # PR #338 head (DRAFT — not yet merged)
-premise       = "ASM-WIN-DACL: the aclaunch DACL grants content read on every write path (main.rs:474). Empirically established by #338 native DACL evidence, NOT proved."
-status        = "partial"   # model PROVED; native probe + #338 merge pending
+impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"  # PR #338 head, MERGED to main @ ef74ee2
+premise       = "ASM-WIN-DACL: the aclaunch DACL grants content read on every write path (main.rs:476, FILE_GENERIC_READ_WRITE). Empirically established by #338 native DACL evidence (kernel_proofs.rs::fs_write_grant_confers_read_e2 + icacls AppContainer-SID mask (R,W)), NOT proved."
+status        = "established"   # model PROVED (Lean); native probe LANDED (#338 merged @ ef74ee2)
 
 # ── #323 env-isolation controls (both directions) ────────────────────────────
 [[claim]]
