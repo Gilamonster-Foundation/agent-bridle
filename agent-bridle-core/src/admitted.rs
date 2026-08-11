@@ -43,10 +43,11 @@ use crate::{
 const HARNESS_PRIVATE_MARKERS: &[&str] = &[".newt", ".ssh", ".gnupg", ".aws", ".config/gh"];
 
 /// Whether a single path entry reaches one of the harness-private stores — the
-/// one canonical predicate both harness-disjoint checks below share (a per-entry
-/// declaration guard and a whole-closure lattice guard), so there is exactly one
-/// definition of "harness-private" in the crate.
-fn entry_reaches_harness_private(entry: &str) -> bool {
+/// one canonical predicate every harness-disjoint check shares (the per-entry
+/// declaration guard, the whole-closure lattice guard, and the backend's
+/// object-identity check on a closure root's *canonical* form), so there is
+/// exactly one definition of "harness-private" in the crate.
+pub(crate) fn entry_reaches_harness_private(entry: &str) -> bool {
     HARNESS_PRIVATE_MARKERS
         .iter()
         .any(|marker| entry.split('/').any(|segment| segment == *marker) || entry.ends_with(marker))
@@ -199,7 +200,10 @@ impl AdmittedFence {
         // The backend's conservative projection of what it will ACTUALLY install
         // for these mechanism caveats (ruleset grain), plus the harness-added
         // substrate that projection rests on. Computed from the same routines the
-        // backend's `apply` uses, so projection and fence cannot drift.
+        // backend's `apply` uses, so the ROOT-SET DERIVATION cannot independently
+        // drift from the fence. (This is NOT native semantic fidelity: OS access
+        // masks, path/symlink interpretation, aliases and deputies still need the
+        // CompiledFence + AppliedFenceEvidence / native-hostile-test layer.)
         let projection = project(&mechanism_caveats);
 
         // L3 (a): the declared runtime closure must be harness-disjoint — it may

@@ -1141,6 +1141,37 @@ pub(crate) mod landlock_impl {
                 classes: BTreeSet::new(),
             };
 
+            // OBJECT-IDENTITY harness-disjointness (review #3): a benign-looking
+            // closure pathname can itself SYMLINK/alias into a harness-private
+            // store, so we check each root's RESOLVED (canonical) object identity —
+            // not only its lexical form — against the harness-private markers. Any
+            // root whose canonical identity reaches harness-private authority
+            // compromises the whole axis ⇒ `Unknown` ⇒ admission fails closed
+            // (`closure_is_harness_disjoint` rejects `Unknown`, L3/L7). Benign
+            // system aliases (`/lib`→`/usr/lib`, the loader) pass: their canonical
+            // identity is not harness-private. (The blanket "any non-canonical
+            // closure root refuses" posture is deferred to the same-object-FD
+            // binding, PR-5; here we refuse only closure roots that actually
+            // resolve INTO harness-private state.)
+            let harness_safe_bounded = |s: BTreeSet<String>| -> ResolvedScope {
+                let reaches_private = s.iter().any(|entry| {
+                    crate::admitted::entry_reaches_harness_private(entry)
+                        || std::fs::canonicalize(entry)
+                            .ok()
+                            .and_then(|canon| {
+                                canon
+                                    .to_str()
+                                    .map(crate::admitted::entry_reaches_harness_private)
+                            })
+                            .unwrap_or(false)
+                });
+                if reaches_private {
+                    ResolvedScope::Unknown
+                } else {
+                    bounded(s)
+                }
+            };
+
             // fs_read additions the ruleset makes BEYOND the granted read scope:
             // the base-read list (loader/lib/system-data) + (confined-exec ? the
             // resolved granted program images : the bin dirs). System runtime
@@ -1163,9 +1194,9 @@ pub(crate) mod landlock_impl {
             };
 
             crate::ResolvedAuthority {
-                fs_read: bounded(existing(read_add)),
-                fs_write: bounded(existing(self.policy.device_sink_paths.resolve())),
-                exec: bounded(exec_add),
+                fs_read: harness_safe_bounded(existing(read_add)),
+                fs_write: harness_safe_bounded(existing(self.policy.device_sink_paths.resolve())),
+                exec: harness_safe_bounded(exec_add),
                 net: ResolvedScope::empty(),
             }
         }
@@ -1340,6 +1371,42 @@ pub(crate) mod landlock_impl {
                 .unwrap()
                 .to_string()]));
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// #3 object-identity: a benign-LOOKING closure root that SYMLINKS into a
+        /// harness-private store (`.newt`) poisons the axis → `Unknown` → admission
+        /// refuses (`closure_is_harness_disjoint` rejects `Unknown`). A benign
+        /// system alias whose canonical identity is NOT harness-private stays
+        /// admissible — the default policy's merged-`/usr` loader/lib symlinks
+        /// (e.g. `/lib`→`/usr/lib` on this host) must remain disjoint, proving we
+        /// refuse on resolved OBJECT IDENTITY, not on the mere presence of a symlink.
+        #[test]
+        fn a_closure_root_resolving_into_harness_private_poisons_the_axis() {
+            use std::sync::Arc;
+            let dir = std::env::temp_dir().join(format!("ab-obj-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".newt/ocap")).unwrap();
+            let link = dir.join("innocent-substrate");
+            symlink(dir.join(".newt/ocap"), &link).unwrap();
+            let policy = crate::SandboxPolicy {
+                base_read_paths: crate::PathList::from_defaults(&[link.to_str().unwrap()]),
+                ..crate::SandboxPolicy::default()
+            };
+            let closure = LandlockSandbox::with_policy(Arc::new(policy))
+                .runtime_closure(&fs_read_only("/tmp"));
+            assert_eq!(
+                closure.fs_read,
+                ResolvedScope::Unknown,
+                "a closure root whose canonical identity reaches .newt must poison the axis"
+            );
+            assert!(!crate::admitted::closure_is_harness_disjoint(&closure));
+            // The default policy (benign merged-/usr symlinks) stays disjoint.
+            let benign = LandlockSandbox::new().runtime_closure(&fs_read_only("/tmp"));
+            assert!(
+                crate::admitted::closure_is_harness_disjoint(&benign),
+                "benign system aliases (loader/lib) must remain harness-disjoint"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// E1 end-to-end: a symlinked read grant (`sub -> /`) resolves `fs_read`
