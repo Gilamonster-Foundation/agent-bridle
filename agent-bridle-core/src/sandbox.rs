@@ -1732,19 +1732,29 @@ mod seatbelt_impl {
                 }
             };
 
-            // NOTE (registered residual — coordinator ruling pending, board
-            // 2026-08-11 E4 note): the profile bounds fs_read CONTENT to the grant
-            // (proven: `cat` of an out-of-scope file is kernel-denied), but it also
-            // emits an unqualified `(allow file-read-metadata)` so a confined
-            // program can traverse firmlink ancestors (`/tmp`→`/private/tmp`). That
-            // metadata allow lets a hostile child `stat` any path (existence/size),
-            // whole-fs — a metadata disclosure ORTHOGONAL to the fs_read *content*
-            // axis this projection bounds. The brief asks whether unqualified
-            // metadata should force fs_read⇒Unknown (⇒ refuse ALL macOS read
-            // confinement) or the profile be narrowed to granted-root traversal
-            // ancestors only. That is a central fence-semantics decision, reported
-            // (not guessed) — this projection bounds the content axis and records
-            // the metadata leak as the residual, pending the ruling.
+            // `fs_read` is the CONTENT-READ authority axis (board R1 ruling,
+            // APPROVE option (a)). Native hostile-child evidence establishes that
+            // undelegated file CONTENT stays kernel-denied (`cat` of an out-of-scope
+            // file → "Operation not permitted"), so `fs_read` may remain faithfully
+            // Bounded on the granted roots — it is NOT forced to Unknown merely
+            // because the profile permits broader metadata observation.
+            //
+            // REGISTERED RESIDUAL `seatbelt-fs-metadata-ambient`: the profile also
+            // emits a global `(allow file-read-metadata)`, real ambient authority.
+            // A hostile child may DISCOVER METADATA about undelegated filesystem
+            // objects — path existence and whatever attributes the permitted
+            // metadata operation exposes (e.g. size). This does NOT imply
+            // content-read authority. The broad metadata permission is currently
+            // LOAD-BEARING for macOS traversal / firmlink behavior (reaching an
+            // in-scope file through `/tmp`→`/private/tmp`). It is therefore an
+            // ORTHOGONAL metadata-confidentiality residual, not evidence that the
+            // `fs_read` content axis is unbounded. `Bounded(fs_read)` here means the
+            // content axis is bounded to the grant — it does NOT assert total
+            // filesystem non-observability. Hardening follow-up (NOT this PR, needs
+            // its own native hostile-child validation): option (c) — narrow
+            // `file-read-metadata` to the granted roots plus required traversal
+            // ancestors. A first-class `fs_metadata` authority axis is deferred
+            // future schema work, deliberately not introduced in this merge train.
             let fs_read = if !confine_read {
                 ResolvedScope::Unbounded
             } else if !grant_leaf_object_stable(&effective.fs_read) {
@@ -1898,8 +1908,12 @@ mod seatbelt_impl {
 
     /// The canonicalized base-read substrate the SBPL profile re-allows (the
     /// loader / library / system-data trees). The SAME derivation
-    /// `seatbelt_profile_with` emits (`base_read_paths` → `canonical_path`), so the
-    /// projection cannot drift from what `command_prefix` installs (Q2 anti-drift).
+    /// `seatbelt_profile_with` emits (`base_read_paths` → `canonical_path`). The
+    /// claim this supports is the NARROW one (board R2 ruling): the **root/token-set
+    /// derivation is shared and cannot independently drift** — NOT that the
+    /// projection and the emitted bytes cannot drift. Literal compiled-policy /
+    /// native-interpretation correspondence (access masks, aliases, deputies) is
+    /// the forthcoming `CompiledFence` → `AppliedFenceEvidence` layer's job.
     fn profile_base_read(policy: &SandboxPolicy) -> Vec<String> {
         policy
             .base_read_paths
@@ -2266,6 +2280,90 @@ mod seatbelt_impl {
                 SeatbeltSandbox::new().resolved_authority(&cav).net,
                 ResolvedScope::Unknown
             );
+        }
+
+        /// R2 anti-drift (the shared-derivation seam). The fs roots
+        /// `resolved_authority` bounds on and the roots the SBPL generator emits
+        /// must come from the SAME semantic derivation over `effective.fs_read`,
+        /// with only the object-stable canonicalization between token and installed
+        /// target — no unaccounted authority-widening transform. Proven by: the
+        /// projection's Bounded set is exactly the grant tokens; `confined_roots`
+        /// (the emitter's derivation over the same token set) canonicalizes each
+        /// token; each canonical root appears verbatim as a `(subpath …)` in the
+        /// emitted profile; and each token is leaf-object-stable to its canonical
+        /// (establishing token ≡ installed target). If any of these breaks, the two
+        /// consumers have independently drifted.
+        #[test]
+        fn resolved_and_emitted_fs_roots_share_one_derivation() {
+            // An object-stable real root (canonical == itself).
+            let real = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let cav = Caveats {
+                fs_read: Scope::only([real.clone()]),
+                ..Caveats::top()
+            };
+            // Projection bounds on the grant tokens.
+            let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
+            let ResolvedScope::Bounded { concrete, .. } = resolved.fs_read else {
+                panic!("object-stable grant must resolve Bounded");
+            };
+            let tokens: std::collections::BTreeSet<String> = [real.clone()].into_iter().collect();
+            assert_eq!(
+                concrete, tokens,
+                "projection must bound on the grant tokens"
+            );
+
+            // The EMITTER derives from the SAME token set via `confined_roots`, and
+            // each derived root must appear in the emitted profile (shared seam) …
+            let profile = seatbelt_profile(&cav);
+            for root in confined_roots(&cav.fs_read) {
+                assert!(
+                    profile.contains(&format!("(subpath {})", sbpl_string(&root))),
+                    "emitter root {root} must appear in the profile: {profile}"
+                );
+                // … and each token is object-stable to its installed canonical root.
+                assert!(
+                    grant_leaf_object_stable(&Scope::only([real.clone()])),
+                    "token must be leaf-object-stable to the installed target"
+                );
+            }
+        }
+
+        /// No unprojected filesystem authority: every granted fs `(subpath …)` the
+        /// profile emits (i.e. beyond the base-read substrate) must be accounted for
+        /// by the projection — either the delegated grant (resolved bounds on the
+        /// tokens whose canonical form these are) or the harness `runtime_closure`
+        /// base-read. A stray emitted root that is neither would be authority the
+        /// admission never saw.
+        #[test]
+        fn emitted_granted_fs_roots_are_all_projected() {
+            let real = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let cav = Caveats {
+                fs_read: Scope::only([real.clone()]),
+                fs_write: Scope::only([real.clone()]),
+                ..Caveats::top()
+            };
+            let base: std::collections::BTreeSet<String> =
+                profile_base_read(&SandboxPolicy::default())
+                    .into_iter()
+                    .collect();
+            let granted_canon: std::collections::BTreeSet<String> =
+                confined_roots(&cav.fs_read).into_iter().collect();
+            // Each emitter-derived granted root is the canonicalization of a grant
+            // token (the delegated authority), not a set the emitter invented.
+            for root in &granted_canon {
+                let accounted = base.contains(root)
+                    || confined_roots(&Scope::only([real.clone()])).contains(root);
+                assert!(
+                    accounted,
+                    "emitted granted root {root} is neither delegated nor harness base-read"
+                );
+            }
         }
 
         /// A benign macOS firmlink PREFIX alias (`/tmp`→`/private/tmp`, same leaf)
