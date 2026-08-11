@@ -56,22 +56,18 @@ async fn windows_ambient_env_is_not_inherited() {
         .expect("invoke");
     std::env::remove_var("AB323_AMBIENT_SECRET");
     let stdout = out["stdout"].as_str().unwrap_or_default();
-    // Non-vacuity: the child actually RAN and printed its environment (the fixed
-    // Windows baseline includes `SystemRoot`), so the assertions below reflect a
-    // real env_clear, not a child that failed to spawn and produced no output.
+    // Positive control (§1B) + non-vacuity (§1C): the explicitly delegated var MUST
+    // reach the child with its exact value. Its presence is the honest non-vacuity
+    // signal — it proves the child actually ran AND that delegation still works.
+    // (`SystemRoot` is the platform baseline, not caller-delegated authority, so it
+    // is deliberately NOT used as the proof.)
     assert!(
-        stdout.contains("SystemRoot="),
-        "positive control: `cmd /c set` must have run and printed the baseline env:\n{stdout}"
+        stdout.contains("AB323_GRANTED=allowed"),
+        "the delegated env var must reach the child (and prove it ran):\n{stdout}"
     );
-    // Negative: the ambient parent secret must NOT reach the confined child.
+    // Negative (§1A): the ambient parent secret must NOT reach the confined child.
     assert!(
         !stdout.contains("AB323_AMBIENT_SECRET"),
         "ambient parent env must not leak into the confined Windows child:\n{stdout}"
-    );
-    // Positive control (#323 §1B): the explicitly delegated var MUST reach the
-    // child — env isolation must not break the legitimate delegation path.
-    assert!(
-        stdout.contains("AB323_GRANTED=allowed"),
-        "an explicitly delegated env var must still pass through to the child:\n{stdout}"
     );
 }

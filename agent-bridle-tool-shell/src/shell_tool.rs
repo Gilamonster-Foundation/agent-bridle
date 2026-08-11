@@ -1595,11 +1595,19 @@ fn run_pipeline(
         cmd.env("LC_ALL", "C");
         #[cfg(windows)]
         {
-            // Windows needs `SystemRoot` for process/DLL initialisation (a
-            // well-known non-secret path, not ambient authority) and `PATHEXT` to
-            // resolve executables — the minimal baseline for a child to run at all.
-            if let Some(root) = std::env::var_os("SystemRoot") {
-                cmd.env("SystemRoot", root);
+            // Minimal Windows execution baseline — well-known non-secret platform
+            // paths, NOT ambient authority (a provider secret like `OPENAI_API_KEY`
+            // is never in this set):
+            //   - `SystemRoot`   — process / DLL initialisation.
+            //   - `LOCALAPPDATA` — the AppContainer runtime's per-profile storage /
+            //     redirection root. WITHOUT it, `CreateProcessW` for an AppContainer
+            //     child fails with `ERROR_ENVVAR_NOT_FOUND (203)` — so clearing the
+            //     env without it would break every confined Windows spawn.
+            //   - `PATHEXT`      — executable resolution.
+            for var in ["SystemRoot", "LOCALAPPDATA"] {
+                if let Some(v) = std::env::var_os(var) {
+                    cmd.env(var, v);
+                }
             }
             cmd.env(
                 "PATHEXT",
