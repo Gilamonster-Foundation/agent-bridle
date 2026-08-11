@@ -1578,16 +1578,34 @@ fn run_pipeline(
         // a Seatbelt `wrap` prefix is present, `sandbox-exec` forwards its own
         // environment to the wrapped program, so setting it here still reaches the
         // confined child.
-        // AB-016: do not inherit the parent's ambient environment — start empty
-        // with a fixed, minimal baseline, then apply only the (already
-        // loader-fenced) caller env. Brings this engine to the env_clear posture
-        // the Brush (`do_not_inherit_env`) and Host (`ConfinedCommand`) engines
-        // already have. Unix-only; the Windows child-env contract is left intact.
+        // AB-016 / #323: do NOT inherit the parent's ambient environment (which
+        // may carry provider secrets — `OPENAI_API_KEY` etc.) — start empty with a
+        // fixed, minimal baseline, then apply only the (already loader-fenced)
+        // caller env. Brings this engine to the env_clear posture the Brush
+        // (`do_not_inherit_env`) and Host (`ConfinedCommand`) engines already have.
+        //
+        // #323 (a 0.8 blocker): this was Unix-only, so on Windows the ambient env
+        // leaked all the way to the AppContainer child via
+        // `dispatch_bridled_shell → ShellTool → aclaunch → AppContainer` (aclaunch
+        // forwards its own env, exactly as Seatbelt's `sandbox-exec` does). Clear on
+        // every platform; the child gets the baseline + only the delegated vars.
+        cmd.env_clear();
+        cmd.env("PATH", agent_bridle_core::default_exec_path());
         #[cfg(unix)]
+        cmd.env("LC_ALL", "C");
+        #[cfg(windows)]
         {
-            cmd.env_clear();
-            cmd.env("PATH", agent_bridle_core::default_exec_path());
-            cmd.env("LC_ALL", "C");
+            // Windows needs `SystemRoot` for process/DLL initialisation (a
+            // well-known non-secret path, not ambient authority) and `PATHEXT` to
+            // resolve executables — the minimal baseline for a child to run at all.
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                cmd.env("SystemRoot", root);
+            }
+            cmd.env(
+                "PATHEXT",
+                std::env::var_os("PATHEXT")
+                    .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD")),
+            );
         }
         for (k, v) in env {
             cmd.env(k, v);
