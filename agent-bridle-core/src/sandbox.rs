@@ -632,6 +632,20 @@ pub(crate) mod appcontainer_impl {
             SandboxKind::AppContainer
         }
 
+        /// Caveats-grain admission placeholder. AppContainer DOES confine (via the
+        /// aclaunch DACL), but its FAITHFUL ruleset-grain projection — notably E2,
+        /// where a write-grant DACL necessarily confers read — is not written yet;
+        /// it lands with the Windows mechanism PR (E2 / PR-4). Until then this
+        /// backend keeps its pre-#317 caveats-grain admission (`from_delegated`),
+        /// so PR-0b neither regresses Windows confined operation nor claims a bound
+        /// AppContainer has not proven (I15 stays Partial for Windows). This is
+        /// deliberately NOT the fail-closed trait default, which resolves every
+        /// axis `Unknown` and would refuse every AppContainer spawn — even an
+        /// unrestricted grant.
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            crate::ResolvedAuthority::from_delegated(effective)
+        }
+
         /// No-op: AppContainer confinement is applied at process creation via the
         /// `command_prefix` launcher wrapper (`agent-bridle-aclaunch`), not via
         /// this thread. `apply` is reached only when `command_prefix` returned an
@@ -1603,6 +1617,20 @@ mod seatbelt_impl {
     impl Sandbox for SeatbeltSandbox {
         fn kind(&self) -> SandboxKind {
             SandboxKind::Seatbelt
+        }
+
+        /// Caveats-grain admission placeholder. Seatbelt DOES confine (via the
+        /// generated SBPL profile), but its FAITHFUL ruleset-grain projection —
+        /// notably E4, the mach-lookup/XPC ambient-deputy egress under `net:none`
+        /// — is not written yet; it lands with the macOS mechanism PR (E4 / PR-2).
+        /// Until then this backend keeps its pre-#317 caveats-grain admission
+        /// (`from_delegated`), so PR-0b neither regresses macOS confined operation
+        /// nor claims a bound Seatbelt has not proven (I15 stays Partial for
+        /// macOS). Deliberately NOT the fail-closed trait default, which resolves
+        /// every axis `Unknown` and would refuse every Seatbelt spawn — even an
+        /// unrestricted grant.
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            crate::ResolvedAuthority::from_delegated(effective)
         }
 
         fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
