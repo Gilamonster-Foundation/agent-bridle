@@ -927,8 +927,14 @@ pub(crate) mod landlock_impl {
         }
 
         // ── Shared root computation (ONE routine for both the applied ruleset and
-        // the resolved-authority projection — Q2 anti-drift: the projection cannot
-        // diverge from the fence because they call the same code). ──────────────
+        // the resolved-authority projection — Q2 anti-drift). The precise claim:
+        // the ROOT-SET DERIVATION cannot independently drift, because both the
+        // fence and the projection call this same code on the same caveats. It is
+        // NOT a claim that the projection equals the kernel's actual authority:
+        // native access masks, `BestEffort` compat behaviour, OS path/symlink
+        // interpretation, aliases and deputies still require the later
+        // CompiledFence + AppliedFenceEvidence / native-hostile-test layer to
+        // establish empirical fidelity. ─────────────────────────────────────────
 
         /// The write roots the ruleset anchors on: the granted write scope plus
         /// the always-write-openable device sinks (#1220), existing paths only.
