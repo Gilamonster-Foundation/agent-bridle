@@ -85,3 +85,6 @@ jobs:
       - name: Validate the assurance manifest references resolve
         shell: bash
         run: ./formal/assurance/validate.sh
+      - name: Certification gate self-test (rejects false certification)
+        shell: bash
+        run: ./formal/assurance/validate_selftest.sh

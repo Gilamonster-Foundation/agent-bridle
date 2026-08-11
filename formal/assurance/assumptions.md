@@ -48,12 +48,23 @@ is SKIPPED (unsupported host) it establishes **nothing** (see the honesty note).
 
 | ID | Assumption | Discharged by | Status |
 |---|---|---|---|
-| **ASM-WIN-DACL** | The aclaunch AppContainer DACL grants **content read** on every `--fs-write` path (`FILE_GENERIC_READ_WRITE`, main.rs:476) — i.e. the projection premise of P3 actually holds on Windows. | `agent-bridle-aclaunch/tests/kernel_proofs.rs::fs_write_grant_confers_read_e2` (write-only path readable; icacls records the AppContainer SID mask `(R,W)`) | **established** (#338 merged @ ef74ee2, native probe under strict `BRIDLE_REQUIRE_APPCONTAINER`) |
+| **ASM-WIN-DACL** | The aclaunch AppContainer DACL grants **content read** on every `--fs-write` path (`FILE_GENERIC_READ_WRITE`, main.rs:476) — i.e. the projection premise of P3 actually holds on Windows. | `agent-bridle-aclaunch/tests/kernel_proofs.rs::fs_write_grant_confers_read_e2` (write-only path readable; icacls records the AppContainer SID mask `(R,W)`) | **landed on main @ ef74ee2** (native probe under strict `BRIDLE_REQUIRE_APPCONTAINER`); **NOT RC-certified** — must re-run on the frozen RC SHA (ancestor-SHA evidence is not final RC evidence) |
 | **ASM-WIN-ENV** | On Windows the ambient parent environment is cleared before `aclaunch`, so an undelegated secret does not reach the child (#323). | `agent-bridle-tool-shell/tests/windows_env_isolation.rs` (passes on real Windows 11) | established (#338 branch) |
 | **ASM-INHERIT** | seccomp / Landlock / Seatbelt / AppContainer actually preserve the confinement boundary across a real **gen-2** grandchild. | linux `real_spawn.rs` + `child_network_seccomp_real.rs`; win `kernel_proofs.rs:222`; macOS `process-exec*` (child-grain) | linux+win established; macOS gen-2 partial |
 | **ASM-SECCOMP-IOURING** | The seccomp floor denies the io_uring primitive so `net:none` is not bypassable off-box (E3). | `child_network_seccomp_real.rs` (needs an explicit io_uring probe — see the E3 review) | **residual: probe not yet landed** |
 | **ASM-MACOS-METADATA** | macOS `file-read-metadata` observability is ORTHOGONAL to content `fs_read` and is a registered residual — it must NOT be modeled as content authority. | `seatbelt_floor_evidence.rs` (content denied, metadata ambient) | established as a residual |
 | **ASM-CID** | Content CIDs are attached to runtime authority-bearing objects (grant/plan/fence/evidence). **Today they are NOT** — CID machinery is HELD in the ceremony P1 layer. P8/PROVENANCE-CONTINUITY is therefore a MODEL property only, not a wired runtime guarantee. | (unwired — Phase-1d freeze) | **held** |
+
+### Release-certification rule (enforced by validate.sh)
+A claim may be marked `status = "proved"` (release-certified) **only if it does not
+depend on** any of: a **missing** evidence reference; an evidence item marked
+**pending / unsupported / UNDISCHARGED**; or a **SHA/CID that does not identify the
+artifact actually tested** (a placeholder `held:` / `TBD` CID, or an `impl_sha`
+that is not the RC SHA under `--rc`). Native evidence that only exists on an
+ANCESTOR SHA (e.g. `main` before the RC is cut) is NOT final RC evidence, so such
+claims stay `partial` until they re-run on `BRIDLE_RC_SHA`. WIN-E2-WRITE-READ is
+therefore `partial`, not certified. The theorem is never weakened to make the
+manifest green.
 
 ### Honesty note — SKIP is not PASS
 The native tiers self-skip where the mechanism is unavailable (no Landlock, no

@@ -6,10 +6,17 @@
 # Deliberately small (grep, no TOML parser dep): the manifest is line-oriented and
 # the references are unique tokens. HOOK/PIPELINE PARITY: run by `just check-tla`
 # (bundled with the assurance gate) and the `tla` job in formal.yml.
-set -euo pipefail
+#
+# NOTE: no `set -e`. This script legitimately runs greps that return 1 (a token
+# not found is a normal branch, not a script error), so it tracks `fail`
+# explicitly and ends with `exit "$fail"`. `set -e` here would abort on the first
+# non-matching grep.
+set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-MAN="$REPO/formal/assurance/manifest.toml"
+# The manifest path is overridable (BRIDLE_ASSURANCE_MANIFEST) so the self-test
+# can point the certification gate at a deliberately-poisoned copy.
+MAN="${BRIDLE_ASSURANCE_MANIFEST:-$REPO/formal/assurance/manifest.toml}"
 LEAN_SRC="$REPO/formal/Ceremony/Assurance/AuthorityLattice.lean"
 TLA_DIR="$REPO/formal/tla"
 fail=0
@@ -55,6 +62,37 @@ for f in $(grep -oE 'agent-bridle[A-Za-z0-9/._-]+\.rs' "$MAN" | sort -u); do
   else note FAIL "native test file missing: $f"; fail=1; fi
 done
 
-if [ "$fail" -eq 0 ]; then echo "assurance manifest: all references resolve"; else
-  echo "assurance manifest: unresolved references above"; fi
+# 5. Release-certification gate. A claim marked status="proved" (release-certified)
+#    must NOT depend on pending/undischarged/missing/placeholder evidence. Optional
+#    `--rc <SHA>`: additionally require every certified claim that cites native
+#    evidence to pin impl_sha == the RC SHA (the artifact actually tested).
+#    One self-contained awk (mawk-safe: no POSIX classes, no \x1f), so a normal
+#    non-match cannot abort the script.
+RC_SHA=""; [ "${1:-}" = "--rc" ] && RC_SHA="${2:-}"
+cert_out="$(awk -v rc="$RC_SHA" '
+  function v(){ s=$0; sub(/^[^=]*=[ \t]*/,"",s); sub(/[ \t]*#.*/,"",s); gsub(/^"|"[ \t]*$/,"",s); return s }
+  function flush(){
+    if(id=="" || status!="proved") return
+    bad=""
+    if(premise ~ /pending|Pending|UNDISCHARGED|unsupported/) bad=bad" premise-undischarged"
+    if(native ~ /pending:/)                                  bad=bad" native-pending"
+    if(cid ~ /held:|TBD/)                                    bad=bad" placeholder-cid"
+    if(rc!="" && native ~ /\.rs/ && impl!=rc)                bad=bad" impl-sha!=RC"
+    if(bad=="") print "PASS certified " id
+    else        print "FAIL certified " id " depends on:" bad
+  }
+  /^\[\[claim\]\]/ { flush(); id="";status="";premise="";native="";cid="";impl=""; next }
+  /^id[ \t]*=/           { id=v() }
+  /^status[ \t]*=/       { status=v() }
+  /^premise[ \t]*=/      { premise=v() }
+  /^native_test[ \t]*=/  { native=$0 }
+  /^evidence_cid[ \t]*=/ { cid=v() }
+  /^impl_sha[ \t]*=/     { impl=v() }
+  END { flush() }
+' "$MAN")"
+printf '%s\n' "$cert_out" | sed 's/^/  /'
+printf '%s\n' "$cert_out" | grep -q '^FAIL' && fail=1
+
+if [ "$fail" -eq 0 ]; then echo "assurance manifest: all references resolve; no certified claim depends on pending/placeholder evidence"; else
+  echo "assurance manifest: violations above"; fi
 exit "$fail"

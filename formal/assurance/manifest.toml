@@ -30,8 +30,8 @@ rust_test     = ["windows_write_without_read_triggers_widening_and_is_rejected",
 native_test   = ["agent-bridle-aclaunch/tests/kernel_proofs.rs"]
 evidence_cid  = "held:phase1d"
 impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"  # PR #338 head, MERGED to main @ ef74ee2
-premise       = "ASM-WIN-DACL: the aclaunch DACL grants content read on every write path (main.rs:476, FILE_GENERIC_READ_WRITE). Empirically established by #338 native DACL evidence (kernel_proofs.rs::fs_write_grant_confers_read_e2 + icacls AppContainer-SID mask (R,W)), NOT proved."
-status        = "established"   # model PROVED (Lean); native probe LANDED (#338 merged @ ef74ee2)
+premise       = "ASM-WIN-DACL: LANDED ON MAIN, NOT RC-CERTIFIED. The aclaunch DACL grants content read on every write path (main.rs:476, FILE_GENERIC_READ_WRITE); the native DACL proof (kernel_proofs.rs::fs_write_grant_confers_read_e2 + icacls AppContainer-SID mask (R,W)) landed on main via #338 (@ ef74ee2 / 523038d) under strict BRIDLE_REQUIRE_APPCONTAINER. But ef74ee2 is NOT the frozen RC SHA, and release doctrine forbids counting ancestor-SHA evidence as final RC evidence — so for RELEASE this premise is PENDING until it re-runs on BRIDLE_RC_SHA. Model half proved (Lean); OS-refinement half awaits RC-SHA evidence."
+status        = "partial"   # model PROVED; native probe landed on main, RC-SHA re-certification pending
 
 # ── #323 env-isolation controls (both directions) ────────────────────────────
 [[claim]]
@@ -41,11 +41,11 @@ statement     = "A parent secret that was not explicitly delegated never reaches
 lean_theorem  = []
 tla_invariant = ["T6_EnvDelegation@AuthorityLifecycle_AmbientEnv.cfg"]
 rust_test     = []
-native_test   = ["pending:agent-bridle-tool-shell/tests/windows_env_isolation.rs (PR #338)"]
+native_test   = ["agent-bridle-tool-shell/tests/windows_env_isolation.rs", "agent-bridle-tool-shell/tests/windows_appcontainer_env.rs"]
 evidence_cid  = "held:phase1d"
 impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"
 premise       = "none — model theorem is unconditional; native test proves the OS refinement"
-status        = "partial"   # native env test passes on real Windows 11 (#338); merge pending
+status        = "partial"   # native env test landed on main (#338 merged); RC-SHA certification pending
 
 [[claim]]
 id            = "ENV-DELEGATION-SURVIVES"

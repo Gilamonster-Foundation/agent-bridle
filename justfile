@@ -73,6 +73,7 @@ check-tla:
     set -e
     ./formal/tla/run-authority-lifecycle.sh
     ./formal/assurance/validate.sh
+    ./formal/assurance/validate_selftest.sh
 
 # Tier-3 REFINEMENT gate (HEAVY — pulls the Aeneas Lean backend + mathlib).
 # Proves the Charon/Aeneas-EXTRACTED Rust of agent-bridle-ceremony satisfies the
