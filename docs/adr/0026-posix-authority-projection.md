@@ -62,6 +62,18 @@ A GO does **not** authorize production libc interposition, a syscall broker, or 
 `bridle-run` launcher advertised as secure. Those require a subsequent explicit
 decision after the #319 slice proves the seam.
 
+> **Implementation status (slice 1, #319 — LANDED on Linux).** Ambient
+> descriptors are now closed at every confined-spawn site (`ConfinedCommand`, the
+> `OsSpawner` shell stages, carried-coreutils) via the new
+> `agent-bridle-fdguard` crate — an async-signal-safe `close_range(3, …)`
+> pre-exec that preserves stdio and fails closed. Per the slice-1 decision here,
+> the `unsafe` lives in that one crate so `agent-bridle-core` keeps
+> `forbid(unsafe_code)`. Proven by
+> `agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited`;
+> `ASM-POSIX-DESCRIPTOR` moves `held → partial`. Enforcement is Linux-only;
+> macOS/Windows fd hygiene and the `/proc`-reopen / `O_PATH` re-mediation are the
+> named follow-ups.
+
 ### Why "revised," not plain GO
 
 The user's stated hypothesis — *object/descriptor authority + authorized

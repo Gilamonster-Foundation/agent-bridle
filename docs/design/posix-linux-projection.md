@@ -49,7 +49,7 @@ No single mechanism enforces everything. The projection is a *composition*.
 | Cross-process signal / ptrace / `/proc` discovery | (pidfd design; unbuilt) | **Unsupported ⇒ refuse** | no confinement today |
 | `ioctl` / device | — | **Unsupported ⇒ refuse** | untyped multiplexer |
 | Metadata `inspect` | — | **Unknown** | Landlock does not confine `stat` |
-| Descriptor inheritance across exec | `close_range` (design, #319) | **Unknown → target Faithful** | CLOEXEC-convention only today (`spawn.rs:342`) |
+| Descriptor inheritance across exec | `close_range(3,..)` pre-exec via `agent-bridle-fdguard` (#319) | **Faithful (Linux)** | ambient fds >= 3 closed at every confined-spawn site, stdio preserved, fail-closed; macOS/Windows still CLOEXEC-convention |
 | Env / loader | `env_clear` + denylist | **Faithful** | `spawn.rs:650`, `config.rs:487` |
 
 ## Composition and kernel prerequisites
