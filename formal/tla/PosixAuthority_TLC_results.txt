@@ -1,0 +1,10 @@
+# PosixAuthority TLC results — regenerate with ./run-posix-authority.sh
+# The faithful cfg holds []Inv (P1..P4); each bug cfg is a counterexample to
+# exactly the named invariant (isolation verified: e.g. NamespaceForge keeps
+# opened ⊆ granted while openAdded ⊄ granted). tla2tools pinned per tla2tools-pin.txt.
+#
+PASS  faithful            []Inv holds
+PASS  Amplify              counterexample to NoAuthorityAmplification
+PASS  NamespaceForge       counterexample to NamespaceNonAmplification
+PASS  DescriptorForge      counterexample to DescriptorNonAmplification
+PASS  DescendantEscalate   counterexample to DescendantAttenuation
