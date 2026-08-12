@@ -334,6 +334,11 @@ fn shim_execute<SE: ShellExtensions>(
                 .map_err(|error| brush_core::Error::from(std::io::Error::other(error)))?;
             let child_control = OwnedFd::from(child_control);
             cmd.stderr(std::process::Stdio::from(child_control));
+            // #319: close ambient descriptors >= 3 in the child. The authenticated
+            // control channel rides in as stderr (fd 2) and is preserved; only
+            // un-delegated ambient capabilities are closed. Linux-enforced today.
+            #[cfg(unix)]
+            agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
             let mut child = cmd.spawn().map_err(|error| {
                 brush_core::ErrorKind::FailedToExecuteCommand(bundled_name.clone(), error)
             })?;

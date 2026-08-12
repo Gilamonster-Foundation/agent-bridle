@@ -332,6 +332,58 @@ async fn real_ambient_env_is_not_inherited() {
     );
 }
 
+/// agent-bridle#319 regression: an *ambient* descriptor the parent left open
+/// (CLOEXEC cleared) is an object capability, and it MUST NOT be inherited by a
+/// confined child. The env analog is `real_ambient_env_is_not_inherited` above;
+/// this is the descriptor analog. A `std::fs::File` is `O_CLOEXEC` by default, so
+/// we explicitly clear CLOEXEC to model a descriptor the parent opened
+/// inheritable, then confirm it does not appear in the child's `/proc/self/fd`.
+///
+/// RED until #319 lands: today the spawn boundary relies on the CLOEXEC
+/// convention only and does not close ambient fds, so the file leaks into the
+/// child. GREEN once the spawn path closes inherited fds >= 3 (preserving stdio).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn real_ambient_fd_is_not_inherited() {
+    use std::os::fd::AsRawFd;
+
+    // A regular file the parent holds open with CLOEXEC CLEARED — i.e. an
+    // inheritable ambient descriptor (an object capability the child was never
+    // delegated).
+    let path = unique_temp("ab319-ambient");
+    std::fs::write(&path, b"ambient-capability").expect("write temp");
+    let file = std::fs::File::open(&path).expect("open temp");
+    rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).expect("clear cloexec");
+    let ambient_fd = file.as_raw_fd();
+    assert!(
+        ambient_fd >= 3,
+        "ambient fd should be >= 3, got {ambient_fd}"
+    );
+
+    // Run a confined child that reports its descriptor table with symlink
+    // targets. `top()` imposes no fs/exec fence, isolating fd hygiene as the only
+    // variable. An inherited *file* fd shows its path in `/proc/self/fd`; the
+    // child's own stdio pipes and dir handle do not carry this path.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "ls", "args": ["-l", "/proc/self/fd"]}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    // Keep the ambient fd open across the spawn, then release it.
+    let stdout = out["stdout"].as_str().unwrap_or_default().to_string();
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+
+    let path_str = path.to_string_lossy();
+    assert!(
+        !stdout.contains(path_str.as_ref()),
+        "ambient descriptor {ambient_fd} ({path_str}) leaked into the confined child (agent-bridle#319):\n{stdout}"
+    );
+}
+
 /// #143 regression: the captured-output cap is config-driven (not a hard-coded
 /// const). A `ShellTool` built with a tiny `max_output_bytes` truncates a chatty
 /// command's stdout at the configured bound and flags it truncated.

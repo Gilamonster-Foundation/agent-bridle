@@ -141,11 +141,11 @@ class         = "unknown"
 
 [posix_descriptor.model]
 projection    = "derive keeps fds within the source descriptor (Ceremony.Posix.descriptor_non_amplification); reach_preserves_wf keeps fds ⊑ effective across every step"
-primitive     = "MODEL: close_range on spawn (#319) + reopen/O_PATH re-mediation design"
+primitive     = "close_range(3,..) pre-exec at every confined-spawn site via agent-bridle-fdguard (#319 slice 1, Linux); reopen/O_PATH re-mediation still design"
 formal_claim  = "DescriptorNonAmplification@PosixAuthority_DescriptorForge.cfg; NoAuthorityAmplification@PosixAuthority_Amplify.cfg"
-native_test   = "pending:agent-bridle-core/tests/posix_descriptor.rs"
-residual      = "ASM-POSIX-DESCRIPTOR: ambient fds not closed on spawn (#319, spawn.rs:342); /proc/self/fd + O_PATH re-mediation unwired"
-class         = "unknown"
+native_test   = "agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited"
+residual      = "ambient-fd inheritance CLOSED on Linux (#319); macOS/Windows still CLOEXEC-convention only; /proc/self/fd + O_PATH re-mediation unwired"
+class         = "bounded"
 
 [posix_descendant.model]
 projection    = "spawnChild bounds child grant + delivered fds by the parent (Ceremony.Posix.spawnChild_attenuates, spawnChild_wf); a wider child has no attenuation witness"

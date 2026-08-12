@@ -47,6 +47,7 @@ dependencies = [
 name = "agent-bridle-core"
 version = "0.8.0-rc.1"
 dependencies = [
+ "agent-bridle-fdguard",
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
@@ -61,6 +62,13 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "agent-bridle-fdguard"
+version = "0.8.0-rc.1"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -116,6 +124,7 @@ name = "agent-bridle-tool-shell"
 version = "0.8.0-rc.1"
 dependencies = [
  "agent-bridle-core",
+ "agent-bridle-fdguard",
  "anyhow",
  "async-trait",
  "brush-ocap-builtins",

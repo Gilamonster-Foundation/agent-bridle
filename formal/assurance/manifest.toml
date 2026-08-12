@@ -184,10 +184,10 @@ statement     = "Every permitted POSIX operation's required authority is within 
 lean_theorem  = ["Ceremony.Posix.complete_mediation", "Ceremony.Posix.reach_preserves_wf"]
 tla_invariant = ["NoAuthorityAmplification@PosixAuthority_Amplify.cfg"]
 rust_test     = []
-native_test   = []
+native_test_fn = ["agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited"]
 evidence_cid  = "held:phase1d"
-premise       = "ASM-POSIX-DESCRIPTOR: model proved (Ceremony.Posix.reach_preserves_wf, PosixAuthority.tla faithful cfg holds []Inv); real-path descriptor closure is #319 and unwired, so this is a MODEL property, not a runtime guarantee."
-status        = "held"
+premise       = "ASM-POSIX-DESCRIPTOR (now PARTIAL, #319 slice 1): model proved (Ceremony.Posix.reach_preserves_wf, PosixAuthority.tla faithful cfg holds []Inv), AND the real-path ambient-fd leak is now closed on Linux — every confined-spawn site closes fds >= 3 via agent-bridle-fdguard, proven by the native test. macOS/Windows fd hygiene + /proc-reopen re-mediation remain design; RC-cert pending, so NOT proved."
+status        = "partial"
 
 [[claim]]
 id            = "POSIX-NAMESPACE-NON-AMPLIFICATION"
@@ -208,10 +208,10 @@ statement     = "A capability derived from a descriptor (dup/openat/reopen/O_PAT
 lean_theorem  = ["Ceremony.Posix.descriptor_non_amplification"]
 tla_invariant = ["DescriptorNonAmplification@PosixAuthority_DescriptorForge.cfg"]
 rust_test     = []
-native_test   = []
+native_test_fn = ["agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited"]
 evidence_cid  = "held:phase1d"
-premise       = "ASM-POSIX-DESCRIPTOR: model proved; /proc/self/fd reopen and O_PATH upgrade must be re-mediated against effective on the real path (design, unwired)."
-status        = "held"
+premise       = "ASM-POSIX-DESCRIPTOR (now PARTIAL, #319 slice 1): model proved, AND ambient inherited descriptors are closed on the real path (Linux) so a child cannot hold a descriptor it was never delegated. The /proc/self/fd reopen and O_PATH-upgrade re-mediation (a distinct sub-property) remains design; macOS/Windows fd hygiene pending."
+status        = "partial"
 
 [[claim]]
 id            = "POSIX-DESCENDANT-ATTENUATION"

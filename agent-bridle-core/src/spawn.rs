@@ -339,23 +339,22 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// and fails closed when a restricted axis cannot meet its required
 /// enforcement floor.
 ///
-/// ## Descriptor inheritance — a KNOWN RESIDUAL (agent-bridle#319)
+/// ## Descriptor inheritance (agent-bridle#319)
 ///
-/// **Environment** is delegated explicitly (`env_clear` + only granted vars), but
-/// **file descriptors are not**: the child's stdio (fds 0/1/2, including the
-/// trusted-worker control channel which rides in as stdin) is deliberately
-/// delegated, yet this spawn boundary does **not** explicitly close *ambient*
-/// descriptors the parent left open. It relies on the platform CLOEXEC
-/// convention — `std::process::Command` sets `CLOEXEC` on the pipes it creates,
-/// but a descriptor the parent opened with `CLOEXEC` cleared **is inherited** by
-/// the confined child. An already-open descriptor is itself an object
-/// capability, so this is a real residual: descriptor hygiene here is
-/// CLOEXEC-based, **not** explicit close-on-spawn (`close_range`). An explicit
-/// `close_range(3, …)` pre-exec (preserving stdio) requires `unsafe`, which this
-/// crate forbids (`#![forbid(unsafe_code)]`), so the fix belongs in an
-/// unsafe-permitting launcher crate — tracked as agent-bridle#319. A downstream
-/// security contract that requires stronger-than-CLOEXEC descriptor hygiene must
-/// account for this residual (it is not yet provided) rather than assume it.
+/// Both **environment** and **file descriptors** are delegated explicitly. The
+/// child's stdio (fds 0/1/2, including the trusted-worker control channel which
+/// rides in as stdin) is deliberately delegated; every *ambient* descriptor the
+/// parent left open (an already-open descriptor is itself an object capability)
+/// is closed at `exec` via [`agent_bridle_fdguard::deny_inherited_fds`], which
+/// installs an async-signal-safe `close_range(3, …, CLOSE_RANGE_CLOEXEC)` pre-exec
+/// that marks every ambient descriptor close-on-exec (preserving stdio, and
+/// preserving std's own exec-status pipe so a failed `exec` is still reported).
+/// The `unsafe` `close_range` is encapsulated in that crate so this crate stays
+/// `#![forbid(unsafe_code)]` (ADR 0026, slice-1 decision). Enforcement is
+/// **Linux-only** today (`close_range(2)`, kernel ≥ 5.11); on other platforms fd
+/// hygiene still relies on the CLOEXEC convention (macOS/Windows close-on-spawn is
+/// a tracked follow-up). The fix fails closed: if `close_range` errors, the spawn
+/// fails and the child never runs.
 #[derive(Debug)]
 pub struct ConfinedCommand {
     program: String,
@@ -672,6 +671,12 @@ impl ConfinedCommand {
             }
             #[cfg(not(unix))]
             let _ = new_process_group;
+            // #319: close ambient descriptors the parent left open so they are not
+            // inherited as un-delegated object capabilities. Encapsulated in
+            // `agent-bridle-fdguard` (the single `unsafe` seam) so core stays
+            // `forbid(unsafe_code)`; Linux-enforced today, no-op elsewhere.
+            #[cfg(unix)]
+            agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
             cmd.spawn().map_err(ToolError::from)
         })
         .join()
