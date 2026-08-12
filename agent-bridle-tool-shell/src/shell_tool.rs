@@ -40,8 +40,8 @@ use agent_bridle_core::{
     admit, best_available_sandbox, effective_sandbox_kind, enforcement_report, human_gate,
     is_unbridled, unenforceable_axis, AdmissionDecision, AdmittedFence, BackendProjection, Caveats,
     ConfinedAxis, ConfinementMechanism, Denial, DenialKind, Disclosure, EnforcementReport,
-    Invocation, LimitsPolicy, RuntimeClosure, SandboxKind, SandboxPolicy, Tool, ToolContext,
-    ToolEnvelope, ToolError, ToolResult,
+    Invocation, LimitsPolicy, ResolvedScope, RuntimeClosure, SandboxKind, SandboxPolicy, Scope,
+    Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -791,8 +791,25 @@ impl Tool for ShellTool {
             // a restricted grant is refused here instead of spawning fail-open.
             if self.spawner.requires_backend_admission() {
                 let sandbox = best_available_sandbox(&self.sandbox);
+                let mut resolved = sandbox.resolved_authority(&backend_caveats);
+                // AppContainer cannot express a non-empty exec allowlist in its
+                // native policy, but this route has already atomically checked
+                // every pipeline stage through the ShellTool exec interceptor.
+                // Intersect that route-local bound with the active AppContainer
+                // projection without changing the backend's native claim or its
+                // runtime closure. The EFFECTIVE-kind guard is load-bearing:
+                // exec-only caveats do not engage AppContainer and must retain the
+                // no-backend Unbounded refusal rather than borrow this interceptor.
+                if sandbox_kind == SandboxKind::AppContainer
+                    && matches!(
+                        &backend_caveats.exec,
+                        Scope::Only(programs) if !programs.is_empty()
+                    )
+                {
+                    resolved.exec = ResolvedScope::from_scope(&backend_caveats.exec);
+                }
                 let projection = BackendProjection {
-                    resolved: sandbox.resolved_authority(&backend_caveats),
+                    resolved,
                     runtime_closure: sandbox.runtime_closure(&backend_caveats),
                 };
                 let rejected_axis = match admit(

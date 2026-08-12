@@ -104,6 +104,44 @@ async fn real_no_backend_restricted_authority_refuses_before_spawn() {
     );
 }
 
+/// A permitted direct command still must not spawn when its restricted exec
+/// authority has no native backend. This isolates the exec axis: every other
+/// caveat is unrestricted, and the marker proves refusal precedes `OsSpawner`.
+#[cfg(not(any(
+    all(target_os = "linux", feature = "linux-landlock"),
+    all(target_os = "macos", feature = "macos-seatbelt")
+)))]
+#[tokio::test]
+async fn real_no_backend_restricted_exec_refuses_before_spawn() {
+    let marker = unique_temp("no-backend-exec-refusal");
+    let _ = std::fs::remove_file(&marker);
+    let restricted = Caveats {
+        exec: Scope::only(["touch".to_string()]),
+        ..Caveats::top()
+    };
+
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "touch", "args": [shell_path(&marker)]}),
+            &ctx(restricted),
+        )
+        .await
+        .expect("backend admission refusal is a structured envelope");
+
+    assert_eq!(
+        out["denied"], true,
+        "restricted exec must fail closed: {out}"
+    );
+    assert_eq!(
+        out["denials"][0]["kind"], "exec",
+        "unexpected refusal: {out}"
+    );
+    assert!(
+        !marker.exists(),
+        "the marker proves the real OsSpawner must not have spawned: {out}"
+    );
+}
+
 /// #269 / AB-006: a timed-out child is KILLED and reaped — it must not run to
 /// completion. The script writes a START marker immediately, then `sleep 3`, then
 /// a DONE marker; with a 1s timeout the envelope reports a confirmed timeout,
