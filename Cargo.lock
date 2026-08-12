@@ -50,6 +50,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "content-addressable",
  "ed25519-dalek",
  "landlock",
  "libc",

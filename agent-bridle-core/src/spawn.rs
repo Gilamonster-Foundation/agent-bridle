@@ -600,6 +600,12 @@ impl ConfinedCommand {
         })?;
         let mechanism_effective = admitted.mechanism_caveats().clone();
 
+        // ASM-CID / L2 at runtime: the caveats we are about to compile+apply must
+        // content-address to the fence admission stamped. Same object today, so
+        // this holds by construction; it is the cryptographic backstop that a
+        // future re-derivation between admit and apply (the #317 bug) cannot pass.
+        admitted.verify_applied(&mechanism_effective)?;
+
         // For a wrapper-based backend (Seatbelt/AppContainer) this is the argv
         // prefix that confines the child; empty for thread-confining backends
         // (Landlock, via `apply`) and Noop. Computed here so a fail-closed wrapper

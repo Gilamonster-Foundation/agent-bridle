@@ -141,8 +141,8 @@ tla_invariant = ["T7_ProvenanceContinuity@AuthorityLifecycle_SubstituteEvidence.
 rust_test     = []
 native_test   = []
 evidence_cid  = "held:phase1d"
-premise       = "ASM-CID: modeled with Cid(x)=x (injective, uninterpreted). The runtime chain does NOT yet attach content CIDs (held in the ceremony P1 layer) — so this is a MODEL property, not a wired runtime guarantee."
-status        = "held"
+premise       = "ASM-CID: the admit→apply handoff is now content-verified at RUNTIME — AdmittedFence carries a real BLAKE3 ContentId (AdmittedFenceId) over its canonical (mechanism_caveats, mechanism) body, and verify_applied refuses fail-closed on mismatch (agent-bridle-core/src/admitted.rs; wired at spawn.rs's apply seam). This upgrades the #317 object-identity guarantee to a content-addressed one, using the same content-addressable machinery as AuthorityId/GrantId. STILL PENDING for the full 6-hop chain: binding the fence CID into ExecutionResult/AppliedFenceEvidence and the CompiledPlan/Evidence CIDs. So the runtime property is PARTIAL, not yet end-to-end."
+status        = "partial"
 
 # ── L3 non-equivocation (pre-existing spec, folded into the assurance surface) ─
 [[claim]]
