@@ -14,7 +14,7 @@
 //! subprocess (the expensive tier) — not a unit test.
 #![cfg(all(windows, feature = "shell"))]
 
-use agent_bridle_core::{Caveats, Gate, Scope, Tool, ToolContext};
+use agent_bridle_core::{Caveats, Gate, Tool, ToolContext};
 use agent_bridle_tool_shell::ShellTool;
 
 /// Mint a context the only legitimate way — through the gate.
@@ -22,13 +22,6 @@ fn ctx(granted: Caveats) -> ToolContext {
     Gate::new(0)
         .authorize(&ShellTool::new(), &granted)
         .expect("authorize")
-}
-
-fn exec_only(names: &[&str]) -> Caveats {
-    Caveats {
-        exec: Scope::only(names.iter().map(|s| (*s).to_string())),
-        ..Caveats::top()
-    }
 }
 
 /// #323: a parent-process (ambient) secret NOT passed as a caller env entry must
@@ -50,7 +43,12 @@ async fn windows_ambient_env_is_not_inherited() {
                 // The ONLY authority the child should receive beyond the baseline.
                 "env": { "AB323_GRANTED": "allowed" },
             }),
-            &ctx(exec_only(&["cmd"])),
+            // Unrestricted grant: this test isolates the OsSpawner env-clear itself,
+            // which is applied UNCONDITIONALLY to every spawn (the confined
+            // AppContainer path is proven separately in `windows_appcontainer_env`).
+            // A restricted-`exec` grant with no engaged native backend now correctly
+            // fails closed (agent-bridle #d69e480), so it cannot be used here.
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
