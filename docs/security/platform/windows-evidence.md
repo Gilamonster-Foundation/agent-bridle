@@ -4,8 +4,8 @@ Evidence collected on:
 
 - Host: Microsoft Windows NT 10.0.26200.0, x86_64
 - Rust: rustc 1.93.1 (x86_64-pc-windows-msvc)
-- Branch: `fix/windows-v080-ocap-closure`, stacked on PR #317 head `1206d76`
-- Token elevation: not elevated; loopback-exemption proof is CI/elevated-runner only on this host
+- Branch: `platform/windows-e2-324-closure-refresh`, rebased on `main` at `5bde417`
+- Token elevation: local session not elevated; loopback-exemption proof is CI/elevated-runner only on this host
 
 ## v0.8 Rows
 
