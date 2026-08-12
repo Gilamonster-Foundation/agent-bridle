@@ -345,14 +345,16 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// child's stdio (fds 0/1/2, including the trusted-worker control channel which
 /// rides in as stdin) is deliberately delegated; every *ambient* descriptor the
 /// parent left open (an already-open descriptor is itself an object capability)
-/// is closed before `exec` via [`agent_bridle_fdguard::deny_inherited_fds`],
-/// which installs an async-signal-safe `close_range(3, …)` pre-exec (preserving
-/// stdio). The `unsafe` `close_range` is encapsulated in that crate so this crate
-/// stays `#![forbid(unsafe_code)]` (ADR 0026, slice-1 decision). Enforcement is
-/// **Linux-only** today (`close_range(2)`); on other platforms fd hygiene still
-/// relies on the CLOEXEC convention (macOS/Windows close-on-spawn is a tracked
-/// follow-up). The fix fails closed: if `close_range` errors, the spawn fails and
-/// the child never runs.
+/// is closed at `exec` via [`agent_bridle_fdguard::deny_inherited_fds`], which
+/// installs an async-signal-safe `close_range(3, …, CLOSE_RANGE_CLOEXEC)` pre-exec
+/// that marks every ambient descriptor close-on-exec (preserving stdio, and
+/// preserving std's own exec-status pipe so a failed `exec` is still reported).
+/// The `unsafe` `close_range` is encapsulated in that crate so this crate stays
+/// `#![forbid(unsafe_code)]` (ADR 0026, slice-1 decision). Enforcement is
+/// **Linux-only** today (`close_range(2)`, kernel ≥ 5.11); on other platforms fd
+/// hygiene still relies on the CLOEXEC convention (macOS/Windows close-on-spawn is
+/// a tracked follow-up). The fix fails closed: if `close_range` errors, the spawn
+/// fails and the child never runs.
 #[derive(Debug)]
 pub struct ConfinedCommand {
     program: String,
