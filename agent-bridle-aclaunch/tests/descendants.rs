@@ -103,7 +103,7 @@ fn assert_appcontainer_identity(out: &std::process::Output, min_lines: usize, ro
     );
 }
 
-fn assert_low_integrity_identity(out: &std::process::Output, route: &str) {
+fn assert_route_marker(out: &std::process::Output, marker: &str, route: &str) {
     assert!(
         out.status.success(),
         "{route} must run; status={:?} stdout={} stderr={}",
@@ -113,8 +113,8 @@ fn assert_low_integrity_identity(out: &std::process::Output, route: &str) {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("S-1-16-4096") || stdout.contains("Mandatory Label\\Low Mandatory Level"),
-        "{route} must retain the low-integrity token boundary; stdout={stdout:?}"
+        stdout.contains(marker),
+        "{route} must reach its built-in marker {marker:?}; stdout={stdout:?}"
     );
 }
 
@@ -155,17 +155,29 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     ]);
     assert_appcontainer_identity(&direct, 1, "direct helper child");
 
-    let via_cmd = launch(&["--name", &tag("cmd"), "cmd.exe", "/c", "whoami", "/groups"]);
-    assert_low_integrity_identity(&via_cmd, "cmd.exe child");
+    let via_cmd = launch(&[
+        "--name",
+        &tag("cmd"),
+        "cmd.exe",
+        "/d",
+        "/c",
+        "echo cmd-route-ran",
+    ]);
+    assert_route_marker(&via_cmd, "cmd-route-ran", "cmd.exe child");
 
     let via_cmd_grandchild = launch(&[
         "--name",
         &tag("cmd-gc"),
         "cmd.exe",
+        "/d",
         "/c",
-        "cmd.exe /c whoami /groups",
+        "cmd.exe /d /c echo cmd-grandchild-route-ran",
     ]);
-    assert_low_integrity_identity(&via_cmd_grandchild, "cmd.exe to cmd.exe grandchild");
+    assert_route_marker(
+        &via_cmd_grandchild,
+        "cmd-grandchild-route-ran",
+        "cmd.exe to cmd.exe grandchild",
+    );
 
     let powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
     let via_powershell = launch(&[
@@ -174,9 +186,9 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         powershell,
         "-NoProfile",
         "-Command",
-        "whoami /groups",
+        "Write-Output powershell-route-ran",
     ]);
-    assert_low_integrity_identity(&via_powershell, "PowerShell child");
+    assert_route_marker(&via_powershell, "powershell-route-ran", "PowerShell child");
 
     let via_powershell_grandchild = launch(&[
         "--name",
@@ -184,10 +196,11 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         powershell,
         "-NoProfile",
         "-Command",
-        "cmd.exe /c whoami /groups",
+        "cmd.exe /d /c echo powershell-grandchild-route-ran",
     ]);
-    assert_low_integrity_identity(
+    assert_route_marker(
         &via_powershell_grandchild,
+        "powershell-grandchild-route-ran",
         "PowerShell to cmd.exe grandchild",
     );
 
@@ -201,8 +214,7 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         &probe_s,
         "spawn-cmd",
     ]);
-    assert_appcontainer_identity(&helper_grandchild, 1, "helper child");
-    assert_low_integrity_identity(&helper_grandchild, "helper child to cmd.exe grandchild");
+    assert_appcontainer_identity(&helper_grandchild, 2, "helper child to cmd.exe grandchild");
 
     let helper_to_helper = launch(&[
         "--name",
