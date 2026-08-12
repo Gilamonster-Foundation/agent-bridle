@@ -1,6 +1,9 @@
 # ADR 0015 — macOS Seatbelt net axis: loopback kernel-confinement + the remote-host allow-list frontier
 
-- Status: Accepted (2026-06-30)
+- Status: **Partially superseded (2026-08-11)** — the SBPL direct-socket
+  findings remain valid, but every claim below that a restricted Seatbelt net
+  scope is a complete `Kernel` witness or is admissible is superseded by the E4
+  ruling in this document.
 - Date: 2026-06-30
 - Context: The macOS `SeatbeltSandbox` (`sandbox.rs`, ADR 0006 / 0009) kernel-denies
   **all** egress when `net` is empty (`(deny network*)` → `net → Kernel`; #50
@@ -17,6 +20,35 @@
   the kernel actually enforces).
 - Related issues: **#124** (this axis), #104 (ADR 0014, the Seatbelt backend this
   extends), #50/#96 (the empty-net kernel case).
+
+## Superseding E4 ruling (2026-08-11)
+
+The original decision measured the child's own network syscalls. It did not
+model ambient Mach/XPC services that can perform network work outside the
+sandbox on the child's behalf. Native characterization has since demonstrated
+one such path: a background `URLSession` can delegate a transfer to
+`com.apple.nsurlsessiond` even while the child is under `(deny network*)`.
+
+The E4 profile adds a default-deny Mach-lookup floor and excludes that service.
+Native evidence establishes the narrow result that this demonstrated deputy is
+closed. It does **not** establish deputy-complete no-egress: the profile
+re-allows a minimal set of Mach services needed for usable processes, and
+neither those services nor every other ambient IPC route have been
+comprehensively certified against child-controlled egress.
+
+Therefore the operative authority ruling is fail-closed:
+
+- `SeatbeltSandbox::resolved_authority().net` is `Unknown` for **every**
+  restricted net scope, including `net:none` and every loopback shape.
+- Admission refuses those scopes. The emitted SBPL direct-network and Mach rules
+  are defense in depth only; they are not a support or `Kernel`-witness
+  promotion.
+- The loopback egress-proxy design from ADR 0016 is held/unavailable on macOS
+  until a deputy-complete native proof supports a faithful projection.
+
+The remainder of this ADR records the 2026-06 direct-socket findings and the
+superseded decision for history. Where it says a restricted net shape is
+`Kernel`, exact, admitted, or supported, this 2026-08-11 ruling controls.
 
 ## Question
 
@@ -59,7 +91,7 @@ pure SBPL (Finding 1). The one non-deny-all policy the kernel *can* enforce is
 
 ## Decision
 
-### D1 — Kernel-confine a loopback-only allow-list; report `net → Kernel`
+### D1 — SUPERSEDED: kernel-confine a loopback-only allow-list; report `net → Kernel`
 
 When `net` is `Only(set)` with `set` non-empty and every host a loopback
 identifier — `localhost`, `127.0.0.1`, `::1` ([`LOOPBACK_HOSTS`]) —
@@ -75,7 +107,7 @@ the bypass table.) The wrapper engages on a loopback-only
 `net` grant alone (it joins `restricts_fs` / `net_fully_denied` / `restricts_exec`
 in `effective_sandbox_kind` and `command_prefix`), even with fs/exec unrestricted.
 
-### D2 — The kernel confines the *interface*; admission refines the *host*
+### D2 — SUPERSEDED: the kernel confines the *interface*; admission refines the *host*
 
 `(remote ip "localhost:*")` confines egress to the loopback interface as a whole
 (`127.0.0.1` **and** `::1`) — the finest grain SBPL can name. This is coarser than
@@ -96,7 +128,7 @@ kernel enforce the identical set, a future change could normalize the loopback
 synonyms in `check_net`; deliberately out of scope here — it changes the
 exact-match net leash for every backend, not just Seatbelt.)
 
-### D3 — A general remote-host allow-list stays `Advisory` (honesty)
+### D3 — SUPERSEDED: a general remote-host allow-list stays `Advisory` (honesty)
 
 Any `net: Only(set)` with a non-loopback member (e.g. `example.com`, `127.0.0.2`,
 a public IP) is **not** loopback-only. SBPL cannot name it (Finding 1), so the
@@ -105,13 +137,17 @@ profile emits **no** network rule — the axis is left ambient and reported
 host taints an otherwise-loopback set (the whole allow-list falls to advisory)
 rather than emit a rule that would silently drop the remote entry.
 
-### D4 — No change to the empty-net or the honesty oracle
+### D4 — SUPERSEDED: no change to the empty-net or the honesty oracle
 
 `net: Only({})` (deny-all) keeps its `(deny network*)` / `net → Kernel` path,
 mutually exclusive with D1. The `noop_host_never_reports_kernel` oracle and the
 `effective ⊑ granted` law are undisturbed (the net rules only ever deny more).
 
 ## Bypass vectors and their disposition
+
+> Historical direct-socket analysis. The table does not establish
+> deputy-complete authority and must not be used to admit a restricted macOS net
+> scope; the superseding E4 ruling above requires `Unknown → refuse`.
 
 | Vector | Disposition on macOS |
 |---|---|
@@ -125,6 +161,10 @@ mutually exclusive with D1. The `noop_host_never_reports_kernel` oracle and the
 | No `sandbox-exec` (incapable host) | **Fails closed** — `command_prefix` returns `Err`, never an unconfined prefix. |
 
 ## Consequences
+
+The consequences below describe the superseded 2026-06 support decision. The
+direct-socket primitive remains available as defense in depth, but the current
+admission outcome for every restricted Seatbelt net scope is refusal.
 
 **Positive**
 - A loopback-only `net` grant is now **kernel-confined**: the process's own off-box

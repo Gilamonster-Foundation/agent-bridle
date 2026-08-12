@@ -52,7 +52,8 @@ is SKIPPED (unsupported host) it establishes **nothing** (see the honesty note).
 | **ASM-WIN-ENV** | On Windows the ambient parent environment is cleared before `aclaunch`, so an undelegated secret does not reach the child (#323). | `agent-bridle-tool-shell/tests/windows_env_isolation.rs` (passes on real Windows 11) | established (#338 branch) |
 | **ASM-INHERIT** | seccomp / Landlock / Seatbelt / AppContainer actually preserve the confinement boundary across a real **gen-2** grandchild. | linux `real_spawn.rs` + `child_network_seccomp_real.rs`; win `kernel_proofs.rs:222`; macOS `process-exec*` (child-grain) | linux+win established; macOS gen-2 partial |
 | **ASM-SECCOMP-IOURING** | The seccomp floor denies the io_uring primitive so `net:none` is not bypassable off-box (E3). | `child_network_seccomp_real.rs` (needs an explicit io_uring probe — see the E3 review) | **residual: probe not yet landed** |
-| **ASM-MACOS-METADATA** | macOS `file-read-metadata` observability is ORTHOGONAL to content `fs_read` and is a registered residual — it must NOT be modeled as content authority. | `seatbelt_floor_evidence.rs` (content denied, metadata ambient) | established as a residual |
+| **ASM-MACOS-METADATA** | macOS `file-read-metadata` observability is ORTHOGONAL to content `fs_read` and is a registered residual — it must NOT be modeled as content authority. | Content boundary: `agent-bridle-core/src/sandbox.rs::fs_read_is_kernel_enforced_outside_scope_denied_inside_allowed` (macOS `seatbelt_kernel_tests`); metadata observability itself has no dedicated native probe | **UNDISCHARGED / registered residual** — content denial is established, but the ambient metadata extent is documented rather than natively characterized |
+| **ASM-MACOS-DEPUTY** | A deputy-complete macOS restricted-net fence would have to bound every child-drivable ambient or allow-listed IPC service, not only the child's direct sockets or one known daemon. The E4 Mach floor closes the demonstrated background-`URLSession` → `com.apple.nsurlsessiond` path, but that narrow result does not establish the full premise. | `agent-bridle-core/src/sandbox.rs::net_none_mach_floor_has_strict_ambient_closed_ambient_differential` (strict native characterization recording the head and tested merge identities) | **UNDISCHARGED / partial** — demonstrated deputy closed as defense in depth; allow-listed and other ambient IPC deputies are not comprehensively certified, so every restricted Seatbelt net scope remains `Unknown` and is refused |
 | **ASM-CID** | Content CIDs are attached to runtime authority-bearing objects (grant/plan/fence/evidence). **Today they are NOT** — CID machinery is HELD in the ceremony P1 layer. P8/PROVENANCE-CONTINUITY is therefore a MODEL property only, not a wired runtime guarantee. | (unwired — Phase-1d freeze) | **held** |
 
 ### Release-certification rule (enforced by validate.sh)
@@ -69,9 +70,13 @@ manifest green.
 ### Honesty note — SKIP is not PASS
 The native tiers self-skip where the mechanism is unavailable (no Landlock, no
 `sandbox-exec`, no AppContainer). A skipped test establishes **nothing**; it must
-not be reported as evidence. Windows CI already forces fail-not-skip via
-`BRIDLE_REQUIRE_APPCONTAINER`; the Linux tests genuinely run on gnuc. Any claim
-whose only native tier was skipped stays `partial`/`held`, never `proved`.
+not be reported as evidence. Windows CI forces fail-not-skip via
+`BRIDLE_REQUIRE_APPCONTAINER`; macOS CI uses `BRIDLE_REQUIRE_SEATBELT` and runs the
+focused E4 characterization serially with the PR head SHA; the Linux tests
+genuinely run on gnuc. Even a green E4 characterization discharges only the
+named `nsurlsessiond` path, not ASM-MACOS-DEPUTY. Any claim whose native tier was
+skipped or whose premise remains incomplete stays `partial`/`held`, never
+`proved`.
 
 ---
 

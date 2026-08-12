@@ -122,6 +122,19 @@ jobs:
       - name: Clippy (compiles the macOS-only SeatbeltSandbox)
         run: cargo clippy --workspace --exclude agent-bridle-py --all-targets --all-features -- -D warnings
 
+      # Bind the focused E4 characterization to the contributor's PR head rather
+      # than GitHub's synthetic merge commit (pushes use GITHUB_SHA). This proves
+      # only the demonstrated NSURLSession/nsurlsessiond path is closed; it does
+      # not promote any restricted macOS net scope from Unknown.
+      - name: Native E4 characterization (strict, serial, head-SHA bound)
+        env:
+          BRIDLE_REQUIRE_SEATBELT: "1"
+          BRIDLE_E4_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cargo test -p agent-bridle-core --features macos-seatbelt \
+            sandbox::seatbelt_kernel_tests::net_none_mach_floor_has_strict_ambient_closed_ambient_differential \
+            -- --exact --nocapture --test-threads=1
+
       # BRIDLE_REQUIRE_SEATBELT turns the Seatbelt kernel-enforcement proofs from
       # silent-skip into hard-FAIL when `sandbox-exec` is unavailable, so CI cannot
       # go green without exercising the fs_write/fs_read boundary (mirrors
@@ -130,6 +143,7 @@ jobs:
       - name: Test (require the Seatbelt kernel proofs)
         env:
           BRIDLE_REQUIRE_SEATBELT: "1"
+          BRIDLE_E4_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: cargo test --workspace --exclude agent-bridle-py --all-features
 
   check-windows:

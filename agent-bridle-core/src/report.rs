@@ -196,12 +196,15 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 ///   AppContainer's deny-all scope. Landlock, AppContainer non-empty allowlists,
 ///   and `None` remain `interceptor`.
 /// - **`net`** — `kernel` for a micro-VM; for empty or loopback-only scopes under
-///   Seatbelt/AppContainer; and — the mechanism-sensitive case — for a Landlock
-///   `net:none` child ONLY when the [`ChildNetworkPolicy::DenyDirect`] seccomp
-///   socket-family deny is installed (which closes UDP/DNS/raw/packet). A Landlock
-///   `net:none` under [`ChildNetworkPolicy::LandlockOnly`] denies only TCP
-///   connect/bind (ABI v4) and leaves the other socket families ambient, so it is
-///   honestly `advisory` — never a complete Kernel network witness.
+///   AppContainer; and — the mechanism-sensitive case — for a Landlock `net:none`
+///   child ONLY when the [`ChildNetworkPolicy::DenyDirect`] seccomp socket-family
+///   deny is installed (which closes UDP/DNS/raw/packet). Seatbelt is `advisory`
+///   for every restricted net shape: its direct socket rules remain useful native
+///   mechanism evidence, but the applied authority projection cannot yet bound
+///   ambient Mach/XPC deputies, so admission refuses rather than treating those
+///   rules as a complete Kernel network witness. A Landlock `net:none` under
+///   [`ChildNetworkPolicy::LandlockOnly`] likewise remains `advisory` because it
+///   denies only TCP connect/bind (ABI v4) and leaves other socket families ambient.
 ///
 /// Accepts a bare [`SandboxKind`] (conservative `LandlockOnly` net mechanism) or
 /// an explicit [`ConfinementMechanism`].
@@ -294,20 +297,6 @@ pub fn enforcement_report(
             }
             SandboxKind::AppContainer => AxisEnforcement::Advisory,
             SandboxKind::MicroVm => AxisEnforcement::Kernel,
-            // Seatbelt kernel-denies *all* egress when the net scope is empty
-            // (`(deny network*)`), and confines a **loopback-only** allowlist to
-            // the loopback interface (`(allow network* (remote ip "localhost:*"))`)
-            // so the process's own off-box socket egress is kernel-denied (ADR
-            // 0015) — both honest `kernel`. A general remote host is inexpressible
-            // in SBPL (only
-            // `*`/`localhost` + ports), so it stays advisory. Landlock does not gate
-            // net this increment.
-            SandboxKind::Seatbelt
-                if crate::sandbox::net_fully_denied(effective)
-                    || crate::sandbox::net_loopback_full_interface(effective) =>
-            {
-                AxisEnforcement::Kernel
-            }
             // Landlock: a `net:none` child reaches a COMPLETE off-box egress deny
             // — the property Bridle associates with a Kernel net axis — ONLY under
             // the `DenyDirect` mechanism, whose seccomp `socket()`-family deny
@@ -324,8 +313,11 @@ pub fn enforcement_report(
             {
                 AxisEnforcement::Kernel
             }
-            // The minimal-rootfs jail does not namespace the network this tier, so
-            // egress is unconfined — advisory, never overclaimed (ADR 0013 D5).
+            // Seatbelt has useful direct-socket SBPL rules for deny-all and
+            // loopback, but no faithful bound for every ambient Mach/XPC deputy;
+            // every restricted shape therefore stays Advisory and is refused by a
+            // Kernel net floor. The minimal-rootfs jail does not namespace the
+            // network this tier either, so it is advisory too (ADR 0013 D5).
             SandboxKind::Landlock
             | SandboxKind::Seatbelt
             | SandboxKind::MinimalRootfs
@@ -773,10 +765,10 @@ mod tests {
         assert_eq!(r.exec, None);
     }
 
-    /// Blocker 2 table (POLICY/UNIT proof — NOT native evidence; real Seatbelt
-    /// enforcement is grounded on-device in `seatbelt_net_evidence.rs`). The net
-    /// witness follows the actual mechanism, each expected value from its true
-    /// semantic capability.
+    /// Blocker 2 table (POLICY/UNIT proof — NOT native evidence). Direct Seatbelt
+    /// socket behavior is grounded on-device separately, but does not promote the
+    /// report while ambient Mach/XPC authority remains unbounded. The net witness
+    /// follows the complete supported mechanism, not one successful primitive.
     #[test]
     fn net_witness_is_mechanism_aware_across_backends() {
         let none = || Caveats {
@@ -809,12 +801,12 @@ mod tests {
                 Advisory,
             ),
             ("deny-direct + net:none", none(), ll(DenyDirect), Kernel),
-            ("seatbelt + net:none", none(), sb, Kernel),
+            ("seatbelt + net:none", none(), sb, Advisory),
             (
                 "seatbelt + loopback full interface",
                 loopback_full(),
                 sb,
-                Kernel,
+                Advisory,
             ),
             (
                 "seatbelt + loopback single addr (widens)",
@@ -837,10 +829,8 @@ mod tests {
 
     /// Seatbelt (macOS) governs the fs axes in the kernel like Landlock, **and**
     /// the `exec` axis via `process-exec*` (ADR 0014) — so exec is `kernel`, not
-    /// `interceptor`. `net` here is a general remote host allowlist, which SBPL
-    /// cannot express, so it stays advisory (the empty-net and loopback-only kernel
-    /// cases are covered by
-    /// [`seatbelt_net_kernel_for_empty_and_loopback_advisory_for_remote_host`]).
+    /// `interceptor`. Every restricted `net` shape stays advisory until the
+    /// applied Seatbelt authority can faithfully bound ambient deputies.
     #[test]
     fn seatbelt_marks_fs_and_exec_kernel_net_advisory() {
         let r = enforcement_report(&fully_restricted(), SandboxKind::Seatbelt);
@@ -1009,12 +999,11 @@ mod tests {
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
     }
 
-    /// Seatbelt's net honesty is scope-shaped (ADR 0015): kernel for the two
-    /// policies SBPL can express — an **empty** scope (`(deny network*)`) and a
-    /// **loopback-only** allowlist (egress confined to the loopback interface) —
-    /// and advisory for a general remote host, which SBPL cannot name.
+    /// Seatbelt's direct SBPL socket rules remain scope-shaped, but none is a
+    /// complete authority witness while ambient Mach/XPC deputies are unbounded.
+    /// Every restricted net shape is therefore Advisory.
     #[test]
-    fn seatbelt_net_kernel_for_empty_and_loopback_advisory_for_remote_host() {
+    fn seatbelt_net_is_advisory_for_every_restricted_scope() {
         let net_report = |net| {
             enforcement_report(
                 &Caveats {
@@ -1026,69 +1015,53 @@ mod tests {
             .net
         };
 
-        // Empty net (all egress denied) → kernel (exact: deny-all == empty scope).
-        assert_eq!(net_report(Scope::none()), Some(AxisEnforcement::Kernel));
-        // Loopback-only is Kernel ONLY when the Caveat denotes the full interface
-        // (`localhost`, or both addresses) — the Seatbelt localhost fence allows
-        // 127.0.0.1 AND ::1, so a single address is a widening (scope-fidelity).
-        assert_eq!(
-            net_report(Scope::only(["localhost".to_string()])),
-            Some(AxisEnforcement::Kernel),
-            "the loopback interface token is an exact Kernel witness"
-        );
-        assert_eq!(
-            net_report(Scope::only(["127.0.0.1".to_string(), "::1".to_string()])),
-            Some(AxisEnforcement::Kernel),
-            "naming both loopback addresses is the full interface → Kernel"
-        );
-        for widening in ["127.0.0.1", "::1"] {
+        for (label, scope) in [
+            ("deny-all", Scope::none()),
+            ("loopback token", Scope::only(["localhost".to_string()])),
+            (
+                "both loopback addresses",
+                Scope::only(["127.0.0.1".to_string(), "::1".to_string()]),
+            ),
+            (
+                "single loopback address",
+                Scope::only(["127.0.0.1".to_string()]),
+            ),
+            ("remote allowlist", Scope::only(["example.com".to_string()])),
+            (
+                "mixed loopback and remote",
+                Scope::only(["localhost".to_string(), "example.com".to_string()]),
+            ),
+        ] {
             assert_eq!(
-                net_report(Scope::only([widening.to_string()])),
+                net_report(scope),
                 Some(AxisEnforcement::Advisory),
-                "single-address loopback {widening} widens to the interface → below Kernel"
+                "Seatbelt {label} must remain Advisory until ambient deputies are bounded"
             );
         }
-        // A general remote host → advisory (inexpressible in SBPL).
-        assert_eq!(
-            net_report(Scope::only(["example.com".to_string()])),
-            Some(AxisEnforcement::Advisory)
-        );
-        // A single remote host taints an otherwise-loopback set → advisory.
-        assert_eq!(
-            net_report(Scope::only([
-                "localhost".to_string(),
-                "example.com".to_string()
-            ])),
-            Some(AxisEnforcement::Advisory)
-        );
     }
 
-    /// OCAP scope-fidelity refusal: a single-address loopback Caveat must NOT be
-    /// admitted under a kernel mechanism that silently supplies additional
-    /// addresses. Under CONFINED (net:Kernel), the single-address loopback reports
-    /// Advisory (the fence widens to the whole interface), so the net axis is
-    /// unenforceable → refuse before spawn. The full interface is admitted.
+    /// Under CONFINED (`net: Kernel`), every restricted Seatbelt net scope is
+    /// refused before spawn because every such report is Advisory. Direct socket
+    /// denial is not enough to discharge the ambient-deputy authority obligation.
     #[test]
-    fn single_address_loopback_cannot_be_admitted_under_confined() {
-        let v4_only = Caveats {
-            net: Scope::only(["127.0.0.1".to_string()]),
-            ..Caveats::top()
-        };
-        let unmet = unenforceable_axis(&v4_only, SandboxKind::Seatbelt, EnforcementFloor::CONFINED)
-            .expect("a single-address loopback caveat must refuse under CONFINED (kernel widens)");
-        assert_eq!(unmet.axis, ConfinedAxis::Net);
-        assert_eq!(unmet.required, AxisEnforcement::Kernel);
-        assert_eq!(unmet.actual, Some(AxisEnforcement::Advisory));
-
-        // The full loopback interface IS an exact witness → admitted.
-        let full = Caveats {
-            net: Scope::only(["localhost".to_string()]),
-            ..Caveats::top()
-        };
-        assert!(
-            unenforceable_axis(&full, SandboxKind::Seatbelt, EnforcementFloor::CONFINED).is_none(),
-            "the full loopback interface is an exact Kernel witness → admitted"
-        );
+    fn restricted_seatbelt_net_cannot_be_admitted_under_confined() {
+        for (label, net) in [
+            ("deny-all", Scope::none()),
+            ("full loopback", Scope::only(["localhost".to_string()])),
+            ("single loopback", Scope::only(["127.0.0.1".to_string()])),
+            ("remote", Scope::only(["example.com".to_string()])),
+        ] {
+            let caveats = Caveats {
+                net,
+                ..Caveats::top()
+            };
+            let unmet =
+                unenforceable_axis(&caveats, SandboxKind::Seatbelt, EnforcementFloor::CONFINED)
+                    .unwrap_or_else(|| panic!("Seatbelt {label} must refuse under CONFINED"));
+            assert_eq!(unmet.axis, ConfinedAxis::Net);
+            assert_eq!(unmet.required, AxisEnforcement::Kernel);
+            assert_eq!(unmet.actual, Some(AxisEnforcement::Advisory));
+        }
     }
 
     /// Model B (exec scope-fidelity): Seatbelt exec is an exact Kernel witness
@@ -1460,15 +1433,13 @@ mod tests {
         );
     }
 
-    /// A network kernel witness that a real backend supplies is accepted: a
-    /// deny-all net scope under Seatbelt is a kernel network fence, so the
-    /// confined floor admits it (this is the macOS `net:none` witness, verified
-    /// here as a pure function).
+    /// A Seatbelt deny-all socket rule is not a complete network witness while
+    /// ambient deputies remain unbounded: report Advisory and refuse CONFINED.
     #[test]
-    fn seatbelt_deny_all_net_is_a_kernel_witness() {
+    fn seatbelt_deny_all_net_is_advisory_and_refused() {
         assert_eq!(
             enforcement_report(&only_net_deny_all(), SandboxKind::Seatbelt).net,
-            Some(AxisEnforcement::Kernel),
+            Some(AxisEnforcement::Advisory),
         );
         assert!(
             unenforceable_axis(
@@ -1476,8 +1447,8 @@ mod tests {
                 SandboxKind::Seatbelt,
                 EnforcementFloor::CONFINED
             )
-            .is_none(),
-            "Seatbelt (deny network*) satisfies the CONFINED network Kernel floor"
+            .is_some(),
+            "Seatbelt restricted net cannot satisfy the CONFINED Kernel floor"
         );
     }
 
@@ -1527,7 +1498,7 @@ mod tests {
                 only_net_deny_all(),
                 SandboxKind::Seatbelt,
                 ConfinedAxis::Net,
-                AxisEnforcement::Kernel,
+                AxisEnforcement::Advisory,
             ),
             (
                 only_exec(),
@@ -1664,9 +1635,9 @@ mod tests {
     /// allowlist}` under floor `CONFINED {fs Kernel, net Kernel, exec Interceptor}`
     /// is ADMITTED only where the actual mechanism supplies each restricted axis's
     /// required strength — and every admission is an *exact* witness (no native
-    /// scope exceeds the Caveat while labelled a strong witness). The macOS
-    /// `net:none` case is grounded end-to-end by the real-Seatbelt suite
-    /// (`tests/seatbelt_net_evidence.rs`); this is the policy/unit half.
+    /// scope exceeds the Caveat while labelled a strong witness). macOS restricted
+    /// net remains unsupported-and-refused until native authority evidence can
+    /// bound ambient deputies.
     #[test]
     fn v0_8_newt_confined_contract_admits_only_with_required_mechanisms() {
         let contract = Caveats {
@@ -1696,8 +1667,12 @@ mod tests {
             "LandlockOnly net:none is incomplete (UDP/DNS/raw ambient) → refuse on net"
         );
 
-        // macOS: `net:none` is a real Seatbelt kernel witness → admits.
-        assert!(admits(ConfinementMechanism::backend(SandboxKind::Seatbelt)));
+        // macOS: direct Seatbelt socket denial is not a complete ambient-authority
+        // witness, so the contract refuses on net before spawn.
+        assert!(refuses_on(
+            ConfinementMechanism::backend(SandboxKind::Seatbelt),
+            ConfinedAxis::Net
+        ));
 
         // Windows: AppContainer independently kernel-denies egress (no net SIDs)
         // and fences fs → admits (exec allowlist is Interceptor, meets the floor).
@@ -1715,10 +1690,8 @@ mod tests {
             "Noop cannot satisfy the CONFINED contract → fail-closed refusal"
         );
 
-        // Scope-fidelity: swapping net:none for a single-address loopback (a fence
-        // that widens to the whole interface) must NOT be admitted as exact even
-        // under Seatbelt — a kernel mechanism whose scope exceeds the Caveat is not
-        // a strong witness.
+        // Every other restricted Seatbelt net shape is refused too; a
+        // single-address loopback additionally widens to the whole interface.
         let widened = Caveats {
             net: Scope::only(["127.0.0.1".to_string()]),
             ..contract.clone()
@@ -1777,9 +1750,8 @@ mod tests {
             net: Scope::none(),
             ..Caveats::top()
         };
-        // Under Seatbelt: fs_write=Kernel, net(deny-all)=Kernel — both satisfy
-        // CONFINED, so admit. Flip fs below floor via a report where net is Kernel
-        // but fs is only Interceptor: fs must still be the refused axis.
+        // Use a synthetic report with net Kernel but fs only Interceptor to isolate
+        // the cross-axis rule: fs must still be the refused axis.
         let report = EnforcementReport {
             fs_write: Some(AxisEnforcement::Interceptor),
             net: Some(AxisEnforcement::Kernel),
@@ -1861,10 +1833,12 @@ mod tests {
         let caveats = newt_confined_caveats();
         let floor = EnforcementFloor::CONFINED;
 
-        // Seatbelt: fs=Kernel, net(deny-all)=Kernel, exec=Kernel(≥Interceptor) ⇒ ADMIT.
-        assert!(
-            unenforceable_axis(&caveats, SandboxKind::Seatbelt, floor).is_none(),
-            "Seatbelt supplies fs/net Kernel + exec≥Interceptor for this contract"
+        // Seatbelt: fs/exec meet their floors, but every restricted net shape is
+        // Advisory until ambient deputies are bounded ⇒ REFUSE on net.
+        assert_eq!(
+            unenforceable_axis(&caveats, SandboxKind::Seatbelt, floor).map(|u| u.axis),
+            Some(ConfinedAxis::Net),
+            "Seatbelt restricted net must fail closed before spawn"
         );
 
         // Landlock: fs=Kernel, exec=Interceptor(meets floor). net(deny-all) is

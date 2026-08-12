@@ -1867,11 +1867,12 @@ mod seatbelt_impl {
     /// effective [`Caveats`] (see [`seatbelt_profile`]): writes are denied
     /// outside the granted `fs_write` roots, and — when `fs_read` is restricted —
     /// reads are denied outside the granted roots plus the loader/system base
-    /// list. It also kernel-denies **all** network egress when `net` is empty
-    /// (`(deny network*)`) — a confinement Landlock cannot provide, closing the
-    /// `find -exec curl` egress path at L3. A non-empty `net` host allowlist is
-    /// not expressible in SBPL (it filters by socket, not hostname) and stays
-    /// advisory.
+    /// list. When `net` is empty it kernel-denies the child's direct socket
+    /// operations and installs a conservative Mach-lookup floor as
+    /// defense-in-depth. That floor is not proof that every ambient deputy is
+    /// closed, so restricted network authority remains held at admission. A
+    /// non-empty `net` host allowlist is not expressible in SBPL (it filters by
+    /// socket, not hostname) and stays advisory.
     ///
     /// **The `exec` axis** — when restricted, the profile emits
     /// `(deny process-exec*)` and re-allows exactly the granted programs (resolved
@@ -1903,6 +1904,16 @@ mod seatbelt_impl {
         policy: Arc<SandboxPolicy>,
     }
 
+    /// The Mach-lookup leg paired with Seatbelt's direct-network deny for
+    /// `net:none`. Production always uses `Closed`; the test-only ambient mode
+    /// exists solely to characterize the incremental effect of the Mach floor.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NetNoneMachFloor {
+        Closed,
+        #[cfg(test)]
+        AmbientCharacterization,
+    }
+
     impl SeatbeltSandbox {
         /// Construct with the built-in defaults (today's read base).
         #[must_use]
@@ -1915,48 +1926,12 @@ mod seatbelt_impl {
         pub fn with_policy(policy: Arc<SandboxPolicy>) -> Self {
             Self { policy }
         }
-    }
 
-    impl Sandbox for SeatbeltSandbox {
-        fn kind(&self) -> SandboxKind {
-            SandboxKind::Seatbelt
-        }
-
-        /// Caveats-grain admission placeholder. Seatbelt DOES confine (via the
-        /// generated SBPL profile), but its FAITHFUL ruleset-grain projection —
-        /// notably E4, the mach-lookup/XPC ambient-deputy egress under `net:none`
-        /// — is not written yet; it lands with the macOS mechanism PR (E4 / PR-2).
-        /// Until then this backend keeps its pre-#317 caveats-grain admission
-        /// (`from_delegated`), so PR-0b neither regresses macOS confined operation
-        /// nor claims a bound Seatbelt has not proven (I15 stays Partial for
-        /// macOS). Deliberately NOT the fail-closed trait default, which resolves
-        /// every axis `Unknown` and would refuse every Seatbelt spawn — even an
-        /// unrestricted grant.
-        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
-            crate::ResolvedAuthority::from_delegated(effective)
-        }
-
-        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
-            // Deliberate no-op: Seatbelt confines via the `sandbox-exec` wrapper
-            // (see `command_prefix`), not by restricting the calling thread. The
-            // boundary is the wrapped spawn.
-            Ok(())
-        }
-
-        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
-            // Nothing on a governed axis (fs, all-egress-denied or loopback-only
-            // net, or a restricted exec allow-list) => nothing to confine; run
-            // unwrapped (coarse honesty falls to `None` upstream, and the per-axis
-            // report omits unrestricted axes).
-            if !super::restricts_fs(effective)
-                && !super::net_fully_denied(effective)
-                && !super::net_loopback_only(effective)
-                && !super::restricts_exec(effective)
-            {
-                return Ok(Vec::new());
-            }
-            // Fail-closed: if the wrapper is gone we cannot enforce, so refuse
-            // rather than hand back an empty (silently unconfined) prefix.
+        fn wrapper_prefix(
+            &self,
+            effective: &Caveats,
+            mach_floor: NetNoneMachFloor,
+        ) -> ToolResult<Vec<String>> {
             if !seatbelt_is_supported() {
                 return Err(ToolError::denied(
                     "macOS seatbelt: /usr/bin/sandbox-exec is unavailable; cannot confine",
@@ -1969,231 +1944,77 @@ mod seatbelt_impl {
                     effective,
                     &self.policy.base_read_paths.resolve(),
                     &self.policy.device_sink_paths.resolve(),
+                    mach_floor,
                 ),
             ])
         }
 
+        /// Test-only typed seam for the E4 differential. It accepts exactly
+        /// `net:none` with every other caveat unrestricted and emits the same
+        /// direct-network deny as production while deliberately leaving Mach
+        /// lookup ambient. No profile text is parsed or rewritten.
+        #[cfg(test)]
+        pub(super) fn net_none_ambient_mach_prefix(
+            &self,
+            effective: &Caveats,
+        ) -> ToolResult<Vec<String>> {
+            let expected = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            if effective != &expected {
+                return Err(ToolError::denied(
+                    "the ambient-Mach characterization requires exactly net:none and otherwise-top caveats",
+                ));
+            }
+            self.wrapper_prefix(effective, NetNoneMachFloor::AmbientCharacterization)
+        }
+    }
+
+    impl Sandbox for SeatbeltSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::Seatbelt
+        }
+
+        /// Deliberately partial Seatbelt projection. The filesystem and exec axes
+        /// retain the legacy caveats-grain/verbatim projection so this change does
+        /// not claim ruleset-grain fidelity that has not been established. Network
+        /// is stricter: unrestricted authority is honestly ambient, while every
+        /// restricted network scope remains `Unknown` and is refused before spawn.
+        /// The Mach floor in the generated profile is defense-in-depth only and is
+        /// not used to promote restricted network authority to a bounded claim.
         fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
-            use crate::ResolvedScope;
-            use std::collections::BTreeSet;
-
-            let confine_read = matches!(effective.fs_read, Scope::Only(_));
-            let confine_write = matches!(effective.fs_write, Scope::Only(_));
-            let confine_exec = matches!(effective.exec, Scope::Only(_));
-
-            let bounded = |roots: Vec<String>| ResolvedScope::Bounded {
-                concrete: roots.into_iter().collect::<BTreeSet<String>>(),
-                classes: BTreeSet::new(),
+            let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
+            resolved.net = match &effective.net {
+                Scope::All => crate::ResolvedScope::Unbounded,
+                Scope::Only(_) => crate::ResolvedScope::Unknown,
             };
-
-            // The granted-root portion of each fs axis is bounded on the grant
-            // TOKENS as written — the SAME representation as the `delegated`
-            // operand admission compares against (`admit(resolved, delegated,
-            // closure)`), so a benign macOS firmlink alias (`/var`→`/private/var`,
-            // `/tmp`→`/private/tmp`) does not read as a mismatch. E1 (a LEAF symlink
-            // that widens the installed `(subpath …)` beyond the object the grant
-            // names) is caught by `grant_leaf_object_stable`: a grant whose leaf is
-            // a symlink to a different object refuses ⇒ Unknown (the same-object
-            // bind is PR-5). The harness-added read substrate the profile also
-            // installs (base-read loader/library trees) is NOT folded in here — it
-            // is the `runtime_closure` operand, so `resolved ⊑ delegated ∪ closure`
-            // holds as Equal for a legitimate grant.
-            let grant_tokens = |scope: &Scope<String>| -> Vec<String> {
-                match scope {
-                    Scope::Only(set) => set.iter().cloned().collect(),
-                    Scope::All => Vec::new(),
-                }
-            };
-
-            // `fs_read` is the CONTENT-READ authority axis (board R1 ruling,
-            // APPROVE option (a)). Native hostile-child evidence establishes that
-            // undelegated file CONTENT stays kernel-denied (`cat` of an out-of-scope
-            // file → "Operation not permitted"), so `fs_read` may remain faithfully
-            // Bounded on the granted roots — it is NOT forced to Unknown merely
-            // because the profile permits broader metadata observation.
-            //
-            // REGISTERED RESIDUAL `seatbelt-fs-metadata-ambient`: the profile also
-            // emits a global `(allow file-read-metadata)`, real ambient authority.
-            // A hostile child may DISCOVER METADATA about undelegated filesystem
-            // objects — path existence and whatever attributes the permitted
-            // metadata operation exposes (e.g. size). This does NOT imply
-            // content-read authority. The broad metadata permission is currently
-            // LOAD-BEARING for macOS traversal / firmlink behavior (reaching an
-            // in-scope file through `/tmp`→`/private/tmp`). It is therefore an
-            // ORTHOGONAL metadata-confidentiality residual, not evidence that the
-            // `fs_read` content axis is unbounded. `Bounded(fs_read)` here means the
-            // content axis is bounded to the grant — it does NOT assert total
-            // filesystem non-observability. Hardening follow-up (NOT this PR, needs
-            // its own native hostile-child validation): option (c) — narrow
-            // `file-read-metadata` to the granted roots plus required traversal
-            // ancestors. A first-class `fs_metadata` authority axis is deferred
-            // future schema work, deliberately not introduced in this merge train.
-            let fs_read = if !confine_read {
-                ResolvedScope::Unbounded
-            } else if !grant_leaf_object_stable(&effective.fs_read) {
-                ResolvedScope::Unknown
-            } else {
-                bounded(grant_tokens(&effective.fs_read))
-            };
-
-            let fs_write = if !confine_write {
-                ResolvedScope::Unbounded
-            } else if !grant_leaf_object_stable(&effective.fs_write) {
-                ResolvedScope::Unknown
-            } else {
-                bounded(grant_tokens(&effective.fs_write))
-            };
-
-            // exec: process-image identity, bounded on the grant tokens (matching
-            // `delegated`). The `/bin/sh`→`/bin/bash` variant re-exec the profile
-            // adds is genuine EXTRA exec authority beyond the token, so it lives in
-            // `runtime_closure`, not here. No leaf-symlink concern: `process-exec*`
-            // is kernel-matched on the resolved image, and a swapped target is
-            // denied (never widened).
-            let exec = if confine_exec {
-                bounded(grant_tokens(&effective.exec))
-            } else {
-                ResolvedScope::Unbounded
-            };
-
-            // net: `All` is ambient. A RESTRICTED net axis is honestly BOUNDED only
-            // for `net: none`, where the profile denies every socket AND (E4)
-            // default-denies mach-lookup with the minimal allow-list — closing the
-            // `nsurlsessiond`-class ambient network deputy so the child truly cannot
-            // egress. The resolved authority is then exactly the empty host set the
-            // grant names (`from_scope(net:none)` = the bound ⇒ admission Equal). A
-            // loopback-only allow-list (the off-box deputy is not closed in that
-            // profile) or a hostname allow-list (SBPL cannot express arbitrary IPs;
-            // ADR 0015) cannot be honestly bounded ⇒ Unknown ⇒ refuse.
-            let net = if matches!(effective.net, Scope::All) {
-                ResolvedScope::Unbounded
-            } else if super::net_fully_denied(effective) {
-                ResolvedScope::from_scope(&effective.net)
-            } else {
-                ResolvedScope::Unknown
-            };
-
-            crate::ResolvedAuthority {
-                fs_read,
-                fs_write,
-                exec,
-                net,
-            }
+            resolved
         }
 
-        fn runtime_closure(&self, effective: &Caveats) -> crate::ResolvedAuthority {
-            use crate::ResolvedScope;
-            use std::collections::BTreeSet;
-
-            let confine_exec = matches!(effective.exec, Scope::Only(_));
-            let existing = |mut v: Vec<String>| -> BTreeSet<String> {
-                v.retain(|p| std::path::Path::new(p).exists());
-                v.into_iter().collect()
-            };
-
-            // OBJECT-IDENTITY harness-disjointness (mirrors the Landlock closure):
-            // a benign-looking substrate root that canonically reaches a
-            // harness-private store compromises the axis ⇒ Unknown ⇒ admission
-            // refuses (`closure_is_harness_disjoint` rejects Unknown).
-            let harness_safe_bounded = |s: BTreeSet<String>| -> ResolvedScope {
-                let reaches_private = s.iter().any(|entry| {
-                    crate::admitted::entry_reaches_harness_private(entry)
-                        || std::fs::canonicalize(entry)
-                            .ok()
-                            .and_then(|canon| {
-                                canon
-                                    .to_str()
-                                    .map(crate::admitted::entry_reaches_harness_private)
-                            })
-                            .unwrap_or(false)
-                });
-                if reaches_private {
-                    ResolvedScope::Unknown
-                } else {
-                    ResolvedScope::Bounded {
-                        concrete: s,
-                        classes: BTreeSet::new(),
-                    }
-                }
-            };
-
-            // The harness-added read substrate the profile re-allows BEYOND the
-            // grant (canonicalized, the SAME `base_read_paths`→`canonical_path`
-            // derivation `seatbelt_profile_with` emits; Q2 anti-drift): the
-            // loader/library/system-data base, plus — when exec is confined — the
-            // resolved granted program IMAGES the process must read to launch and
-            // the `/bin/sh`→`/bin/bash` variant. System runtime substrate the
-            // resolution rests on; must be harness-disjoint.
-            let mut read_add = profile_base_read(&self.policy);
-            if confine_exec {
-                read_add.extend(resolve_exec_targets(&effective.exec));
-            }
-
-            crate::ResolvedAuthority {
-                fs_read: harness_safe_bounded(existing(read_add)),
-                fs_write: harness_safe_bounded(existing(self.policy.device_sink_paths.resolve())),
-                // The extra exec authority the profile adds beyond the grant token:
-                // the `/bin/sh`→`/bin/bash` variant (`resolve_exec_targets` appends
-                // bash whenever sh is granted). The resolved granted images
-                // themselves are the grant's referent (bounded on tokens in
-                // `resolved_authority`), so only the variant is closure here.
-                exec: if confine_exec {
-                    harness_safe_bounded(existing(sh_variant_extra(&effective.exec)))
-                } else {
-                    ResolvedScope::empty()
-                },
-                net: ResolvedScope::empty(),
-            }
+        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+            // Deliberate no-op: Seatbelt confines via the `sandbox-exec` wrapper
+            // (see `command_prefix`), not by restricting the calling thread. The
+            // boundary is the wrapped spawn.
+            Ok(())
         }
-    }
 
-    /// Is the LEAF of every grant root in `scope` object-stable — i.e., the grant
-    /// resolves to an object whose final path component matches the grant's own?
-    /// This admits benign macOS firmlink PREFIX aliases (`/var/folders/x` →
-    /// `/private/var/folders/x`: same leaf `x`) while refusing a LEAF symlink that
-    /// widens the installed `(subpath …)` to a different object (`/tmp/link` →
-    /// `/etc`, or a symlink to `/`) — E1, fail-closed. A grant that does not
-    /// resolve at all also refuses. `All` (unrestricted) is vacuously stable.
-    fn grant_leaf_object_stable(scope: &Scope<String>) -> bool {
-        let Scope::Only(set) = scope else {
-            return true;
-        };
-        set.iter().all(|p| match std::fs::canonicalize(p) {
-            Ok(canon) => canon.file_name() == Path::new(p).file_name(),
-            Err(_) => false,
-        })
-    }
-
-    /// The `/bin/bash` variant `resolve_exec_targets` adds whenever `/bin/sh` is
-    /// granted (agent-bridle#318) — the genuine extra exec authority beyond the
-    /// grant token, so it belongs in the runtime closure. Empty when `sh` was not
-    /// granted.
-    fn sh_variant_extra(scope: &Scope<String>) -> Vec<String> {
-        let Scope::Only(set) = scope else {
-            return Vec::new();
-        };
-        if set.iter().any(|t| t == "/bin/sh") {
-            canonical_path("/bin/bash").into_iter().collect()
-        } else {
-            Vec::new()
+        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            // Nothing on a governed axis (fs, a direct-network floor, or a
+            // restricted exec allow-list) => nothing to confine; run
+            // unwrapped (coarse honesty falls to `None` upstream, and the per-axis
+            // report omits unrestricted axes).
+            if !super::restricts_fs(effective)
+                && !super::net_fully_denied(effective)
+                && !super::net_loopback_only(effective)
+                && !super::restricts_exec(effective)
+            {
+                return Ok(Vec::new());
+            }
+            // Production always installs the closed Mach floor. The network
+            // projection remains Unknown for every restricted scope regardless.
+            self.wrapper_prefix(effective, NetNoneMachFloor::Closed)
         }
-    }
-
-    /// The canonicalized base-read substrate the SBPL profile re-allows (the
-    /// loader / library / system-data trees). The SAME derivation
-    /// `seatbelt_profile_with` emits (`base_read_paths` → `canonical_path`). The
-    /// claim this supports is the NARROW one (board R2 ruling): the **root/token-set
-    /// derivation is shared and cannot independently drift** — NOT that the
-    /// projection and the emitted bytes cannot drift. Literal compiled-policy /
-    /// native-interpretation correspondence (access masks, aliases, deputies) is
-    /// the forthcoming `CompiledFence` → `AppliedFenceEvidence` layer's job.
-    fn profile_base_read(policy: &SandboxPolicy) -> Vec<String> {
-        policy
-            .base_read_paths
-            .resolve()
-            .iter()
-            .filter_map(|b| canonical_path(b))
-            .collect()
     }
 
     /// Generate the SBPL profile for `effective`. **Pure** (modulo path
@@ -2218,6 +2039,7 @@ mod seatbelt_impl {
             effective,
             &policy.base_read_paths.resolve(),
             &policy.device_sink_paths.resolve(),
+            NetNoneMachFloor::Closed,
         )
     }
 
@@ -2228,6 +2050,7 @@ mod seatbelt_impl {
         effective: &Caveats,
         base_read: &[String],
         sinks: &[String],
+        mach_floor: NetNoneMachFloor,
     ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n");
 
@@ -2280,38 +2103,32 @@ mod seatbelt_impl {
         // arbitrary IP is rejected: "host must be * or localhost"; ADR 0015), so a
         // general host allowlist is inexpressible and left ambient (reported
         // advisory, never silently dropped). The two policies it *can* enforce:
-        //   • empty scope  → `(deny network*)`: every socket kernel-denied — a
-        //     confinement no Landlock increment can supply.
+        //   • empty scope  → `(deny network*)`: the child's direct socket
+        //     operations are kernel-denied. Production also installs the typed
+        //     Mach-lookup floor below as defense-in-depth; this is not an exhaustive
+        //     deputy proof and restricted network admission remains held.
         //   • loopback-only allowlist → deny all, then re-allow the loopback
         //     interface (`localhost` = 127.0.0.1 + ::1). The process's own off-box
         //     socket egress stays kernel-denied; the exact loopback host is narrowed
         //     by admission. Last-match-wins, so the allow overrides.
         if super::net_fully_denied(effective) {
             p.push_str("(deny network*)\n");
-            // E4 (the Mach/XPC ambient network deputy). `(deny network*)` stops the
-            // child's OWN sockets, but NOT an ambient out-of-process deputy it can
-            // reach over Mach: a background `NSURLSession` hands the transfer to
-            // `com.apple.nsurlsessiond`, which holds the socket and exfiltrates on
-            // the child's behalf — proven on-device (a hostile child under
-            // `(deny network*)` alone still fetches; see the adversarial suite). So
-            // `net: none` is honest no-egress ONLY once the child cannot reach an
-            // arbitrary-destination network deputy. Default-deny mach-lookup and
-            // re-allow the smallest set of services a confined build tool needs to
-            // run (audited on-device against sh/make/python/cargo/rustc/cc). None of
-            // the allowed services is an arbitrary-egress channel the child can
-            // drive (directory/notification/logging/trust — the child cannot pick a
-            // remote destination + payload through them); the proven arbitrary-egress
-            // deputy (nsurlsessiond-class background transfer) is NOT on the list and
-            // is therefore denied. Any allowed service that can itself reach the
-            // network for its own purpose (e.g. `opendirectoryd` on a host bound to a
-            // network directory) is a registered residual, not silent — it is not a
-            // child-controlled exfil channel. Last-match-wins, so the allow overrides.
-            p.push_str("(deny mach-lookup)\n");
-            p.push_str("(allow mach-lookup");
-            for name in MACH_LOOKUP_ALLOWLIST {
-                p.push_str(&format!(" (global-name {})", sbpl_string(name)));
+            match mach_floor {
+                NetNoneMachFloor::Closed => {
+                    // Defense-in-depth: default-deny named Mach lookup, then restore
+                    // the compatibility floor below. This characterizes one known
+                    // incremental barrier; it does not prove that all Mach/XPC,
+                    // AppleEvent, or other ambient deputies are closed.
+                    p.push_str("(deny mach-lookup)\n");
+                    p.push_str("(allow mach-lookup");
+                    for name in MACH_LOOKUP_ALLOWLIST {
+                        p.push_str(&format!(" (global-name {})", sbpl_string(name)));
+                    }
+                    p.push_str(")\n");
+                }
+                #[cfg(test)]
+                NetNoneMachFloor::AmbientCharacterization => {}
             }
-            p.push_str(")\n");
         } else if super::net_loopback_only(effective) {
             p.push_str("(deny network*)\n");
             p.push_str("(allow network* (remote ip \"localhost:*\"))\n");
@@ -2355,16 +2172,10 @@ mod seatbelt_impl {
         roots
     }
 
-    /// The smallest set of Mach services a confined build tool needs to run,
-    /// re-allowed after the `net: none` default-deny mach-lookup (E4). Audited
-    /// on-device: with exactly this allow-list, `/bin/sh`, `make`, `python3`,
-    /// `cargo`, `rustc`, and `cc` all run, while the arbitrary-egress
-    /// `com.apple.nsurlsessiond` background-transfer deputy — deliberately absent
-    /// — stays denied. None of these lets the child choose a remote destination
-    /// and payload (they are directory / notification / launch / logging / trust /
-    /// diagnostics services), so none is a child-driven exfil channel. A service
-    /// that can reach the network for its OWN purpose (`opendirectoryd` on a host
-    /// bound to a network directory) is a registered residual, not a silent claim.
+    /// Operational compatibility floor re-allowed after the production
+    /// `net:none` Mach-lookup deny. It has been exercised with common build tools,
+    /// but it is not an exhaustive deputy audit and does not justify bounded
+    /// network authority. Restricted network scopes remain `Unknown` at admission.
     const MACH_LOOKUP_ALLOWLIST: &[&str] = &[
         "com.apple.system.opendirectoryd.libinfo",
         "com.apple.system.opendirectoryd.membership",
@@ -2488,13 +2299,11 @@ mod seatbelt_impl {
         use super::*;
         use crate::{ResolvedScope, Scope};
 
-        /// E4 (pure): the `net: none` profile must carry the Mach-lookup
-        /// default-deny + the minimal allow-list, and must NOT allow the
-        /// arbitrary-egress `nsurlsessiond` deputy. The real hostile-child proof is
-        /// `net_none_closes_the_nsurlsessiond_ambient_deputy`; this pins the SBPL so
-        /// a future edit to the profile can't silently drop the deny.
+        /// The production `net:none` profile carries the configured Mach-lookup
+        /// defense-in-depth floor. This pins the selected policy shape only; it is
+        /// not evidence that all ambient deputies are closed.
         #[test]
-        fn net_none_profile_default_denies_mach_lookup_but_not_nsurlsessiond() {
+        fn net_none_profile_installs_the_mach_defense_floor() {
             let cav = Caveats {
                 net: Scope::none(),
                 ..Caveats::top()
@@ -2503,15 +2312,15 @@ mod seatbelt_impl {
             assert!(profile.contains("(deny network*)"), "{profile}");
             assert!(
                 profile.contains("(deny mach-lookup)"),
-                "net:none must default-deny mach-lookup to close the ambient deputy: {profile}"
+                "net:none production profile must install the Mach defense floor: {profile}"
             );
             assert!(
                 profile.contains("com.apple.system.opendirectoryd.libinfo"),
-                "the minimal allow-list must be re-allowed: {profile}"
+                "the compatibility allow-list must be re-allowed: {profile}"
             );
             assert!(
                 !profile.contains("nsurlsessiond"),
-                "the arbitrary-egress background-transfer deputy must stay denied: {profile}"
+                "the selected background-session service is outside this compatibility floor: {profile}"
             );
         }
 
@@ -2523,28 +2332,19 @@ mod seatbelt_impl {
             assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
         }
 
-        /// `resolved_authority`: `net: none` now resolves to the bounded empty host
-        /// set (honest no-egress via the deputy close) — the operand that makes the
-        /// confined-net lane ADMIT, where the fail-closed foundation refused it.
+        /// Support remains held: every restricted network scope is Unknown even
+        /// when the profile installs direct-network and Mach defense-in-depth.
         #[test]
-        fn net_none_resolves_bounded_empty_not_unknown() {
+        fn every_restricted_network_scope_resolves_unknown() {
             let cav = Caveats {
                 net: Scope::none(),
                 ..Caveats::top()
             };
-            let r = SeatbeltSandbox::new().resolved_authority(&cav);
             assert_eq!(
-                r.net,
-                ResolvedScope::from_scope(&Scope::none()),
-                "net:none must resolve to the bounded empty host set (admits), not Unknown"
+                SeatbeltSandbox::new().resolved_authority(&cav).net,
+                ResolvedScope::Unknown,
+                "net:none support must remain held at admission"
             );
-        }
-
-        /// A loopback-only net grant — the off-box deputy is NOT closed in that
-        /// profile, and SBPL can't bound it in the resolved lattice — stays Unknown
-        /// (refuse), conservative.
-        #[test]
-        fn loopback_only_net_resolves_unknown() {
             let cav = Caveats {
                 net: Scope::only(["127.0.0.1".to_string()]),
                 ..Caveats::top()
@@ -2553,145 +2353,6 @@ mod seatbelt_impl {
                 SeatbeltSandbox::new().resolved_authority(&cav).net,
                 ResolvedScope::Unknown
             );
-        }
-
-        /// R2 anti-drift (the shared-derivation seam). The fs roots
-        /// `resolved_authority` bounds on and the roots the SBPL generator emits
-        /// must come from the SAME semantic derivation over `effective.fs_read`,
-        /// with only the object-stable canonicalization between token and installed
-        /// target — no unaccounted authority-widening transform. Proven by: the
-        /// projection's Bounded set is exactly the grant tokens; `confined_roots`
-        /// (the emitter's derivation over the same token set) canonicalizes each
-        /// token; each canonical root appears verbatim as a `(subpath …)` in the
-        /// emitted profile; and each token is leaf-object-stable to its canonical
-        /// (establishing token ≡ installed target). If any of these breaks, the two
-        /// consumers have independently drifted.
-        #[test]
-        fn resolved_and_emitted_fs_roots_share_one_derivation() {
-            // An object-stable real root (canonical == itself).
-            let real = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            let cav = Caveats {
-                fs_read: Scope::only([real.clone()]),
-                ..Caveats::top()
-            };
-            // Projection bounds on the grant tokens.
-            let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
-            let ResolvedScope::Bounded { concrete, .. } = resolved.fs_read else {
-                panic!("object-stable grant must resolve Bounded");
-            };
-            let tokens: std::collections::BTreeSet<String> = [real.clone()].into_iter().collect();
-            assert_eq!(
-                concrete, tokens,
-                "projection must bound on the grant tokens"
-            );
-
-            // The EMITTER derives from the SAME token set via `confined_roots`, and
-            // each derived root must appear in the emitted profile (shared seam) …
-            let profile = seatbelt_profile(&cav);
-            for root in confined_roots(&cav.fs_read) {
-                assert!(
-                    profile.contains(&format!("(subpath {})", sbpl_string(&root))),
-                    "emitter root {root} must appear in the profile: {profile}"
-                );
-                // … and each token is object-stable to its installed canonical root.
-                assert!(
-                    grant_leaf_object_stable(&Scope::only([real.clone()])),
-                    "token must be leaf-object-stable to the installed target"
-                );
-            }
-        }
-
-        /// No unprojected filesystem authority: every granted fs `(subpath …)` the
-        /// profile emits (i.e. beyond the base-read substrate) must be accounted for
-        /// by the projection — either the delegated grant (resolved bounds on the
-        /// tokens whose canonical form these are) or the harness `runtime_closure`
-        /// base-read. A stray emitted root that is neither would be authority the
-        /// admission never saw.
-        #[test]
-        fn emitted_granted_fs_roots_are_all_projected() {
-            let real = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            let cav = Caveats {
-                fs_read: Scope::only([real.clone()]),
-                fs_write: Scope::only([real.clone()]),
-                ..Caveats::top()
-            };
-            let base: std::collections::BTreeSet<String> =
-                profile_base_read(&SandboxPolicy::default())
-                    .into_iter()
-                    .collect();
-            let granted_canon: std::collections::BTreeSet<String> =
-                confined_roots(&cav.fs_read).into_iter().collect();
-            // Each emitter-derived granted root is the canonicalization of a grant
-            // token (the delegated authority), not a set the emitter invented.
-            for root in &granted_canon {
-                let accounted = base.contains(root)
-                    || confined_roots(&Scope::only([real.clone()])).contains(root);
-                assert!(
-                    accounted,
-                    "emitted granted root {root} is neither delegated nor harness base-read"
-                );
-            }
-        }
-
-        /// A benign macOS firmlink PREFIX alias (`/tmp`→`/private/tmp`, same leaf)
-        /// is object-stable — it must NOT fail closed, or nearly every real macOS
-        /// grant (anything under /tmp, /var) would refuse.
-        #[test]
-        fn firmlink_prefix_alias_is_object_stable() {
-            assert!(
-                grant_leaf_object_stable(&Scope::only(["/tmp".to_string()])),
-                "/tmp -> /private/tmp is a benign prefix alias (leaf unchanged)"
-            );
-        }
-
-        /// A LEAF symlink that widens the installed subpath to a different object
-        /// (E1) cannot be honestly bounded ⇒ Unknown ⇒ admission refuses.
-        #[test]
-        fn leaf_symlink_that_escapes_resolves_unknown_fs_read() {
-            let dir = std::env::temp_dir().join(format!("ab-e1-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            let link = dir.join("link"); // leaf "link"
-            let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink("/usr", &link).unwrap(); // resolves to /usr (leaf "usr")
-            let cav = Caveats {
-                fs_read: Scope::only([link.to_string_lossy().into_owned()]),
-                ..Caveats::top()
-            };
-            assert_eq!(
-                SeatbeltSandbox::new().resolved_authority(&cav).fs_read,
-                ResolvedScope::Unknown,
-                "a leaf symlink whose target has a different name must fail closed (E1)"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// An object-stable fs_read grant resolves BOUNDED, and the granted root is
-        /// within the bound (base-read substrate ∪ grant) — so admission can hold.
-        #[test]
-        fn object_stable_fs_read_grant_resolves_bounded_including_the_grant() {
-            let real = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            let cav = Caveats {
-                fs_read: Scope::only([real.clone()]),
-                ..Caveats::top()
-            };
-            match SeatbeltSandbox::new().resolved_authority(&cav).fs_read {
-                ResolvedScope::Bounded { concrete, .. } => {
-                    assert!(
-                        concrete.contains(&real),
-                        "the granted root must be in the resolved read bound: {concrete:?}"
-                    );
-                }
-                other => panic!("object-stable grant must resolve Bounded, got {other:?}"),
-            }
         }
 
         /// #1220: a write-confined profile must re-allow the device sinks as
@@ -2769,9 +2430,9 @@ mod seatbelt_impl {
         }
 
         #[test]
-        fn empty_net_denies_all_egress_and_engages_the_wrapper() {
+        fn empty_net_denies_direct_socket_egress_and_engages_the_wrapper() {
             // net:none with fs unrestricted still confines (network), so the
-            // wrapper must engage and the profile must deny all egress.
+            // wrapper must engage and the profile must deny direct socket egress.
             let cav = Caveats {
                 net: Scope::none(),
                 ..Caveats::top()
@@ -4028,7 +3689,7 @@ mod seatbelt_kernel_tests {
     use super::*;
     use crate::Scope;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// Whether a proof should run, skip, or hard-**FAIL** — the same gate as the
     /// Landlock proofs (#74): *required but unsupported is a FAILURE*, so a
@@ -4053,9 +3714,7 @@ mod seatbelt_kernel_tests {
     /// *required* (`BRIDLE_REQUIRE_SEATBELT` set, as a macOS CI job does) but the
     /// host lacks `sandbox-exec`. A local run without the flag legitimately skips.
     fn skip_proof_unless_seatbelt() -> bool {
-        let required = std::env::var("BRIDLE_REQUIRE_SEATBELT")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
+        let required = seatbelt_required();
         match proof_gate(seatbelt_is_supported(), required) {
             ProofGate::Run => false,
             ProofGate::Skip => {
@@ -4070,6 +3729,19 @@ mod seatbelt_kernel_tests {
                  the fs_write/fs_read kernel-enforcement proofs cannot be verified"
             ),
         }
+    }
+
+    fn seatbelt_required() -> bool {
+        std::env::var("BRIDLE_REQUIRE_SEATBELT")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    }
+
+    fn fail_required_or_skip(reason: &str) {
+        if seatbelt_required() {
+            panic!("required Seatbelt proof unavailable: {reason}");
+        }
+        eprintln!("skipping optional Seatbelt proof: {reason}");
     }
 
     fn unique_dir(tag: &str) -> PathBuf {
@@ -4225,7 +3897,7 @@ mod seatbelt_kernel_tests {
     }
 
     #[test]
-    fn net_fully_denied_kernel_blocks_egress() {
+    fn net_fully_denied_kernel_blocks_direct_socket_egress() {
         if skip_proof_unless_seatbelt() {
             return;
         }
@@ -4260,61 +3932,43 @@ mod seatbelt_kernel_tests {
         );
     }
 
-    /// E4 — the ambient Mach/XPC network deputy. `(deny network*)` stops the
-    /// child's own sockets, but a background `NSURLSession` hands the transfer to
-    /// the out-of-process `com.apple.nsurlsessiond` daemon, which egresses on the
-    /// child's behalf. This proves, on real `sandbox-exec`, that the `net: none`
-    /// profile's Mach-lookup default-deny closes that deputy — a hostile child
-    /// cannot exfiltrate through it. Grounds `resolved_authority`'s claim that
-    /// `net: none` is honest no-egress (the bounded empty host set), not the
-    /// generated SBPL alone (the board ruling's requirement).
-    ///
-    /// Needs `swiftc` (the deputy driver uses a background `URLSession`). Uses a
-    /// real off-box fetch, so it also self-skips when the host has no egress.
+    /// Direct-wrapper inheritance proof independent of admission: a live loopback
+    /// listener makes the destination reachable, yet a generation-2 descendant
+    /// under the production `net:none` profile receives curl's exact socket-denied
+    /// exit 7. This proves inheritance of the direct-network floor only; restricted
+    /// network admission remains held.
     #[test]
-    fn net_none_closes_the_nsurlsessiond_ambient_deputy() {
+    fn net_none_direct_floor_is_inherited_by_a_grandchild() {
         if skip_proof_unless_seatbelt() {
             return;
         }
-        let Some(deputy) = build_deputy_probe() else {
-            eprintln!("skipping: swiftc unavailable to build the deputy probe");
-            return;
-        };
-        // Baseline (unsandboxed): the deputy path must actually work on this host
-        // + network, else the deny assertion below would pass vacuously.
-        let base = std::process::Command::new(&deputy)
-            .output()
-            .expect("run deputy baseline");
-        let base_out = String::from_utf8_lossy(&base.stdout);
-        if !base_out.contains("EGRESS-SUCCEEDED") {
-            eprintln!("skipping: deputy egress unavailable on this host/network ({base_out})");
+        if !std::path::Path::new("/usr/bin/curl").exists() {
+            eprintln!("skipping: no curl(1) on this host");
             return;
         }
-        // Confined under net:none: the same background transfer must FAIL — the
-        // child can no longer reach nsurlsessiond to make the fetch.
         let cav = Caveats {
             net: Scope::none(),
             ..Caveats::top()
         };
-        let prefix = SeatbeltSandbox::new()
-            .command_prefix(&cav)
-            .expect("net:none yields a wrapper prefix");
-        let confined = std::process::Command::new(&prefix[0])
-            .args(&prefix[1..])
-            .arg(&deputy)
-            .output()
-            .expect("run confined deputy");
-        let confined_out = String::from_utf8_lossy(&confined.stdout);
+        let benign = run_wrapped(&cav, "/bin/sh", &["-c", "/bin/sh -c /usr/bin/true"]);
         assert!(
-            !confined_out.contains("EGRESS-SUCCEEDED"),
-            "the nsurlsessiond ambient deputy must be closed under net:none \
-             (Mach-lookup default-deny) — hostile-child egress leaked: {confined_out}"
+            benign.success(),
+            "a benign generation-2 descendant must run under the profile"
+        );
+
+        let listener = spawn_loopback_http("127.0.0.1:0").expect("bind live loopback listener");
+        let url = format!("http://127.0.0.1:{}/", listener.port());
+        let script = format!("/bin/sh -c '/usr/bin/curl -sS --max-time 5 {url}'");
+        let denied = run_wrapped(&cav, "/bin/sh", &["-c", &script]);
+        assert_eq!(
+            denied.code(),
+            Some(7),
+            "the generation-2 curl must inherit the direct-network deny (exact exit 7)"
         );
     }
 
-    /// The Mach-lookup allow-list must keep a confined build tool RUNNABLE — a
-    /// deny that also breaks `/bin/sh` would be useless (callers would drop
-    /// confinement). Positive control for the deputy-close above.
+    /// The Mach-lookup compatibility floor keeps a representative build shell
+    /// runnable. This is operational evidence, not a bounded-authority claim.
     #[test]
     fn net_none_mach_deny_still_runs_a_build_tool() {
         if skip_proof_unless_seatbelt() {
@@ -4331,46 +3985,294 @@ mod seatbelt_kernel_tests {
         );
     }
 
-    /// Compile the background-`URLSession` deputy driver with `swiftc`. `None`
-    /// when `swiftc` is unavailable (the test self-skips).
-    fn build_deputy_probe() -> Option<PathBuf> {
-        if std::process::Command::new("/usr/bin/xcrun")
-            .args(["-f", "swiftc"])
+    struct DeputyProbe {
+        dir: PathBuf,
+        binary: PathBuf,
+    }
+
+    /// Compile the background-URLSession characterization probe with the exact
+    /// compiler path returned by xcrun.
+    fn build_deputy_probe() -> Result<DeputyProbe, String> {
+        let found = std::process::Command::new("/usr/bin/xcrun")
+            .args(["--find", "swiftc"])
             .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            return None;
+            .map_err(|e| format!("launch xcrun --find swiftc: {e}"))?;
+        if !found.status.success() {
+            return Err(format!(
+                "xcrun could not find swiftc: {}",
+                String::from_utf8_lossy(&found.stderr)
+            ));
+        }
+        let swiftc = String::from_utf8(found.stdout)
+            .map_err(|e| format!("xcrun returned non-UTF-8 swiftc path: {e}"))?;
+        let swiftc = swiftc.trim();
+        if swiftc.is_empty() {
+            return Err("xcrun returned an empty swiftc path".to_string());
+        }
+        let sdk = std::process::Command::new("/usr/bin/xcrun")
+            .args(["--sdk", "macosx", "--show-sdk-path"])
+            .output()
+            .map_err(|e| format!("launch xcrun --show-sdk-path: {e}"))?;
+        if !sdk.status.success() {
+            return Err(format!(
+                "xcrun could not find the macOS SDK: {}",
+                String::from_utf8_lossy(&sdk.stderr)
+            ));
+        }
+        let sdk = String::from_utf8(sdk.stdout)
+            .map_err(|e| format!("xcrun returned a non-UTF-8 SDK path: {e}"))?;
+        let sdk = sdk.trim();
+        if sdk.is_empty() {
+            return Err("xcrun returned an empty macOS SDK path".to_string());
         }
         let dir = unique_dir("deputy");
-        let _ = fs::create_dir_all(&dir);
         let src = dir.join("deputy.swift");
         let bin = dir.join("deputy");
         fs::write(
             &src,
-            r#"import Foundation
+            r#"import Darwin
+import Foundation
 final class D: NSObject, URLSessionDownloadDelegate {
-  let done = DispatchSemaphore(value: 0); var ok = false
-  func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didFinishDownloadingTo l: URL) { ok = true; done.signal() }
-  func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError e: Error?) { if e != nil { done.signal() } }
+  let done = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var outcome = "callback_timeout"
+  private var finished = false
+  private func finish(_ value: String) {
+    lock.lock(); defer { lock.unlock() }
+    if !finished { finished = true; outcome = value; done.signal() }
+  }
+  func value() -> String { lock.lock(); defer { lock.unlock() }; return outcome }
+  func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didFinishDownloadingTo l: URL) { finish("callback_success") }
+  func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError e: Error?) {
+    if let e = e { finish("callback_error:\(e.localizedDescription)") }
+  }
+}
+guard CommandLine.arguments.count == 2, let url = URL(string: CommandLine.arguments[1]) else {
+  print("launch_error:expected one URL"); exit(2)
 }
 let d = D()
-let cfg = URLSessionConfiguration.background(withIdentifier: "probe.deputy.\(ProcessInfo.processInfo.processIdentifier)")
+let cfg = URLSessionConfiguration.background(withIdentifier: "probe.deputy.\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString)")
 cfg.isDiscretionary = false
-URLSession(configuration: cfg, delegate: d, delegateQueue: nil).downloadTask(with: URL(string: "http://captive.apple.com/")!).resume()
-_ = d.done.wait(timeout: .now() + 8)
-print(d.ok ? "EGRESS-SUCCEEDED" : "egress-failed")
+cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+let session = URLSession(configuration: cfg, delegate: d, delegateQueue: nil)
+let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 20)
+session.downloadTask(with: request).resume()
+if d.done.wait(timeout: .now() + 25) == .timedOut {
+  print("callback_timeout"); exit(3)
+}
+print(d.value())
 "#,
         )
-        .ok()?;
-        let built = std::process::Command::new("/usr/bin/swiftc")
-            .args(["-O", src.to_str()?, "-o", bin.to_str()?])
+        .map_err(|e| format!("write deputy source: {e}"))?;
+        let src_str = src
+            .to_str()
+            .ok_or_else(|| "deputy source path is not UTF-8".to_string())?;
+        let bin_str = bin
+            .to_str()
+            .ok_or_else(|| "deputy binary path is not UTF-8".to_string())?;
+        let module_cache = dir.join("module-cache");
+        fs::create_dir_all(&module_cache).map_err(|e| format!("create Swift module cache: {e}"))?;
+        let built = std::process::Command::new(swiftc)
+            .env("CLANG_MODULE_CACHE_PATH", &module_cache)
+            .env("SWIFT_MODULE_CACHE_PATH", &module_cache)
+            .args(["-sdk", sdk, "-O", src_str, "-o", bin_str])
             .output()
-            .ok()?;
+            .map_err(|e| format!("launch xcrun-selected swiftc: {e}"))?;
         if !built.status.success() || !bin.exists() {
-            return None;
+            return Err(format!(
+                "swiftc failed: {}",
+                String::from_utf8_lossy(&built.stderr)
+            ));
         }
-        Some(bin)
+        Ok(DeputyProbe { dir, binary: bin })
+    }
+
+    fn run_deputy(
+        prefix: &[String],
+        deputy: &Path,
+        url: &str,
+    ) -> Result<std::process::Output, String> {
+        let (program, args) = prefix
+            .split_first()
+            .ok_or_else(|| "empty Seatbelt prefix".to_string())?;
+        std::process::Command::new(program)
+            .args(args)
+            .arg(deputy)
+            .arg(url)
+            .output()
+            .map_err(|e| format!("launch deputy through sandbox-exec: {e}"))
+    }
+
+    fn callback_output(output: &std::process::Output) -> String {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn unique_probe_url(phase: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "https://captive.apple.com/hotspot-detect.html?agent_bridle_e4={}-{}-{phase}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn sha256(path: &Path) -> String {
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .expect("launch shasum");
+        assert!(output.status.success(), "shasum must succeed");
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .expect("shasum digest")
+            .to_string()
+    }
+
+    fn system_text(program: &str, args: &[&str]) -> String {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace(' ', "_"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unavailable".to_string())
+    }
+
+    fn evidence_env(names: &[&str]) -> String {
+        names
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| "unset".to_string())
+    }
+
+    /// Strict A/B/A characterization of the selected Mach floor. Both A legs use
+    /// the typed network-deny-only/Mach-ambient profile and must complete a unique,
+    /// uncached HTTPS background transfer. The production B leg must launch and
+    /// exit successfully through an explicit callback_error. This proves the
+    /// incremental behavior of this floor, not global deputy closure; support stays
+    /// held because restricted network projection is Unknown.
+    #[test]
+    fn net_none_mach_floor_has_strict_ambient_closed_ambient_differential() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let probe = match build_deputy_probe() {
+            Ok(probe) => probe,
+            Err(reason) => {
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let cav = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let sandbox = SeatbeltSandbox::new();
+        let ambient = sandbox
+            .net_none_ambient_mach_prefix(&cav)
+            .expect("typed ambient-Mach characterization prefix");
+        let production = sandbox
+            .command_prefix(&cav)
+            .expect("production net:none prefix");
+
+        let before = match run_deputy(&ambient, &probe.binary, &unique_probe_url("before")) {
+            Ok(output) => output,
+            Err(reason) => {
+                let _ = fs::remove_dir_all(&probe.dir);
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let before_marker = callback_output(&before);
+        if !before.status.success() || !before_marker.contains("callback_success") {
+            let reason = format!(
+                "ambient-before baseline did not succeed: status={:?} stdout={before_marker:?} stderr={:?}",
+                before.status.code(),
+                String::from_utf8_lossy(&before.stderr)
+            );
+            let _ = fs::remove_dir_all(&probe.dir);
+            fail_required_or_skip(&reason);
+            return;
+        }
+
+        let closed = match run_deputy(
+            &production,
+            &probe.binary,
+            &unique_probe_url("production-closed"),
+        ) {
+            Ok(output) => output,
+            Err(reason) => {
+                let _ = fs::remove_dir_all(&probe.dir);
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let closed_marker = callback_output(&closed);
+        assert!(
+            !closed_marker.contains("callback_success"),
+            "production Mach floor unexpectedly permitted the characterized transfer"
+        );
+        if !closed.status.success() || closed_marker.contains("callback_timeout") {
+            let reason = format!(
+                "production leg did not exit via callback: status={:?} stdout={closed_marker:?} stderr={:?}",
+                closed.status.code(),
+                String::from_utf8_lossy(&closed.stderr)
+            );
+            let _ = fs::remove_dir_all(&probe.dir);
+            fail_required_or_skip(&reason);
+            return;
+        }
+        assert!(
+            closed_marker.contains("callback_error"),
+            "production leg must report an explicit callback_error: {closed_marker:?}"
+        );
+
+        let after = match run_deputy(&ambient, &probe.binary, &unique_probe_url("after")) {
+            Ok(output) => output,
+            Err(reason) => {
+                let _ = fs::remove_dir_all(&probe.dir);
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let after_marker = callback_output(&after);
+        if !after.status.success() || !after_marker.contains("callback_success") {
+            let reason = format!(
+                "ambient-after baseline did not succeed: status={:?} stdout={after_marker:?} stderr={:?}",
+                after.status.code(),
+                String::from_utf8_lossy(&after.stderr)
+            );
+            let _ = fs::remove_dir_all(&probe.dir);
+            fail_required_or_skip(&reason);
+            return;
+        }
+
+        let profile_path = probe.dir.join("production.sb");
+        fs::write(
+            &profile_path,
+            production.get(2).expect("production profile argument"),
+        )
+        .expect("write profile evidence");
+        eprintln!(
+            "SEATBELT_E4_EVIDENCE head_sha={} merge_sha={} sw_vers={} kernel={} arch={} profile_sha256={} probe_sha256={} phases=ambient_before:callback_success,production_closed:callback_error,ambient_after:callback_success",
+            evidence_env(&[
+                "BRIDLE_E4_HEAD_SHA",
+                "BRIDLE_HEAD_SHA",
+                "PR_HEAD_SHA",
+                "GITHUB_HEAD_SHA",
+            ]),
+            evidence_env(&["BRIDLE_MERGE_SHA", "MERGE_SHA", "GITHUB_SHA"]),
+            system_text("/usr/bin/sw_vers", &["-productVersion"]),
+            system_text("/usr/bin/uname", &["-r"]),
+            system_text("/usr/bin/uname", &["-m"]),
+            sha256(&profile_path),
+            sha256(&probe.binary),
+        );
+        let _ = fs::remove_dir_all(&probe.dir);
     }
 
     /// A one-shot loopback listener answering a single HTTP request, so an ALLOW

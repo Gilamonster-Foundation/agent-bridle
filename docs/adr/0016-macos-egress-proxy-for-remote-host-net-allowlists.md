@@ -1,6 +1,8 @@
 # ADR 0016 — macOS egress proxy: enforce a general remote-host `net` allow-list behind the loopback kernel fence
 
-- Status: Accepted (2026-06-30)
+- Status: **Held/unavailable on macOS (2026-08-11)** — design retained, but its
+  execution path is not admissible until a deputy-complete Seatbelt network proof
+  replaces the current `Unknown → refuse` projection.
 - Date: 2026-06-30
 - Context: ADR 0015 proved SBPL cannot name a remote host (`(remote ip
   "1.2.3.4:443")` → compile error) and shipped the **loopback kernel fence** —
@@ -14,6 +16,22 @@
   only for what is actually enforced there).
 - Related: #124 (this axis), ADR 0015 (the fence + frontier), ADR 0008 (core
   leanness — no new core deps).
+
+## E4 hold (2026-08-11)
+
+ADR 0015's loopback fence proves a direct-socket property, not that loopback is
+the child's only effective egress path. The E4 investigation demonstrated an
+ambient `nsurlsessiond` Mach deputy and added a defense-in-depth Mach floor that
+closes that specific path. The allow-listed and other ambient IPC services have
+not been comprehensively certified, so all restricted Seatbelt net projections
+remain `Unknown` and admission refuses them.
+
+Consequently this proxy architecture is a retained design target, not current
+macOS support. Rewriting a remote-host grant to loopback does not make it
+admissible; the proxy route must remain held/unavailable until native evidence
+establishes a deputy-complete loopback boundary and the authority projection can
+be made faithful. The decision text below is historical design rationale, not a
+claim that the path currently executes.
 
 ## Question
 
@@ -30,7 +48,8 @@ loopback interface is the proxy, and the proxy admits only allow-listed hosts.
 
 ### D1 — Two pure core predicates; the mechanism lives in the shell tool
 
-`agent-bridle-core` gains two **pure, dependency-free** predicates (ADR 0008
+The historical implementation introduced two **pure, dependency-free**
+predicates (ADR 0008
 leanness intact — no tokio, no networking in core):
 
 - `net_egress_proxy_hosts(caveats) -> Option<Vec<String>>` — `Some(full host set)`
@@ -41,15 +60,12 @@ leanness intact — no tokio, no networking in core):
   the loopback set, so its `seatbelt_profile` emits the ADR 0015 fence while the
   `fs`/`exec` rules are preserved verbatim.
 
-The proxy itself is `agent-bridle-tool-shell/src/net_proxy.rs`, **std-only**
-(`std::net` + `std::thread`, no async runtime, no new dependency). The shell's
-`OsSpawner::run` routes on one helper, `egress_proxy_plan(caveats)`, which is
-**self-gating**: it returns `Some` only where the loopback fence is actually
-emittable (`intended_sandbox_kind(fenced) ≠ None` — today macOS + `macos-seatbelt`
-+ `sandbox-exec`); everywhere else it is `None` and the ordinary paths run
-unchanged (no regression, no surprise fail-closed). `run_with_egress_proxy` starts
-the proxy, computes the fence prefix from the fenced caveats, and injects
-`*_PROXY` (both cases) into a **clone** of the env-seam map so the child routes out.
+The proxy machinery uses `egress_proxy_plan(caveats)` to identify a profile that
+can be emitted. Profile emission alone is no longer an admission witness: on
+macOS the resulting loopback authority is `Unknown` and must refuse before
+execution. `run_with_egress_proxy` remains design machinery for a future
+deputy-complete boundary; it must not be described as supported while the E4
+hold is active.
 
 ### D2 — Honesty: the report is UNCHANGED; the proxy over-delivers
 

@@ -551,12 +551,10 @@ impl ConfinedCommand {
             |mechanism_caveats| {
                 // Mechanism selection for the projection: the authority a spawn is
                 // bounded by is EITHER the OS sandbox OR, for a trusted worker, the
-                // in-process brush-ocap engine (a VERIFIED interceptor that bounds
-                // exec/fs/net — `DenialKind::Exec`/`Open`/`Net`). A trusted worker's
-                // bounding mechanism is brush-ocap, so its conservative projection
-                // is the delegated grant itself (brush-ocap admits exactly the
-                // grant, at Interceptor strength; the OS sandbox underneath is
-                // defense-in-depth). This exemption is keyed on the TRUSTED-WORKER
+                // in-process brush-ocap engine (a VERIFIED interceptor for exec/fs).
+                // Brush cannot mediate sockets or ambient IPC used by an external
+                // descendant, so the net axis must always come from the OS backend's
+                // conservative projection. This exemption is keyed on the TRUSTED-WORKER
                 // route, NOT on `SandboxKind::None`: an arbitrary Noop spawn is
                 // bounded by NOTHING and must fall through to the backend
                 // projection below (Noop ⇒ Unbounded ⇒ refuse a restricted axis).
@@ -566,8 +564,12 @@ impl ConfinedCommand {
                     // into the exec axis for the OS layer only. Projecting the
                     // delegated grant keeps that OS-layer fold from reading as a
                     // widening (resolved.exec ⊋ delegated.exec) under this mechanism.
+                    // Preserve the backend's net result: an Unknown/Unbounded native
+                    // network boundary cannot borrow Brush's fs/exec interception.
+                    let mut resolved = crate::ResolvedAuthority::from_delegated(&effective);
+                    resolved.net = sandbox.resolved_authority(mechanism_caveats).net;
                     return BackendProjection {
-                        resolved: crate::ResolvedAuthority::from_delegated(&effective),
+                        resolved,
                         runtime_closure: crate::empty_closure(),
                     };
                 }
@@ -2129,55 +2131,35 @@ mod seatbelt_child_tests {
         );
     }
 
-    /// E4 evidence C — DESCENDANT INHERITANCE (≥2 generations) through the REAL
-    /// Bridle spawn path. The Seatbelt boundary is inherited by every descendant,
-    /// so a GRANDCHILD the confined child forks under `net: none` also cannot
-    /// egress. A `sh -c 'sh -c "curl …"'` reaches curl at generation 2; its egress
-    /// must be kernel-denied (curl exit 7), while a benign grandchild succeeds
-    /// (positive control — the profile parsed and only egress is denied).
+    /// Restricted Seatbelt network authority remains held: admission must refuse
+    /// before the program is spawned, regardless of the defense-in-depth profile.
     #[test]
-    fn net_none_boundary_is_inherited_by_a_grandchild() {
+    fn restricted_net_authority_is_denied_before_spawn() {
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
         }
-        if !std::path::Path::new("/usr/bin/curl").exists() {
-            eprintln!("skipping: no curl(1)");
-            return;
-        }
-        // net:none plus exec allowing the shells + curl the grandchild needs.
+        let dir = unique_dir("net-held");
+        let marker = dir.join("must-not-spawn");
         let cx = ctx(Caveats {
             net: Scope::none(),
-            exec: Scope::only([
-                "/bin/sh".to_string(),
-                "/usr/bin/curl".to_string(),
-                "/usr/bin/true".to_string(),
-            ]),
             ..Caveats::top()
         });
-
-        // Positive control: a benign generation-2 process runs.
-        let ok = ConfinedCommand::new("/bin/sh")
-            .arg("-c")
-            .arg("/bin/sh -c /usr/bin/true")
+        match ConfinedCommand::new("/usr/bin/touch")
+            .arg(&marker)
             .spawn(&cx)
-            .expect("spawn benign grandchild")
-            .child
-            .wait()
-            .expect("wait");
-        assert!(ok.success(), "a benign generation-2 descendant must run");
-
-        // The grandchild's egress is kernel-denied (inherited net:none): curl to a
-        // literal IP exits 7 (socket denied), not 0.
-        let mut escaped = ConfinedCommand::new("/bin/sh")
-            .arg("-c")
-            .arg("/bin/sh -c '/usr/bin/curl -sS --max-time 5 http://1.1.1.1/'")
-            .spawn(&cx)
-            .expect("spawn egressing grandchild");
-        let status = escaped.child.wait().expect("wait");
+        {
+            Err(ToolError::Denied { .. }) => {}
+            Err(other) => panic!("expected a restricted-network authority denial, got {other}"),
+            Ok(mut spawned) => {
+                let _ = spawned.child.kill();
+                panic!("restricted network authority must be denied before spawn");
+            }
+        }
         assert!(
-            !status.success(),
-            "a generation-2 descendant must inherit the net:none boundary (egress denied)"
+            !marker.exists(),
+            "the denied command must never have executed"
         );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

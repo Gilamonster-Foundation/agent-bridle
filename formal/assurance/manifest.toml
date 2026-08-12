@@ -5,6 +5,8 @@
 #   tla_invariant  — an invariant in a formal/tla spec, + the cfg that checks it
 #   rust_test      — a #[test] proving model≈production semantics
 #   native_test    — the hostile-child test proving OS≈production (per platform)
+#   native_test_fn — an exact `path/to/file.rs::test_function` reference;
+#                    validate.sh resolves both the file and function
 #   evidence_cid   — content-address of the native evidence artifact, via the
 #                    EXISTING ceremony CID machinery. That layer is HELD (not yet
 #                    wired to a concrete hash — see assumptions.md ASM-CID), so
@@ -46,6 +48,21 @@ evidence_cid  = "held:phase1d"
 impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"
 premise       = "none — model theorem is unconditional; native test proves the OS refinement"
 status        = "partial"   # native env test landed on main (#338 merged); RC-SHA certification pending
+
+# ── macOS E4: narrow demonstrated-deputy result, not deputy-complete net:none ─
+[[claim]]
+id             = "MACOS-E4-NSURLSESSIOND-DEFENSE"
+platform       = "macos"
+statement      = "The Seatbelt E4 Mach-lookup floor closes the demonstrated background-URLSession to com.apple.nsurlsessiond deputy path. This is defense in depth only: it does not establish that net:none, loopback, or the loopback-proxy shape has no other child-drivable ambient IPC deputy."
+lean_theorem   = []
+tla_invariant  = []
+rust_test      = []
+native_test    = ["agent-bridle-core/src/sandbox.rs"]
+native_test_fn = ["agent-bridle-core/src/sandbox.rs::net_none_mach_floor_has_strict_ambient_closed_ambient_differential"]
+evidence_cid   = "held:phase1d"
+impl_sha       = "pending:PR-341-head"
+premise        = "ASM-MACOS-DEPUTY: UNDISCHARGED. The named nsurlsessiond path is natively characterized at the PR head SHA, but allowed and ambient IPC deputies are not comprehensively certified; every restricted Seatbelt net projection remains Unknown and admission refuses it."
+status         = "partial"
 
 [[claim]]
 id            = "ENV-DELEGATION-SURVIVES"
