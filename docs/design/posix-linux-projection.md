@@ -63,10 +63,10 @@ No single mechanism enforces everything. The projection is a *composition*.
   user namespaces remain available** — the repo already refuses the trusted
   worker in that case (`spawn.rs:806`, sysctl probe `spawn.rs:873`). The POSIX
   projection inherits this precondition.
-- **The first slice (#319)** needs only kernel primitives already present on the
-  gnuc 6.8 kernel: `close_range(2)` and `openat2(2)` with `RESOLVE_BENEATH` /
-  `RESOLVE_NO_SYMLINKS`. No new daemon, no broker — consistent with ADR 0026's
-  no-broker-in-slice-1 decision.
+- **The first slice (#319)** needs only kernel primitives already present on a
+  Linux 6.8 kernel (Landlock ABI v4): `close_range(2)` and `openat2(2)` with
+  `RESOLVE_BENEATH` / `RESOLVE_NO_SYMLINKS`. No new daemon, no broker —
+  consistent with ADR 0026's no-broker-in-slice-1 decision.
 
 ## What Linux cannot do (refuse, do not widen)
 
