@@ -1751,6 +1751,14 @@ fn run_pipeline(
             }
         }
 
+        // #319: close ambient descriptors the parent left open so a confined
+        // stage does not inherit un-delegated object capabilities (the descriptor
+        // analog of the `env_clear` above). Encapsulated in `agent-bridle-fdguard`
+        // (the single `unsafe` seam); Linux-enforced today, no-op elsewhere. Runs
+        // last so it applies regardless of the stdio disposition chosen above.
+        #[cfg(unix)]
+        agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
+
         let mut child = ok_or_kill(cmd.spawn(), &mut children)?;
 
         if matches!(stage.stderr_disposition(), StderrTo::Capture) {

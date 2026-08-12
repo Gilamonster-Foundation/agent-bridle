@@ -109,6 +109,11 @@ brush-ocap-coreutils-builtins = { version = "0.1", features = [
     "coreutils.wc",
 ], optional = true }
 
+# #319 fd-hygiene seam applied at every confined-spawn site in this crate
+# (OsSpawner stages + carried-coreutils). Unix-only; no-op off-Linux today.
+[target.'cfg(unix)'.dependencies]
+agent-bridle-fdguard = { workspace = true }
+
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 nix = { version = "0.31.3", features = ["fs", "process", "socket", "uio", "user"], optional = true }
 
