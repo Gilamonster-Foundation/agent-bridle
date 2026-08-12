@@ -18,6 +18,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # can point the certification gate at a deliberately-poisoned copy.
 MAN="${BRIDLE_ASSURANCE_MANIFEST:-$REPO/formal/assurance/manifest.toml}"
 LEAN_SRC="$REPO/formal/Ceremony/Assurance/AuthorityLattice.lean"
+POSIX_LEAN_SRC="$REPO/formal/Ceremony/Posix/Machine.lean"
 TLA_DIR="$REPO/formal/tla"
 fail=0
 note() { printf '  %-6s %s\n' "$1" "$2"; }
@@ -27,6 +28,13 @@ for t in $(grep -oE 'Ceremony\.Assurance\.[A-Za-z0-9_]+' "$MAN" | sort -u); do
   name="${t##*.}"
   if grep -qE "theorem[[:space:]]+$name\b" "$LEAN_SRC"; then note PASS "lean $name"
   else note FAIL "lean theorem missing: $name"; fail=1; fi
+done
+
+# 1b. POSIX Lean theorems (ADR 0026): resolved against Ceremony/Posix/Machine.lean.
+for t in $(grep -oE 'Ceremony\.Posix\.[A-Za-z0-9_]+' "$MAN" | sort -u); do
+  name="${t##*.}"
+  if grep -qE "theorem[[:space:]]+$name\b" "$POSIX_LEAN_SRC"; then note PASS "lean $name (posix)"
+  else note FAIL "lean theorem missing: $name (posix)"; fail=1; fi
 done
 
 # 2. TLA invariants: entries look like `Invariant@Config.cfg`. Require the cfg to
@@ -39,6 +47,7 @@ for ref in $(grep -oE '[A-Za-z0-9_]+@[A-Za-z0-9_]+\.cfg' "$MAN" | sort -u); do
   case "$cfg" in
     AuthorityLifecycle_*) spec="AuthorityLifecycle.tla" ;;
     EnforcementFence_*)   spec="EnforcementFence_NonEquivocation.tla" ;;
+    PosixAuthority_*)      spec="PosixAuthority.tla" ;;
   esac
   if grep -qE "\b$inv\b" "$TLA_DIR/$spec"; then note PASS "tla $inv ($cfg)"
   else note FAIL "tla invariant $inv absent from $spec"; fail=1; fi

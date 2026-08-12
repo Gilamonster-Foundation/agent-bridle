@@ -100,6 +100,9 @@ jobs:
       - name: Model-check T1..T7 (faithful holds; every bug cfg is a counterexample)
         shell: bash
         run: ./formal/tla/run-authority-lifecycle.sh
+      - name: Model-check POSIX projection P1..P4 (faithful holds; every bug cfg is a counterexample)
+        shell: bash
+        run: ./formal/tla/run-posix-authority.sh
       - name: Validate the assurance manifest references resolve
         shell: bash
         run: ./formal/assurance/validate.sh

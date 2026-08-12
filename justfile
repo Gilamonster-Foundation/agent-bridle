@@ -74,6 +74,7 @@ check-tla:
     fi
     set -e
     ./formal/tla/run-authority-lifecycle.sh
+    ./formal/tla/run-posix-authority.sh
     ./formal/assurance/validate.sh
     ./formal/assurance/validate_selftest.sh
 

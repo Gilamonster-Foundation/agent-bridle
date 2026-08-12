@@ -169,3 +169,58 @@ rust_test     = []
 native_test   = []
 premise       = "none"
 status        = "proved"
+
+# ── POSIX authority projection (ADR 0026) — MODEL half proved, OS half held ───
+# These claims establish the four properties of the POSIX projection at the MODEL
+# level (Lean + TLA+). They are status="held": the model is proved and axiom-
+# audited, but no OS-refinement native evidence exists yet (the projection is
+# architecture-before-implementation; the first executable slice is #319). They
+# MUST NOT be marked "proved" until a hostile-child native test lands per the
+# release-certification rule. See docs/adr/0026-posix-authority-projection.md.
+[[claim]]
+id            = "POSIX-COMPLETE-MEDIATION"
+platform      = "all"
+statement     = "Every permitted POSIX operation's required authority is within the process's effective authority, and from a well-formed start every reachable state keeps fds ⊑ effective (no resolve/derive/operate sequence amplifies authority beyond the grant)."
+lean_theorem  = ["Ceremony.Posix.complete_mediation", "Ceremony.Posix.reach_preserves_wf"]
+tla_invariant = ["NoAuthorityAmplification@PosixAuthority_Amplify.cfg"]
+rust_test     = []
+native_test   = []
+evidence_cid  = "held:phase1d"
+premise       = "ASM-POSIX-DESCRIPTOR: model proved (Ceremony.Posix.reach_preserves_wf, PosixAuthority.tla faithful cfg holds []Inv); real-path descriptor closure is #319 and unwired, so this is a MODEL property, not a runtime guarantee."
+status        = "held"
+
+[[claim]]
+id            = "POSIX-NAMESPACE-NON-AMPLIFICATION"
+platform      = "all"
+statement     = "Resolving a name confers no authority beyond the grant: the namespace routes, it does not grant. openName preserves fds ⊑ effective even for a maximally-permissive resolution."
+lean_theorem  = ["Ceremony.Posix.namespace_non_amplification"]
+tla_invariant = ["NamespaceNonAmplification@PosixAuthority_NamespaceForge.cfg"]
+rust_test     = []
+native_test   = []
+evidence_cid  = "held:phase1d"
+premise       = "none — model theorem is unconditional; the PosixAuthority_NamespaceForge bug cfg is the counterexample witness (ambient-root resolution)."
+status        = "held"
+
+[[claim]]
+id            = "POSIX-DESCRIPTOR-NON-AMPLIFICATION"
+platform      = "all"
+statement     = "A capability derived from a descriptor (dup/openat/reopen/O_PATH/SCM_RIGHTS) never exceeds the descriptor it derives from."
+lean_theorem  = ["Ceremony.Posix.descriptor_non_amplification"]
+tla_invariant = ["DescriptorNonAmplification@PosixAuthority_DescriptorForge.cfg"]
+rust_test     = []
+native_test   = []
+evidence_cid  = "held:phase1d"
+premise       = "ASM-POSIX-DESCRIPTOR: model proved; /proc/self/fd reopen and O_PATH upgrade must be re-mediated against effective on the real path (design, unwired)."
+status        = "held"
+
+[[claim]]
+id            = "POSIX-DESCENDANT-ATTENUATION"
+platform      = "all"
+statement     = "A spawned child's authority (grant and delivered descriptors) is bounded by the parent's; a child grant wider than the parent has no attenuation witness and is unconstructable."
+lean_theorem  = ["Ceremony.Posix.spawnChild_attenuates"]
+tla_invariant = ["DescendantAttenuation@PosixAuthority_DescendantEscalate.cfg"]
+rust_test     = []
+native_test   = []
+evidence_cid  = "held:phase1d"
+premise       = "none — model theorem is unconditional; refines the same discipline as AuthorityLifecycle T5. Real-path kernel-fence inheritance is established for existing backends (real_spawn.rs grandchild tests)."
+status        = "held"
