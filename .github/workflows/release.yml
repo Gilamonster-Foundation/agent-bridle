@@ -188,6 +188,7 @@ jobs:
       # HOOK PARITY: keep this exact dependency order aligned with the
       # `publish-crates` recipe in justfile.
       PUBLISH_CRATES: >-
+        agent-bridle-fdguard
         agent-bridle-core
         agent-bridle-tool-shell
         agent-bridle-tool-web

@@ -220,7 +220,7 @@ publish-crates:
     set -euo pipefail
     dry=""
     [ "${DRY_RUN:-0}" != "0" ] && dry="--dry-run"
-    for crate in agent-bridle-core agent-bridle-tool-shell agent-bridle-tool-web agent-bridle agent-bridle-mcp; do
+    for crate in agent-bridle-fdguard agent-bridle-core agent-bridle-tool-shell agent-bridle-tool-web agent-bridle agent-bridle-mcp; do
         echo ">>> cargo publish -p ${crate} ${dry}"
         cargo publish -p "${crate}" ${dry}
     done
