@@ -122,3 +122,43 @@ formal_claim  = "within/admit at caveats grain"
 native_test   = "agent-bridle-aclaunch/tests/net_proofs.rs (deny-all blocks loopback egress)"
 residual      = "general host allowlist inexpressible (deny-by-default only); loopback-exemption needs elevation"
 class         = "verbatim"
+
+# ═══════════════════ POSIX projection axes (ADR 0026) ════════════════════════
+# The object/descriptor/namespace grain over the four Caveats axes. MODEL-level
+# rows: class reflects the abstract-machine guarantee (Lean + TLA+); native
+# OS-refinement is pending (#319 for descriptor, briefs for macOS/Windows). These
+# are NOT a per-backend certification — they record the projection's design
+# classification so the assurance report reads them instead of prose.
+# See docs/design/posix-authority-matrix.md for the full per-operation grid.
+
+[posix_namespace.model]
+projection    = "openName bounds resolution by effective (Ceremony.Posix.namespace_non_amplification); a name resolves to an object capability, never to ambient authority"
+primitive     = "MODEL: openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS) design; PosixNamespaceCID binding (posix-authority-model.md §6)"
+formal_claim  = "NamespaceNonAmplification@PosixAuthority_NamespaceForge.cfg; Ceremony.Posix.namespace_non_amplification"
+native_test   = "pending:agent-bridle-core/tests/posix_namespace.rs"
+residual      = "real-path namespace resolution + PosixNamespaceCID unwired (design); #319 for ambient-fd closure"
+class         = "unknown"
+
+[posix_descriptor.model]
+projection    = "derive keeps fds within the source descriptor (Ceremony.Posix.descriptor_non_amplification); reach_preserves_wf keeps fds ⊑ effective across every step"
+primitive     = "MODEL: close_range on spawn (#319) + reopen/O_PATH re-mediation design"
+formal_claim  = "DescriptorNonAmplification@PosixAuthority_DescriptorForge.cfg; NoAuthorityAmplification@PosixAuthority_Amplify.cfg"
+native_test   = "pending:agent-bridle-core/tests/posix_descriptor.rs"
+residual      = "ASM-POSIX-DESCRIPTOR: ambient fds not closed on spawn (#319, spawn.rs:342); /proc/self/fd + O_PATH re-mediation unwired"
+class         = "unknown"
+
+[posix_descendant.model]
+projection    = "spawnChild bounds child grant + delivered fds by the parent (Ceremony.Posix.spawnChild_attenuates, spawnChild_wf); a wider child has no attenuation witness"
+primitive     = "MODEL: refines AuthorityLifecycle T5; real kernel-fence inheritance established for existing backends"
+formal_claim  = "DescendantAttenuation@PosixAuthority_DescendantEscalate.cfg; Ceremony.Posix.spawnChild_attenuates"
+native_test   = "agent-bridle-tool-shell/tests/real_spawn.rs"
+residual      = "none at model grain; POSIX-specific delegation (SCM_RIGHTS) is a distinct unmodeled class"
+class         = "bounded"
+
+[posix_inspect.model]
+projection    = "metadata (stat/existence/size/topology) is a distinct inspect authority reported Unknown ⇒ refuse, NEVER folded into content fs_read"
+primitive     = "NONE — no backend confines metadata today"
+formal_claim  = "posix-authority-matrix.md inspect rows; subsumes ASM-MACOS-METADATA at the POSIX grain"
+native_test   = "pending:agent-bridle-core/tests/posix_inspect.rs"
+residual      = "ASM-POSIX-INSPECT: metadata confinement is a native-probe question (macOS/Windows briefs §metadata); Unknown on all backends"
+class         = "unknown"
