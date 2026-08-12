@@ -3352,8 +3352,13 @@ mod tests {
         net_audit_sink(None).record(&ev);
 
         // Some(path) → JSONL sink appends the event to that exact path.
-        let path = std::env::temp_dir().join(format!("ab-audit-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ab-audit-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create isolated audit test directory");
+        let path = dir.join("audit.jsonl");
         let sink = net_audit_sink(path.to_str());
         sink.record(&ev);
         drop(sink);
@@ -3362,7 +3367,7 @@ mod tests {
             contents.contains("example.test"),
             "the configured sink must write the event: {contents}"
         );
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #138 (audit robustness): a *bad* audit path must degrade to the null sink so
