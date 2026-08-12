@@ -37,10 +37,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    best_available_sandbox, effective_sandbox_kind, enforcement_report, human_gate, is_unbridled,
-    unenforceable_axis, Caveats, ConfinementMechanism, Denial, DenialKind, Disclosure,
-    EnforcementReport, Invocation, LimitsPolicy, SandboxKind, SandboxPolicy, Tool, ToolContext,
-    ToolEnvelope, ToolError, ToolResult,
+    admit, best_available_sandbox, effective_sandbox_kind, enforcement_report, human_gate,
+    is_unbridled, unenforceable_axis, AdmissionDecision, AdmittedFence, BackendProjection, Caveats,
+    ConfinedAxis, ConfinementMechanism, Denial, DenialKind, Disclosure, EnforcementReport,
+    Invocation, LimitsPolicy, ResolvedScope, RuntimeClosure, SandboxKind, SandboxPolicy, Scope,
+    Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -110,6 +111,12 @@ pub(crate) struct SpawnCfg {
 }
 
 pub(crate) trait Spawner: Send + Sync {
+    /// Whether this spawner crosses the native process boundary and therefore
+    /// must pass the backend's ruleset-grain authority admission. Test spawners
+    /// that execute no process return `false`; every production spawner must
+    /// return `true`.
+    fn requires_backend_admission(&self) -> bool;
+
     /// Run one leash-approved pipeline to completion, capturing its output. The
     /// effective `caveats` are passed so the real spawner can apply the selected
     /// L3 OS sandbox before spawning; the mock ignores them. `env` is the
@@ -133,6 +140,10 @@ pub(crate) trait Spawner: Send + Sync {
 struct OsSpawner;
 
 impl Spawner for OsSpawner {
+    fn requires_backend_admission(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         stages: &[Command],
@@ -527,20 +538,25 @@ impl Tool for ShellTool {
         // that will actually be enforced for these caveats on this host and
         // backend. `OsSpawner` applies exactly this decision, fail-closed.
         //
-        // On the egress-proxy path (#124, ADR 0016) the run is governed by the
-        // loopback-`fenced` caveats — a real Seatbelt kernel boundary — so the
-        // coarse kind is reported from those, derived from the SAME
-        // `egress_proxy_plan` helper `OsSpawner::run` routes on (they cannot
-        // disagree). The per-axis `net` stays Advisory below (the report is
-        // computed from the ORIGINAL grant, whose remote host SBPL cannot confine)
-        // — the proxy over-delivers above that floor, it does not raise the claim.
+        // For a remote-host allow-list on a profile-capable host,
+        // `egress_proxy_plan` derives candidate loopback-fenced backend caveats.
+        // Profile emission is not authority evidence: the ruleset-grain admission
+        // below projects these exact candidate caveats and rejects an Unknown net
+        // axis before `OsSpawner` can run. The candidate kind/report are retained
+        // for the structured refusal. If a future backend establishes a faithful
+        // bounded projection, this same derivation becomes the executable route.
+        let backend_caveats = if unbridled {
+            cx.caveats().clone()
+        } else {
+            match egress_proxy_plan(cx.caveats(), &self.sandbox) {
+                Some((_, fenced)) => fenced,
+                None => cx.caveats().clone(),
+            }
+        };
         let sandbox_kind = if unbridled {
             SandboxKind::None
         } else {
-            match egress_proxy_plan(cx.caveats(), &self.sandbox) {
-                Some((_, fenced)) => intended_sandbox_kind(&fenced, &self.sandbox),
-                None => intended_sandbox_kind(cx.caveats(), &self.sandbox),
-            }
+            intended_sandbox_kind(&backend_caveats, &self.sandbox)
         };
         // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
         // returns carries the per-axis report alongside the coarse sandbox_kind.
@@ -759,28 +775,87 @@ impl Tool for ShellTool {
 
         // Fail closed (ADR 0012 D4) — AFTER L2 admission (so a specific
         // out-of-scope glob/redirect/exec denial is reported first) but before any
-        // spawn: refuse when a restricted axis cannot be enforced on this host at
-        // the principal's strength floor. Decided against `sandbox_kind` — the kind
-        // that ACTUALLY governs the spawn (`effective_sandbox_kind`, what
-        // `OsSpawner` routes through), NOT the raw probe: a backend the run path
-        // does not route through collapses to `None` here, so an fs-restricted
-        // run on it fails closed instead of executing unconfined via
-        // `run_pipeline` (the adversarial-review fix — the check and the routing
-        // must agree). The filesystem axes always
-        // fail closed when restricted-but-unenforceable (closing the run-unconfined
-        // gap the shell shared with ConfinedCommand); exec/net fail closed only for
-        // a strong principal (the default floor is permissive).
+        // spawn: require the same ruleset-grain authority admission used by
+        // `ConfinedCommand`. Strength reporting alone is insufficient: a backend
+        // may honestly report Advisory while its conservative authority projection
+        // is Unknown, which must refuse independently of the principal's floor.
+        // Project the exact caveats `OsSpawner` will apply (including the egress
+        // proxy's loopback fence), so the admission and wrapper cannot equivocate.
         // Unbridled skips this fail-closed guard by consent: dropping the L3
         // mechanism is *exactly* what the operator acknowledged (ADR 0018 D1). The
         // L2 grant checks above still ran (advisory), and every axis reports
         // advisory + `disclosure.unbridled` — honest, not silent.
         if !unbridled {
+            // Production spawners must pass backend admission even when no native
+            // sandbox engages. The no-op backend projects unbounded authority, so
+            // a restricted grant is refused here instead of spawning fail-open.
+            if self.spawner.requires_backend_admission() {
+                let sandbox = best_available_sandbox(&self.sandbox);
+                let mut resolved = sandbox.resolved_authority(&backend_caveats);
+                // AppContainer cannot express a non-empty exec allowlist in its
+                // native policy, but this route has already atomically checked
+                // every pipeline stage through the ShellTool exec interceptor.
+                // Intersect that route-local bound with the active AppContainer
+                // projection without changing the backend's native claim or its
+                // runtime closure. The EFFECTIVE-kind guard is load-bearing:
+                // exec-only caveats do not engage AppContainer and must retain the
+                // no-backend Unbounded refusal rather than borrow this interceptor.
+                if sandbox_kind == SandboxKind::AppContainer
+                    && matches!(
+                        &backend_caveats.exec,
+                        Scope::Only(programs) if !programs.is_empty()
+                    )
+                {
+                    resolved.exec = ResolvedScope::from_scope(&backend_caveats.exec);
+                }
+                let projection = BackendProjection {
+                    resolved,
+                    runtime_closure: sandbox.runtime_closure(&backend_caveats),
+                };
+                let rejected_axis = match admit(
+                    &projection.resolved,
+                    &backend_caveats,
+                    &projection.runtime_closure,
+                ) {
+                    AdmissionDecision::Admit => None,
+                    AdmissionDecision::Reject(reject) => Some(reject.axis),
+                };
+
+                if let Err(error) = AdmittedFence::admit(
+                    &backend_caveats,
+                    RuntimeClosure::empty(),
+                    mechanism,
+                    cx.strength_floor(),
+                    |_| projection,
+                ) {
+                    let rejected_axis = rejected_axis.or_else(|| {
+                        unenforceable_axis(cx.caveats(), mechanism, cx.strength_floor())
+                            .map(|unmet| unmet.axis)
+                    });
+                    let (kind, target) = match rejected_axis {
+                        Some(ConfinedAxis::FsRead | ConfinedAxis::FsWrite) => {
+                            (DenialKind::Open, "filesystem")
+                        }
+                        Some(ConfinedAxis::Net) => (DenialKind::Net, "network"),
+                        Some(ConfinedAxis::Exec) | None => (DenialKind::Exec, "confinement"),
+                    };
+                    return Ok(deny(sandbox_kind, enforcement, kind, target, &error));
+                }
+            }
+
             if let Some(unmet) = unenforceable_axis(cx.caveats(), mechanism, cx.strength_floor()) {
+                let (kind, target) = match unmet.axis {
+                    ConfinedAxis::FsRead | ConfinedAxis::FsWrite => {
+                        (DenialKind::Open, "filesystem")
+                    }
+                    ConfinedAxis::Net => (DenialKind::Net, "network"),
+                    ConfinedAxis::Exec => (DenialKind::Exec, "confinement"),
+                };
                 return Ok(deny(
                     sandbox_kind,
                     enforcement,
-                    DenialKind::Exec,
-                    "confinement",
+                    kind,
+                    target,
                     &ToolError::denied(format!("{unmet}; refusing to run unconfined")),
                 ));
             }
@@ -2015,6 +2090,10 @@ mod tests {
     }
 
     impl Spawner for MockSpawner {
+        fn requires_backend_admission(&self) -> bool {
+            false
+        }
+
         fn run(
             &self,
             stages: &[Command],
@@ -2048,6 +2127,10 @@ mod tests {
     }
 
     impl Spawner for CoordinatedSpawner {
+        fn requires_backend_admission(&self) -> bool {
+            false
+        }
+
         fn run(
             &self,
             _stages: &[Command],
@@ -2118,6 +2201,10 @@ mod tests {
     struct TemporalPipelineSpawner;
 
     impl Spawner for TemporalPipelineSpawner {
+        fn requires_backend_admission(&self) -> bool {
+            false
+        }
+
         fn run(
             &self,
             stages: &[Command],
@@ -3282,8 +3369,13 @@ mod tests {
         net_audit_sink(None).record(&ev);
 
         // Some(path) → JSONL sink appends the event to that exact path.
-        let path = std::env::temp_dir().join(format!("ab-audit-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ab-audit-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create isolated audit test directory");
+        let path = dir.join("audit.jsonl");
         let sink = net_audit_sink(path.to_str());
         sink.record(&ev);
         drop(sink);
@@ -3292,7 +3384,7 @@ mod tests {
             contents.contains("example.test"),
             "the configured sink must write the event: {contents}"
         );
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #138 (audit robustness): a *bad* audit path must degrade to the null sink so

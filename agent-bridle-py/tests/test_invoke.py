@@ -28,16 +28,21 @@ import pytest
 
 import agent_bridle
 
-# A grant that authorizes executing *only* ``echo``. Since an omitted axis now
-# defaults to bottom/deny (#271 / AB-009), the read and call-budget axes echo
-# needs are named explicitly; fs_write and net stay omitted (denied).
-# exec is restricted to echo (the invariant these tests exercise); the other
-# axes are granted unrestricted so the host can actually run — a *restricted*
-# fs/net axis it cannot enforce at the required strength floor would (correctly)
-# refuse to run. Under the old omitted-defaults-to-top behavior these were
-# implicit; deny-all-by-default (#271 / AB-009) makes them explicit.
+# A restricted grant used for denial coverage. The stock Python wheel has no
+# native L3 sandbox backend, so even an in-scope external spawn must fail closed.
 ECHO_ONLY = {
     "exec": {"only": ["echo"]},
+    "fs_read": "all",
+    "fs_write": "all",
+    "net": "all",
+    "max_calls": "unlimited",
+    "valid_for_generation": "all",
+}
+
+# Positive external-spawn smoke tests deliberately request ambient authority.
+# Restricted grants stay in the denial tests above and below.
+FULL_AUTHORITY = {
+    "exec": "all",
     "fs_read": "all",
     "fs_write": "all",
     "net": "all",
@@ -62,20 +67,14 @@ def test_shell_is_registered() -> None:
     assert "shell" in names, f"shell missing from tool_names(): {names}"
 
 
-def test_in_scope_echo_runs_and_captures_stdout() -> None:
-    """An allowed dispatch passes the leash and runs: ``echo`` is within the
-    granted ``exec`` scope, so it is spawned as an external program and stdout is
-    captured. (Equivalent to the spec's ``echo hi`` in argv form.)"""
-    r = agent_bridle.invoke(
-        "shell",
-        {"program": "echo", "args": ["hi"]},
-        ECHO_ONLY,
-    )
-    assert r["exit_code"] == 0, r
-    assert "hi" in r["stdout"], r
-    # The recorded sandbox kind travels with every result (DESIGN §6).
-    assert r["sandbox_kind"] == "none"
-    assert r["timed_out"] is False
+def test_in_scope_restricted_echo_refuses_without_native_backend() -> None:
+    """An in-scope restricted spawn fails closed without a native backend."""
+    with pytest.raises(agent_bridle.BridleDenied):
+        agent_bridle.invoke(
+            "shell",
+            {"program": "echo", "args": ["hi"]},
+            ECHO_ONLY,
+        )
 
 
 def test_out_of_scope_program_is_denied() -> None:
@@ -113,11 +112,9 @@ def test_denied_reason_is_surfaced() -> None:
     assert "curl" in str(exc.value)
 
 
-def test_freeform_in_scope_runs() -> None:
-    """Free-form ``{"cmd": ...}`` IS accepted (it is confined in-process by the
-    interceptor hook). With ``echo`` in scope, ``echo hi`` runs and is not
-    flagged denied."""
-    r = agent_bridle.invoke("shell", {"cmd": "echo hi"}, ECHO_ONLY)
+def test_freeform_runs_with_explicit_full_authority() -> None:
+    """The safe-subset form can spawn with explicit ambient authority."""
+    r = agent_bridle.invoke("shell", {"cmd": "echo hi"}, FULL_AUTHORITY)
     assert r["exit_code"] == 0, r
     assert "hi" in r["stdout"], r
     # An in-scope free-form run records no denial.
@@ -219,17 +216,12 @@ def test_explicit_all_axes_still_runs_unconfined() -> None:
     r = agent_bridle.invoke(
         "shell",
         {"program": "echo", "args": ["unconfined"]},
-        {
-            "exec": "all",
-            "fs_read": "all",
-            "fs_write": "all",
-            "net": "all",
-            "max_calls": "unlimited",
-            "valid_for_generation": "all",
-        },
+        FULL_AUTHORITY,
     )
     assert r["exit_code"] == 0
     assert "unconfined" in r["stdout"]
+    assert r["sandbox_kind"] == "none"
+    assert r["timed_out"] is False
 
 
 def test_tool_definitions_have_name_and_schema() -> None:

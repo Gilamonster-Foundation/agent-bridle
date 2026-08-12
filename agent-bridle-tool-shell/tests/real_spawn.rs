@@ -58,13 +58,88 @@ async fn real_echo_runs_and_captures_stdout() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "echo", "args": ["hello"]}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
     assert_eq!(out["exit_code"], 0);
     assert_eq!(out["stdout"], "hello\n");
     assert!(out.get("denied").is_none());
+}
+
+/// A production `OsSpawner` must refuse restricted authority when this build has
+/// no native sandbox backend. The marker proves refusal happens before spawn.
+#[cfg(not(any(
+    all(target_os = "linux", feature = "linux-landlock"),
+    all(target_os = "macos", feature = "macos-seatbelt")
+)))]
+#[tokio::test]
+async fn real_no_backend_restricted_authority_refuses_before_spawn() {
+    let marker = unique_temp("no-backend-refusal");
+    let _ = std::fs::remove_file(&marker);
+    let restricted = Caveats {
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "touch", "args": [shell_path(&marker)]}),
+            &ctx(restricted),
+        )
+        .await
+        .expect("backend admission refusal is a structured envelope");
+
+    assert_eq!(
+        out["denied"], true,
+        "restricted authority must fail closed: {out}"
+    );
+    assert_eq!(
+        out["denials"][0]["kind"], "net",
+        "unexpected refusal: {out}"
+    );
+    assert!(
+        !marker.exists(),
+        "the marker proves the real OsSpawner must not have spawned: {out}"
+    );
+}
+
+/// A permitted direct command still must not spawn when its restricted exec
+/// authority has no native backend. This isolates the exec axis: every other
+/// caveat is unrestricted, and the marker proves refusal precedes `OsSpawner`.
+#[cfg(not(any(
+    all(target_os = "linux", feature = "linux-landlock"),
+    all(target_os = "macos", feature = "macos-seatbelt")
+)))]
+#[tokio::test]
+async fn real_no_backend_restricted_exec_refuses_before_spawn() {
+    let marker = unique_temp("no-backend-exec-refusal");
+    let _ = std::fs::remove_file(&marker);
+    let restricted = Caveats {
+        exec: Scope::only(["touch".to_string()]),
+        ..Caveats::top()
+    };
+
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "touch", "args": [shell_path(&marker)]}),
+            &ctx(restricted),
+        )
+        .await
+        .expect("backend admission refusal is a structured envelope");
+
+    assert_eq!(
+        out["denied"], true,
+        "restricted exec must fail closed: {out}"
+    );
+    assert_eq!(
+        out["denials"][0]["kind"], "exec",
+        "unexpected refusal: {out}"
+    );
+    assert!(
+        !marker.exists(),
+        "the marker proves the real OsSpawner must not have spawned: {out}"
+    );
 }
 
 /// #269 / AB-006: a timed-out child is KILLED and reaped — it must not run to
@@ -75,11 +150,8 @@ async fn real_echo_runs_and_captures_stdout() {
 /// sleep elapses DONE never appears (the sleep was SIGKILLed, not merely
 /// un-awaited).
 ///
-/// Runs under real Seatbelt on macOS too (agent-bridle#318): the START marker is
-/// the on-device fix's proof — the confined `/bin/sh` now runs its body because
-/// its `/bin/bash` interpreter variant is on the `process-exec*` allow-list, so
-/// `sleep` actually executes and can be timed out and killed. Previously the
-/// confined shell died at its own variant re-exec and returned immediately.
+/// This process-lifecycle test intentionally uses unrestricted caveats. Native
+/// Seatbelt exec-closure behavior is covered by the dedicated test below.
 #[tokio::test]
 async fn real_timed_out_child_is_killed_and_never_writes_marker() {
     let start = unique_temp("ab006-child-start");
@@ -89,14 +161,10 @@ async fn real_timed_out_child_is_killed_and_never_writes_marker() {
         shell_path(&start),
         shell_path(&done)
     );
-    // Grant every program the script execs (`sh`, `sleep`, `touch`). On macOS the
-    // Seatbelt exec allow-list additionally includes `/bin/bash` (sh's interpreter
-    // variant) automatically — see resolve_exec_targets. `touch` must be granted so
-    // "DONE absent" reflects the KILL, not an exec denial.
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
-            &ctx(exec_only(&["sh", "sleep", "touch"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -106,7 +174,7 @@ async fn real_timed_out_child_is_killed_and_never_writes_marker() {
     // (the exact #318 false-green this guards against).
     assert!(
         start.exists(),
-        "the confined child never started (START marker absent) — a fast-return \
+        "the child never started (START marker absent) — a fast-return \
          masquerading as a timeout, not a real kill"
     );
     // Wait well past the child's 3s sleep; a killed child never reaches DONE.
@@ -136,14 +204,14 @@ async fn real_timed_out_grandchild_is_killed() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
-            &ctx(exec_only(&["sh", "sleep", "touch"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
     assert_eq!(out["timed_out"], true);
     assert!(
         start.exists(),
-        "the confined tree never started (START marker absent) — not a real kill"
+        "the process tree never started (START marker absent) — not a real kill"
     );
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     assert!(
@@ -223,7 +291,7 @@ async fn real_loader_hook_env_vars_are_fenced_out() {
                     "SAFE_VAR": "keep",
                 },
             }),
-            &ctx(exec_only(&["env"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -253,10 +321,7 @@ async fn real_ambient_env_is_not_inherited() {
     // A parent-process (ambient) var not passed as a caller env entry.
     std::env::set_var("AB016_AMBIENT_SECRET", "leak");
     let out = ShellTool::new()
-        .invoke(
-            serde_json::json!({"program": "env"}),
-            &ctx(exec_only(&["env"])),
-        )
+        .invoke(serde_json::json!({"program": "env"}), &ctx(Caveats::top()))
         .await
         .expect("invoke");
     std::env::remove_var("AB016_AMBIENT_SECRET");
@@ -279,7 +344,7 @@ async fn real_output_cap_is_config_driven() {
     let out = ShellTool::with_config(limits)
         .invoke(
             serde_json::json!({"program": "echo", "args": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -301,7 +366,7 @@ async fn real_pipeline_passes_data_between_stages() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "echo hello | cat"}),
-            &ctx(exec_only(&["echo", "cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -315,7 +380,7 @@ async fn real_pipeline_exit_code_is_the_last_stage() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "true | false"}),
-            &ctx(exec_only(&["true", "false"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -328,7 +393,7 @@ async fn real_pipeline_exit_code_is_the_last_stage() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "false | true"}),
-            &ctx(exec_only(&["true", "false"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -341,7 +406,7 @@ async fn real_stderr_and_nonzero_exit_are_captured() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "cat", "args": ["/nonexistent/agent-bridle/path"]}),
-            &ctx(exec_only(&["cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -379,7 +444,7 @@ async fn real_stdout_redirect_truncates_then_appends_a_file() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": format!("echo first > {p}")}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -390,7 +455,7 @@ async fn real_stdout_redirect_truncates_then_appends_a_file() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": format!("echo second >> {p}")}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -409,7 +474,7 @@ async fn real_stdin_redirect_feeds_a_file() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": format!("cat < {p}")}),
-            &ctx(exec_only(&["cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -429,7 +494,7 @@ async fn real_pipeline_with_stdout_redirect_on_last_stage() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": format!("echo piped | cat > {p}")}),
-            &ctx(exec_only(&["echo", "cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -449,7 +514,7 @@ async fn real_and_chain_runs_then_short_circuits() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "true && echo ran"}),
-            &ctx(exec_only(&["true", "echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -460,7 +525,7 @@ async fn real_and_chain_runs_then_short_circuits() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "false && echo nope"}),
-            &ctx(exec_only(&["false", "echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -474,7 +539,7 @@ async fn real_or_fallback_and_semicolon_sequence() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "false || echo fallback"}),
-            &ctx(exec_only(&["false", "echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -484,7 +549,7 @@ async fn real_or_fallback_and_semicolon_sequence() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "echo a ; echo b"}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -505,7 +570,7 @@ async fn real_glob_expands_against_the_filesystem() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "cat *.rs", "cwd": d}),
-            &ctx(exec_only(&["cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -516,7 +581,7 @@ async fn real_glob_expands_against_the_filesystem() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "cat zzz*", "cwd": d}),
-            &ctx(exec_only(&["cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -536,7 +601,7 @@ async fn real_allowlisted_var_expands_from_the_environment() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "echo $HOME"}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -560,7 +625,7 @@ async fn real_env_map_reaches_the_child() {
                 "program": "env",
                 "env": { "AB_ENV_SEAM_PROOF": marker },
             }),
-            &ctx(exec_only(&["env"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -580,7 +645,7 @@ async fn real_mixed_and_quoted_variable_words_expand() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "echo $HOME/sub"}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -590,7 +655,7 @@ async fn real_mixed_and_quoted_variable_words_expand() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "echo \"prefix-$HOME\""}),
-            &ctx(exec_only(&["echo"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -610,7 +675,7 @@ async fn real_stderr_redirect_to_file() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": format!("cat /nonexistent/agent-bridle 2> {p}")}),
-            &ctx(exec_only(&["cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -630,7 +695,7 @@ async fn real_2to1_merges_stderr_into_captured_stdout() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "cat /nonexistent/agent-bridle 2>&1"}),
-            &ctx(exec_only(&["cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -649,7 +714,7 @@ async fn real_2to1_before_a_pipe_feeds_stderr_downstream() {
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"cmd": "cat /nonexistent/agent-bridle 2>&1 | cat"}),
-            &ctx(exec_only(&["cat"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
@@ -1029,47 +1094,47 @@ async fn real_seatbelt_confines_a_spawned_childs_own_read() {
     let _ = std::fs::remove_dir_all(&forbidden);
 }
 
-// The issue #50 "find -exec curl blocked" scenario, end to end: with `net` empty
-// (no egress granted), a permitted program's OWN network connection is denied by
-// the kernel (`(deny network*)`) — egress L2 cannot see, that Landlock cannot
-// gate at all. The envelope honestly reports net=kernel.
+// Restricted Seatbelt net is unsupported until ambient Mach/XPC deputies are
+// faithfully bounded. End to end, CONFINED must refuse before any child starts;
+// direct socket-rule mechanism evidence lives below admission in core.
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 #[tokio::test]
-async fn real_seatbelt_denies_egress_when_net_is_empty() {
+async fn real_seatbelt_restricted_net_refuses_before_spawn() {
     use agent_bridle_core::seatbelt_is_supported;
 
-    if !seatbelt_is_supported() || !std::path::Path::new("/usr/bin/curl").exists() {
-        eprintln!("skipping: sandbox-exec or curl unavailable");
-        return;
-    }
+    assert!(
+        seatbelt_is_supported(),
+        "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
+    );
 
-    // Allow exec of curl, deny ALL network (net: none). fs stays open.
+    let marker = unique_temp("sb-net-refused");
+    let _ = std::fs::remove_file(&marker);
+    // `touch` would create the marker if admission accidentally spawned it.
     let caveats = Caveats {
-        exec: Scope::only(["curl".to_string()]),
+        exec: Scope::only(["touch".to_string()]),
         net: Scope::none(),
         ..Caveats::top()
     };
-    // Literal IP (no DNS); --max-time bounds it. Under net:none the socket is
-    // kernel-denied immediately, so curl exits non-zero without reaching the net.
     let out = ShellTool::new()
         .invoke(
-            serde_json::json!({ "cmd": "curl -sS --max-time 5 http://1.1.1.1/" }),
+            serde_json::json!({ "cmd": format!("touch {}", marker.display()) }),
             &ctx(caveats),
         )
         .await
         .expect("invoke");
 
-    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
     assert_eq!(
-        out["enforcement"]["net"], "kernel",
-        "net:none must report kernel-enforced egress denial: {out}"
+        out["denied"], true,
+        "restricted Seatbelt net must fail closed before spawn: {out}"
     );
-    // curl exits 7 ("couldn't connect") — the socket was kernel-denied. Asserting
-    // exactly 7 (not merely non-zero) keeps this non-vacuous: a timeout (28) or a
-    // child that never launched under a broken profile (65) would not be 7.
     assert_eq!(
-        out["exit_code"], 7,
-        "egress under net:none must be denied at the socket (curl exit 7): {out}"
+        out["denials"][0]["kind"], "net",
+        "the refusal must identify the net axis: {out}"
+    );
+    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
+    assert!(
+        !marker.exists(),
+        "the child must not spawn after the net-floor refusal: {out}"
     );
 }
 

@@ -20,20 +20,27 @@ the wheel.
 ```python
 import agent_bridle
 
-# A grant that authorizes executing ONLY `echo` — nothing else.
-grant = {"exec": {"only": ["echo"]}}
-
-# ALLOWED: `echo` is within the granted `exec` scope, so it is spawned as an
-# external program (after the exec leash admits it) and stdout is captured.
-r = agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, grant)
+# Successful external spawning in the stock wheel requires an explicit ambient
+# grant because the wheel does not enable a native L3 sandbox backend.
+full_authority = {
+    "exec": "all",
+    "fs_read": "all",
+    "fs_write": "all",
+    "net": "all",
+    "max_calls": "unlimited",
+    "valid_for_generation": "all",
+}
+r = agent_bridle.invoke(
+    "shell", {"program": "echo", "args": ["hi"]}, full_authority
+)
 print(r["exit_code"], repr(r["stdout"]))   # -> 0 'hi\n'
 print(r["sandbox_kind"])                    # -> 'none' (default wheel enables no native L3 backend)
 
-# DENIED: `rm` is NOT in the granted `exec` scope. The leash refuses to mint
-# the tool's context, so the destructive command never runs — no prompt
-# hygiene required. The confused-deputy gap is closed structurally.
+# DENIED: restricted external spawns fail closed without a native backend,
+# even when the named program is inside the L2 exec allowlist.
+restricted = {**full_authority, "exec": {"only": ["echo"]}}
 try:
-    agent_bridle.invoke("shell", {"program": "rm", "args": ["-rf", "/tmp/x"]}, grant)
+    agent_bridle.invoke("shell", {"program": "echo", "args": ["held"]}, restricted)
 except agent_bridle.BridleDenied as e:   # subclass of PermissionError
     print("blocked by the leash:", e)
 
@@ -42,19 +49,20 @@ print(agent_bridle.tool_names())          # -> ['shell']
 print(agent_bridle.tool_definitions())    # MCP tools/list schemas
 ```
 
-### The `shell` tool takes argv form, not a `cmd` string
+### The `shell` tool accepts argv and parsed safe-subset forms
 
-The shell tool's arguments are **argv form** — `{"program": ..., "args": [...]}`
-— deliberately, not a free-form `{"cmd": "echo hi"}` string. The `exec` caveat
-gates on the *named program token*, so the program has to be a discrete field the
-leash can check. A `cmd` string would let `echo hi; rm -rf /` slip the leash,
-which is exactly the hole the bridle closes (DESIGN §6).
+The shell tool accepts explicit **argv form** —
+`{"program": ..., "args": [...]}` — and the parsed safe-subset
+`{"cmd": "echo hi"}` compatibility form. The safe-subset parser rejects shell
+control syntax before execution. Both forms pass through L2 authority checks and
+native-backend admission; stock wheels therefore refuse restricted external
+spawns because they ship without a native L3 sandbox backend.
 
 ## API
 
 | Function | Signature | Notes |
 |---|---|---|
-| `invoke` | `invoke(tool: str, args: dict, caveats: dict \| None = None) -> dict` | Dispatch `tool` with `args` under `caveats`. `None` → unconfined (`Caveats::top()`) with a stderr WARNING. Returns the result dict; raises `BridleDenied` on a leash denial or any tool error. |
+| `invoke` | `invoke(tool: str, args: dict, caveats: dict \| None = None) -> dict` | Dispatch `tool` with `args` under `caveats`. `None` means deny-all. Ambient authority must be granted explicitly. Returns the result dict; raises `BridleDenied` on a leash denial or any tool error. |
 | `tool_names` | `tool_names() -> list[str]` | Registered tool names (sorted). |
 | `tool_definitions` | `tool_definitions() -> list[dict]` | One MCP `tools/list` dict (`name` + `inputSchema`) per tool. |
 | `BridleDenied` | exception class | Subclass of `PermissionError`; its message carries the human-readable denial reason. |
@@ -70,8 +78,8 @@ which is exactly the hole the bridle closes (DESIGN §6).
 | `max_calls` | `"unlimited"` or `{"at_most": N}` |
 | `valid_for_generation` | `"all"` or `{"only": [N, …]}` (non-negative integers) |
 
-Any omitted axis defaults to its **top** (unrestricted). This is exactly the
-shape `serde_json::to_value(&Caveats)` produces in Rust.
+Any omitted axis defaults to its **bottom** (deny-all). A full serialized Rust
+`Caveats` value names every axis, so it round-trips without relying on defaults.
 
 > **Interop note.** The `agent_mesh.core.Caveats` *pyclass* (agent-mesh PR #18)
 > exposes a friendlier surface (`fs_read=["/repo"]`, `max_calls=10`, top axes as

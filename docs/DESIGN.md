@@ -155,8 +155,14 @@ Native L3 coverage is deliberately scope-shaped and reported per axis:
 - Linux Landlock confines both filesystem axes, narrows direct `execve`
   (`exec` remains `Interceptor` because of the loader trampoline), and can
   kernel-deny all TCP on ABI-v4 kernels.
-- macOS Seatbelt confines both filesystem axes, restricted exec, and empty or
-  loopback-only network scopes.
+- macOS Seatbelt confines both filesystem axes and restricted exec. For a
+  restricted network scope it emits direct-network restrictions and, for the
+  E4 `net:none` profile, a Mach-lookup floor that closes the demonstrated
+  NSURLSession/`nsurlsessiond` deputy. That is defense in depth, not a faithful
+  network-authority projection: allow-listed and other ambient IPC deputies are
+  not comprehensively certified, so every restricted macOS `net` shape remains
+  `Unknown` and admission refuses it. There is no current `net:none`, loopback,
+  or loopback-proxy support promotion.
 - Windows AppContainer confines filesystem paths, empty or loopback-only
   network scopes, and exec deny-all; non-empty exec allowlists remain
   `Interceptor`.

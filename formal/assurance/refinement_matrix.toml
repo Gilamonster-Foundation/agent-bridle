@@ -33,11 +33,11 @@ residual      = "E1 symlinked-root widening ⇒ Unknown (same-object bind = PR-5
 class         = "bounded"
 
 [fs_read.macos]
-projection    = "SeatbeltSandbox::resolved_authority (sandbox.rs:1690) = from_delegated placeholder"
+projection    = "LEGACY/PARTIAL: from_delegated/verbatim projection; this train does not certify a faithful Seatbelt fs_read projection"
 primitive     = "SBPL (deny file-read*) + (allow file-read-metadata) + re-allow roots — CONTENT-level deny"
-formal_claim  = "within/admit at caveats grain; faithful projection = PR-2/#337 (not yet)"
-native_test   = "agent-bridle-tool-shell/tests/seatbelt_floor_evidence.rs"
-residual      = "ORTHOGONAL: file-read-metadata observability (stat/traverse, never content) — MUST NOT be modeled as content fs_read=Unknown"
+formal_claim  = "within/admit at caveats grain only; faithful applied-authority projection remains pending"
+native_test   = "agent-bridle-core/src/sandbox.rs::fs_read_is_kernel_enforced_outside_scope_denied_inside_allowed (macOS seatbelt_kernel_tests: in-scope content allowed, out-of-scope content denied)"
+residual      = "ORTHOGONAL and UNDISCHARGED: file-read-metadata observability (stat/traverse, never content) has no dedicated native probe — MUST NOT be modeled as content fs_read=Unknown"
 class         = "verbatim"
 
 [fs_read.windows]
@@ -58,10 +58,10 @@ residual      = "E1 writable-symlink root ⇒ Unknown"
 class         = "bounded"
 
 [fs_write.macos]
-projection    = "from_delegated placeholder"
+projection    = "LEGACY/PARTIAL: from_delegated/verbatim projection; this train does not certify a faithful Seatbelt fs_write projection"
 primitive     = "SBPL (deny file-write*) + re-allow roots + device sinks"
-formal_claim  = "within/admit at caveats grain"
-native_test   = "seatbelt_floor_evidence.rs (out-of-fence write denied)"
+formal_claim  = "within/admit at caveats grain only; faithful applied-authority projection remains pending"
+native_test   = "agent-bridle-core/src/sandbox.rs::fs_write_is_kernel_enforced_outside_scope_denied_inside_allowed (macOS seatbelt_kernel_tests: in-scope write allowed, out-of-scope write denied)"
 residual      = "none beyond I15 verbatim"
 class         = "verbatim"
 
@@ -83,10 +83,10 @@ residual      = "ld.so mmap-exec trampoline ⇒ report strength = interceptor (A
 class         = "bounded"
 
 [exec.macos]
-projection    = "from_delegated placeholder"
+projection    = "LEGACY/PARTIAL: from_delegated/verbatim projection; this train does not certify a faithful Seatbelt exec projection"
 primitive     = "SBPL (deny process-exec*) + re-allow granted programs — governs interior execs of ALL descendants"
-formal_claim  = "within/admit at caveats grain; TLA T5 descendant non-escalation"
-native_test   = "seatbelt_floor_evidence.rs (sh→bash closure ⇒ interceptor)"
+formal_claim  = "within/admit at caveats grain; TLA T5 is model-level and the faithful native projection remains pending"
+native_test   = "agent-bridle-tool-shell/tests/seatbelt_floor_evidence.rs::real_seatbelt_exec_floor_downgrades_to_interceptor_for_sh (sh→bash closure ⇒ interceptor)"
 residual      = "sh→bash closure widening ⇒ interceptor not kernel"
 class         = "verbatim"
 
@@ -108,12 +108,12 @@ residual      = "net:none under DEFAULT LandlockOnly (io_uring/UDP open) ⇒ Unk
 class         = "exact"      # for net:none/DenyDirect; else unknown
 
 [net.macos]
-projection    = "from_delegated placeholder"
-primitive     = "SBPL (deny network*); loopback-only = deny + re-allow localhost"
-formal_claim  = "within/admit at caveats grain; faithful projection = PR-2/#337 (E4)"
-native_test   = "agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs (UDP, loopback, AF_UNIX deputy)"
-residual      = "E4: mach-lookup/XPC ambient network deputy under net:none (not modeled); host allowlist inexpressible"
-class         = "verbatim"
+projection    = "All=>Unbounded; every restricted Seatbelt net shape=>Unknown=>refuse. No net:none, loopback, or loopback-proxy authority promotion"
+primitive     = "SBPL direct-network deny; loopback may re-allow localhost; E4 net:none also default-denies Mach lookup and excludes the demonstrated nsurlsessiond service"
+formal_claim  = "Unknown fails closed (L6/T4). The nsurlsessiond close is defense in depth, not a faithful restricted-net projection"
+native_test   = "E4 A/B/A deputy differential: agent-bridle-core/src/sandbox.rs::net_none_mach_floor_has_strict_ambient_closed_ambient_differential; direct-socket inheritance: agent-bridle-core/src/sandbox.rs::net_none_direct_floor_is_inherited_by_a_grandchild; loopback mechanism: agent-bridle-core/src/sandbox.rs::net_loopback_only_permits_loopback_interface_denies_offbox; end-to-end restricted shapes: agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs (refused before spawn)"
+residual      = "ASM-MACOS-DEPUTY UNDISCHARGED: allow-listed and other ambient IPC deputies are not comprehensively certified; ADR 0016 proxy path held"
+class         = "unknown"
 
 [net.windows]
 projection    = "from_delegated placeholder"

@@ -62,7 +62,22 @@ for f in $(grep -oE 'agent-bridle[A-Za-z0-9/._-]+\.rs' "$MAN" | sort -u); do
   else note FAIL "native test file missing: $f"; fail=1; fi
 done
 
-# 5. Release-certification gate. A claim marked status="proved" (release-certified)
+# 5. Exact native test functions. A file-only reference is insufficient for a
+#    security claim: require every `path.rs::function` token to resolve to both a
+#    source file and a function definition in that file.
+for ref in $(grep -oE 'agent-bridle[A-Za-z0-9/._-]+\.rs::[A-Za-z0-9_]+' "$MAN" | sort -u); do
+  file="${ref%%::*}"
+  name="${ref##*::}"
+  if [ ! -f "$REPO/$file" ]; then
+    note FAIL "native test function file missing: $file"; fail=1
+  elif grep -qE "fn[[:space:]]+$name([[:space:]]|\()" "$REPO/$file"; then
+    note PASS "native fn $name ($file)"
+  else
+    note FAIL "native test function missing: $ref"; fail=1
+  fi
+done
+
+# 6. Release-certification gate. A claim marked status="proved" (release-certified)
 #    must NOT depend on pending/undischarged/missing/placeholder evidence. Optional
 #    `--rc <SHA>`: additionally require every certified claim that cites native
 #    evidence to pin impl_sha == the RC SHA (the artifact actually tested).
@@ -85,7 +100,7 @@ cert_out="$(awk -v rc="$RC_SHA" '
   /^id[ \t]*=/           { id=v() }
   /^status[ \t]*=/       { status=v() }
   /^premise[ \t]*=/      { premise=v() }
-  /^native_test[ \t]*=/  { native=$0 }
+  /^native_test(_fn)?[ \t]*=/ { native=native " " $0 }
   /^evidence_cid[ \t]*=/ { cid=v() }
   /^impl_sha[ \t]*=/     { impl=v() }
   END { flush() }

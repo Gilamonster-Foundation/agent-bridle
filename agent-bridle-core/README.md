@@ -25,7 +25,7 @@ construction.
 | Feature | Default | Pulls | Enables |
 |---|---|---|---|
 | `linux-landlock` | off | `landlock` (Linux only) | filesystem confinement, direct-exec narrowing, and deny-all TCP on ABI-v4 kernels |
-| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement and deny-all or loopback-only network policy |
+| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement; expressible restricted-net profiles add direct-network rules and `net:none` also adds a Mach floor, but all remain `Unknown` and are refused |
 | `windows-appcontainer` | off | companion `agent-bridle-aclaunch.exe` | AppContainer filesystem DACLs, deny-all or loopback-only network policy, and exec deny-all |
 | `os-sandbox` | off | target-specific backend deps | convenience feature for every native OS sandbox backend |
 | `verifier-ed25519` | off | `ed25519-dalek` | production `Ed25519Verifier` for step-up discharges |
@@ -35,9 +35,16 @@ construction.
 Coverage is scope-shaped and is surfaced per axis. Landlock's loader-trampoline
 residual keeps `exec` at interceptor strength; Seatbelt confines restricted
 exec; AppContainer reports exec as kernel only for deny-all. General hostname
-network allowlists are not directly expressible by the native kernels and keep
-their documented proxy/advisory posture. A restricted filesystem scope fails
-closed when no native backend can enforce it.
+network allowlists are not directly expressible by the native kernels. Their
+support is backend-specific, and the macOS proxy path is currently held. A
+restricted filesystem scope fails closed when no native backend can enforce it.
+
+On macOS, the E4 `net:none` Mach floor closes the demonstrated NSURLSession /
+`nsurlsessiond` deputy as defense in depth. It does not establish deputy-complete
+no-egress: allow-listed and other ambient IPC services have not been
+comprehensively certified. Consequently every restricted Seatbelt `net` scope,
+including `net:none`, loopback, and the former loopback-proxy shape, resolves
+`Unknown` and is refused by admission.
 
 On Windows, AppContainer is attached at process creation by the wired
 `agent-bridle-aclaunch.exe` wrapper rather than by `Sandbox::apply` on the

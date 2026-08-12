@@ -32,10 +32,14 @@ linux-landlock = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 # Real, kernel-enforced Seatbelt profile (macOS only). Enables the
 # `SeatbeltSandbox` (see src/sandbox.rs), which confines a spawned program via
 # the `sandbox-exec(1)` wrapper — no extra dependency and no FFI (core forbids
-# `unsafe`), so the feature is empty here. Confines both filesystem axes,
-# restricted exec, and empty/loopback-only net scopes. Without it/off-macOS,
-# another native backend may apply or the honest NoopSandbox reports
-# SandboxKind::None. ADR 0006/0009/0014/0015.
+# `unsafe`), so the feature is empty here. It confines both filesystem axes and
+# restricted exec. Expressible restricted-net profiles add direct-network rules;
+# `net:none` additionally adds the E4 Mach-lookup floor. Every restricted macOS
+# net scope still resolves Unknown and admission refuses it until ambient and
+# allow-listed IPC deputies have a deputy-complete native proof. The demonstrated
+# nsurlsessiond close is defense in depth, not a net:none/loopback/proxy support
+# promotion. Without this feature/off-macOS, another native backend may apply or
+# the honest NoopSandbox reports SandboxKind::None. ADR 0006/0009/0014/0015/0016.
 macos-seatbelt = []
 # Windows AppContainer process sandbox (Windows only). AppContainer is applied
 # by `agent-bridle-aclaunch` at process creation via SECURITY_CAPABILITIES.

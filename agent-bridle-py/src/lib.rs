@@ -5,16 +5,22 @@
 //!
 //! ```python
 //! import agent_bridle
-//! # The `shell` tool takes argv form (program + args), NOT a free-form
-//! # `cmd` string — that is the deliberate brush exec-bypass mitigation
-//! # (DESIGN §6): the leash gates on the named program token.
+//! full_authority = {
+//!     "exec": "all", "fs_read": "all", "fs_write": "all", "net": "all",
+//!     "max_calls": "unlimited", "valid_for_generation": "all",
+//! }
 //! r = agent_bridle.invoke(
 //!     "shell",
 //!     {"program": "echo", "args": ["hi"]},
-//!     {"exec": {"only": ["echo"]}},
+//!     full_authority,
 //! )
 //! print(r["exit_code"], r["stdout"])  # -> 0 'hi\n'
 //! ```
+//!
+//! The shell accepts explicit argv form and a parsed safe-subset `cmd` form.
+//! Both pass through the L2 authority gate and native-backend admission. The
+//! stock wheel has no native sandbox backend, so it refuses restricted external
+//! spawns even when the named program is present in the `exec` allowlist.
 //!
 //! The leash is the same one the Rust hosts use: every dispatch flows through
 //! the registry's [`Gate`](agent_bridle::Gate), which mints the tool's
@@ -92,8 +98,8 @@ fn shared_registry() -> &'static Registry {
 /// Dispatch `tool` with `args` through the registry's leash.
 ///
 /// `caveats` is the granted authority as a dict in the agent-mesh `Caveats`
-/// serde shape (see the module docs). `None` → unconfined `Caveats::top()` with
-/// a stderr WARNING.
+/// serde shape (see the module docs). `None` selects deny-all authority; callers
+/// that intentionally need ambient authority must grant every axis explicitly.
 ///
 /// Returns the tool's result as a Python `dict`. A leash denial (out-of-scope
 /// `exec`/`fs`/`net`, exhausted `max_calls`, wrong generation) or any tool

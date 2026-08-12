@@ -93,7 +93,7 @@ async fn registry_dispatch_observes_only_admitted_captured_output() {
             ShellTool::new().with_output_observer(observer.clone()),
         ))
         .build();
-    let grant = registry.mint_grant(exec_only(&["echo"]));
+    let grant = registry.mint_grant(Caveats::top());
 
     let out = registry
         .dispatch(
@@ -110,11 +110,12 @@ async fn registry_dispatch_observes_only_admitted_captured_output() {
     assert_eq!(out["stdout"], "observed\n");
 
     observer.clear();
+    let restricted_grant = registry.mint_grant(exec_only(&["echo"]));
     let denied = registry
         .dispatch(
             "shell",
             serde_json::json!({"program": "cat", "args": ["/dev/null"]}),
-            &grant,
+            &restricted_grant,
         )
         .await
         .expect("an in-tool leash refusal is a structured envelope");
@@ -142,7 +143,7 @@ async fn observer_is_bounded_by_the_configured_output_cap() {
         ))
         .build();
 
-    let grant = registry.mint_grant(exec_only(&["echo"]));
+    let grant = registry.mint_grant(Caveats::top());
     let out = registry
         .dispatch(
             "shell",
@@ -176,7 +177,7 @@ async fn observer_panic_does_not_change_the_tool_result() {
         ))
         .build();
 
-    let grant = registry.mint_grant(exec_only(&["echo"]));
+    let grant = registry.mint_grant(Caveats::top());
     let out = registry
         .dispatch(
             "shell",
@@ -201,7 +202,7 @@ async fn concurrent_dispatches_have_distinct_invocation_ids() {
             ShellTool::new().with_output_observer(observer.clone()),
         ))
         .build();
-    let grant = registry.mint_grant(exec_only(&["echo"]));
+    let grant = registry.mint_grant(Caveats::top());
 
     let (alpha, beta) = tokio::join!(
         registry.dispatch(

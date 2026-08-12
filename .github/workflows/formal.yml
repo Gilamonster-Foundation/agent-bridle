@@ -16,12 +16,30 @@ on:
   push:
     paths:
       - "formal/**"
+      # These implementation and native-evidence surfaces are described by the
+      # assurance manifest/refinement matrix, so changing them must run the gate.
+      - "agent-bridle-core/src/sandbox.rs"
+      - "agent-bridle-core/src/spawn.rs"
+      - "agent-bridle-core/src/report.rs"
+      - "agent-bridle-core/src/net_proxy.rs"
+      - "agent-bridle-tool-shell/src/shell_tool.rs"
+      - "agent-bridle-tool-shell/tests/real_spawn.rs"
+      - "agent-bridle-tool-shell/tests/seatbelt_floor_evidence.rs"
+      - "agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs"
       - ".github/workflows/formal.yml"
       - ".githooks/pre-push"
       - "justfile"
   pull_request:
     paths:
       - "formal/**"
+      - "agent-bridle-core/src/sandbox.rs"
+      - "agent-bridle-core/src/spawn.rs"
+      - "agent-bridle-core/src/report.rs"
+      - "agent-bridle-core/src/net_proxy.rs"
+      - "agent-bridle-tool-shell/src/shell_tool.rs"
+      - "agent-bridle-tool-shell/tests/real_spawn.rs"
+      - "agent-bridle-tool-shell/tests/seatbelt_floor_evidence.rs"
+      - "agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs"
       - ".github/workflows/formal.yml"
       - ".githooks/pre-push"
       - "justfile"

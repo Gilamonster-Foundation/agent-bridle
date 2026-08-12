@@ -27,8 +27,9 @@ fn tool(child_network: ChildNetworkPolicy) -> ShellTool {
     })
 }
 
-/// Mint a context for `tool` granting exec of `execs` and denying ALL network
-/// (`net: none`, which is what arms `DenyDirect`).
+/// Mint a context for `tool` granting exec of `execs` and denying ALL network.
+/// `net: none` arms `DenyDirect`; under `LandlockOnly` it is intentionally
+/// inadmissible because Landlock cannot conservatively bound direct sockets.
 fn ctx(tool: &ShellTool, execs: &[&str]) -> ToolContext {
     let granted = Caveats {
         exec: Scope::only(execs.iter().map(|s| (*s).to_string())),
@@ -51,8 +52,8 @@ fn skip() -> bool {
 }
 
 /// The child CREATES an AF_INET datagram socket. Under DenyDirect the seccomp
-/// filter EACCES-denies `socket()` → Python raises `PermissionError` → exit 1;
-/// under LandlockOnly the socket is created (Landlock can't filter UDP) → exit 0.
+/// filter EACCES-denies `socket()` and Python exits non-zero. Under LandlockOnly,
+/// production admission refuses `net: none` before this probe can execute.
 const PROBE: &str =
     r#"python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)""#;
 
@@ -102,21 +103,26 @@ async fn shell_tool_deny_direct_denies_a_forked_descendants_socket() {
 }
 
 #[tokio::test]
-async fn shell_tool_landlock_only_default_allows_the_childs_socket() {
+async fn shell_tool_landlock_only_refuses_unenforceable_network_restriction() {
     if skip() {
         return;
     }
-    // Default policy == LandlockOnly: the control. The same probe SUCCEEDS,
-    // proving both that the leak DenyDirect closes is real AND that ordinary
-    // behavior is unchanged for callers who don't opt in.
+    // Default policy == LandlockOnly cannot conservatively bound the child's
+    // direct network authority. The restricted request must fail before spawn,
+    // rather than silently running with UDP access.
     let t = tool(ChildNetworkPolicy::LandlockOnly);
     let out = t
         .invoke(serde_json::json!({ "cmd": PROBE }), &ctx(&t, &["python3"]))
         .await
         .expect("invoke");
+    assert_eq!(out["denied"], true, "restricted net must be refused: {out}");
     assert_eq!(
-        out["exit_code"], 0,
-        "LandlockOnly (default) must leave the child's UDP socket creation open: {out}"
+        out["denials"][0]["kind"], "net",
+        "refusal must identify the unresolved network axis: {out}"
+    );
+    assert!(
+        out.get("exit_code").is_none(),
+        "the socket probe must not have spawned: {out}"
     );
 }
 

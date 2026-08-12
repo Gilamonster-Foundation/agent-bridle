@@ -1,20 +1,13 @@
-//! macOS Seatbelt **real-resource** network evidence (#317 Blocker 2 grounding).
+//! macOS Seatbelt restricted-network fail-closed evidence.
 //!
-//! These are NATIVE-ENFORCEMENT proofs, not policy/unit assertions: each spawns a
-//! real confined child under real `/usr/bin/sandbox-exec` and adversarially
-//! attempts to open sockets, with parent-side listeners and positive controls so
-//! a connection *failure* cannot masquerade as a sandbox *denial*. They ground
-//! the classifications `enforcement_report` makes for Seatbelt:
+//! Direct `sandbox-exec` mechanism probes live below admission in core and remain
+//! useful evidence about the child's own sockets. These tests exercise the
+//! end-to-end `ShellTool` path instead: because ambient Mach/XPC authority is not
+//! faithfully bounded, every restricted Seatbelt net shape reports Advisory and
+//! is refused before the probe process can spawn.
 //!
-//! * `net:none`      → Kernel: TCP, UDP, loopback, and pathname AF_UNIX all
-//!   kernel-DENIED (`(deny network*)`), proven against live parent listeners.
-//! * loopback-only   → Kernel: the loopback listener is REACHABLE while off-box
-//!   egress stays DENIED — the exact ADR 0015 fence.
-//! * remote allowlist → Advisory (below Kernel): SBPL cannot name a general host,
-//!   so the witness is honestly NOT Kernel and CONFINED would refuse before spawn.
-//!
-//! Every enforcing case pins `sandbox_kind == "seatbelt"` so a denial is the real
-//! envelope, never command-not-found or a silent downgrade.
+//! Parent-side listeners make an accidental spawn observable; structured denial
+//! envelopes must name `net`, report `advisory`, and leave probe stdout empty.
 #![cfg(all(target_os = "macos", feature = "macos-seatbelt", feature = "shell"))]
 
 use std::io::{Read, Write};
@@ -88,17 +81,19 @@ fn spawn_loopback_tcp() -> (u16, std::thread::JoinHandle<()>) {
     (port, handle)
 }
 
-fn skip() -> bool {
-    if !seatbelt_is_supported() || !std::path::Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: sandbox-exec or python3 unavailable");
-        return true;
-    }
-    false
+fn require_prerequisites() {
+    assert!(
+        seatbelt_is_supported(),
+        "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
+    );
+    assert!(
+        std::path::Path::new("/usr/bin/python3").exists(),
+        "macOS Seatbelt evidence requires /usr/bin/python3"
+    );
 }
 
-/// Run the probe under `caveats` and return (sandbox_kind, net_enforcement,
-/// stdout). Uses the safe-subset ShellTool, which engages Seatbelt when a
-/// governed axis is restricted.
+/// Attempt the probe through the end-to-end ShellTool path. Restricted Seatbelt
+/// net must be refused by admission before this child command starts.
 async fn run_probe(
     caveats: Caveats,
     probe: &std::path::Path,
@@ -127,41 +122,33 @@ fn net_none() -> Caveats {
 
 #[tokio::test]
 async fn seatbelt_net_none_denies_udp() {
-    if skip() {
-        return;
-    }
+    require_prerequisites();
     let probe = write_probe();
     let out = run_probe(net_none(), &probe, "udp", "1.1.1.1:53").await;
-    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
-    assert_eq!(out["enforcement"]["net"], "kernel", "{out}");
-    assert!(
-        out["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("DENIED"),
-        "UDP sendto under net:none must be kernel-denied: {out}"
+    assert_eq!(
+        out["denied"], true,
+        "net:none must refuse before spawn: {out}"
     );
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
+    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
+    assert_eq!(out["stdout"].as_str().unwrap_or_default(), "", "{out}");
     let _ = std::fs::remove_file(&probe);
 }
 
 #[tokio::test]
 async fn seatbelt_net_none_denies_loopback_tcp_against_a_live_listener() {
-    if skip() {
-        return;
-    }
+    require_prerequisites();
     let probe = write_probe();
     // A REAL listener is accepting on this port: a refusal is therefore the
     // sandbox, not a missing server (the positive control is the live socket).
     let (port, handle) = spawn_loopback_tcp();
     let out = run_probe(net_none(), &probe, "tcp", &format!("127.0.0.1:{port}")).await;
-    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
-    assert!(
-        out["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("DENIED"),
-        "loopback TCP to a LIVE listener under net:none must be kernel-denied: {out}"
+    assert_eq!(
+        out["denied"], true,
+        "net:none must refuse before spawn: {out}"
     );
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
+    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
     // Unblock the listener (nothing connected) by connecting from the parent.
     let _ = std::net::TcpStream::connect(("127.0.0.1", port));
     let _ = handle.join();
@@ -170,9 +157,7 @@ async fn seatbelt_net_none_denies_loopback_tcp_against_a_live_listener() {
 
 #[tokio::test]
 async fn seatbelt_net_none_denies_pathname_af_unix_deputy() {
-    if skip() {
-        return;
-    }
+    require_prerequisites();
     let probe = write_probe();
     // A host deputy on a PATHNAME AF_UNIX socket — the Linux residual, repeated.
     // On macOS `(deny network*)` governs AF_UNIX connect itself (stronger than
@@ -189,14 +174,12 @@ async fn seatbelt_net_none_denies_pathname_af_unix_deputy() {
         let _ = sock_for_thread;
     });
     let out = run_probe(net_none(), &probe, "unix", &sock.to_string_lossy()).await;
-    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
-    assert!(
-        out["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("DENIED"),
-        "pathname AF_UNIX connect under net:none must be kernel-denied: {out}"
+    assert_eq!(
+        out["denied"], true,
+        "net:none must refuse before spawn: {out}"
     );
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
+    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
     // Unblock the deputy thread.
     if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
         let mut buf = [0u8; 8];
@@ -211,33 +194,30 @@ async fn seatbelt_net_none_denies_pathname_af_unix_deputy() {
 
 #[tokio::test]
 async fn seatbelt_loopback_only_allows_loopback_but_denies_offbox() {
-    if skip() {
-        return;
-    }
+    require_prerequisites();
     let probe = write_probe();
-    // The FULL loopback interface (`localhost` = 127.0.0.1 AND ::1) is an EXACT
-    // Kernel witness — the Seatbelt localhost fence denotes exactly this set.
+    // Even the full loopback interface remains unsupported at admission while
+    // ambient deputy authority is unbounded.
     let loopback_only = Caveats {
         net: Scope::only(["localhost".to_string()]),
         ..Caveats::top()
     };
 
-    // Scope-fidelity: a SINGLE-address loopback grant (127.0.0.1 only) is the same
-    // coarse kernel fence but strictly narrower than what it permits (::1 is also
-    // allowed), so it is reported honestly BELOW Kernel (advisory) — a CONFINED
-    // floor would refuse it rather than admit an over-broad fence as exact.
+    // A single-address loopback grant is likewise Advisory and refused.
     let single = Caveats {
         net: Scope::only(["127.0.0.1".to_string()]),
         ..Caveats::top()
     };
     let single_out = run_probe(single, &probe, "tcp", "1.1.1.1:80").await;
-    assert_eq!(single_out["sandbox_kind"], "seatbelt", "{single_out}");
+    assert_eq!(single_out["denied"], true, "{single_out}");
+    assert_eq!(single_out["denials"][0]["kind"], "net", "{single_out}");
     assert_eq!(
         single_out["enforcement"]["net"], "advisory",
-        "a single-address loopback grant widens to the interface → reported below Kernel: {single_out}"
+        "every restricted Seatbelt net shape is Advisory: {single_out}"
     );
 
-    // (a) loopback to a LIVE listener SUCCEEDS — the ADR 0015 loopback re-allow.
+    // A live loopback listener must not be reached because admission refuses
+    // before the probe child starts.
     let (port, handle) = spawn_loopback_tcp();
     let ok = run_probe(
         loopback_only.clone(),
@@ -246,28 +226,20 @@ async fn seatbelt_loopback_only_allows_loopback_but_denies_offbox() {
         &format!("127.0.0.1:{port}"),
     )
     .await;
-    assert_eq!(ok["sandbox_kind"], "seatbelt", "{ok}");
     assert_eq!(
-        ok["enforcement"]["net"], "kernel",
-        "loopback-only is a kernel fence: {ok}"
+        ok["denied"], true,
+        "full loopback must refuse before spawn: {ok}"
     );
-    assert!(
-        ok["stdout"].as_str().unwrap_or_default().contains("OK"),
-        "granted loopback must connect to a live listener: {ok}"
-    );
+    assert_eq!(ok["denials"][0]["kind"], "net", "{ok}");
+    assert_eq!(ok["enforcement"]["net"], "advisory", "{ok}");
     let _ = std::net::TcpStream::connect(("127.0.0.1", port));
     let _ = handle.join();
 
-    // (b) off-box egress under the SAME loopback-only fence is DENIED.
+    // Off-box use of the same restricted grant is refused at the same boundary.
     let denied = run_probe(loopback_only, &probe, "tcp", "1.1.1.1:80").await;
-    assert_eq!(denied["sandbox_kind"], "seatbelt", "{denied}");
-    assert!(
-        denied["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("DENIED"),
-        "off-box TCP under a loopback-only fence must be kernel-denied: {denied}"
-    );
+    assert_eq!(denied["denied"], true, "{denied}");
+    assert_eq!(denied["denials"][0]["kind"], "net", "{denied}");
+    assert_eq!(denied["enforcement"]["net"], "advisory", "{denied}");
     let _ = std::fs::remove_file(&probe);
 }
 
@@ -275,22 +247,21 @@ async fn seatbelt_loopback_only_allows_loopback_but_denies_offbox() {
 
 #[tokio::test]
 async fn seatbelt_general_remote_allowlist_is_not_kernel() {
-    if skip() {
-        return;
-    }
+    require_prerequisites();
     // A general remote host is inexpressible in SBPL, so Bridle must NOT claim a
-    // Kernel net witness for it — CONFINED would then refuse before spawn rather
-    // than run under an over-claimed fence. Assert the envelope's net axis is not
-    // "kernel" (it is advisory: no wrapper engages for a bare remote allowlist).
+    // Kernel net witness for it — CONFINED refuses before spawn rather than
+    // running under an over-claimed fence.
     let probe = write_probe();
     let remote = Caveats {
         net: Scope::only(["example.com".to_string()]),
         ..Caveats::top()
     };
     let out = run_probe(remote, &probe, "udp", "1.1.1.1:53").await;
-    assert_ne!(
-        out["enforcement"]["net"], "kernel",
-        "a general remote allowlist must NOT be reported as a Kernel net witness: {out}"
+    assert_eq!(
+        out["denied"], true,
+        "remote net must refuse before spawn: {out}"
     );
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
+    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
     let _ = std::fs::remove_file(&probe);
 }
