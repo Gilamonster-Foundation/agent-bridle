@@ -81,6 +81,11 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 async-trait = { workspace = true }
 agent-mesh-protocol = { workspace = true }
+# Runtime authority/evidence provenance (ASM-CID): the typed content-addressed
+# identity of the admitted fence, verified at the admit→apply handoff. This is the
+# SAME machinery agent-mesh-protocol uses for AuthorityId/GrantId — not a parallel
+# hash format. Already in the lockfile (transitive via agent-mesh-protocol).
+content-addressable = "0.1.0"
 
 # Optional: the production `Ed25519Verifier`, gated by `verifier-ed25519`. NOT in
 # the default build — core stays lean (`cargo build` with no features does not

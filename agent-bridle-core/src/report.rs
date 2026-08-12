@@ -43,7 +43,7 @@ use crate::{Caveats, ChildNetworkPolicy, SandboxKind, Scope};
 /// caller that has not stated a stronger one can never *over*-claim. A spawn site
 /// that installs a stronger mechanism passes it explicitly (via
 /// [`ConfinementMechanism::new`]) so the report matches the child's real boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfinementMechanism {
     kind: SandboxKind,
     child_network: ChildNetworkPolicy,

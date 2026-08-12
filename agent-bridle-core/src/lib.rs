@@ -54,7 +54,7 @@ mod step_up;
 mod tool;
 mod unbridle;
 
-pub use admitted::{AdmittedFence, BackendProjection, RuntimeClosure};
+pub use admitted::{AdmittedFence, AdmittedFenceId, BackendProjection, RuntimeClosure};
 pub use config::{
     default_env_denylist, default_exec_path, fence_env, BackendToggles, BridleConfig, BridleMode,
     ChildNetworkPolicy, GatePolicy, HostMatch, LimitsPolicy, NetDefault, NetPolicy, NetRule,

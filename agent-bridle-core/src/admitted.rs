@@ -28,6 +28,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use content_addressable::{ContentAddressable, ContentError, ContentId};
+
 use crate::provenance::{
     admit, AdmissionDecision, ResolvedAuthority, ResolvedScope, ScopeRelation,
 };
@@ -158,6 +160,55 @@ pub struct BackendProjection {
 pub struct AdmittedFence {
     mechanism: ConfinementMechanism,
     mechanism_caveats: Caveats,
+    /// The content-addressed identity of this fence (ASM-CID). Computed ONCE at
+    /// admission over the canonical `(mechanism_caveats, mechanism)` body; the
+    /// admit→apply handoff re-derives it from the caveats actually being applied
+    /// and refuses on mismatch. This makes #340's T7 a RUNTIME property, not just
+    /// `Cid(x)=x` in the model: a re-derivation between admit and apply (the #317
+    /// class of bug) yields a different CID and cannot hide.
+    fence_id: AdmittedFenceId,
+}
+
+/// The typed content-addressed identity of an [`AdmittedFence`] — a BLAKE3 CIDv1
+/// over its canonical body, using the SAME `content-addressable` machinery
+/// `agent-mesh-protocol` uses for `AuthorityId`/`GrantId` (not a parallel hash).
+/// A distinct newtype so a stray `AdmittedFenceId(grant_id.0)` will not compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedFenceId(pub ContentId);
+
+/// The canonical, serializable body an [`AdmittedFenceId`] is computed over: the
+/// authority actually admitted plus the governing mechanism. The CID is a
+/// function of these bytes alone (equal fences ⇒ equal CID).
+#[derive(serde::Serialize)]
+struct FenceBody<'a> {
+    mechanism_caveats: &'a Caveats,
+    mechanism: ConfinementMechanism,
+}
+
+impl ContentAddressable for FenceBody<'_> {
+    fn canonical_form(&self) -> Result<Vec<u8>, ContentError> {
+        content_addressable::canonical::to_canonical_dagcbor(self)
+    }
+}
+
+/// Compute the content-addressed identity of a fence body. Fail-closed: an
+/// un-encodable body refuses admission rather than admitting an un-identifiable
+/// fence.
+fn compute_fence_id(
+    mechanism_caveats: &Caveats,
+    mechanism: ConfinementMechanism,
+) -> ToolResult<AdmittedFenceId> {
+    FenceBody {
+        mechanism_caveats,
+        mechanism,
+    }
+    .content_id()
+    .map(AdmittedFenceId)
+    .map_err(|error| {
+        ToolError::denied(format!(
+            "cannot content-address the admitted fence: {error}"
+        ))
+    })
 }
 
 impl AdmittedFence {
@@ -252,9 +303,14 @@ impl AdmittedFence {
             )));
         }
 
+        // ASM-CID: stamp the admitted fence with its content-addressed identity,
+        // computed over the ONE derivation above. Fail-closed if it cannot encode.
+        let fence_id = compute_fence_id(&mechanism_caveats, mechanism)?;
+
         Ok(Self {
             mechanism,
             mechanism_caveats,
+            fence_id,
         })
     }
 
@@ -268,6 +324,35 @@ impl AdmittedFence {
     #[must_use]
     pub fn mechanism(&self) -> ConfinementMechanism {
         self.mechanism
+    }
+
+    /// The content-addressed identity of this fence (ASM-CID) — the runtime
+    /// witness of #340's T7. Callers can bind it into an `ExecutionResult` /
+    /// evidence record so a downstream artifact references the exact fence.
+    #[must_use]
+    pub fn fence_id(&self) -> &AdmittedFenceId {
+        &self.fence_id
+    }
+
+    /// Verify that the caveats about to be APPLIED recompute to the admitted
+    /// fence's CID (L2 non-equivocation, at runtime). The spawn path applies
+    /// [`Self::mechanism_caveats`] — the same object admitted — so this holds by
+    /// construction today; it is a cryptographic backstop that a future
+    /// re-derivation between admit and apply (the #317 bug) cannot slip past.
+    ///
+    /// # Errors
+    /// [`ToolError::Denied`] if the applied caveats do not content-address to the
+    /// admitted fence id (a substitution/widening between admit and apply).
+    pub fn verify_applied(&self, applied: &Caveats) -> ToolResult<()> {
+        let recomputed = compute_fence_id(applied, self.mechanism)?;
+        if recomputed == self.fence_id {
+            Ok(())
+        } else {
+            Err(ToolError::denied(
+                "refusing to spawn: the applied fence caveats do not recompute to the admitted \
+                 fence CID (L2 non-equivocation: a re-derivation between admit and apply)",
+            ))
+        }
     }
 }
 
@@ -316,6 +401,66 @@ mod tests {
             resolved: ResolvedAuthority::from_delegated(caveats),
             runtime_closure: empty_closure(),
         }
+    }
+
+    // ── ASM-CID: the admitted fence carries a content-addressed identity, and the
+    //    admit→apply handoff verifies against it. (Grounds #340/T7 at runtime.) ──
+
+    fn admit_ok(delegated: &Caveats) -> AdmittedFence {
+        AdmittedFence::admit(
+            delegated,
+            empty_closure_ledger(),
+            mechanism_none(),
+            advisory_floor(),
+            identity_projection,
+        )
+        .expect("advisory floor + identity projection admits")
+    }
+
+    fn empty_closure_ledger() -> RuntimeClosure {
+        RuntimeClosure::empty()
+    }
+
+    #[test]
+    fn fence_id_is_deterministic_and_distinct() {
+        let a1 = admit_ok(&exec_only(&["/bin/sh"]));
+        let a2 = admit_ok(&exec_only(&["/bin/sh"]));
+        let b = admit_ok(&exec_only(&["/bin/sh", "/bin/bash"]));
+        // Equal fences ⇒ equal CID; different admitted authority ⇒ different CID.
+        assert_eq!(
+            a1.fence_id(),
+            a2.fence_id(),
+            "same fence must content-address equally"
+        );
+        assert_ne!(
+            a1.fence_id(),
+            b.fence_id(),
+            "a widened exec set is a different fence CID"
+        );
+    }
+
+    #[test]
+    fn verify_applied_accepts_the_admitted_caveats() {
+        let admitted = admit_ok(&exec_only(&["/bin/sh"]));
+        // The spawn path applies exactly the admitted caveats — must verify.
+        admitted
+            .verify_applied(admitted.mechanism_caveats())
+            .expect("applying the admitted caveats must recompute to the admitted CID");
+    }
+
+    #[test]
+    fn verify_applied_rejects_a_substituted_widened_fence() {
+        // The #317 class of bug: admission analyzed `{sh}` but apply is handed a
+        // WIDER `{sh, bash}`. The CID mismatch must refuse fail-closed.
+        let admitted = admit_ok(&exec_only(&["/bin/sh"]));
+        let widened = exec_only(&["/bin/sh", "/bin/bash"]);
+        let err = admitted
+            .verify_applied(&widened)
+            .expect_err("a re-derived wider fence must be refused on CID mismatch");
+        assert!(
+            matches!(err, ToolError::Denied { .. }),
+            "CID mismatch between admit and apply must be a fail-closed denial"
+        );
     }
 
     /// A faithful projector that DECLARES a folded trusted-worker exec entry in
