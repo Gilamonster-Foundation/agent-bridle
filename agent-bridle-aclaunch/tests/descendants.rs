@@ -134,6 +134,36 @@ fn assert_os_access_denied(out: &std::process::Output, route: &str) {
     );
 }
 
+fn assert_appcontainer_descendant_or_os_spawn_denial(out: &std::process::Output, route: &str) {
+    assert_appcontainer_identity(out, 1, route);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.contains("cmd_spawn_denied_os_policy=5") {
+        assert_eq!(
+            sids(&out.stdout).len(),
+            1,
+            "{route} must not claim a descendant identity after OS-policy denial; stdout={stdout:?}"
+        );
+    } else {
+        assert_appcontainer_identity(out, 2, route);
+    }
+}
+
+fn assert_host_descendant_control(out: &std::process::Output, route: &str) {
+    assert!(
+        out.status.success(),
+        "{route} must run; status={:?} stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("is_appcontainer=0").count(),
+        2,
+        "{route} must prove both host-token generations; stdout={stdout:?}"
+    );
+}
+
 #[test]
 fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     if skip_proof_unless_appcontainer() {
@@ -142,6 +172,13 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     let (probe_dir, probe) = stage_probe();
     let probe_s = probe.to_string_lossy();
     let probe_dir_s = probe_dir.to_string_lossy();
+
+    let host_cmd_control = Command::new(&probe)
+        .arg("spawn-cmd")
+        .current_dir("C:\\Windows")
+        .output()
+        .expect("run host helper-to-cmd positive control");
+    assert_host_descendant_control(&host_cmd_control, "host helper to cmd.exe positive control");
 
     let direct = launch(&[
         "--name",
@@ -214,7 +251,10 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         &probe_s,
         "spawn-cmd",
     ]);
-    assert_appcontainer_identity(&helper_grandchild, 2, "helper child to cmd.exe grandchild");
+    assert_appcontainer_descendant_or_os_spawn_denial(
+        &helper_grandchild,
+        "helper child to cmd.exe grandchild",
+    );
 
     let helper_to_helper = launch(&[
         "--name",

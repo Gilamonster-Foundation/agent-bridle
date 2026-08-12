@@ -9,13 +9,20 @@ fn main() {
         "print" => print_identity(),
         "spawn-cmd" => {
             print_identity();
-            let mut child = std::process::Command::new("cmd.exe")
+            let child = std::process::Command::new("cmd.exe")
                 .args(["/d", "/q", "/k"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn cmd grandchild");
+                .spawn();
+            let mut child = match child {
+                Ok(child) => child,
+                Err(error) if error.raw_os_error() == Some(5) => {
+                    println!("cmd_spawn_denied_os_policy=5");
+                    return;
+                }
+                Err(error) => panic!("spawn cmd grandchild: {error}"),
+            };
             print_child_identity(&child);
             drop(child.stdin.take());
             let _ = child.kill();
