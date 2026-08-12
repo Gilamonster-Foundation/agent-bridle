@@ -39,6 +39,18 @@ fn ctx(tool: &ShellTool, execs: &[&str]) -> ToolContext {
     Gate::new(0).authorize(tool, &granted).expect("authorize")
 }
 
+/// Mint a context granting exec + AMBIENT network (`net: All`). No `net:none`, so
+/// `DenyDirect` does not fire and the seccomp egress/io_uring floor is NOT
+/// installed — the capability baseline for the io_uring positive control.
+fn ctx_net_all(tool: &ShellTool, execs: &[&str]) -> ToolContext {
+    let granted = Caveats {
+        exec: Scope::only(execs.iter().map(|s| (*s).to_string())),
+        net: Scope::All,
+        ..Caveats::top()
+    };
+    Gate::new(0).authorize(tool, &granted).expect("authorize")
+}
+
 fn skip() -> bool {
     if !landlock_is_supported() {
         eprintln!("skipping: kernel lacks Landlock");
@@ -150,4 +162,108 @@ async fn shell_tool_deny_direct_leaves_ordinary_non_network_work_unchanged() {
             .contains("hello-from-confined"),
         "stdout must be captured unchanged: {out}"
     );
+}
+
+// ── E3: the io_uring egress floor (ASM-SECCOMP-IOURING) ──────────────────────
+//
+// `net:none` on Landlock is bypassable off-box because `IORING_OP_SOCKET` +
+// `IORING_OP_CONNECT`/`SEND` create and use a socket WITHOUT the `socket()`
+// syscall, so the socket()-only seccomp deny misses it. The honest close is to
+// deny the io_uring setup/enter primitive (agent-bridle-core installs
+// `SYS_io_uring_setup`/`enter`/`register` = EACCES on the DenyDirect leg). These
+// tests prove that natively: under DenyDirect a child cannot even create a ring,
+// with a capability positive control so a host that lacks io_uring SKIPS rather
+// than passing vacuously. `io_uring_setup` is syscall 425 on x86_64 + aarch64.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod io_uring_e3 {
+    use super::*;
+
+    /// Attempt `io_uring_setup(1, &params)` via ctypes and map the outcome to an
+    /// exit code: 0 = a ring was created (NOT denied), 13 = EACCES (the Bridle
+    /// seccomp deny, errno-exact), 20 = denied with some OTHER errno. A 256-byte
+    /// zeroed params buffer is ≥ the kernel struct, so the kernel's `copy_from_user`
+    /// never faults on the positive-control path.
+    const IOURING_PROBE: &str = r#"python3 -c "import ctypes,os; libc=ctypes.CDLL(None,use_errno=True); p=(ctypes.c_ubyte*256)(); fd=libc.syscall(425,1,ctypes.byref(p)); os.close(fd) if fd>=0 else None; os._exit(0 if fd>=0 else (13 if ctypes.get_errno()==13 else 20))""#;
+
+    /// The same probe re-exec'd in a grandchild, propagating its code — proves the
+    /// io_uring deny is inherited across fork/exec like the socket() deny.
+    const IOURING_DESCENDANT_PROBE: &str = r#"python3 -c "import subprocess,sys; sys.exit(subprocess.run([sys.executable,'-c','import ctypes,os; libc=ctypes.CDLL(None,use_errno=True); p=(ctypes.c_ubyte*256)(); fd=libc.syscall(425,1,ctypes.byref(p)); os.close(fd) if fd>=0 else None; os._exit(0 if fd>=0 else (13 if ctypes.get_errno()==13 else 20))']).returncode)""#;
+
+    /// Whether THIS host can create an io_uring ring at all — run the probe with
+    /// AMBIENT net (no DenyDirect, so no io_uring deny). If it cannot (kernel too
+    /// old, `io_uring_disabled` sysctl, an outer container seccomp), the denial
+    /// test would pass vacuously, so it must SKIP instead. SKIP is not PASS.
+    async fn io_uring_capable() -> bool {
+        let t = tool(ChildNetworkPolicy::LandlockOnly);
+        let out = t
+            .invoke(
+                serde_json::json!({ "cmd": IOURING_PROBE }),
+                &ctx_net_all(&t, &["python3"]),
+            )
+            .await
+            .expect("invoke");
+        out["exit_code"] == 0
+    }
+
+    #[tokio::test]
+    async fn io_uring_positive_control_the_host_can_create_a_ring() {
+        if skip() {
+            return;
+        }
+        if !io_uring_capable().await {
+            eprintln!(
+                "skipping E3: this host cannot create an io_uring ring even unconfined \
+                       (kernel/sysctl/outer-seccomp) — the denial proof would be vacuous"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_direct_denies_a_childs_io_uring_setup_with_eacces() {
+        if skip() || !io_uring_capable().await {
+            eprintln!("skipping E3 denial: io_uring not creatable on this host (SKIP is not PASS)");
+            return;
+        }
+        let t = tool(ChildNetworkPolicy::DenyDirect);
+        let out = t
+            .invoke(
+                serde_json::json!({ "cmd": IOURING_PROBE }),
+                &ctx(&t, &["python3"]),
+            )
+            .await
+            .expect("invoke");
+        // The confined path must actually have been taken (else the floor never ran).
+        assert_eq!(
+            out["sandbox_kind"], "landlock",
+            "the child must be kernel-confined: {out}"
+        );
+        // Errno-EXACT: EACCES (13) is Bridle's rule; any other errno (20) would be
+        // an outer layer, not our floor.
+        assert_eq!(
+            out["exit_code"], 13,
+            "DenyDirect must deny io_uring_setup with EACCES (not another errno / not allowed): {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_direct_denies_a_forked_descendants_io_uring_setup() {
+        if skip() || !io_uring_capable().await {
+            eprintln!(
+                "skipping E3 descendant: io_uring not creatable on this host (SKIP is not PASS)"
+            );
+            return;
+        }
+        let t = tool(ChildNetworkPolicy::DenyDirect);
+        let out = t
+            .invoke(
+                serde_json::json!({ "cmd": IOURING_DESCENDANT_PROBE }),
+                &ctx(&t, &["python3"]),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(
+            out["exit_code"], 13,
+            "the io_uring deny must be inherited across fork/exec (EACCES in the grandchild): {out}"
+        );
+    }
 }
