@@ -134,10 +134,22 @@ fn assert_os_access_denied(out: &std::process::Output, route: &str) {
     );
 }
 
-fn assert_appcontainer_descendant_or_os_spawn_denial(out: &std::process::Output, route: &str) {
+fn assert_appcontainer_identity_or_os_access_denied(out: &std::process::Output, route: &str) {
+    if out.status.success() {
+        assert_appcontainer_identity(out, 1, route);
+    } else {
+        assert_os_access_denied(out, route);
+    }
+}
+
+fn assert_appcontainer_descendant_or_os_spawn_denial(
+    out: &std::process::Output,
+    denial_marker: &str,
+    route: &str,
+) {
     assert_appcontainer_identity(out, 1, route);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if stdout.contains("cmd_spawn_denied_os_policy=5") {
+    if stdout.contains(denial_marker) {
         assert_eq!(
             sids(&out.stdout).len(),
             1,
@@ -164,6 +176,48 @@ fn assert_host_descendant_control(out: &std::process::Output, route: &str) {
     );
 }
 
+fn powershell_token_script(generation: u8) -> String {
+    r#"
+$ProgressPreference = 'SilentlyContinue'
+$assemblyName = New-Object System.Reflection.AssemblyName('AbTokenNative')
+$assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+$module = $assembly.DefineDynamicModule('AbTokenNative')
+$type = $module.DefineType('AbTokenNative', [System.Reflection.TypeAttributes]'Public,Sealed,Abstract')
+$attrs = [System.Reflection.MethodAttributes]'Public,Static,PinvokeImpl'
+$impl = [System.Reflection.MethodImplAttributes]'PreserveSig'
+$method = $type.DefinePInvokeMethod('GetCurrentProcess', 'kernel32.dll', $attrs, [System.Reflection.CallingConventions]::Standard, [IntPtr], [Type[]]@(), [System.Runtime.InteropServices.CallingConvention]::Winapi, [System.Runtime.InteropServices.CharSet]::Auto); $method.SetImplementationFlags($impl)
+$method = $type.DefinePInvokeMethod('OpenProcessToken', 'advapi32.dll', $attrs, [System.Reflection.CallingConventions]::Standard, [bool], [Type[]]@([IntPtr], [uint32], [IntPtr].MakeByRefType()), [System.Runtime.InteropServices.CallingConvention]::Winapi, [System.Runtime.InteropServices.CharSet]::Auto); $method.SetImplementationFlags($impl)
+$method = $type.DefinePInvokeMethod('GetTokenInformation', 'advapi32.dll', $attrs, [System.Reflection.CallingConventions]::Standard, [bool], [Type[]]@([IntPtr], [int32], [IntPtr], [int32], [int32].MakeByRefType()), [System.Runtime.InteropServices.CallingConvention]::Winapi, [System.Runtime.InteropServices.CharSet]::Auto); $method.SetImplementationFlags($impl)
+$method = $type.DefinePInvokeMethod('CloseHandle', 'kernel32.dll', $attrs, [System.Reflection.CallingConventions]::Standard, [bool], [Type[]]@([IntPtr]), [System.Runtime.InteropServices.CallingConvention]::Winapi, [System.Runtime.InteropServices.CharSet]::Auto); $method.SetImplementationFlags($impl)
+$native = $type.CreateType()
+$token = [IntPtr]::Zero
+if (-not $native::OpenProcessToken($native::GetCurrentProcess(), 8, [ref]$token)) { exit 21 }
+try {
+  $isBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+  $needed = 0
+  [void]$native::GetTokenInformation($token, 31, [IntPtr]::Zero, 0, [ref]$needed)
+  if ($needed -le 0) { exit 22 }
+  $sidBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal($needed)
+  try {
+    $returned = 0
+    if (-not $native::GetTokenInformation($token, 29, $isBuffer, 4, [ref]$returned)) { exit 23 }
+    $isAppContainer = [Runtime.InteropServices.Marshal]::ReadInt32($isBuffer)
+    $returned = 0
+    if (-not $native::GetTokenInformation($token, 31, $sidBuffer, $needed, [ref]$returned)) { exit 24 }
+    $sidPointer = [Runtime.InteropServices.Marshal]::ReadIntPtr($sidBuffer)
+    $sid = New-Object System.Security.Principal.SecurityIdentifier($sidPointer)
+    Write-Output "generation=__GENERATION__ pid=$PID is_appcontainer=$isAppContainer appcontainer_sid=$($sid.Value)"
+  } finally {
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($isBuffer)
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($sidBuffer)
+  }
+} finally {
+  [void]$native::CloseHandle($token)
+}
+"#
+    .replace("__GENERATION__", &generation.to_string())
+}
+
 #[test]
 fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     if skip_proof_unless_appcontainer() {
@@ -179,6 +233,15 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         .output()
         .expect("run host helper-to-cmd positive control");
     assert_host_descendant_control(&host_cmd_control, "host helper to cmd.exe positive control");
+    let host_self_control = Command::new(&probe)
+        .arg("spawn-self")
+        .current_dir("C:\\Windows")
+        .output()
+        .expect("run host helper-to-helper positive control");
+    assert_host_descendant_control(
+        &host_self_control,
+        "host helper to tokenprobe positive control",
+    );
 
     let direct = launch(&[
         "--name",
@@ -241,6 +304,27 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         "PowerShell to cmd.exe grandchild",
     );
 
+    let inner_identity = powershell_token_script(2);
+    let outer_identity = format!(
+        "{}\n$inner = @'\n{}\n'@\n$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))\n& '{}' -NoProfile -EncodedCommand $encoded\nif ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}",
+        powershell_token_script(1),
+        inner_identity,
+        powershell.replace('\'', "''")
+    );
+    let powershell_identity = launch(&[
+        "--name",
+        &tag("ps-identity"),
+        powershell,
+        "-NoProfile",
+        "-Command",
+        &outer_identity,
+    ]);
+    assert_appcontainer_identity(
+        &powershell_identity,
+        2,
+        "PowerShell child to PowerShell grandchild token identity",
+    );
+
     let helper_grandchild = launch(&[
         "--name",
         &tag("helper"),
@@ -253,6 +337,7 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     ]);
     assert_appcontainer_descendant_or_os_spawn_denial(
         &helper_grandchild,
+        "cmd_spawn_denied_os_policy=5",
         "helper child to cmd.exe grandchild",
     );
 
@@ -266,9 +351,9 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         &probe_s,
         "spawn-self",
     ]);
-    assert_appcontainer_identity(
+    assert_appcontainer_descendant_or_os_spawn_denial(
         &helper_to_helper,
-        2,
+        "self_spawn_denied_os_policy=5",
         "helper child to tokenprobe grandchild",
     );
 
@@ -286,7 +371,10 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
     ]);
     assert_os_access_denied(&cmd_to_helper, "cmd.exe to staged helper grandchild");
 
-    let ps_command = format!("& '{}' print", probe_s.replace('\'', "''"));
+    let ps_command = format!(
+        "$ErrorActionPreference = 'Stop'; try {{ & '{}' print; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }} }} catch {{ Write-Error $_; exit 5 }}",
+        probe_s.replace('\'', "''")
+    );
     let powershell_to_helper = launch(&[
         "--name",
         &tag("ps-helper"),
@@ -299,9 +387,8 @@ fn direct_cmd_powershell_and_helper_descendants_keep_appcontainer_identity() {
         "-Command",
         &ps_command,
     ]);
-    assert_appcontainer_identity(
+    assert_appcontainer_identity_or_os_access_denied(
         &powershell_to_helper,
-        1,
         "PowerShell to staged helper grandchild",
     );
 

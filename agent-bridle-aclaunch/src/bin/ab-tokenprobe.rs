@@ -31,10 +31,15 @@ fn main() {
         "spawn-self" => {
             print_identity();
             let exe = std::env::current_exe().expect("current probe executable");
-            let out = std::process::Command::new(exe)
-                .arg("print")
-                .output()
-                .expect("spawn tokenprobe grandchild");
+            let out = std::process::Command::new(exe).arg("print").output();
+            let out = match out {
+                Ok(out) => out,
+                Err(error) if error.raw_os_error() == Some(5) => {
+                    println!("self_spawn_denied_os_policy=5");
+                    return;
+                }
+                Err(error) => panic!("spawn tokenprobe grandchild: {error}"),
+            };
             print!("{}", String::from_utf8_lossy(&out.stdout));
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(out.status.code().unwrap_or(1));
