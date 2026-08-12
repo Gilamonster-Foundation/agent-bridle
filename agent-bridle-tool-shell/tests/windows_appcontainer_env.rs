@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_bridle_core::{Caveats, Gate, Scope, Tool, ToolContext};
+use agent_bridle_core::{Caveats, Gate, SandboxPolicy, Scope, Tool, ToolContext};
 use agent_bridle_tool_shell::ShellTool;
 
 fn ctx(granted: Caveats) -> ToolContext {
@@ -86,13 +86,10 @@ async fn shelltool_appcontainer_env_isolation_real_path() {
         }
     };
 
-    // Put the launcher's dir on PATH so `ShellTool`'s `find_launcher` locates it.
-    let dir = launcher.parent().expect("launcher dir");
-    let mut parts = vec![dir.to_path_buf()];
-    parts.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    std::env::set_var("PATH", std::env::join_paths(parts).expect("join PATH"));
+    let tool = ShellTool::new().with_sandbox_policy(SandboxPolicy {
+        appcontainer_launcher_path: Some(launcher.to_string_lossy().into_owned()),
+        ..SandboxPolicy::default()
+    });
 
     // A provider-shaped secret that lives ONLY in the parent environment and is NOT
     // delegated — it must not cross the confinement boundary.
@@ -111,7 +108,7 @@ async fn shelltool_appcontainer_env_isolation_real_path() {
     // A generation-2 descendant (`cmd` → `cmd`) prints the env: this also proves
     // (§6) that env isolation holds for a real second-generation process running
     // inside the AppContainer boundary, not just the direct child.
-    let out = ShellTool::new()
+    let out = tool
         .invoke(
             serde_json::json!({
                 "program": "cmd",

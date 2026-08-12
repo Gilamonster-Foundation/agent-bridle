@@ -7,8 +7,16 @@ waits for it to finish, and returns the child's exit status.
 This is an internal companion binary, not a separately supported crates.io
 surface. The Windows `agent-bridle-mcp` release archive bundles it so the
 `windows-appcontainer` backend can apply kernel confinement at process
-creation. The additional `ab-netprobe` binary is a test fixture for network
-confinement proofs.
+creation. Strong AppContainer requests trust this helper only when it is shipped
+next to the current executable, or when the host supplies an explicit absolute
+`SandboxPolicy::appcontainer_launcher_path`; ambient `PATH` is not a launcher
+provenance source.
+
+The launcher delegates stdio through `STARTUPINFOEXW` with an explicit
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; arbitrary inheritable launcher handles are
+not ambiently inherited by the confined child. The additional `ab-netprobe`,
+`ab-handleprobe`, and `ab-fsprobe` binaries are test fixtures for network,
+inherited-handle, and filesystem ACL concurrency proofs.
 
 On non-Windows platforms the launcher compiles to an explicit unsupported
 stub.

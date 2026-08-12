@@ -11,7 +11,7 @@
 //!
 //! Kept out of the unit tests (which mock the spawner) per the workspace norm:
 //! no real subprocesses/fs in unit tests.
-#![cfg(feature = "host-shell")]
+#![cfg(all(feature = "host-shell", unix))]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -41,7 +41,10 @@ closed when no native backend can enforce it.
 
 On Windows, AppContainer is attached at process creation by the wired
 `agent-bridle-aclaunch.exe` wrapper rather than by `Sandbox::apply` on the
-current thread.
+current thread. The wrapper is trusted only when it is shipped next to the
+current executable, or when `SandboxPolicy::appcontainer_launcher_path` names an
+explicit absolute helper path; the AppContainer backend never searches ambient
+`PATH` for its sandbox constructor.
 
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
 the capability leash for agent tools — a shared, capability-governed tool

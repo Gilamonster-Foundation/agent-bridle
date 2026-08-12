@@ -53,3 +53,31 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
           BRIDLE_REQUIRE_ELEVATED: "1" # runner is elevated → require the loopback proof
         run: cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1
+
+      - name: AppContainer inherited-HANDLE proof (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test handle_inheritance -- --test-threads=1
+
+      - name: AppContainer fail-closed setup proofs (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test fail_closed -- --test-threads=1
+
+      - name: AppContainer adversarial filesystem proofs (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1
+
+      - name: AppContainer descendant containment proofs (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test descendants -- --test-threads=1
+
+      - name: AppContainer local-deputy proof (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test local_deputy -- --test-threads=1
+
+      - name: AppContainer Newt CONFINED route contract
+        run: cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test windows_appcontainer_contract -- --test-threads=1

@@ -1,7 +1,10 @@
 //! Default-registry keystone: the MCP binary serves the carried Brush shell,
 //! understands its re-exec dispatch protocol, and runs bundled coreutils.
 
-#![cfg(feature = "carried-coreutils")]
+#![cfg(all(
+    feature = "carried-coreutils",
+    any(target_os = "linux", target_os = "macos")
+))]
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
