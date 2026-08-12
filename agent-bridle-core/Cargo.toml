@@ -115,6 +115,12 @@ tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
 # Landlock is Linux-only; gate the dep on the target so enabling the feature on
 # macOS/Windows does not try to build it. Used only under
 # cfg(all(target_os = "linux", feature = "linux-landlock")).
+# The confined-spawn fd-hygiene seam (#319). Encapsulates the one `unsafe`
+# `close_range` pre-exec so core stays `forbid(unsafe_code)` (ADR 0026 slice 1).
+# Unix-only: it is a no-op off-Linux today, so Windows core stays clean.
+[target.'cfg(unix)'.dependencies]
+agent-bridle-fdguard = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4", optional = true }
 # The seccomp `socket()`-family egress deny for `ChildNetworkPolicy::DenyDirect`,
