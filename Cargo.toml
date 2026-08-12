@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "agent-bridle-core",
+    "agent-bridle-fdguard",
     "agent-bridle-ceremony",
     "agent-bridle-config",
     "agent-bridle-aclaunch",
@@ -24,6 +25,9 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 [workspace.dependencies]
 # In-workspace crates (lock-step version).
 agent-bridle-core = { version = "0.8.0-rc.1", path = "agent-bridle-core" }
+# The single unsafe-permitting seam (fd hygiene on confined spawn, #319) so core
+# can stay `forbid(unsafe_code)`. Published (ADR 0008) because core depends on it.
+agent-bridle-fdguard = { version = "0.8.0-rc.1", path = "agent-bridle-fdguard" }
 agent-bridle-tool-shell = { version = "0.8.0-rc.1", path = "agent-bridle-tool-shell" }
 agent-bridle-tool-web = { version = "0.8.0-rc.1", path = "agent-bridle-tool-web" }
 # `default-features = false` here so `agent-bridle-mcp` controls the facade's
