@@ -9,16 +9,19 @@ Labels: **Exact | Narrower | Approximation | Unsupported | Cannot Prove**. `Appr
 > **FenceCaveats**; `max_calls`/`valid_for_generation` are Gate-only **GateCaveats**
 > and are **not** projected (RFC §A.2) — so their old "Exact by not projecting"
 > label is replaced by "mediated = Exact / direct-exec = Unsupported." **(b)** the
-> reported strength is `min(MechanismStrength, EvidenceCap)` (RFC §A.4): OpenShell's
-> in-sandbox Landlock is *mechanism-Kernel* but the **claim is capped at
-> Interceptor until applied-policy attestation (U1)** — never report bare `Kernel`.
+> claim is a **product** `EnforcementClaim{mechanism, evidence}` (RFC §A.4, R3-2), NOT a
+> scalar `min()`: OpenShell's in-sandbox Landlock is honestly **mechanism-Kernel** with
+> **evidence-CannotProve** pre-U1 — the mechanism is **never** relabelled Interceptor;
+> instead, since the fs floor is structurally Kernel, a **restricted-fs RemoteFence
+> refuses admission pre-U1** unless the operator sets an explicit CannotProve floor.
+> **(c)** image identity is split: `RequestedImageCid` (intent) ≠ `AttestedImageCid` (proof, Cannot-Prove) (R3-4).
 
-Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `net` (**FenceCaveats**, OS-confinement, `Scope<String>`), `max_calls`, `valid_for_generation` (**GateCaveats**, gate-enforced only). Achieved **MechanismStrength** lattice: `Kernel > Interceptor > Advisory`; the advertised claim is capped by **EvidenceStrength** (§A.4).
+Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `net` (**FenceCaveats**, OS-confinement, `Scope<String>`), `max_calls`, `valid_for_generation` (**GateCaveats**, gate-enforced only). Each axis carries an `EnforcementClaim{mechanism ∈ {Kernel>Interceptor>Advisory}, evidence ∈ {Attested>Reported>CannotProve}}`; admission = `mechanism ⊒ required_mechanism AND evidence ⊒ required_evidence` (§A.4).
 
 ## Axis rows
 
 ### 1. `fs_read` / `fs_write` → `filesystem_policy.read_only` / `read_write` (in-sandbox Landlock)
-- **Mapping label: Narrower; MechanismStrength `Kernel` under the conditions below, but reported claim CAPPED at `Interceptor` until per-invocation applied-policy attestation (U1) — never bare `Kernel` (§A.4). Enforced by OpenShell's *in-sandbox* Landlock, not desk-local Landlock (§A.1).**
+- **Mapping label: Narrower; claim `(mechanism=Kernel, evidence=CannotProve)` pre-U1 (§A.4, R3-2). The mechanism is honestly Kernel (in-sandbox Landlock constrains the child interior) — NOT relabelled Interceptor. Because the fs floor is structurally Kernel (`report.rs:370-395`), a restricted-fs RemoteFence REFUSES admission pre-U1 unless the operator sets an explicit CannotProve evidence floor. Enforced by OpenShell's *in-sandbox* Landlock, not desk-local (§A.1).**
 - Conditions the projection compiler MUST emit:
   - `landlock.compatibility: hard_requirement` — the default `best_effort` runs the sandbox with ZERO fs restriction on 3 failure paths (landlock.rs:157-179, 269-289, 309-332), each returning Ok. Default = fail-open; hard_requirement makes each fatal. A projection that omits this silently violates the fs Kernel floor.
   - Non-empty path lists — empty `filesystem_policy` short-circuits Landlock entirely (landlock.rs:146; the one default-ALLOW in OpenShell's model). `Scope::All` on fs axes → do NOT emit empty policy; either refuse (floor demands Kernel bound) or emit explicit broad roots.
@@ -31,7 +34,7 @@ Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `ne
 - **Mapping label: Unsupported (kernel grain) / Approximation (image-as-closure) / Cannot Prove (image identity).**
 - OpenShell has no exec allowlist: `process` policy is run_as identity only; seccomp is a fixed denylist (default-allow, seccomp.rs:6-13,146); any binary present in the image executes freely. `network_policies.binaries` binds *egress* to binaries, not execution.
 - Best available: the sandbox image IS the exec closure — but OpenShell does **no image digest pinning** (only `SandboxTemplate.image` tag; no digest resolved/recorded anywhere), so the closure has no verifiable identity → **Cannot Prove**. Upstream ask #1: digest-pin + record image identity.
-- Practical resolution per topology: keep exec mediation *inside* the boundary (wyvern's 4-tool surface, or bridle-in-sandbox) and treat OpenShell's boundary as the outer fence bounding what an un-mediated exec can reach (fs/net axes). Report exec axis honestly as bounded-by-image (Advisory→Interceptor at best), never Kernel.
+- **Normative admission theorem (§A.6, R3-5):** `exec` is *identity authority* ("no ungranted program may execute"), not behavior bounded by fs/net. A **restrictive `exec` Caveat over a direct-exec worker with no verified executable-closure mechanism REFUSES admission** (`Unknown ⇒ refuse`), fail-closed, before any spawn — because OpenShell cannot prove `actual_executable_closure ⊆ granted_exec_scope`. A worker may hold restrictive `exec` only if it is **mediated-tool-only** (no arbitrary process creation). `RequestedImageCid` is intent, never exec proof. Report exec honestly as bounded-by-image (Advisory→Interceptor at best), never Kernel — and refuse rather than approximate when the grant is restrictive.
 
 ### 3. `net` (host-grain `Scope<String>`) → `network_policies` (CONNECT proxy + OPA + netns/nft)
 - **Mapping label: Narrower (host→host+port+L7 available), strength `Interceptor` with a kernel deny-direct backstop; Kernel claim conditional and currently Cannot Prove remotely.**
@@ -64,12 +67,12 @@ Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `ne
 ### 8. Provenance / CID chain → (mostly absent upstream)
 - OpenShell-side identities available today: sandbox UUID + `spiffe://openshell/sandbox/<uuid>` JWT subject; `policy_hash` (SHA-256, gateway-computed); `version` counter; `config_revision`; provider-env revision.
 - **`policy_hash` is NOT canonical**: hashes prost bytes; nested proto maps (L7Allow.query/params, persisted queries) have unspecified encoding order; only top-level maps sorted; framing inconsistent (policy.rs:4391-4424). Also the delivered hash for a version can differ from the stored revision hash when provider composition is active (policy.rs:1875), and the supervisor never verifies hash-vs-bytes (grpc_client.rs:783-800). → `OpenShellPolicyCid` must be computed by OUR compiler over OUR canonical encoding of the spec we submit; treat gateway `policy_hash` as a correlation token only. The repo's own `examples/governance-interceptor/src/policy_hash.rs` ("openshell-governance-protojson-sha256-v2", recursive key-sorted protoJSON, length-framed) is the right pattern and proves upstream appetite.
-- `SandboxImageCid`: **impossible today** (no digest pinning). `AppliedPolicyCid`/`RuntimeEvidenceCid`: **Cannot Prove** (self-reported ints; unsigned, lossy, opt-in OCSF; no attestation path). Chain today is honest only as: DelegatedGrantCid → EffectiveAuthorityCid → EnforcementPlanCid → OpenShellSandboxSpecCid → OpenShellPolicyCid (ours, canonical) → [gap: applied/evidence = partial, ASM row]. Upstream asks: signed applied-policy attestation (hash echo in ReportPolicyStatus would be a 1-field PR), image digest pinning, signed/structured OCSF export.
+- **Image identity is split (R3-4):** `RequestedImageCid` (the digest Bridle pins — **intent**, part of `StaticFenceCid`) is available now; `AttestedImageCid` (proof of what actually ran) is **Cannot-Prove** (OpenShell records no running-image digest). `AppliedPolicyCid`/`RuntimeEvidenceCid`: **Cannot-Prove** (self-reported ints; unsigned, lossy OCSF). Chain today is honest only as intent: DelegatedGrantCid → EffectiveAuthorityCid → EnforcementPlanCid → OpenShellSandboxSpecCid → RequestedImageCid → OpenShellPolicyCid (ours, canonical) → [evidence gap: applied/attested-image = Cannot-Prove until U1/U3]. Upstream asks: **U1** gateway-signed applied-policy receipt (NOT sandbox-signed — the sandbox holds no key; `sandbox_jwt.rs:6-7`), **U3** running-image digest recording, signed/structured OCSF export.
 
 ### 9. Evidence honesty summary (strength-floor consequences)
 | Bridle demands | OpenShell provides | Verdict |
 |---|---|---|
-| fs Kernel floor | in-sandbox Landlock hard_requirement + non-empty paths + native test | Mechanism-Kernel achievable; **reported claim capped at Interceptor until U1 attestation** (§A.4), never bare Kernel |
+| fs Kernel floor | in-sandbox Landlock hard_requirement + non-empty paths + native test | Claim `(mechanism=Kernel, evidence=CannotProve)` pre-U1; mechanism honest-Kernel (never relabelled Interceptor); **restricted-fs RemoteFence refuses pre-U1** unless explicit CannotProve floor (§A.4) |
 | exec bound | image contents, unpinned | Refuse Kernel; Advisory/bounded-by-image; keep exec mediation inside boundary |
 | net bound | proxy Interceptor + nft DenyDirect backstop | Interceptor for allowlists; deployment must guarantee nft present (probe at admission) |
 | budgets/generation | none | Gate-only: **mediated = Exact, direct-exec = Unsupported** (§A.2); restrictive grant over direct-exec worker → fail admission |
