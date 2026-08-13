@@ -83,7 +83,12 @@ Load-bearing conclusions (evidence and file:line citations in the companion RFC)
    `ConfinementMechanism` carrier for probed runtime state. The heavy mechanism
    (tonic/tokio, gateway client, lifecycle) lives in a leaf crate
    `agent-bridle-openshell`, keeping core `forbid(unsafe)` and tokio-free per the
-   jaild/aclaunch precedent.
+   jaild/aclaunch precedent. The seam must additionally supply a **remote-worker
+   authentication** mechanism: Bridle's existing worker auth is kernel-local
+   (`SCM_CREDENTIALS` + `same_image` dev/ino in `private_control.rs`;
+   `SO_PEERCRED` in jaild) and a containerized worker passes none of it, so a
+   remote fence needs a cryptographic worker identity — the mesh AgentKey —
+   coupling B's seam to E's identity work even though B ships first.
 
 2. **B is an axis-split acquisition, stated honestly (ADR 0017).** On Linux,
    native Landlock is **strictly stronger** on the filesystem axis (local,
