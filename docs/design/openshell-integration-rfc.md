@@ -345,7 +345,7 @@ Consequences that must be built, not assumed:
 
 ### 5.4 Network flow
 ```
- workload ─(netns; nft rejects all non-proxy TCP/UDP)─▶ CONNECT proxy (10.200.0.1)
+ workload ─(netns; nft rejects all non-proxy TCP/UDP)─▶ CONNECT proxy (host-side veth gw)
      proxy-side DNS (no workload resolver) → resolved-IP set is what's dialed (rebinding-safe)
      OPA host+L7 policy (MUST be enforcement=enforce, not audit) → upstream (real TLS)
    the ONE authorized egress in E = the mesh dock back to the desk (once a TCP transport exists)
