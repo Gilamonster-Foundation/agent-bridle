@@ -73,7 +73,7 @@ as the first de-risking proof, D rejected, and E (the swarm) as a later gated
 track.** This is an architecture GO only; it does not authorize production
 enforcement code. The normative model, formal invariants (I1–I6), and test
 obligations are in the companion RFC **§A/§B/§C**; that section is the security
-contract later PRs are held against. (Review pass 2 folded findings F1–F6 into it.)
+contract later PRs are held against. (Review pass 2 folded F1–F6; pass 3 corrected the identity grain, the enforcement-claim product, the image split, the exec theorem, the PR order, and U1 — R3-1…R3-6.)
 
 Load-bearing conclusions (evidence and file:line citations in the companion RFC):
 
@@ -93,27 +93,31 @@ Load-bearing conclusions (evidence and file:line citations in the companion RFC)
    (`SCM_CREDENTIALS` + `same_image` dev/ino in `private_control.rs`;
    `SO_PEERCRED` in jaild) and a containerized worker passes none of it. That is a
    distinct grain from authority: **AuthorityIdentity** (AgentKey possession) ≠
-   **ExecutionIdentity** (process/image proof). The remote path binds them with a
-   content-addressed **`RemoteWorkerBinding`** (authority × sandbox instance ×
-   image × plan × generation × audience), constructed mismatch-unrepresentably per
-   the `ResolvedGrant::bind` pattern, with the signing key held by a desk-side
-   **broker**, never by the hostile worker.
+   **ExecutionIdentity** (process/image proof). **The remote binding is
+   sandbox-grain, not process-grain (R3-1):** a desk-side **broker** mints a
+   content-addressed **`SandboxPrincipalBinding`** (authority × sandbox instance ×
+   *requested* image × plan × static-fence × generation × audience), constructed
+   mismatch-unrepresentably per `ResolvedGrant::bind`, holding the root key outside
+   the worker. It proves "this authority was delegated to THIS sandbox
+   environment," **not** which process/executable ran — once a narrow credential is
+   inside a hostile sandbox, another process there can use it and the executable can
+   be swapped, neither caught by the binding. Per-process remote identity is a named
+   upstream/TCB dependency (Outcome B), not something the binding supplies; callers
+   needing process-grain identity run **Local**.
 
 2. **B is a per-execution acquisition, stated honestly (ADR 0017); NOT a within-
-   process axis split.** A single process has one ExecutionBackend and cannot be
-   jointly constrained by desk-local Landlock *and* a remote fence — `restrict_self`
-   confines only the calling desk thread and has no reach into a container. A
-   **Local** execution keeps native Landlock (fs Kernel, observed in-process); a
-   **RemoteFence** execution has *all* axes enforced by in-sandbox mechanisms, its
-   fs by OpenShell's in-sandbox Landlock (mechanism-Kernel). The claim Bridle
-   advertises separates **MechanismStrength** (`AxisEnforcement`, a pure function
-   of `(effective, mechanism)`) from **EvidenceStrength**: `effective_claim =
-   min(MechanismStrength, EvidenceCap)`, and pre-U1 the OpenShell fs/net EvidenceCap
-   is **Interceptor**, so the backend must **not** report `Kernel` (RFC §A.4). A
-   remote fs axis is thus *evidence-weaker* than the same command run locally. The
-   "additive" benefit (Landlock-strong fs *and* OpenShell egress) is a **fleet**
-   property — route fs-sensitive work Local, egress-sensitive/unconfined work
-   Remote — never a per-axis split on one process.
+   process axis split, and NOT a scalar strength.** A single process has one
+   ExecutionBackend and cannot be jointly constrained by desk-local Landlock *and* a
+   remote fence. A **Local** execution keeps native Landlock (fs `(Kernel,
+   observed-in-process)`); a **RemoteFence** has all axes enforced in-sandbox. The
+   claim is a **product** `EnforcementClaim{mechanism, evidence}` (R3-2), NOT a
+   scalar `min()`: OpenShell's in-sandbox Landlock is honestly **mechanism-Kernel**
+   (it constrains the child interior) with **evidence-CannotProve** pre-U1 — it is
+   **never** relabelled Interceptor. Because the fs floor is structurally Kernel
+   (`report.rs:370-395`) and admission is `report[axis] >= floor[axis]`
+   (`report.rs:348-349`), a **restricted-fs RemoteFence refuses admission pre-U1**
+   unless the operator sets an explicit, visible `CannotProve` evidence floor. The
+   "additive" benefit is a **fleet** property, never a per-axis split on one process.
 
 3. **Fence authority vs Gate authority (the `∧`-invariant is scope-level on the
    direct-exec path).** Projection quantifies over **FenceCaveats**
@@ -147,32 +151,39 @@ Load-bearing conclusions (evidence and file:line citations in the companion RFC)
 
 ## Consequences
 
-- **Crate boundary & PR order (F6).** New leaf crate `agent-bridle-openshell`; a
-  non-trivial change to `agent-bridle-core` that **lands the abstraction before
-  OpenShell**: PR 5a introduces the `ExecutionBackend` seam with **zero** behavior
-  change and no OpenShell dependency (existing tests stay green; the local
-  identity path is untouched, I6), then PR 5b implements the `RemoteFence` backend
-  on top. The net-new, **domain-tagged** content-addressed types
-  (`RemoteWorkerBinding`, `StaticFenceCid`, `SandboxImageCid`, `EnforcementPlanCid`,
-  `RuntimeClosureCid`, `OpenShellSandboxSpecCid`) follow the `ResolvedGrant::bind`
-  mismatch-unrepresentable pattern. OpenShell-specific types stay out of
-  `agent-bridle-core`; Bridle-specific types stay out of Newt's reasoning core
-  (which reaches the backend only through the existing `bridle_registry` seam).
+- **Crate boundary & PR order (F6 + R3-3).** New leaf crate `agent-bridle-openshell`;
+  a non-trivial change to `agent-bridle-core` that **lands identity/provenance
+  before usable remote execution**: PR 5a introduces the `ExecutionBackend` seam
+  (zero behavior change, no OpenShell dep, local identity untouched — I6);
+  **PR 5b introduces the identity/provenance primitives with ZERO remote-execution
+  capability** — the net-new, **domain-tagged** content-addressed types
+  (`SandboxPrincipalBinding`, `StaticFenceCid`, `RequestedImageCid`,
+  `AttestedImageCid`, `EnforcementPlanCid`, `RuntimeClosureCid`,
+  `OpenShellSandboxSpecCid`) and the `EnforcementClaim{mechanism, evidence}`
+  product, all via the `ResolvedGrant::bind` mismatch-unrepresentable pattern;
+  then **PR 5c** implements the `RemoteFence` backend, which is type-gated so it
+  **cannot accept a remote result** without 5b's bindings. `RemoteFence` is
+  **never** routed through `best_available_sandbox` (a local-only mechanism
+  selector). OpenShell-specific types stay out of `agent-bridle-core`;
+  Bridle-specific types stay out of Newt's reasoning core.
 
 - **Fence identity completeness (F5, I4).** Today a fence's identity is only
   `FenceBody{mechanism_caveats, mechanism}` (`admitted.rs:183-186`). A remote fence
   must be identified by a `StaticFenceCid` over *all* security-relevant static
-  inputs (static authority, mechanism, runtime-closure CID, image CID, spec CID,
-  enforcement floor, capability probes, compiler version, generation baseline);
-  fence **reuse requires `StaticFenceCid` equality**, never a coarse `(grant ×
-  scope)` key alone. Dynamic net policy binds via a separate `(OpenShellPolicyCid,
-  generation)` and never mutates the static identity.
+  inputs (static authority, mechanism, runtime-closure CID, **`RequestedImageCid`**
+  — pinned intent, not runtime proof — spec CID, enforcement floor, capability
+  probes, compiler version, generation baseline); fence **reuse requires
+  `StaticFenceCid` equality**, never a coarse `(grant × scope)` key alone. Dynamic
+  net policy binds via a separate `(OpenShellPolicyCid, generation)` and never
+  mutates the static identity.
 
-- **Evidence honesty (ADR 0023).** OpenShell can *prove* (kernel/e2e-verified)
-  filesystem confinement and deny-by-default egress; it can only *log* — unsigned,
-  lossy, self-reported — that a control is actually active, and it pins no image
-  digest. `AppliedPolicyCid` / `RuntimeEvidenceCid` / `SandboxImageCid` are
-  therefore `partial` / `Cannot-Prove` in the assurance manifest until closed. An
+- **Evidence honesty (ADR 0023), and intent ≠ proof (R3-4).** OpenShell can
+  *prove* (kernel/e2e-verified) filesystem confinement and deny-by-default egress;
+  it can only *log* — unsigned, lossy, self-reported — that a control is active,
+  and it records **no running-image digest**. `AppliedPolicyCid` /
+  `RuntimeEvidenceCid` / **`AttestedImageCid`** are therefore `Cannot-Prove` in the
+  assurance manifest until closed — held **distinct** from `RequestedImageCid` (the
+  digest Bridle pins: strong intent, never runtime proof). An
   **applied-policy attestation** (upstream hash-echo over the *effective composed*
   policy) is a **certification blocker**, not an open question.
 
@@ -195,7 +206,7 @@ Load-bearing conclusions (evidence and file:line citations in the companion RFC)
 - **A GO does not authorize** a production `bridle-openshell` backend advertised
   as secure, nor any enforcement claim above `Advisory` without a native
   hostile-child test + an `ASM-OPENSHELL-*` assurance row. Per the study charter,
-  the companion RFC has had two adversarial review passes (C1–C6 in v2; F1–F6 +
-  invariants I1–I6 + test obligations in v3) and should receive at least one more
-  independent hostile review before an
-  implementation GO.
+  the companion RFC has had three adversarial review passes (C1–C6 in v2; F1–F6 +
+  invariants in v3; R3-1…R3-6 + sandbox-grain identity + `EnforcementClaim` product
+  + exec theorem in v3.1) and should receive at least one more independent hostile
+  review before an implementation GO.
