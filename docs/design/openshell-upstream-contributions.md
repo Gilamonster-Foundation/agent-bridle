@@ -29,30 +29,50 @@ which trusts the self-report and CAS-updates `current_policy_version`). There is
 `active_version` is a supervisor self-assertion of an integer, and the gateway
 never verifies that the bytes the supervisor loaded match the bytes it stored.
 Consequently an external authority cannot bind runtime evidence to *which* policy
-was enforced. In Bridle terms this makes `AppliedPolicyCid` **Cannot-Prove** and
-sets the **EvidenceCap** to Interceptor: since the advertised claim is
-`min(MechanismStrength, EvidenceCap)` (RFC §A.4), the fs/net axes cannot be
-reported as `Kernel` regardless of the in-sandbox mechanism. **U1 is precisely the
-change that lifts the EvidenceCap** so a mechanism-Kernel fence can be claimed as
-effective-Kernel.
+was enforced. In the product model (RFC §A.4, R3-2) this leaves the OpenShell
+fs/net **mechanism at Kernel** (honest — in-sandbox Landlock constrains the child
+interior) but the **per-invocation evidence at CannotProve**. Since the fs floor is
+structurally Kernel, a restricted-fs RemoteFence **refuses admission pre-U1** unless
+the operator sets an explicit CannotProve evidence floor. **U1 is precisely the
+change that raises the evidence dimension** (CannotProve → Attested) so a
+mechanism-Kernel fence becomes admissible against a Kernel/Attested floor. It does
+**not** change the mechanism class — that was already Kernel.
 
-**Proposal.** Add `applied_policy_hash` (and ideally an Ed25519 signature over
-`{sandbox_id, applied_policy_hash, generation}` using the sandbox's existing
-gateway-minted key material) to `ReportPolicyStatus`. Critically, the hash must
-cover the **effective composed** policy the supervisor actually enforces, not the
-submitted base — provider composition legitimately makes loaded ≠ submitted
-(`crates/openshell-server/src/grpc/policy.rs:1860-1878`). Pair it with a canonical
-hash (see U2).
+**Proposal — trust path corrected (R3-6).** The sandbox holds **no signing key**:
+the **gateway** signs the Ed25519 sandbox JWT at create time and the supervisor
+merely presents it as a bearer credential (`crates/openshell-server/src/auth/sandbox_jwt.rs:6-7`).
+So U1 is **not** "the sandbox signs an attestation." The realizable model is:
 
-**Size.** Small: one proto field (+ optional signature), a hash computation the
-supervisor already does for change-detection (`crates/openshell-sandbox/src/lib.rs:2559`),
-and a gateway-side comparison.
+```
+trusted supervisor  --applied_policy_hash over the bearer-authenticated ReportPolicyStatus-->  gateway
+gateway  verifies the sandbox-authenticated channel, then EMITS/STORES a gateway-signed receipt binding:
+    { sandbox identity, applied-policy CID/hash, policy generation, report sequence, gateway identity }
+```
+
+The hash MUST cover the **effective composed** policy (provider composition makes
+loaded ≠ submitted — `crates/openshell-server/src/grpc/policy.rs:1860-1878`); pair
+with a canonical hash (U2).
+
+**What the receipt proves — stated precisely.** *"The trusted OpenShell supervisor
+reported applying this effective policy, and the gateway authenticated that
+report."* It does **NOT** prove correct enforcement against a **compromised
+supervisor** — the supervisor (root PID 1 in the sandbox) is part of **B's TCB**;
+that is an explicit trust assumption, not something U1 removes. A stronger root
+(remote attestation / measured boot of the supervisor) would be a separate,
+larger dependency, not this PR. If a workload-signing design (SPIFFE-SVID issuer /
+verifier / audience / key-custody) is later preferred, it must be specified
+concretely against the then-current OpenShell — the SVID path is not wired for
+policy attestation at the pinned commit.
+
+**Size.** Small-to-medium: one proto field + a gateway-side signed-receipt store;
+the supervisor already computes the change-detection hash
+(`crates/openshell-sandbox/src/lib.rs:2559`).
 
 **Local shim?** No. Attestation of the enforcer's actual state cannot be
-synthesized from outside the enforcer. This is the one item that genuinely needs
-upstream. (A partial local mitigation: run a native hostile-child probe at
-provisioning time — but that attests the mechanism class at t0, not the applied
-policy per generation.)
+synthesized from outside the enforcer; this is the one item that genuinely needs
+upstream. A native hostile-child probe at provisioning attests the mechanism class
+at t0, not the applied policy per generation — so it raises evidence to at most
+`Reported`, never `Attested`.
 
 ---
 
@@ -88,28 +108,36 @@ hash agree with ours end-to-end; without it, we bridge via our own CID. So U2 is
 
 ---
 
-## U3 — Image digest pinning on `SandboxTemplate`  ·  **Blocking: NO (we pin the ref ourselves)**
+## U3 — Running-image digest recording — `RequestedImageCid` vs `AttestedImageCid` (R3-4)  ·  **Blocking: NO for intent; attested-image is Cannot-Prove without it**
 
-**Gap.** No image digest is resolved, recorded, or pinned anywhere in the gateway.
-`SandboxTemplate.image` (`proto/openshell.proto:827`) is a *tag* reference; the
-server fills a default when empty (`crates/openshell-server/src/grpc/sandbox.rs:264-269`);
-the only `sha256` digests in the server are policy/provider-env revision hashes.
-The OCSF `Image` object even carries only `name`, no digest
-(`crates/openshell-ocsf/src/objects/container.rs:23-28`). So there is no verifiable
-identity for *what actually ran* → `SandboxImageCid` is Cannot-Prove.
+**The two facts, kept separate (HIGH 4).** *Requested* image identity (what Bridle
+pinned) is **not** *attested* image identity (what OpenShell actually launched):
+
+- **`RequestedImageCid`** — we pin `template.image` to a `…@sha256:…` digest
+  ourselves. This is strong **intent**, available now, and is part of
+  `StaticFenceCid` and `SandboxPrincipalBinding`. It requires no upstream work.
+- **`AttestedImageCid`** — proof of the running image. **Cannot-Prove today.** No
+  image digest is resolved, recorded, or surfaced in the gateway:
+  `SandboxTemplate.image` (`proto/openshell.proto:827`) is a *tag* reference; the
+  server fills a default when empty (`crates/openshell-server/src/grpc/sandbox.rs:264-269`);
+  the OCSF `Image` object carries only `name`, no digest
+  (`crates/openshell-ocsf/src/objects/container.rs:23-28`).
+
+`SandboxPrincipalBinding` carries `RequestedImageCid` and MUST NOT imply
+`AttestedImageCid` — same epistemic discipline as `OpenShellPolicyCid` (intent) vs
+`AppliedPolicyCid` (attested).
 
 **Proposal.** Resolve and record the image **digest** at sandbox creation, store it
-on `SandboxStatus`, and surface it in the OCSF `Image` object. Optionally support
-attestation verification (`gh attestation verify` is already used for the VM kernel
-at `.github/workflows/release-vm-kernel.yml:254`; the machinery exists).
+on `SandboxStatus`, surface it in the OCSF `Image` object (and ideally
+`gh attestation verify` the digest — the VM-kernel path already does this at
+`.github/workflows/release-vm-kernel.yml:254`). This is what turns
+`AttestedImageCid` from Cannot-Prove into evidence.
 
-**Size.** Small-to-medium: digest resolution at create, one status field, one OCSF
-field.
+**Size.** Small-to-medium: digest resolution at create, one status field, one OCSF field.
 
-**Local shim?** **Yes, partially.** We pin `template.image` to a `…@sha256:…`
-digest reference ourselves, which fixes the *submitted* identity. Recording the
-*resolved/running* digest for evidence still wants upstream. Digest-pin (ours) is
-enough for a `partial` `SandboxImageCid`; upstream recording is needed for `proved`.
+**Local shim?** For **`RequestedImageCid`**: yes, fully (we pin the digest). For
+**`AttestedImageCid`**: no — recording what actually ran cannot be synthesized from
+outside the gateway. Do not let the requested digest masquerade as runtime proof.
 
 ---
 
