@@ -3,12 +3,22 @@
 Pinned: agent-bridle `d1cb545` (+#319 delta on origin), OpenShell `0f8fad23`, newt-agent `4ab6a7be`.
 Labels: **Exact | Narrower | Approximation | Unsupported | Cannot Prove**. `Approximation` and `Cannot Prove` must not silently pass a strength floor.
 
-Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `net` (OS-confinement axes, `Scope<String>`), `max_calls`, `valid_for_generation` (gate-enforced). Achieved strength lattice: `Kernel > Interceptor > Advisory`. Floors: fs structurally pinned `Kernel`.
+> **v3 alignment (normative model = RFC §A).** This crosswalk predates the v3
+> corrections; where it conflicts, RFC **§A** wins. Two structural corrections
+> apply throughout: **(a)** the four `fs_read/fs_write/exec/net` are the projectable
+> **FenceCaveats**; `max_calls`/`valid_for_generation` are Gate-only **GateCaveats**
+> and are **not** projected (RFC §A.2) — so their old "Exact by not projecting"
+> label is replaced by "mediated = Exact / direct-exec = Unsupported." **(b)** the
+> reported strength is `min(MechanismStrength, EvidenceCap)` (RFC §A.4): OpenShell's
+> in-sandbox Landlock is *mechanism-Kernel* but the **claim is capped at
+> Interceptor until applied-policy attestation (U1)** — never report bare `Kernel`.
+
+Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `net` (**FenceCaveats**, OS-confinement, `Scope<String>`), `max_calls`, `valid_for_generation` (**GateCaveats**, gate-enforced only). Achieved **MechanismStrength** lattice: `Kernel > Interceptor > Advisory`; the advertised claim is capped by **EvidenceStrength** (§A.4).
 
 ## Axis rows
 
-### 1. `fs_read` / `fs_write` → `filesystem_policy.read_only` / `read_write` (Landlock)
-- **Mapping label: Exact-at-creation (Narrower thereafter), strength `Kernel` ONLY under conditions below; otherwise Cannot Prove.**
+### 1. `fs_read` / `fs_write` → `filesystem_policy.read_only` / `read_write` (in-sandbox Landlock)
+- **Mapping label: Narrower; MechanismStrength `Kernel` under the conditions below, but reported claim CAPPED at `Interceptor` until per-invocation applied-policy attestation (U1) — never bare `Kernel` (§A.4). Enforced by OpenShell's *in-sandbox* Landlock, not desk-local Landlock (§A.1).**
 - Conditions the projection compiler MUST emit:
   - `landlock.compatibility: hard_requirement` — the default `best_effort` runs the sandbox with ZERO fs restriction on 3 failure paths (landlock.rs:157-179, 269-289, 309-332), each returning Ok. Default = fail-open; hard_requirement makes each fatal. A projection that omits this silently violates the fs Kernel floor.
   - Non-empty path lists — empty `filesystem_policy` short-circuits Landlock entirely (landlock.rs:146; the one default-ALLOW in OpenShell's model). `Scope::All` on fs axes → do NOT emit empty policy; either refuse (floor demands Kernel bound) or emit explicit broad roots.
@@ -34,8 +44,8 @@ Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `ne
   - `tls: skip` endpoints and protocol-less endpoints degrade to L4 raw relay — fine, but label those endpoints L4/Interceptor, no L7 claims.
 - Bridle vocabulary: keep `Caveats.net` host-grain (Option A of the network investigation). OpenShell port/method/path rules enter as mechanism-side narrowing via the `#[non_exhaustive]` `NetRule` (`Rest{..}` placeholders, #153) and resolved-scope `classes`. No trusted-core vocabulary expansion needed for slice 1.
 
-### 4. `max_calls` / `valid_for_generation`
-- **Exact — by NOT projecting.** These are gate-enforced (Bridle `Gate::authorize` budget CAS + generation check) and remain desk-side. OpenShell has no call budgets (RFC 0011 Phase 6 quotas unimplemented; inference quotas: one unrelated error string). Never claim OpenShell enforcement for these axes.
+### 4. `max_calls` / `valid_for_generation` (GateCaveats — NOT projected, §A.2)
+- **Mediated MCP/Gate path: Exact** (`Gate::authorize` budget CAS `gate.rs:244-270` + generation check `gate.rs:228-238`). **Direct in-sandbox exec path: Unsupported** — the Gate is not in the syscall path, so an unmediated shell op consumes no budget and honors no generation bound. Do **not** label these "Exact by not projecting" (I2). OpenShell has no call budgets (RFC 0011 Phase 6 quotas unimplemented). **Admission rule:** a grant carrying a restrictive `max_calls`/`valid_for_generation` over a worker that has direct-exec authority MUST **fail admission** (§A.2, adversarial case 8).
 - Swarm fair-share of dgx1 inference = `max_calls` metering at the Bridle gate fronting the inference capability (mode-3 justification), optionally hard-bounded by OpenShell L7 rate middleware later (none built-in today).
 
 ### 5. Step-up / presence / attestation
@@ -59,11 +69,11 @@ Bridle authority = mesh `Caveats` (6 fields): `fs_read`, `fs_write`, `exec`, `ne
 ### 9. Evidence honesty summary (strength-floor consequences)
 | Bridle demands | OpenShell provides | Verdict |
 |---|---|---|
-| fs Kernel floor | Landlock hard_requirement + non-empty paths + native test | Achievable; runtime attestation partial (ASM row) |
+| fs Kernel floor | in-sandbox Landlock hard_requirement + non-empty paths + native test | Mechanism-Kernel achievable; **reported claim capped at Interceptor until U1 attestation** (§A.4), never bare Kernel |
 | exec bound | image contents, unpinned | Refuse Kernel; Advisory/bounded-by-image; keep exec mediation inside boundary |
 | net bound | proxy Interceptor + nft DenyDirect backstop | Interceptor for allowlists; deployment must guarantee nft present (probe at admission) |
-| budgets/generation | none | stays at Bridle Gate (Exact) |
-| presence/step-up | none | stays at Bridle Gate (Exact) |
+| budgets/generation | none | Gate-only: **mediated = Exact, direct-exec = Unsupported** (§A.2); restrictive grant over direct-exec worker → fail admission |
+| presence/step-up | none | Gate-only: **mediated = Exact, direct-exec = Unsupported** (§A.2) |
 | applied-policy proof | version int self-report | Cannot Prove → assurance manifest `partial`, never `proved` |
 | image identity | tag only | Cannot Prove → upstream PR or pin-by-digest ourselves in template.image |
 | audit trail | unsigned lossy OCSF | Advisory evidence only |
