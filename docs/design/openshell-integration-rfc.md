@@ -4,12 +4,21 @@
 > **Companions:** [semantic crosswalk](openshell-semantic-crosswalk.md) · [upstream contribution proposals](openshell-upstream-contributions.md).
 > This is the full study behind the ADR: decision matrix, threat model, migration path, prototype plan, PR train, exit criteria. It follows the ADR 0026 projection template ("POSIX is a projection of Bridle authority; the same law governs OpenShell").
 
-**Status:** Draft, v2 — adversarially reviewed once; *no implementation authorized*
+**Status:** Draft, v3 — adversarially reviewed twice; *no implementation authorized*
 **Author:** architecture coordinator (integration study)
 **Date:** 2026-08-13
-**Verdict of review pass 1:** survive-with-amendments. Recommendation (B; C→B→A; reject D; gate E) stands; six findings folded in below.
+**Verdict of review pass 1:** survive-with-amendments. Recommendation (B; C→B→A; reject D; gate E) stands; six findings folded into v2.
+**Verdict of review pass 2:** the recommendation still stands, but pass 2 found the v2 text still carried an **impossible-conjunction error** (a single remote process cannot be jointly constrained by desk-local Landlock *and* an OpenShell fence) and several under-specified security objects. v3 adds a **normative model (§A)**, six **formal invariants (§B/I1–I6)**, **test obligations (§C)**, and reworks §0/§3/§5.2/§7/§9/§10. **This is a security contract; later implementation PRs are held against it.**
 
-**Changelog v1→v2 (each item is a conceded red-team finding):**
+**Changelog v2→v3 (each item is a conceded review-pass-2 finding; §A is authoritative):**
+- **F1 — separate execution backend from enforcement mechanism.** v2 still said "`SandboxKind::OpenShell`" and implied a single process could get desk-local Landlock for fs *and* an OpenShell fence for net. **Retracted.** A process has exactly one **ExecutionBackend** (`Local` | `RemoteFence`); each authority axis is enforced by an **EnforcementMechanism** *that lives where the execution runs*. Desk-local Landlock cannot reach a remote container. The "additive" split is valid only at the fleet level (some commands Local, some Remote), never within one execution. See §A.1.
+- **F2 — separate authority identity from execution identity.** "Authenticate with an AgentKey" was too vague. AgentKey possession (**AuthorityIdentity**) is a different grain from the kernel-local process/image proof (**ExecutionIdentity**). v3 defines both and a content-addressed **`RemoteWorkerBinding`** that cryptographically binds authority to a specific sandbox instance, image, plan, generation, and audience; recommends the **brokered** key model (root key never enters the worker). See §A.3.
+- **F3 — split fence authority from gate authority.** The projection theorem must quantify over **FenceCaveats** (`fs_read/fs_write/exec/net`), not all `EffectiveCaveats`. **GateCaveats** (`max_calls`, `valid_for_generation`, presence) are Gate-only; on the direct-exec path they are **Unsupported**, not "Exact by not projecting." A grant that needs a global GateCaveat over unmediated exec must **fail admission**. See §A.2.
+- **F4 — reconcile mechanism strength with evidence strength.** `AxisEnforcement` (Kernel/Interceptor/Advisory) is a **MechanismStrength** — a pure function of `(effective, mechanism)` (`report.rs:211-219`), no evidence input. The claim Bridle advertises = `min(MechanismStrength, EvidenceCap)`; pre-U1 the OpenShell fs/net **EvidenceCap is Interceptor**, so the backend must **not** report `Kernel`. See §A.4.
+- **F5 — strengthen persistent-fence identity.** Today the fence id is only `FenceBody{mechanism_caveats, mechanism}` (`admitted.rs:183-186`); reuse keyed on `(grant × fs/exec scope)` is unsound. v3 defines a content-addressed **`StaticFenceCid`** over all security-relevant static inputs; reuse requires CID equality. See §A.5.
+- **F6 — abstraction before OpenShell.** PR 5 split into **5a** (the execution seam; local behavior unchanged, no OpenShell dep) then **5b** (OpenShell via the seam). See §9.
+
+**Changelog v1→v2 (each item is a conceded review-pass-1 finding):**
 - **C1 (was "one small core PR"):** retracted. The `Sandbox` trait is a *local-confinement* contract (`apply` confines the current thread; `command_prefix` wraps local argv); OpenShell is a *remote execution service* with no local child to confine. B requires a **new persistent-fence execution seam** in `spawn.rs`/`best_available_sandbox`, and the local `verify_applied` non-equivocation backstop goes vacuous for a remote fence. **C1-bis (verified against a prior evaluation, reinforces C1):** the seam must *also* supply a **new remote-worker-authentication** mechanism — Bridle's existing worker auth is kernel-local by construction (`agent-bridle-tool-shell/src/private_control.rs`: `SCM_CREDENTIALS` from the worker's real parent + `same_image` dev/ino identity + a pre/post parent snapshot; `agent-bridle-jaild` peer auth via `SO_PEERCRED`). A containerized/remote worker shares no kernel socket, parent, or image with the desk and **fails every check**. This is where B's seam meets E's identity work: the natural remote-worker credential is a mesh AgentKey (attenuated, per-AgentKey dock-pinned), not a kernel peer-cred. PR 5 re-scoped (§9); matrix size/migration rows re-read (§2).
 - **C2 (the AND-invariant):** degraded honestly. For the *direct in-sandbox exec path* (wyvern's unconfined `bash`), Bridle is **not** in the per-operation decision path — it authored the fence once, pre-provisioning. `max_calls`/`valid_for_generation`/presence are enforced **only on the mediated MCP channel**, and fs revocation cannot reach a running workload until `DeleteSandbox`. §5.2 and threat rows T18–T19 added.
 - **C3 (C prototype safety):** the naive C leaks the operator root key (`~/.newt/identity.pem`) into hostile `bash`, and nested Bridle seccomp/Landlock likely fails closed inside the OpenShell workload. §8 respecified: slice-1 worker = **wyvern** (no confinement to break), desk-minted attenuated AgentKey injected (root key never crosses), in-image capability probe added, `agent-bridle-mcp` placement pinned. Threat row T20.
@@ -36,10 +45,148 @@
 ## 0. Executive summary
 
 - **Recommended target architecture: B — OpenShell as a Bridle `Sandbox`/enforcer backend** (`agent-bridle-openshell` leaf crate + a **non-trivial `agent-bridle-core` change**: a new `SandboxKind` variant, its honest per-axis `enforcement_report` mapping, **and a persistent-fence execution seam** — the current `Sandbox` trait cannot express a remote fence, see C1/§3/F-note). Bridle's `AdmittedFence::admit` remains the sole adjudicator; OpenShell receives a *compiled, post-admission* policy and can only narrow. Topology **A** (a three-layer compiler) is the *deployment face* of the same code, not a competing design — the compiler is the backend's `project` closure.
-- **What B actually buys (and what it does not):** B is a **net-enforcement + credential-non-equivocation + outer-fence acquisition**. It gives Bridle, for the first time on Linux, host-allowlist egress enforcement for arbitrary child processes (Interceptor-grade proxy + kernel deny-direct backstop — Bridle's own egress proxy is macOS-only today), credential placeholder/proxy substitution (Bridle has no counterpart), and an outer boundary for *deliberately unconfined* workers (wyvern; Newt's open `b1-os-isolation`). On the **filesystem axis it is a downgrade**: native Landlock is local, observed per-invocation, and fail-closed in-process; OpenShell's fs "Kernel" is *Kernel-modulo-an-unverified-remote-TCB* (self-reported `LOADED` integer, full-admin-by-default gateway in the path). **Use B additively for net/credentials/placement — never as a substitute for desk-local Landlock on fs.**
+- **What B actually buys (and what it does not) — corrected in v3 (F1):** B is a **net-enforcement + credential-non-equivocation + outer-fence acquisition**. It gives Bridle, for the first time on Linux, host-allowlist egress enforcement for arbitrary child processes (Interceptor-grade proxy + kernel deny-direct backstop — Bridle's own egress proxy is macOS-only today), credential placeholder/proxy substitution (Bridle has no counterpart), and an outer boundary for *deliberately unconfined* workers (wyvern; Newt's open `b1-os-isolation`). The acquisition is **per-execution-backend, not per-axis on one process**: a command that runs **Local** keeps native desk-local Landlock (fs = Kernel, observed in-process); a command that runs in an OpenShell sandbox (**RemoteFence**) has **all** its axes enforced by in-sandbox mechanisms — its fs is OpenShell's in-sandbox Landlock (mechanism-Kernel, but **claim capped at Interceptor** until applied-policy attestation exists, §A.4), and it is **not** additionally constrained by desk-local Landlock, which cannot reach a remote container. So a remote execution's fs is **evidence-weaker** than the same command run locally. The "additive" benefit is a **fleet** property (route fs-sensitive work Local, egress-sensitive/unconfined work Remote), never a within-process axis split. See §A.1.
 - **Rejected: D — Bridle as an OpenShell authority subsystem.** OpenShell's only sanctioned interposition point (gateway interceptors) cannot mediate `ExecSandbox` (streaming), reads, or the new `StopSandbox`/`StartSandbox`, has an unauthenticated transport to the interceptor, and is blind to prior state. Complete mediation cannot be built on it. Revisit only if upstream closes those gaps.
 - **Migration path: C → B → A, with E (the swarm) as a parallel track gated on a transport prerequisite.** C (Newt or a worker *inside* one OpenShell sandbox, reached by an `agent-bridle-mcp` authority) is the cheapest interop proof and it exercises the real wire. B is the actual integration. A is B deployed as a compiler service. **E** — your Drake-Swarm shape, `newt → agent-mesh → OpenShell → wyvern` — is the aspirational capstone but is **blocked at the transport layer**: agent-mesh is QUIC/UDP with relay disabled, OpenShell egress is a TCP-only HTTP CONNECT proxy behind an nftables UDP reject. E is unreachable until a TCP/WebSocket mesh `Transport` and per-AgentKey dock pinning exist. Do not start with E.
 - **The honest ceiling:** OpenShell can *prove* (kernel/e2e-verified) filesystem confinement and deny-by-default egress; it can only *log* — unsigned, lossy, self-reported — that any control is actually active, and it pins no image digest. So `AppliedPolicyCid`/`RuntimeEvidenceCid`/`SandboxImageCid` are "Cannot Prove" upstream today. The integration is safe to *build* and *demo*; it is not safe to *certify* until the assurance residuals below are closed with native hostile-child evidence.
+
+---
+
+## A. Execution / enforcement / identity model (v3 — NORMATIVE)
+
+> **Label note:** the normative sections **§A / §B / §C** (this block) are distinct from the candidate **topologies A–E** (§2). "§A.4" is a section reference; "topology B" / "B backend" / "A as its face" refer to topologies. The `§` prefix always marks a section.
+
+**This section is authoritative.** Where any looser language elsewhere in this RFC (or in v1/v2) conflicts with it, this section wins. It resolves the six review-pass-2 findings. All claims are grounded in the current tree (agent-bridle `d1cb545`+#348).
+
+### A.1 Three separated concepts — execution ≠ mechanism ≠ evidence (F1)
+
+**Fact — no separation exists today.** `SandboxKind` (`sandbox.rs:45-78`) enumerates only *per-OS, desk-local mechanisms that are simultaneously execution models* (Landlock, Seatbelt, AppContainer, MinimalRootfs, MicroVm, None). The `Sandbox` trait (`sandbox.rs:84-157`) bundles both: `apply(&Caveats)` confines the **calling thread** (Landlock `restrict_self`, per-thread, irreversible, inherited only across *that thread's own* `fork`/`execve` — `sandbox.rs:1128-1131`), and `command_prefix` wraps **local argv** (`sandbox-exec`/`aclaunch`). `best_available_sandbox` (`sandbox.rs:546-571`) returns exactly **one** `Box<dyn Sandbox>` by a returning cascade — there is **no composition**; one spawn gets one backend (`spawn.rs:508-509`).
+
+**Contract — separate the three concepts:**
+
+1. **ExecutionBackend** — *where/how* the command runs: `Local` (a desk-local child) or `RemoteFence(handle)` (a process inside an OpenShell sandbox). **One execution has exactly one ExecutionBackend.**
+2. **EnforcementMechanism** — *which* mechanism enforces *each* fence axis, **at the execution location**. A mechanism can only enforce an axis of an execution that runs *where the mechanism lives*.
+3. **Evidence** — *what proves* a mechanism was applied to *this* invocation (§A.4), distinct from mechanism identity.
+
+**The impossible-conjunction ban.** `restrict_self` confines only the calling desk thread; it has no reach into a remote container. Therefore a process inside an OpenShell sandbox is **not**, and **cannot** be, constrained by desk-local Landlock. For a RemoteFence execution, *every* axis is enforced by an in-sandbox mechanism or by nothing. The v2 "native Landlock for fs + OpenShell for net on the same process" framing is **retracted**; that split is valid only at the **fleet** level.
+
+**Required answer — "for a worker executing inside OpenShell, what enforces `fs_read`/`fs_write`, and what strength may Bridle claim?"** The mechanism is **OpenShell's in-sandbox Landlock** (the supervisor's `restrict_self` on the workload), MechanismStrength **Kernel**. The **effective claim is capped at Interceptor** until per-invocation applied-policy attestation exists (U1), because Bridle has only a self-reported `LOADED` integer that *this* invocation received the intended ruleset (§A.4). Native desk-local Landlock (a Local execution) is Kernel **and observed in-process**; a remote fs axis is therefore **evidence-weaker for the same caveats** — a downgrade in EvidenceStrength, not mechanism class.
+
+### A.2 Fence authority vs Gate authority (F3)
+
+**Fact — the split already exists.** `report.rs:147-153`: the four `fs_read/fs_write/exec/net` are "OS-confinement axes"; `max_calls`/`valid_for_generation` are "gate-enforced budget/causality, **not** OS-confinement axes." Both gate axes are enforced only inside `Gate::authorize` — a software generation check (`gate.rs:228-238`) and an atomic compare-and-decrement budget (`gate.rs:244-270`), called per authorize (`gate.rs:211,216`); `SandboxKind` is consumed only later at the mint site (`gate.rs:219-223`). No OS mechanism backs them.
+
+**Contract — name the product and quantify projection over the fence subset:**
+
+```
+EffectiveCaveats = FenceCaveats × GateCaveats
+FenceCaveats = { fs_read, fs_write, exec, net }      -- projectable to a mechanism
+GateCaveats  = { max_calls, valid_for_generation }   -- Gate-only ( + presence/step-up, composed via StepUpPolicy )
+
+project : (FenceCaveats, RuntimeCapabilities) -> OpenShellPolicySpec | Unsupported
+theorem :  authority(project(fence(c))) ⊑ fence(c)          -- I1, never widen
+```
+
+GateCaveats are **not projected**. Per-caveat behavior by path:
+
+| GateCaveat | Mediated MCP / Gate path | Direct in-sandbox exec (unmediated shell) |
+|---|---|---|
+| `max_calls` | **Exact** (Gate charges the budget per authorize) | **Unsupported** — the Gate is not in the syscall path |
+| `valid_for_generation` | **Exact** (Gate checks the generation per authorize) | **Unsupported** |
+| presence / step-up | **Exact** (discharge verified per authorize) | **Unsupported** |
+
+**Admission rule (fail-closed, I2).** If a grant carries a *restrictive* GateCaveat (non-`⊤` `max_calls`, bounded `valid_for_generation`, or a presence requirement) **and** the execution model exposes a direct unmediated exec path (a worker that can run arbitrary shell, not a mediated-tool-only surface), `admit` MUST **refuse**. No mechanism enforces a per-operation budget or presence gate over unmediated bash. The grant is satisfiable only if the worker has **no** direct-exec authority (every op crosses the Gate) or the grant does not restrict the GateCaveat. Do not admit and pretend (adversarial case 8).
+
+### A.3 Authority identity vs execution identity (F2)
+
+Two different grains, never conflated:
+
+- **ExecutionIdentity** — proves facts about a *specific process / executable*. **Local:** the kernel-local proof — `SCM_CREDENTIALS` from the real parent (fail-closed on absence, `private_control.rs:394-418`), `same_image` dev/ino (`private_control.rs:36-44,71-76`), a parent pre/post snapshot (`verify_parent`, `private_control.rs:450-464`); `SO_PEERCRED` in `jaild` (`broker.rs:98-131`). **Remote:** **unavailable** across the container boundary (C1-bis) — no shared kernel socket, parent, or image inode.
+- **AuthorityIdentity** — proves *possession of delegated cryptographic authority* (a mesh AgentKey / attenuation-only Grant chain, `child ⊑ parent`). Possessing a key says nothing about which process or image holds it.
+
+**Possession of an AgentKey is NOT equivalent to `SCM_CREDENTIALS + parent PID + image identity`.** For a **remote** worker, ExecutionIdentity is *replaced* by a cryptographic **`RemoteWorkerBinding`** — a content-addressed object built with the existing `content-addressable` `ContentId` + `to_canonical_dagcbor` machinery, but **domain-tagged** in the mesh's `Tagged{kind, body}` style (`authority.rs:43-44`, e.g. a `"agent-bridle/remote-worker-binding/v1"` kind) — note `FenceBody` today is **not** domain-tagged (`admitted.rs:182-192`), a gap this design should not copy. Fields (reuse existing CIDs; net-new ones flagged):
+
+```
+RemoteWorkerBinding {
+    authority_cid,          // the EffectiveAuthorityCid / grant exercised (mesh AuthorityId/GrantId)
+    sandbox_instance_cid,   // OpenShell sandbox UUID, content-addressed        [net-new]
+    sandbox_image_cid,      // digest-pinned image identity                     [net-new]
+    enforcement_plan_cid,   // the admitted plan (mechanisms + fence caveats)   [net-new]
+    static_fence_cid,       // §A.5                                             [net-new]
+    generation,             // causal, per valid_for_generation (NOT wall-clock; caveats.rs:159-161)
+    expiry_generation,      // causal window (freshness = generations, per step_up)
+    audience,               // session/dock scope the binding is valid for
+}
+```
+
+Construction MUST follow the `ResolvedGrant::bind` pattern (`authority.rs:298-311`): the binding is **only constructible when the body's CID equals the named authority** — a mismatch is *unrepresentable*, not merely checked. The desk accepts a remote result **only if** the proof resolves to a `RemoteWorkerBinding` whose every field matches the intended authority, sandbox instance, image, plan, and current generation (I5); a binding minted for S1 fails for S2, a stale one fails the generation check, a wrong-image/plan one fails those CID equalities (adversarial cases 1–4).
+
+**Chosen trust model: brokered execution identity (Option B).** The signing authority (parent/root AgentKey) stays **outside** the hostile worker; a trusted desk-side broker (the dock registry that already gates responders) mints the `RemoteWorkerBinding` for an identified sandbox and hands the worker only a **narrow, sandbox-scoped, short-lived** credential — never the root key (this is the fix for T20). **Option A** (sandbox-scoped principal — "any process in sandbox S holding key K") is documented as the explicitly **broader, weaker** fallback: if chosen, the RFC must state the grain is deliberately coarser than today's fixed local worker-image identity, and that a captured K authorizes any process in S for the binding's generation window (replay bounded only by generation + audience). **Recommendation: Option B.**
+
+### A.4 Mechanism strength vs evidence strength (F4)
+
+**Fact.** `AxisEnforcement` (`Kernel > Interceptor > Advisory`, hand-ordered ascending `rank`, `report.rs:88-132`) is computed by `enforcement_report(effective, mechanism)` — a **pure function of `(effective, mechanism)`** with **no** evidence/attestation input (`report.rs:211-219`; module doc `report.rs:10-14`). It is a **MechanismStrength**. The separate `formal/assurance/manifest.toml` carries claim-level **EvidenceStrength** (`proved | partial | held`, `manifest.toml:14`); there is **no per-invocation** evidence type today.
+
+**Contract:**
+
+```
+effective_claim = min( MechanismStrength , EvidenceCap )        -- I3, reported ≤ provable
+```
+
+- **MechanismStrength**: what the mechanism class can enforce (OpenShell in-sandbox Landlock fs = Kernel-class).
+- **EvidenceCap**: the strongest claim provable for *this* invocation. Pre-U1, an OpenShell fence's applied policy is a self-reported `LOADED` integer → EvidenceCap = **Interceptor** (policy-accepted / proxy-observed), **not** Kernel.
+
+Therefore the OpenShell-projected EnforcementMechanism arm of `enforcement_report` MUST report fs/net at **Interceptor, not Kernel**, until per-invocation applied-policy attestation (U1) lifts the cap — exactly the honesty-deduction pattern already used for Seatbelt-net (always Advisory) and Landlock-exec (Interceptor, loader trampoline). `Kernel` must **never** ambiguously mean "the provider probably uses a kernel mechanism." A per-invocation `EvidenceStrength` type is proposed as future design; until it exists, admission conservatively caps the claim (adversarial case 7).
+
+### A.5 Static fence identity (F5)
+
+**Fact.** A fence's identity today is `FenceBody { mechanism_caveats, mechanism }` (`admitted.rs:183-186`, un-domain-tagged) — it omits the runtime closure (the *value* `RuntimeClosure` exists at `admitted.rs:97-100` but has no CID), the image, the spec, the floor, and the capability probes. Fence **reuse** keyed on `(session grant × fs/exec scope)` (the v2 wording) is therefore **unsound**: two executions with identical caveats but a different image/closure/floor/nft-availability would share a fence they must not.
+
+**Contract — a content-addressed `StaticFenceCid`** (net-new; domain-tagged) over *all* security-relevant static inputs:
+
+```
+StaticFenceCid = H_tagged(
+    static_authority     = fence(mechanism_caveats),   // existing Caveats
+    mechanism            = ConfinementMechanism,        // existing
+    runtime_closure_cid  = H(RuntimeClosure),           // value exists (admitted.rs:97-100); CID net-new
+    sandbox_image_cid,                                  // net-new (digest-pinned)
+    openshell_spec_cid,                                 // net-new (static sandbox spec)
+    enforcement_floor    = EnforcementFloor,            // existing
+    runtime_capabilities,  // nft present? Landlock ABI? seccomp-filter permitted? (probed)
+    policy_compiler_version,
+    authority_generation_baseline
+)
+```
+
+**Reuse rule (I4):** a coarse `(grant × scope)` key MAY index the fence cache, but reuse requires **`StaticFenceCid` equality**. Dynamic invocation policy (net narrowing) binds to the fence instance via a *separate* `(OpenShellPolicyCid, generation)` and **never** mutates `StaticFenceCid` (adversarial case 11). **Invalidation:** any static-input change → a different `StaticFenceCid` → no reuse (new sandbox); generation rollover past `expiry_generation`, image/closure/floor change, or a capability-probe delta all force invalidation (adversarial cases 5, 6).
+
+### B. Formal / security invariants
+
+- **I1 — No authority widening.** For every enforceable projected (fence) axis: `authority(project(fence(c))) ⊑ fence(c)`. Property-tested; TLA+/Lean non-amplification model reusing the ADR 0026 harness.
+- **I2 — No unsupported-caveat masquerading.** A caveat not enforced on a given execution path MUST NOT be reported as enforced because another path would enforce it (GateCaveats on direct-exec → Unsupported, not Exact).
+- **I3 — Evidence-bounded claim.** `reported_enforcement ≤ provable_enforcement` (`effective_claim = min(MechanismStrength, EvidenceCap)`).
+- **I4 — Fence-identity completeness.** Any security-relevant static-input change produces a different `StaticFenceCid` or forces invalidation; reuse requires CID equality, never a coarse key alone.
+- **I5 — Remote-identity binding.** A remote execution result is accepted only if its identity proof binds the intended authority, sandbox/fence instance, image/runtime identity, enforcement plan, generation/lifetime, and audience/session.
+- **I6 — No local-identity downgrade.** Introducing remote execution MUST NOT weaken the existing local `SCM_CREDENTIALS`/`SO_PEERCRED`/real-parent/`same_image` path. The local path is unchanged; the remote path *adds* a separate cryptographic identity, never relaxes the local one.
+
+### C. Test / proof obligations (implementation acceptance criteria — NOT built in this docs PR)
+
+Each maps to the invariant it guards; express as future property tests or model-checkable invariants.
+
+| # | Adversarial case | Guards | Expected |
+|---|---|---|---|
+| 1 | captured AgentKey used from a *different* sandbox | I5 | reject (`sandbox_instance_cid` mismatch) |
+| 2 | captured AgentKey reused after a generation change | I5 | reject (past `expiry_generation`) |
+| 3 | correct AgentKey + wrong enforcement-plan CID | I5 | reject (`enforcement_plan_cid` mismatch) |
+| 4 | correct AgentKey + wrong sandbox-image CID | I5 | reject (`sandbox_image_cid` mismatch) |
+| 5 | fence reused after runtime closure changes | I4 | no reuse (`StaticFenceCid` differs) |
+| 6 | fence reused after static OpenShell policy changes | I4 | no reuse (`StaticFenceCid` differs) |
+| 7 | provider reports `LOADED` but applied-policy CID differs | I3 | claim capped / refuse; never `Kernel` |
+| 8 | direct exec attempts to claim `max_calls` enforcement | I2 | admission refuses the grant (§A.2) |
+| 9 | local worker with wrong parent/image | I6 | reject (unchanged local proof) |
+| 10 | remote execution bypasses the authority-floor comparison | I1 | impossible — `admit` runs before any spawn |
+| 11 | dynamic net-policy generation mutates static fs/exec identity | I4 | impossible — `StaticFenceCid` excludes dynamic policy |
+| 12 | unsupported mechanism/axis combination | I2/I3 | fail admission, never silently degrade |
 
 ---
 
@@ -87,29 +234,34 @@ Scores: ✅ strong · ⚠️ conditional/partial · ❌ weak/blocked. "≈" = sa
 
 ## 3. Recommended target architecture — **B, with A as its face**
 
-Bridle stays the sole authority. Add one leaf crate `agent-bridle-openshell` (holds tonic/tokio, gateway client, lifecycle — off the trusted core, per the jaild/aclaunch precedent) **plus a core change that is larger than a new enum arm** (C1). The backend's job is a total function:
+> **Read §A first — it is the normative model.** This section describes the backend shape; §A governs the execution/mechanism/identity separation, the fence/gate split, the strength-vs-evidence cap, and the fence identity. Any conflict resolves to §A.
+
+Bridle stays the sole authority. Add one leaf crate `agent-bridle-openshell` (holds tonic/tokio, gateway client, lifecycle — off the trusted core, per the jaild/aclaunch precedent) **plus a core change that is larger than a new enum arm** (C1). The backend's job is a total function **over the fence subset** (§A.2), never over the gate axes:
 
 ```
-project : (EffectiveCaveats, RuntimeCapabilities) -> OpenShellPolicySpec | Unsupported
-    such that   authority(OpenShellPolicySpec) ⊑ EffectiveCaveats     (never widen)
+project : (FenceCaveats, RuntimeCapabilities) -> OpenShellPolicySpec | Unsupported
+    such that   authority(project(fence(c))) ⊑ fence(c)     (I1, never widen)
+    where       fence(c) = { fs_read, fs_write, exec, net }        -- NOT max_calls / valid_for_generation
 ```
+
+The backend is registered under an **ExecutionBackend::RemoteFence** (§A.1), not as another local `SandboxKind` variant selected by `best_available_sandbox`; a RemoteFence execution receives its enforcement entirely from in-sandbox mechanisms.
 
 **The core-surgery reality (C1).** The existing `Sandbox` trait is a *local-confinement* contract: `apply(&Caveats)` confines the calling thread (Landlock `restrict_self` on a throwaway spawn thread) and `command_prefix` wraps *local* argv (Seatbelt/`aclaunch`). OpenShell has **no local child to confine** — the workload is spawned by the supervisor inside a remote container. So B cannot be "implement two trait methods":
 - Core needs a **third execution mode — a persistent remote fence** — threaded through `ConfinedCommand::spawn` and `best_available_sandbox` (today: fresh-boxed backend *per spawn*, one hardcoded `cfg` arm per kind; a seconds-to-create reusable sandbox cannot live behind a per-spawn constructor). This touches `spawn.rs`, the most audit-sensitive file in Bridle (home of the #317 nineteen-violation audit). It must be done with the same admission discipline, not bolted on.
 - **Remote-worker authentication is a distinct sub-problem the seam must solve (C1-bis).** Bridle authenticates a spawned worker with kernel-local primitives — `SCM_CREDENTIALS` from the real parent, `same_image` (dev/ino) identity, and a parent pre/post snapshot in `agent-bridle-tool-shell/src/private_control.rs`; `SO_PEERCRED` in `agent-bridle-jaild`. None of these can authenticate a worker running in a remote container: no shared kernel socket, no parent relation, no shared image inode. The remote fence therefore needs a **cryptographic worker identity** in place of peer-creds — the mesh AgentKey (attenuated, per-AgentKey dock-pinned) is the natural fit, which is why B's execution seam and E's identity/dock work are coupled and should be designed together even though B ships first.
 - The local `verify_applied` backstop (recompute the CID of "the caveats about to be applied", refuse on mismatch — spawn.rs:607) **goes vacuous** for a remote fence: "about to be applied" becomes a gRPC hop ending in a self-reported integer. B must replace it with an *evidence-returning* admission (see the applied-policy hash-echo, now a certification blocker, §10) or explicitly record the lost backstop as an assurance residual.
-- A `ConfinementMechanism` config carrier must transport *probed* runtime state (nft presence, `hard_requirement`, Landlock ABI) into the honesty mapping, since the same `SandboxKind::OpenShell` enforces differently per probe.
+- A `ConfinementMechanism` config carrier must transport *probed* runtime state (nft presence, `hard_requirement`, Landlock ABI) into the honesty mapping, since the same OpenShell-projected EnforcementMechanism enforces differently per probe. (The OpenShell mechanism needs a `enforcement_report` arm as a *mechanism identity*, but it is reached via `ExecutionBackend::RemoteFence`, **not** auto-selected as a local `SandboxKind` by `best_available_sandbox` — §A.1.)
 
 - **Where the compiler lives:** inside the backend crate, desk-side (in the trusted host, *not* in the sandbox). It is exactly `AdmittedFence::admit`'s `project` closure. `admit` runs first; the compiler only ever sees post-`meet` effective caveats.
 - **How projection is validated:** the backend implements `resolved_authority`/`runtime_closure` as a *conservative hostile-child upper bound* computed from the **same** routine that emits the policy (anti-drift), so `admit` can prove `resolved ⊑ delegated ∪ runtime_closure` at ruleset grain and refuse on `Superset|Incomparable|Unknown`. Anything OpenShell cannot bound (exec identity, ICMP/SCTP, audit-mode endpoints) resolves `Unknown ⇒ refuse`.
 - **How dynamic policy updates are authorized:** narrowing (revoke, tighten) compiles freely and pushes via `UpdateConfig`; **widening requires a new grant → new `EffectiveAuthorityCid` → new `EnforcementPlanCid` → new policy submission.** A gateway interceptor on `UpdateConfig` (which *is* interceptable) denies any policy transition not carrying a valid enforcement-plan CID the authority service authored. The interceptor can't see prior state, but the authority service can — it wrote every admitted policy.
 - **How isolation evidence returns to Bridle:** today, weakly — a self-reported version integer. The backend must therefore treat runtime attestation as `partial` (assurance-manifest row), and the *real* evidence for a `Kernel` claim is our own native hostile-child test run inside the pinned image at integration time. Upstream asks (below) would upgrade this.
-- **How strength floors operate:** the backend emits `enforcement_report` per axis. fs → `Kernel` **only** if it compiled `landlock.compatibility: hard_requirement` + non-empty paths (else the axis fails the structural fs floor and `admit` refuses). net → `Interceptor` for host allowlists (proxy-enforced) with a kernel deny-direct backstop, and only if nft presence is probed at admission. exec → never `Kernel` (no OpenShell primitive); bounded-by-image, reported honestly.
+- **How strength floors operate (with the §A.4 evidence cap):** the backend emits `enforcement_report` per axis, but the *reported* strength is `min(MechanismStrength, EvidenceCap)`. fs mechanism is Kernel-class **only** if it compiled `landlock.compatibility: hard_requirement` + non-empty paths (else it fails the structural fs floor and `admit` refuses) — but the **reported** fs strength is capped at **Interceptor until per-invocation applied-policy attestation (U1) exists** (§A.4); it must **not** report `Kernel` pre-U1. net → `Interceptor` for host allowlists (proxy-enforced, evidence-observable) with a kernel deny-direct backstop, only if nft presence is probed at admission. exec → never `Kernel` (no OpenShell primitive); bounded-by-image, reported honestly.
 - **How denials/downgrades propagate to Newt:** unchanged — Bridle's structured `Denial{kind,target,reason}` envelope flows back through the existing tool-result oracle; a projection that would widen returns `Unsupported`, which Newt surfaces as "axis unsupported on this backend," never a silent success.
 
 **Lifecycle reconciliation — the fence key, made precise (C4).** "Sandbox-per-grant" was underspecified: Bridle's `Registry::Grant` is session-scoped with a shared budget, but Newt mints *per-turn attenuated* caveats and its denial→repair loop widens an axis mid-session. Those cannot each spawn a fresh seconds-scale sandbox. Define instead:
 
-> **fence key = (session grant identity × fs/exec scope).** One OpenShell sandbox is created per distinct fs/exec scope within a session and **reused** while that scope holds. The `net` axis is narrowed per-invocation via dynamic `UpdateConfig` (cheap, hot-reloaded, kills in-flight relays). `max_calls`/`valid_for_generation`/presence stay at the Bridle Gate on the mediated channel and are **not** fence properties.
+> **Indexing key = (session grant identity × fs/exec scope); reuse gate = `StaticFenceCid` equality (§A.5).** The coarse `(grant × scope)` pair MAY index the fence cache, but a cached sandbox is **reused only if its full `StaticFenceCid` matches** — i.e. identical runtime closure, image, spec, floor, and capability probes, not merely identical fs/exec caveats (I4; F5). The `net` axis is narrowed per-invocation via dynamic `UpdateConfig` (cheap, hot-reloaded, kills in-flight relays) bound by `(OpenShellPolicyCid, generation)`, which **never** mutates `StaticFenceCid`. `max_calls`/`valid_for_generation`/presence stay at the Bridle Gate on the mediated channel and are **not** fence properties (§A.2).
 
 Consequences that must be built, not assumed:
 - **fs-widen protocol.** fs is create-time-static and additive-only (additions inert until restart). So a denial→repair fs widen = a *new* fence with a new fs scope. Workspace state lives in the old sandbox's driver-owned volume, so the widen requires either a **volume handoff** (re-attach the named volume to the new sandbox) or a **workspace-mount indirection** (workspace on a mount the new fence re-attaches). Pick one in the prototype; do not hand-wave "amortized."
@@ -162,8 +314,10 @@ Consequences that must be built, not assumed:
                  ├─ projection 1 (mesh Grant/Derivation chain, attenuation-only)
                  │     → what the worker is AUTHORIZED to do        [E only; unused today]
                  └─ projection 2 (agent-bridle-openshell → OpenShellPolicySpec)
-                       → what the worker CAN PHYSICALLY do
+                       → what the worker CAN PHYSICALLY do   [projects FENCE axes only, §A.2]
    invariant:  both descend from the SAME EffectiveAuthorityCid, bound in the CID chain.
+               projection 2 quantifies over FenceCaveats (fs/exec/net + read); GateCaveats
+               (max_calls, valid_for_generation, presence) are NOT projected (§A.2).
    ALLOW = Bridle_authorized ∧ projection_valid ∧ runtime_floor_satisfied ∧ OpenShell_allows
 
    ── TWO ENFORCEMENT REGIMES (C2), do not conflate ───────────────────────────
@@ -243,12 +397,14 @@ Consequences that must be built, not assumed:
 
 | Bridle axis | OpenShell primitive | Label | Strength-floor consequence |
 |---|---|---|---|
-| `fs_read`/`fs_write` | Landlock `filesystem_policy` | **Exact@create / Narrower after** | `Kernel` **only** with `hard_requirement` + non-empty paths + native test; else refuse |
+| **Fence axes** (project; §A.2) | | | |
+| `fs_read`/`fs_write` | OpenShell in-sandbox Landlock | **Narrower; Kernel-mechanism, claim capped** | mechanism-Kernel only with `hard_requirement` + non-empty paths + native test; **reported Interceptor until applied-policy attestation (U1)** — never bare `Kernel` (§A.4); else refuse |
 | `exec` | (none) | **Unsupported / Cannot-Prove** | never `Kernel`; keep exec mediation inside the boundary; image-as-closure is unpinned |
 | `net` (host) | CONNECT proxy + OPA + nft | **Narrower** | `Interceptor` for allowlists + kernel deny-direct backstop; MUST emit `enforce`, probe nft; `inference.local` carve-out projected explicitly |
-| `max_calls` | (none) | **Exact by not projecting** | stays at Bridle Gate; = swarm fair-share meter for dgx1 |
-| `valid_for_generation` | (none) | **Exact by not projecting** | stays at Bridle Gate |
-| presence/step-up | (none — draft-approval ≠ presence) | **Unsupported** | stays at Bridle Gate |
+| **Gate axes** (NOT projected; §A.2) | | | |
+| `max_calls` | (none) | Mediated path: **Exact** (Gate) · Direct exec: **Unsupported** | Gate-only; a grant needing a *global* budget over unmediated exec MUST fail admission (I2, adv. case 8) — never "Exact by not projecting" |
+| `valid_for_generation` | (none) | Mediated path: **Exact** (Gate) · Direct exec: **Unsupported** | Gate-only; same admission rule as `max_calls` |
+| presence/step-up | (none — draft-approval ≠ presence) | Mediated path: **Exact** (Gate) · Direct exec: **Unsupported** | Gate-only; StepUpPolicy composes on top of Caveats |
 | credential use | placeholder + proxy substitution | **Exact (mechanism)** | best alignment; keep Vault gateway-side |
 | dynamic change | `UpdateConfig` static/dynamic split | **Narrower freely; widen⇒new grant** | interceptor on UpdateConfig; authority service tracks prior state |
 | applied-policy proof | version int self-report | **Cannot-Prove** | assurance `partial`, never `proved`; our CID is authoritative |
@@ -284,13 +440,14 @@ Separate prototype success from security certification explicitly in the writeup
 3. `[agent-bridle]` `agent-bridle-mcp` caveats profile + example for the in-sandbox worker; document the in-sandbox-stdio-vs-desk-side trust distinction (C3.3). — *owner: agent-bridle*
 4. `[workspace, tests]` In-image capability probe (Landlock ABI + `seccomp(SET_MODE_FILTER)` permitted?) + Native hostile-child bypass test harness (the §8.7 test) + `ASM-OPENSHELL-BYPASS` assurance row. — *owner: newt-agent*
 
-**Track 2 — B backend**
-5. `[agent-bridle-core]` **(re-scoped, C1 — no longer "small")** Add `SandboxKind::OpenShell` + exhaustive `enforcement_report`/`effective_sandbox_kind` arms + a `ConfinementMechanism` probe-carrier **+ a persistent-remote-fence execution seam in `spawn.rs`/`best_available_sandbox`** that admits with the same discipline as the local path and records the loss of the local `verify_applied` backstop as an assurance residual. Split into 5a (enum+report+carrier) and 5b (exec seam) if reviewable separately; 5b is the audit-sensitive one. — *owner: agent-bridle*
-6. `[agent-bridle-openshell]` New leaf crate (tonic/tokio here, off core): `Sandbox` impl + `project` compiler (effective Caveats → canonical `OpenShellPolicySpec`), `resolved_authority`/`runtime_closure` conservative bounds, `OpenShellPolicyCid` canonical hash (port `examples/governance-interceptor` protoJSON-v2). — *owner: agent-bridle*
-7. `[agent-bridle-openshell, tests]` Property test: `authority(project(c)) ⊑ c` for generated caveats; `Unsupported` on unmediatable axes. — *owner: agent-bridle*
-8. `[agent-bridle-openshell]` **(scope-expanded, C6)** Gateway-interceptor widen-guard denying any policy-affecting transition lacking a valid enforcement-plan CID — covering **`UpdateConfig` + `SubmitPolicyAnalysis` + all draft-approve RPCs + `ImportProviderProfiles`/`UpdateProviderProfiles`/`AttachSandboxProvider` + the global-policy path**; documented as *corroborating, not load-bearing* (T22). — *owner: agent-bridle*
-9. `[agent-bridle, formal]` TLA+/Lean projection non-amplification model (reuse ADR 0026 harness) + assurance rows (`held`→`partial` on native evidence). — *owner: agent-bridle*
-10. `[newt-agent]` Wire the OpenShell backend behind the existing `bridle_registry` seam; no `newt_core` type changes; define the fence key = (session grant × fs/exec scope) + fs-widen volume-handoff (C4). — *owner: newt-agent*
+**Track 2 — B backend. The abstraction lands BEFORE OpenShell (F6). PR 5a must merge and be green before 5b starts.**
+- **5a `[agent-bridle-core]` — the execution seam, NO OpenShell dependency.** Introduce the **ExecutionBackend** distinction (`Local` | `RemoteFence`) separate from `EnforcementMechanism` (§A.1), threaded through `ConfinedCommand::spawn`/`best_available_sandbox`. Acceptance: existing local behavior **unchanged**; all existing enforcement/provenance tests stay green; **no** OpenShell dep; the local `SCM_CREDENTIALS`/`SO_PEERCRED`/`same_image` identity path is **not weakened** (I6, adv. case 9); cancellation / wait / kill / stream / drop semantics for a remote handle are explicitly modeled (even if only `Local` is implemented); the `verify_applied` local backstop remains exactly as-is on the `Local` path. This PR ships with **zero** behavior change — it is pure seam. — *owner: agent-bridle*
+- **5b `[agent-bridle-openshell]` — OpenShell via the seam.** New leaf crate (tonic/tokio here, off core): the `RemoteFence` backend, remote lifecycle (create/reuse/delete), remote exec, the `project` compiler (`FenceCaveats` → canonical `OpenShellPolicySpec`), `resolved_authority`/`runtime_closure` conservative bounds, `OpenShellPolicyCid` canonical hash (port `examples/governance-interceptor` protoJSON-v2), the **evidence cap** so fs/net report Interceptor-not-Kernel pre-U1 (§A.4), and fail-closed behavior throughout. Depends on 5a; introduces **no** new `SandboxKind` that `best_available_sandbox` would auto-select. — *owner: agent-bridle*
+- **5c `[agent-bridle-core / agent-bridle-openshell]` — identity & fence-identity objects.** The net-new, **domain-tagged** content-addressed types (§A.3, §A.5): `RemoteWorkerBinding`, `StaticFenceCid`, `SandboxImageCid`, `EnforcementPlanCid`, `RuntimeClosureCid`, `OpenShellSandboxSpecCid` — each constructed via the `ResolvedGrant::bind` "mismatch-is-unrepresentable" pattern (`authority.rs:298-311`). Brokered-identity flow (Option B): desk mints the binding; the worker never holds the root key. — *owner: agent-bridle*
+- **6 `[agent-bridle-openshell, tests]`** Property tests: `authority(project(fence(c))) ⊑ fence(c)` (I1); admission **refuses** a grant with a restrictive GateCaveat over a direct-exec worker (I2, adv. case 8); the 12 adversarial cases of §C as red→green tests. — *owner: agent-bridle*
+- **7 `[agent-bridle-openshell]` (scope-expanded, C6)** Gateway-interceptor widen-guard covering **`UpdateConfig` + `SubmitPolicyAnalysis` + all draft-approve RPCs + `ImportProviderProfiles`/`UpdateProviderProfiles`/`AttachSandboxProvider` + the global-policy path**; documented as *corroborating, not load-bearing* (T22). — *owner: agent-bridle*
+- **8 `[agent-bridle, formal]`** TLA+/Lean projection non-amplification model over the **fence subset** (reuse ADR 0026 harness) + assurance rows (`held`→`partial` on native evidence). — *owner: agent-bridle*
+- **9 `[newt-agent]`** Wire the OpenShell backend behind the existing `bridle_registry` seam; no `newt_core` type changes; implement fence reuse keyed by **`StaticFenceCid` equality** (not the coarse `(grant × scope)` alone, I4) + the fs-widen volume-handoff (C4). — *owner: newt-agent*
 
 **Track 3 — A face** (after B)
 11. `[agent-bridle-openshell]` Expose `project` as a standalone compilation service for non-Newt callers. — *owner: agent-bridle*
@@ -308,7 +465,8 @@ No mega-PR. Each PR carries its own regression test; Bridle PRs carry an assuran
 
 ## 10. Exit criteria (before declaring the integration *safe*, not merely *working*)
 
-1. **Projection theorem holds:** property test `authority(project(c)) ⊑ c` green across generated caveats; TLA+/Lean non-amplification model checked (reusing ADR 0026 harness).
+0. **The six invariants I1–I6 (§B) hold**, each with the mapped adversarial cases of §C green as red→green tests. In particular: I2 (a restrictive GateCaveat over a direct-exec worker fails admission), I3 (`effective_claim = min(MechanismStrength, EvidenceCap)`; no bare `Kernel` pre-U1), I4 (fence reuse gated on `StaticFenceCid` equality), I5 (`RemoteWorkerBinding` field-match), I6 (local identity path unchanged).
+1. **Projection theorem holds over the fence subset:** property test `authority(project(fence(c))) ⊑ fence(c)` green across generated caveats (I1); TLA+/Lean non-amplification model checked (reusing ADR 0026 harness).
 2. **Native hostile-child evidence** (not mock) for every axis claimed above `Advisory`: the §8.7 bypass test fails closed for fs and net, run inside the pinned image; `ASM-OPENSHELL-*` rows carry `evidence_cid`, status `partial`→`held` only with that evidence.
 3. **fs Kernel floor proven:** `hard_requirement` + non-empty paths compiled; a policy that would run Landlock best-effort/empty is refused by the compiler, with a test.
 4. **net honesty proven:** compiler emits `enforce` (never `audit`), probes nft presence at admission, and refuses when the deny-direct fence is unverifiable; `inference.local` carve-out is an explicitly projected route or refused.
@@ -317,10 +475,10 @@ No mega-PR. Each PR carries its own regression test; Bridle PRs carry an assuran
 7. **Control-plane preconditions asserted in code/deploy:** refuse to operate against an unauthenticated gateway; one workspace per trust domain; image digest-pinned.
 8. **Honest register:** assurance manifest carries `AppliedPolicyCid`/`RuntimeEvidenceCid`/`SandboxImageCid` as `partial`/`Cannot-Prove` with reasons until closed. **"SKIP is not PASS."**
 9. **Applied-policy attestation is a CERTIFICATION BLOCKER, not an open question (C5).** A fs/net `Kernel` claim requires the enforcer to attest *which policy it actually applied*, bound to our `OpenShellPolicyCid`. Today's `ReportPolicyStatus{version:int, LOADED}` cannot carry a `Kernel` claim. The upstream fix (echo the applied-policy hash) must cover the **effective composed** artifact (provider composition legitimately makes loaded ≠ submitted), and until it lands, OpenShell's fs axis is reported at most **Interceptor-grade / `partial`**, never `Kernel` — and native Landlock is preferred on any host where it is available.
-10. **fs-vs-Landlock honesty asserted:** the RFC's own §0 statement — B is a net/credential/outer-fence acquisition and an fs downgrade — is reflected in backend selection: `best_available_sandbox` prefers native Landlock for the fs axis on Linux hosts and uses the OpenShell fence for net/placement/outer-boundary, never the reverse.
+10. **fs-vs-Landlock honesty asserted, per-execution (F1 — corrected):** routing is by **ExecutionBackend**, not per-axis on one process. An fs-sensitive command is routed to a **Local** execution (native Landlock, fs Kernel, observed in-process); a command placed in a **RemoteFence** has *all* axes enforced in-sandbox and its fs reported at the §A.4 evidence cap (Interceptor pre-U1). The v2 wording — "`best_available_sandbox` prefers native Landlock for the fs axis *and* uses the OpenShell fence for net" on one process — is **retracted** as an impossible conjunction (§A.1). No single execution is jointly constrained by desk-local Landlock and a remote fence.
 11. **E-gate (if pursued):** a **TCP framing** mesh transport (not tunneled QUIC — the CONNECT proxy MITMs TLS and doesn't speak QUIC) crosses the boundary in a test, with envelope-sig + Olm ratchet as the in-tunnel confidentiality controls; residual 1 (auto-team PoP + AgentKey pinning) closed; a hostile worker on a dock cannot reach a responder outside its per-AgentKey allowlist.
 
-**Certification is withheld** until 1–10 hold. Prototype/demo success (§8) is explicitly *not* certification.
+**Certification is withheld** until 0–10 hold. Prototype/demo success (§8) is explicitly *not* certification.
 
 ---
 
@@ -337,4 +495,4 @@ Resolved in v2 (moved to blockers/decisions): the applied-policy hash-echo is no
 
 ---
 
-*This RFC has had one adversarial review pass (findings C1–C6 folded in as v2). Per the study charter it should get at least one more independent hostile review — with fresh eyes on the re-scoped PR 5 exec seam (C1) and the fs-downgrade claim (C5) — before any implementation GO.*
+*This RFC has had two adversarial review passes (C1–C6 in v2; F1–F6 + invariants I1–I6 + test obligations in v3, now normative in §A/§B/§C). Per the study charter it should get at least one more independent hostile review — with fresh eyes on the ExecutionBackend/EnforcementMechanism seam (F1), the `RemoteWorkerBinding` construction (F2), and the mechanism-vs-evidence cap (F4) — before any implementation GO.*
