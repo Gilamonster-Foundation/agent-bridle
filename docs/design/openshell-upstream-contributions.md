@@ -30,7 +30,11 @@ which trusts the self-report and CAS-updates `current_policy_version`). There is
 never verifies that the bytes the supervisor loaded match the bytes it stored.
 Consequently an external authority cannot bind runtime evidence to *which* policy
 was enforced. In Bridle terms this makes `AppliedPolicyCid` **Cannot-Prove** and
-caps the fs/net axes below a `Kernel` claim regardless of mechanism.
+sets the **EvidenceCap** to Interceptor: since the advertised claim is
+`min(MechanismStrength, EvidenceCap)` (RFC §A.4), the fs/net axes cannot be
+reported as `Kernel` regardless of the in-sandbox mechanism. **U1 is precisely the
+change that lifts the EvidenceCap** so a mechanism-Kernel fence can be claimed as
+effective-Kernel.
 
 **Proposal.** Add `applied_policy_hash` (and ideally an Ed25519 signature over
 `{sandbox_id, applied_policy_hash, generation}` using the sandbox's existing
