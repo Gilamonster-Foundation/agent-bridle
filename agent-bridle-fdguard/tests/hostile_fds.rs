@@ -34,6 +34,34 @@
 //! false-PASS face (a shell answering `>&N` from a descriptor of its own)
 //! survived the switch, because the defect was never the choice of shell.
 //!
+//! ## The red-before is deterministic, and it is NOT a race
+//!
+//! The old oracle fails on demand, single-threaded, as a function of the
+//! descriptor NUMBER. On Darwin at 38ca0d2 (pre-rework), one command:
+//!
+//! ```text
+//! bash -c 'exec 3</dev/null 4</dev/null 5</dev/null 6</dev/null \
+//!          7</dev/null 8</dev/null 9</dev/null; \
+//!          exec "$0" --test-threads=1' <fdguard-test-binary>
+//! ```
+//!
+//! Pre-opening fds 3..9 forces the probe onto fd 10 and the old test fails
+//! every time; forcing it onto 8, 9 or 11 passes every time. **There is no
+//! concurrency, no timing and no race in this failure, and it must never be
+//! cited as evidence of one.** It says nothing about how the sweep behaves
+//! under concurrent descriptor creation — that question belongs to
+//! `concurrent_descriptor_creation_never_reaches_the_confined_child` below, and
+//! to agent-bridle#358 on its own native probe evidence.
+//!
+//! What it does show is why the defect stayed hidden: the trigger is a function
+//! of **suite size**, not of the guard. Natural failures over 100 runs per SHA,
+//! isolated target dirs throughout, with no difference in guard behaviour
+//! between them — 38ca0d2 (2 tests) 0/100, the probe landing on fd 3 in 95 runs
+//! and fd 4 in the other 5; b04ca39 (7 tests) 0/100; 80f2213 (16 tests) 10/100,
+//! every failure at fd 10. A green baseline was luck, not soundness: nothing
+//! competed for descriptors, so the probe never reached the number where the
+//! shell answers for itself.
+//!
 //! Every ambient descriptor under test is also placed at a number this suite
 //! *owns* (above everything currently open), so a test never probes a
 //! descriptor belonging to the harness or to a concurrent test.
@@ -46,7 +74,11 @@
 //! `CARGO_TARGET_DIR`. A globally shared `target-dir` makes two worktrees
 //! compile this crate to the same path with the same hash, so one silently
 //! executes the other's binary; the only symptom is a wrong test count, which
-//! is exactly how a stale binary once looked like a flaky guard.
+//! is exactly how a stale binary once looked like a flaky guard. Treat the
+//! count as a first-class wrong-binary signal: this crate's lib target reports
+//! 12 tests on Linux and 13 on macOS (the extra one is
+//! `sweep::tests::the_planned_bound_tracks_the_kernel_ceiling_rather_than_a_constant`),
+//! and this file 10 on both. The pre-rework baseline reported 2.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
