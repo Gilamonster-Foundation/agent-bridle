@@ -19,5 +19,5 @@ categories = ["development-tools", "os::unix-apis"]
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = { version = "0.2" }
