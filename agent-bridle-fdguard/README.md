@@ -29,14 +29,20 @@ let child = cmd.spawn()?;
 - **Linux**: `close_range(2)` with `CLOSE_RANGE_CLOEXEC` (kernel ≥ 5.11) — one
   race-free syscall marks the whole range.
 - **macOS**: no `close_range` exists, so the pre-exec hook sweeps
-  `fcntl(F_SETFD, FD_CLOEXEC)` over a bound computed in the parent (the larger
-  of `RLIMIT_NOFILE.rlim_cur` and one past the highest open descriptor); see the
-  crate docs for the bound's rationale and residual.
+  `fcntl(F_SETFD, FD_CLOEXEC)` over `[3, bound)`. The bound is derived in the
+  parent from the kernel's own ceilings — `max(min(RLIMIT_NOFILE.rlim_cur,
+  kern.maxfilesperproc), highest open descriptor + 1)` — and when it cannot be
+  established, or exceeds what the sweep can inspect, **the confined spawn is
+  refused** rather than swept short (agent-bridle#352). Apple's
+  `POSIX_SPAWN_CLOEXEC_DEFAULT` is the better primitive for this property but is
+  unreachable through `std::process::Command`; see the crate docs for the
+  measured comparison and the concurrency argument.
 - On other platforms `deny_inherited_fds` is a no-op and the CLOEXEC-convention
   residual remains (on Windows the confined path spawns via
   `agent-bridle-aclaunch`'s explicit handle allowlist instead).
-- **Fail-closed**: if the marking step fails at spawn time, the pre-exec hook
-  returns an error, so `spawn` fails and the child never runs.
+- **Fail-closed**: if the marking step fails at spawn time — or, on macOS, if
+  the descriptor universe cannot be proven sweepable — the pre-exec hook returns
+  an error, so `spawn` fails and the child never runs.
 
 Part of the [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle)
 capability-enforcement line. License: Apache-2.0.
