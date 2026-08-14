@@ -157,6 +157,15 @@ else
   # correspondence tests named by `rust_test` entries.
   covered_ok=1
   rust_src_rel="${RUST_SRC#$REPO/}"
+  # Pathname expansion OFF for the coverage walk. `$pr_p` holds GitHub trigger
+  # PATTERNS, and an unquoted `agent-bridle-fdguard/**` is expanded by the
+  # shell against the working tree — so `$p` arrived as `agent-bridle-fdguard/
+  # Cargo.toml`, `.../src`, … and the literal `**` the matcher below keys on
+  # was never seen. Every `**`-covered evidence file then reported as
+  # uncovered: a FALSE FAIL from the gate whose whole job is deciding what
+  # counts as covered. Fails closed, so it never hid anything — but a gate
+  # that cries wolf is one people learn to route around.
+  set -f
   for f in $( { grep -oE 'agent-bridle[A-Za-z0-9/._-]+\.rs' "$MAN" | sed 's/^pending://'
                 printf '%s\n' "$rust_src_rel"; } | sort -u ); do
     hit=0
@@ -173,6 +182,7 @@ else
       fail=1; covered_ok=0
     fi
   done
+  set +f
   [ "$covered_ok" -eq 1 ] && note PASS "every cited evidence path triggers the formal gate"
 fi
 
