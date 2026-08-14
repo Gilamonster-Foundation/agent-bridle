@@ -4,7 +4,9 @@
 # PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml and the `check` /
 # `check-windows` / `publish-check` / `py-test` recipes in justfile. When editing the
 # lint/format/test/publish/python steps here, verify it still matches the CI
-# workflow and the justfile (HOOK PARITY rule). `check-windows` only does real work
+# workflow and the justfile (HOOK PARITY rule). That includes the REQUIRE_*
+# environment guards, not just the commands: a flag armed in the pipeline and not
+# here means the two gates test different properties. `check-windows` only does real work
 # on a Windows host (the AppContainer backend is Windows-only) and skips elsewhere.
 #
 # Do NOT bypass with --no-verify. If this fails, fix the issue.
@@ -23,6 +25,19 @@ set -euo pipefail
 # harmless to the helper. This changes no gate step and no bound, so hook /
 # pipeline parity is untouched.
 exec 1>&2
+
+# HOOK PARITY (agent-bridle#352): ci.yml arms BRIDLE_REQUIRE_FD_FIXTURES on its
+# test steps, so this hook must too. Without it the local gate runs the SKIP path
+# for the fdguard lib-target fixtures while CI runs the FAIL path — the hook
+# would stop mirroring the pipeline for exactly the property the flag exists to
+# enforce, and a developer on a low RLIMIT_NOFILE would see green locally and red
+# in CI. libtest captures a passing test's skip line, so the skip is otherwise
+# invisible. Siblings: BRIDLE_REQUIRE_LANDLOCK / BRIDLE_REQUIRE_SEATBELT are set
+# by the CI jobs themselves; this hook inherits the developer's environment for
+# those, which is deliberate (a local kernel may genuinely lack Landlock),
+# whereas descriptor headroom is a property of the shell you push from and is
+# fixable with `ulimit -n`.
+export BRIDLE_REQUIRE_FD_FIXTURES=1
 
 echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, including bare Brush)"
 just check

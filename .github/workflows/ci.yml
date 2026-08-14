@@ -2,7 +2,10 @@
 #
 # HOOK PARITY: This pipeline is mirrored by .githooks/pre-push and the `check` /
 # `publish-check` / `py-test` recipes in justfile. When editing this file, update
-# the push hook to match.
+# the push hook to match — including the REQUIRE_* environment guards
+# (BRIDLE_REQUIRE_LANDLOCK / _SEATBELT / _FD_FIXTURES), not just the commands. A
+# flag armed here and not in the hook means the local gate silently tests a
+# weaker property than CI (agent-bridle#352).
 #
 # The `check` job (ubuntu) is the primary matrix. The `check-macos` job
 # (macos-latest, free for public repos) is the ONLY place the macOS-only
@@ -57,8 +60,16 @@ jobs:
         # cannot go green without actually exercising the fs_write/fs_read
         # boundary (agent-bridle#74). ubuntu-latest ships a Landlock-capable
         # kernel; a local run without this flag legitimately skips.
+        #
+        # BRIDLE_REQUIRE_FD_FIXTURES does the same for the fdguard lib-target
+        # fixtures that place a descriptor high in the table (agent-bridle#352):
+        # under a low RLIMIT_NOFILE they cannot place one and skip, and libtest
+        # CAPTURES the skip line, so a restricted runner would report all-green
+        # with a test that checked nothing. Unset locally, those tests skip
+        # legitimately; here they must run or fail.
         env:
           BRIDLE_REQUIRE_LANDLOCK: "1"
+          BRIDLE_REQUIRE_FD_FIXTURES: "1"
         run: cargo test --workspace --all-features
 
       - name: Test (no default features)
@@ -143,6 +154,7 @@ jobs:
       - name: Test (require the Seatbelt kernel proofs)
         env:
           BRIDLE_REQUIRE_SEATBELT: "1"
+          BRIDLE_REQUIRE_FD_FIXTURES: "1"
           BRIDLE_E4_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: cargo test --workspace --exclude agent-bridle-py --all-features
 

@@ -278,16 +278,18 @@ mod tests {
     /// `BRIDLE_REQUIRE_SEATBELT` / `BRIDLE_REQUIRE_LANDLOCK` elsewhere in this
     /// repo. SKIP IS NOT PASS.
     fn skip_or_fail_fixture(test: &str, offset: u64) {
-        let message = format!(
-            "skipping {test}: the soft RLIMIT_NOFILE leaves no free descriptor \
-             {offset} above the open table, so the FIXTURE cannot place one \
-             (the guard itself is unaffected — raise `ulimit -n` to run it)"
+        let why = format!(
+            "the soft RLIMIT_NOFILE leaves no free descriptor {offset} above the \
+             open table, so the FIXTURE cannot place one (the guard itself is \
+             unaffected — raise `ulimit -n` to run it)"
         );
+        // The two paths must not read alike in a log: a FAILURE whose message
+        // opens with "skipping" is unreadable at a glance.
         assert!(
             std::env::var_os("BRIDLE_REQUIRE_FD_FIXTURES").is_none(),
-            "{message}"
+            "REQUIRED FIXTURE UNAVAILABLE: {test} could not run because {why}"
         );
-        eprintln!("{message}");
+        eprintln!("skipping {test}: {why}");
     }
 
     /// A free descriptor number `offset` above the current table, or `None`
