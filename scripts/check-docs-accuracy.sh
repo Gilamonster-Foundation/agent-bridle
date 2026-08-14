@@ -8,8 +8,9 @@
 # ADRs under docs/adr/ are immutable history (ADR 0003 deliberately records the
 # old brush-stub state) and are intentionally NOT scanned.
 #
-# PIPELINE PARITY: run by .github/workflows/security-audit.yml and mirrored by
-# .pre-commit-config.yaml. When editing, keep both in sync.
+# PIPELINE PARITY: run by .github/workflows/security-audit.yml and locally by the
+# `check-security` recipe in justfile (.githooks/pre-push) and
+# .pre-commit-config.yaml. When editing, keep all three in sync.
 set -uo pipefail
 
 # Consumer-facing docs that describe the shipped tool.
