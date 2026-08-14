@@ -107,14 +107,20 @@
 //! --list`), never from a number quoted in prose. This crate is a stacking
 //! point, so any absolute written down here is wrong by the next merge.
 //!
-//! What is stable is the *gating*, which is a property of the source: the lib
-//! target carries exactly one platform-gated test —
+//! **State the mechanism, derive the arithmetic.** What is durable is *which
+//! tests are platform-gated and why*; the resulting count difference is a
+//! consequence that changes whenever a gated test is added on either side. On
+//! this branch the lib target has exactly one gated test —
 //! `sweep::tests::the_planned_bound_tracks_the_kernel_ceiling_rather_than_a_constant`,
 //! macOS-only because it reads `kern.maxfilesperproc`, which Linux does not
-//! have — so for the same checkout macOS must list exactly ONE more lib test
-//! than Linux. This file is platform-independent and must list the same number
-//! on both. A mismatch in that delta, or against the count you listed for the
-//! previous checkout you ran, is the signal; an absolute is not.
+//! have — so macOS lists one more lib test than Linux *here*. That arithmetic
+//! does not survive the #351/#354 stack merge, which adds a Linux-only
+//! `beneath` test and removes a Linux-only test this rework superseded: the two
+//! gates then cancel and both platforms list the same number. Enumerate the
+//! gates in the checkout in front of you and derive the delta from them; a
+//! transported number turns a correct run into a false alarm.
+//!
+//! This file is platform-independent and must list the same number on both.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
@@ -142,9 +148,15 @@ fn fd_lock() -> MutexGuard<'static, ()> {
     FD_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// The confined child. Normally a no-op test; when `BRIDLE_FDGUARD_PROBE` is
-/// set it is the probe program the other tests `exec`, reporting on its OWN
-/// descriptor table with `fcntl` and a real write attempt.
+/// NOT A TEST — the child-process entrypoint the probes `exec`.
+///
+/// It asserts nothing: when `BRIDLE_FDGUARD_PROBE` is set it reports on its OWN
+/// descriptor table with `fcntl` and a real write attempt, and otherwise
+/// returns. `#[ignore]` keeps it out of the passed count, because a `#[test]`
+/// that always succeeds inflates static enumeration and the runtime `--list`
+/// **identically** — so the count cross-check protocol, which exists to catch
+/// vacuous evidence, is structurally blind to it. The probes pass
+/// `--include-ignored` to invoke it deliberately.
 ///
 /// Lines carry a `FDPROBE` marker — `FDPROBE <n> open cloexec=<0|1> wrote=<n>`
 /// or `FDPROBE <n> closed` — because the harness's own output and the probe
@@ -153,7 +165,8 @@ fn fd_lock() -> MutexGuard<'static, ()> {
 /// means the child did not run, which the assertions treat as a failure rather
 /// than a pass.
 #[test]
-fn fd_probe_helper() {
+#[ignore = "child-process entrypoint invoked by the probes, not coverage"]
+fn harness_child_entrypoint_not_a_test() {
     let Ok(targets) = std::env::var(PROBE_ENV) else {
         return; // ordinary test run: nothing to do
     };
@@ -203,7 +216,8 @@ fn probe_child(targets: &[RawFd], owned: Option<RawFd>, guarded: bool) -> ProbeR
     let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
     cmd.args([
         "--exact",
-        "fd_probe_helper",
+        "harness_child_entrypoint_not_a_test",
+        "--include-ignored",
         "--nocapture",
         "--test-threads=1",
     ])
@@ -288,6 +302,17 @@ fn highest_open_fd() -> RawFd {
 /// `dup2` clears `FD_CLOEXEC` on the target, which is what makes it ambient.
 fn place_ambient(source: RawFd) -> RawFd {
     let target = highest_open_fd() + 16;
+    // The FIXTURE needs headroom the product code does not: it places a
+    // descriptor 16 above the table on purpose. Under a lowered soft limit
+    // (`ulimit -n 64` in a container or a hardened runner) that placement
+    // fails, which would read as a guard defect and is not one.
+    if let Some(soft) = soft_fd_limit() {
+        assert!(
+            u64::try_from(target).is_ok_and(|t| t < soft),
+            "this fixture needs a free descriptor at {target}, but the soft \
+             RLIMIT_NOFILE is {soft}; raise it (ulimit -n) to run this suite"
+        );
+    }
     // SAFETY: `dup2` onto a descriptor number proven free immediately below.
     unsafe {
         assert_eq!(

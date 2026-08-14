@@ -266,15 +266,73 @@ mod tests {
         FD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Report a fixture that cannot run here — and FAIL instead when the
+    /// caller demands it.
+    ///
+    /// A silently-skipping test is a passing test that checked nothing, which
+    /// is the same vacuity this suite just finished removing from its harness
+    /// entrypoints; libtest captures a passing test's output, so the message
+    /// below is invisible without `--nocapture`. Set
+    /// `BRIDLE_REQUIRE_FD_FIXTURES=1` (CI, and any run being used as evidence)
+    /// to turn the skip into a hard failure, mirroring
+    /// `BRIDLE_REQUIRE_SEATBELT` / `BRIDLE_REQUIRE_LANDLOCK` elsewhere in this
+    /// repo. SKIP IS NOT PASS.
+    fn skip_or_fail_fixture(test: &str, offset: u64) {
+        let message = format!(
+            "skipping {test}: the soft RLIMIT_NOFILE leaves no free descriptor \
+             {offset} above the open table, so the FIXTURE cannot place one \
+             (the guard itself is unaffected — raise `ulimit -n` to run it)"
+        );
+        assert!(
+            std::env::var_os("BRIDLE_REQUIRE_FD_FIXTURES").is_none(),
+            "{message}"
+        );
+        eprintln!("{message}");
+    }
+
+    /// A free descriptor number `offset` above the current table, or `None`
+    /// when the soft `RLIMIT_NOFILE` leaves no room for one.
+    ///
+    /// The FIXTURE needs headroom the product code does not: these tests place
+    /// a descriptor high in the table on purpose. Under a lowered limit
+    /// (`ulimit -n 64` in a container, a hardened runner, a launchd job) the
+    /// placement itself fails, which reads as a guard defect and is not one.
+    /// Callers report a named skip instead.
+    fn owned_slot_above_table(offset: u64) -> Option<libc::c_int> {
+        let base = highest_open_fd().expect("/dev/fd must be enumerable");
+        let target = base + offset;
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes only into the stack struct above.
+        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            lim.rlim_cur
+        } else {
+            u64::MAX
+        };
+        if target >= soft {
+            return None;
+        }
+        libc::c_int::try_from(target).ok()
+    }
+
     /// Descriptor number the re-exec'd child must report on.
     const PROBE_ENV: &str = "BRIDLE_FDGUARD_UNIT_PROBE";
 
-    /// The confined child: normally a no-op test, but when `PROBE_ENV` is set
-    /// it reports whether the named descriptor is open in ITS OWN table. A
-    /// shell cannot answer this question soundly (see the module docs of
-    /// `tests/hostile_fds.rs`), so the child answers with `fcntl` directly.
+    /// NOT A TEST — the child-process entrypoint the probes `exec`.
+    ///
+    /// It asserts nothing: when `PROBE_ENV` is set it reports whether the named
+    /// descriptor is open in ITS OWN table (a shell cannot answer that soundly
+    /// — see the module docs of `tests/hostile_fds.rs`), and otherwise returns.
+    /// `#[ignore]` keeps it out of the passed count, because a `#[test]` that
+    /// always succeeds inflates static enumeration and the runtime `--list`
+    /// **identically** — so the count cross-check protocol, which exists to
+    /// catch vacuous evidence, is structurally blind to it. The probes pass
+    /// `--include-ignored` to invoke it deliberately.
     #[test]
-    fn fd_probe_helper() {
+    #[ignore = "child-process entrypoint invoked by the probes, not coverage"]
+    fn harness_child_entrypoint_not_a_test() {
         let Ok(target) = std::env::var(PROBE_ENV) else {
             return; // ordinary test run: nothing to do
         };
@@ -294,7 +352,8 @@ mod tests {
         let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
         cmd.args([
             "--exact",
-            "sweep::tests::fd_probe_helper",
+            "sweep::tests::harness_child_entrypoint_not_a_test",
+            "--include-ignored",
             "--nocapture",
             "--test-threads=1",
         ])
@@ -401,9 +460,14 @@ mod tests {
     #[test]
     fn the_enumeration_leg_sees_a_descriptor_high_in_the_table() {
         let _guard = fd_lock();
-        let base = highest_open_fd().expect("/dev/fd must be enumerable");
+        let Some(target) = owned_slot_above_table(64) else {
+            skip_or_fail_fixture(
+                "the_enumeration_leg_sees_a_descriptor_high_in_the_table",
+                64,
+            );
+            return;
+        };
         let file = std::fs::File::open("/dev/null").unwrap();
-        let target = libc::c_int::try_from(base + 64).unwrap();
         // SAFETY: test-only `dup2` onto a descriptor number proven free below.
         unsafe {
             assert_eq!(
@@ -478,9 +542,14 @@ mod tests {
     #[test]
     fn a_truncated_sweep_bound_leaks_a_descriptor_the_honest_bound_closes() {
         let _guard = fd_lock();
+        let Some(target) = owned_slot_above_table(32) else {
+            skip_or_fail_fixture(
+                "a_truncated_sweep_bound_leaks_a_descriptor_the_honest_bound_closes",
+                32,
+            );
+            return;
+        };
         let file = std::fs::File::open("/dev/null").unwrap();
-        let base = highest_open_fd().expect("/dev/fd must be enumerable");
-        let target = libc::c_int::try_from(base + 32).unwrap();
         // SAFETY: test-only `dup2` onto a descriptor number proven free; `dup2`
         // clears `FD_CLOEXEC` on the new descriptor, which is exactly the
         // ambient (inheritable) descriptor being modelled.
@@ -541,9 +610,14 @@ mod tests {
     #[test]
     fn a_lowered_allocation_limit_never_shrinks_the_bound_below_the_open_table() {
         let _guard = fd_lock();
+        let Some(target) = owned_slot_above_table(16) else {
+            skip_or_fail_fixture(
+                "a_lowered_allocation_limit_never_shrinks_the_bound_below_the_open_table",
+                16,
+            );
+            return;
+        };
         let file = std::fs::File::open("/dev/null").unwrap();
-        let base = highest_open_fd().expect("/dev/fd must be enumerable");
-        let target = libc::c_int::try_from(base + 16).unwrap();
         // SAFETY: test-only `dup2` onto a descriptor number proven free below.
         unsafe {
             assert_eq!(
@@ -600,16 +674,19 @@ mod tests {
         // The allocation ceiling dominates the open table by orders of
         // magnitude on any real machine (61440 vs a few dozen), so this
         // equality is stable even though the two probes are not atomic.
+        //
+        // Note honestly what this proves: the expected value is RE-DERIVED from
+        // the same formula the implementation uses, so it establishes that the
+        // bound tracks the kernel's ceilings rather than a constant — the #352
+        // regression — and it CANNOT catch a shared misconception in which the
+        // formula itself is wrong in code and test alike. On the reference
+        // machine it discriminates for real: min(1048576, 61440) = 61440, while
+        // the pre-#352 clamp produced 1048576, which fails this assertion.
         assert_eq!(
             planned,
             expected_alloc.max(highest + 1),
             "the planned bound must be min(RLIMIT_NOFILE, kern.maxfilesperproc) \
              widened to cover the open table — nothing else"
-        );
-        assert!(
-            planned <= expected_alloc.max(highest + 1),
-            "planned bound {planned} exceeds the kernel's per-process ceiling \
-             ({expected_alloc}) — that is a constant clamp, not a derived bound"
         );
     }
 }
