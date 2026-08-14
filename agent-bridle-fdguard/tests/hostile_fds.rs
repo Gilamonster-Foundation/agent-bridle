@@ -83,11 +83,20 @@
 //! `CARGO_TARGET_DIR`. A globally shared `target-dir` makes two worktrees
 //! compile this crate to the same path with the same hash, so one silently
 //! executes the other's binary; the only symptom is a wrong test count, which
-//! is exactly how a stale binary once looked like a flaky guard. Treat the
-//! count as a first-class wrong-binary signal: this crate's lib target reports
-//! 12 tests on Linux and 13 on macOS (the extra one is
-//! `sweep::tests::the_planned_bound_tracks_the_kernel_ceiling_rather_than_a_constant`),
-//! and this file 10 on both. The pre-rework baseline reported 2.
+//! is exactly how a stale binary once looked like a flaky guard. Treat the test
+//! count as a first-class wrong-binary signal — but **derive it from the
+//! checkout you are about to build** (`cargo test -p agent-bridle-fdguard --
+//! --list`), never from a number quoted in prose. This crate is a stacking
+//! point, so any absolute written down here is wrong by the next merge.
+//!
+//! What is stable is the *gating*, which is a property of the source: the lib
+//! target carries exactly one platform-gated test —
+//! `sweep::tests::the_planned_bound_tracks_the_kernel_ceiling_rather_than_a_constant`,
+//! macOS-only because it reads `kern.maxfilesperproc`, which Linux does not
+//! have — so for the same checkout macOS must list exactly ONE more lib test
+//! than Linux. This file is platform-independent and must list the same number
+//! on both. A mismatch in that delta, or against the count you listed for the
+//! previous checkout you ran, is the signal; an absolute is not.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
