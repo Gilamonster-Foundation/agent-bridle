@@ -384,6 +384,66 @@ async fn real_ambient_fd_is_not_inherited() {
     );
 }
 
+/// macOS twin of `real_ambient_fd_is_not_inherited` (agent-bridle#319, macOS
+/// leg). macOS has no `/proc/self/fd` with symlink targets, so the child probes
+/// the descriptor by *using* it (`echo >&N`): the positive control (a plain
+/// `std::process::Command`, no guard) proves the descriptor really is
+/// inheritable; the confined spawn through `ShellTool` must find it closed.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn real_ambient_fd_is_not_inherited_macos() {
+    use std::os::fd::AsRawFd;
+
+    // A writable file the parent holds open with CLOEXEC CLEARED — an
+    // inheritable ambient descriptor (an object capability the child was never
+    // delegated). Write-capable so the control's `echo >&N` can succeed.
+    let path = unique_temp("ab319-ambient-macos");
+    std::fs::write(&path, b"ambient-capability").expect("write temp");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open temp");
+    rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).expect("clear cloexec");
+    let ambient_fd = file.as_raw_fd();
+    assert!(
+        ambient_fd >= 3,
+        "ambient fd should be >= 3, got {ambient_fd}"
+    );
+    let probe = format!("echo probe >&{ambient_fd} 2>/dev/null");
+
+    // Positive control: an UNGUARDED spawn can use the descriptor, so the test
+    // measures the guard, not a descriptor that was never inheritable.
+    let control = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&probe)
+        .status()
+        .expect("spawn control sh");
+    assert!(
+        control.success(),
+        "positive control: without the guard, fd {ambient_fd} must be usable in the child"
+    );
+
+    // The confined child must find the descriptor closed. `top()` imposes no
+    // fs/exec fence, isolating fd hygiene as the only variable.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "/bin/sh", "args": ["-c", probe]}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    // Keep the ambient fd open across the spawn, then release it.
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+
+    assert_ne!(
+        out["exit_code"], 0,
+        "ambient descriptor {ambient_fd} leaked into the confined child (agent-bridle#319 macOS leg): {out}"
+    );
+}
+
 /// #143 regression: the captured-output cap is config-driven (not a hard-coded
 /// const). A `ShellTool` built with a tiny `max_output_bytes` truncates a chatty
 /// command's stdout at the configured bound and flags it truncated.
