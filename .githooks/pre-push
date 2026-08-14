@@ -11,6 +11,19 @@
 
 set -euo pipefail
 
+# Hook stdout is NOT a safe channel. Over Smart-HTTP, `git` drives the
+# `remote-curl` remote helper by writing commands on the same stdout this hook
+# inherits, so anything printed here — or by any child process a gate step
+# spawns, which `cargo test` does not capture — is injected into git's protocol
+# stream. That really happened: probe children in
+# agent-bridle-fdguard/tests/hostile_fds.rs wrote through an inherited
+# descriptor and git died on
+# `unknown command 'probeprobeprobepush HEAD:refs/heads/...'` AFTER a fully
+# green gate. Send every diagnostic to stderr: still visible to the operator,
+# harmless to the helper. This changes no gate step and no bound, so hook /
+# pipeline parity is untouched.
+exec 1>&2
+
 echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, including bare Brush)"
 just check
 
