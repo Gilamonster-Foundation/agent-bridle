@@ -75,6 +75,24 @@
 //! *owns* (above everything currently open), so a test never probes a
 //! descriptor belonging to the harness or to a concurrent test.
 //!
+//! ## Inspect any descriptor; WRITE only through the one you own
+//!
+//! The child reports on every descriptor it is asked about, but it attempts a
+//! `write` through exactly one — the descriptor the calling test created
+//! (`PROBE_WRITE_ENV`). Report-only is the default.
+//!
+//! This is not tidiness. An earlier revision wrote `probe` through *every* open
+//! descriptor in the probed band, which in the unguarded control includes
+//! descriptors the harness owns — among them duplicates of the inherited
+//! stdout. Pushing this branch over HTTPS, `git` drives `remote-curl` as a
+//! remote helper over its stdout pipe, and the pre-push hook inherits that same
+//! descriptor; three probe children wrote into it and git rejected the
+//! resulting command
+//! (`unknown command 'probeprobeprobepush HEAD:refs/heads/...'`). A
+//! descriptor-hygiene suite corrupted a protocol channel by writing through a
+//! descriptor it did not own — exactly the class of bug this crate exists to
+//! prevent. A `wrote=-1` in the report means "not attempted", not "failed".
+//!
 //! On Linux these exercise the `close_range(CLOSE_RANGE_CLOEXEC)` leg; on macOS
 //! the planned `fcntl(F_SETFD, FD_CLOEXEC)` sweep. The contract is identical, so
 //! the same suite is the acceptance evidence for both.
@@ -110,6 +128,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// Descriptor numbers the re-exec'd child must report on (comma-separated).
 const PROBE_ENV: &str = "BRIDLE_FDGUARD_PROBE";
 
+/// The single descriptor the child may WRITE through — the one the calling test
+/// created and owns. Unset means report-only.
+const PROBE_WRITE_ENV: &str = "BRIDLE_FDGUARD_PROBE_WRITE";
+
 /// `cargo test` runs a test binary's tests as threads of one process, so
 /// descriptor-table surgery has to be serialized: two tests must not choose the
 /// same free descriptor number, and an unguarded control must not observe an
@@ -135,18 +157,31 @@ fn fd_probe_helper() {
     let Ok(targets) = std::env::var(PROBE_ENV) else {
         return; // ordinary test run: nothing to do
     };
+    // The ONE descriptor the calling test owns and may be written through. Any
+    // other probed descriptor is inspected but never written to: a probe that
+    // writes into a descriptor it does not own corrupts whatever that
+    // descriptor is attached to — see the module docs.
+    let owned: Option<RawFd> = std::env::var(PROBE_WRITE_ENV)
+        .ok()
+        .and_then(|fd| fd.parse().ok());
+
     for target in targets.split(',').filter(|t| !t.is_empty()) {
         let fd: RawFd = target.parse().expect("probe target");
         // SAFETY: `fcntl`/`write` on a descriptor number, both defined for any
-        // integer (they report `EBADF` for a closed one). The write is what a
-        // leaked capability would let this child do.
+        // integer (they report `EBADF` for a closed one). The write happens
+        // only for the descriptor this test owns, and is what a leaked
+        // capability would let this child do with it.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
             if flags == -1 {
                 println!("\nFDPROBE {fd} closed");
                 continue;
             }
-            let wrote = libc::write(fd, c"probe".as_ptr().cast(), 5);
+            let wrote = if owned == Some(fd) {
+                libc::write(fd, c"probe".as_ptr().cast(), 5)
+            } else {
+                -1
+            };
             let cloexec = i32::from(flags & libc::FD_CLOEXEC != 0);
             println!("\nFDPROBE {fd} open cloexec={cloexec} wrote={wrote}");
         }
@@ -159,7 +194,7 @@ fn fd_probe_helper() {
 type ProbeReport = BTreeMap<RawFd, Option<isize>>;
 
 /// Run the probe child over `targets`, with or without the guard installed.
-fn probe_child(targets: &[RawFd], guarded: bool) -> ProbeReport {
+fn probe_child(targets: &[RawFd], owned: Option<RawFd>, guarded: bool) -> ProbeReport {
     let list = targets
         .iter()
         .map(RawFd::to_string)
@@ -173,8 +208,12 @@ fn probe_child(targets: &[RawFd], guarded: bool) -> ProbeReport {
         "--test-threads=1",
     ])
     .env(PROBE_ENV, list)
+    .env_remove(PROBE_WRITE_ENV)
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
+    if let Some(fd) = owned {
+        cmd.env(PROBE_WRITE_ENV, fd.to_string());
+    }
     if guarded {
         agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
     }
@@ -214,13 +253,13 @@ fn probe_child(targets: &[RawFd], guarded: bool) -> ProbeReport {
 /// Prove the descriptor is inherited without the guard (positive control) and
 /// closed with it — asked of the child's own descriptor table, twice.
 fn assert_guard_closes(fd: RawFd, what: &str) {
-    let control = probe_child(&[fd], false);
+    let control = probe_child(&[fd], Some(fd), false);
     assert!(
         matches!(control.get(&fd), Some(Some(_))),
         "positive control: an unguarded child must inherit the {what} at fd {fd}: {control:?}"
     );
 
-    let guarded = probe_child(&[fd], true);
+    let guarded = probe_child(&[fd], Some(fd), true);
     assert_eq!(
         guarded.get(&fd),
         Some(&None),
@@ -576,11 +615,11 @@ fn concurrent_descriptor_creation_never_reaches_the_confined_child() {
 
     // Positive control WHILE the churn runs: the held ambient descriptor alone
     // guarantees an inherited descriptor, so the control is deterministic.
-    let control = probe_child(&targets, false);
+    let control = probe_child(&targets, None, false);
 
     let mut leaks = Vec::new();
     for _ in 0..8 {
-        let guarded = probe_child(&targets, true);
+        let guarded = probe_child(&targets, None, true);
         let open: Vec<_> = guarded
             .iter()
             .filter(|(_, state)| state.is_some())
