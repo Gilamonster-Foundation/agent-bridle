@@ -44,5 +44,15 @@ let child = cmd.spawn()?;
   the descriptor universe cannot be proven sweepable — the pre-exec hook returns
   an error, so `spawn` fails and the child never runs.
 
+## Bounded opens (`open_beneath_*`, agent-bridle#351)
+
+The crate also hosts the race-free bounded-open seam: `open_beneath_read` /
+`open_beneath_write` open `root/rel` with resolution bounded beneath `root` —
+`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux, an `O_NOFOLLOW`
+component walk on other Unix. A path component swapped for a symlink after a
+caller's authority check is refused by the kernel at open time (the check→open
+TOCTOU), and `is_resolution_refusal` classifies that refusal so callers can
+report an authority denial rather than an I/O error.
+
 Part of the [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle)
 capability-enforcement line. License: Apache-2.0.
