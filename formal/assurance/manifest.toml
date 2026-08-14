@@ -184,9 +184,9 @@ statement     = "Every permitted POSIX operation's required authority is within 
 lean_theorem  = ["Ceremony.Posix.complete_mediation", "Ceremony.Posix.reach_preserves_wf"]
 tla_invariant = ["NoAuthorityAmplification@PosixAuthority_Amplify.cfg"]
 rust_test     = []
-native_test_fn = ["agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited"]
+native_test_fn = ["agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited", "agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited_macos"]
 evidence_cid  = "held:phase1d"
-premise       = "ASM-POSIX-DESCRIPTOR (now PARTIAL, #319 slice 1): model proved (Ceremony.Posix.reach_preserves_wf, PosixAuthority.tla faithful cfg holds []Inv), AND the real-path ambient-fd leak is now closed on Linux — every confined-spawn site closes fds >= 3 via agent-bridle-fdguard, proven by the native test. macOS/Windows fd hygiene + /proc-reopen re-mediation remain design; RC-cert pending, so NOT proved."
+premise       = "ASM-POSIX-DESCRIPTOR (now PARTIAL, #319 slices 1+2): model proved (Ceremony.Posix.reach_preserves_wf, PosixAuthority.tla faithful cfg holds []Inv), AND the real-path ambient-fd leak is closed on Linux (close_range) and macOS (bounded FD_CLOEXEC sweep) — every confined-spawn site closes fds >= 3 via agent-bridle-fdguard, proven by the native tests. Windows confined path goes via aclaunch's HANDLE_LIST; the std-path Windows residual + /proc-reopen re-mediation remain design; RC-cert pending, so NOT proved."
 status        = "partial"
 
 [[claim]]
@@ -208,9 +208,9 @@ statement     = "A capability derived from a descriptor (dup/openat/reopen/O_PAT
 lean_theorem  = ["Ceremony.Posix.descriptor_non_amplification"]
 tla_invariant = ["DescriptorNonAmplification@PosixAuthority_DescriptorForge.cfg"]
 rust_test     = []
-native_test_fn = ["agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited"]
+native_test_fn = ["agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited", "agent-bridle-tool-shell/tests/real_spawn.rs::real_ambient_fd_is_not_inherited_macos"]
 evidence_cid  = "held:phase1d"
-premise       = "ASM-POSIX-DESCRIPTOR (now PARTIAL, #319 slice 1): model proved, AND ambient inherited descriptors are closed on the real path (Linux) so a child cannot hold a descriptor it was never delegated. The /proc/self/fd reopen and O_PATH-upgrade re-mediation (a distinct sub-property) remains design; macOS/Windows fd hygiene pending."
+premise       = "ASM-POSIX-DESCRIPTOR (now PARTIAL, #319 slices 1+2): model proved, AND ambient inherited descriptors are closed on the real path (Linux + macOS) so a child cannot hold a descriptor it was never delegated. The /proc/self/fd reopen and O_PATH-upgrade re-mediation (a distinct sub-property) remains design; std-path Windows fd hygiene pending (confined Windows path spawns via aclaunch's HANDLE_LIST)."
 status        = "partial"
 
 [[claim]]
