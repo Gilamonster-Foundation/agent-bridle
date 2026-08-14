@@ -16,7 +16,8 @@
 # a real operational host (e.g. 192.168.1.100) is still caught.
 #
 # PIPELINE PARITY: this script is run by .github/workflows/security-audit.yml AND
-# mirrored locally by .pre-commit-config.yaml. When editing it, keep both in sync.
+# locally by the `check-security` recipe in justfile (.githooks/pre-push) and
+# .pre-commit-config.yaml. When editing it, keep all three in sync.
 #
 # Run locally:  bash scripts/check-internal-specifics.sh
 set -uo pipefail
