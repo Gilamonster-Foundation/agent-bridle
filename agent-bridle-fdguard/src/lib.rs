@@ -273,10 +273,14 @@ mod tests {
                 0
             );
         }
+        // bash, not /bin/sh: dash (Ubuntu's sh) hard-errors at PARSE time on a
+        // multi-digit fd redirection ("Bad fd number"), and the fd number here
+        // is whatever the test harness left free — often >= 10. bash treats a
+        // closed fd as a runtime redirection failure, which is the probe.
         let probe = format!("echo probe >&{raw} 2>/dev/null");
 
         // Positive control: WITHOUT the guard the child can use the descriptor.
-        let control = Command::new("/bin/sh")
+        let control = Command::new("/bin/bash")
             .arg("-c")
             .arg(&probe)
             .status()
@@ -287,7 +291,7 @@ mod tests {
         );
 
         // With the guard the same probe must fail: the fd is closed at `exec`.
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = Command::new("/bin/bash");
         cmd.arg("-c").arg(&probe);
         super::deny_inherited_fds(&mut cmd);
         let status = cmd.status().expect("spawn guarded sh");

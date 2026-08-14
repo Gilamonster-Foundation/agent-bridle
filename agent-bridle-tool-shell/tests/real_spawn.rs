@@ -410,11 +410,14 @@ async fn real_ambient_fd_is_not_inherited_macos() {
         ambient_fd >= 3,
         "ambient fd should be >= 3, got {ambient_fd}"
     );
+    // bash, not /bin/sh: a multi-digit fd redirection is a PARSE error in
+    // dash-like shells; bash treats a closed fd as the runtime failure the
+    // probe wants (macOS /bin/bash is bash 3.2 — multi-digit fds are fine).
     let probe = format!("echo probe >&{ambient_fd} 2>/dev/null");
 
     // Positive control: an UNGUARDED spawn can use the descriptor, so the test
     // measures the guard, not a descriptor that was never inheritable.
-    let control = std::process::Command::new("/bin/sh")
+    let control = std::process::Command::new("/bin/bash")
         .arg("-c")
         .arg(&probe)
         .status()
@@ -428,7 +431,7 @@ async fn real_ambient_fd_is_not_inherited_macos() {
     // fs/exec fence, isolating fd hygiene as the only variable.
     let out = ShellTool::new()
         .invoke(
-            serde_json::json!({"program": "/bin/sh", "args": ["-c", probe]}),
+            serde_json::json!({"program": "/bin/bash", "args": ["-c", probe]}),
             &ctx(Caveats::top()),
         )
         .await
