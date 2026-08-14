@@ -27,8 +27,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter, Read};
-#[cfg(windows)]
-use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
