@@ -210,7 +210,7 @@ mod sweep;
 #[cfg(unix)]
 mod beneath;
 #[cfg(unix)]
-pub use beneath::{is_resolution_refusal, open_beneath_read, open_beneath_write};
+pub use beneath::{is_resolution_refusal, GrantedRoot, RootIdentity};
 
 /// No-op on platforms without an enforcement leg: the CLOEXEC-convention
 /// residual remains there (see the crate docs — on Windows the confined path
