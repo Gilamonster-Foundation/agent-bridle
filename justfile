@@ -119,7 +119,16 @@ check-security:
     bash scripts/check-docs-accuracy.sh
     if command -v gitleaks >/dev/null 2>&1; then
         echo ">>> gitleaks secret scan"
-        gitleaks dir . --config .gitleaks.toml --redact --no-banner --verbose
+        # CI runs `gitleaks dir .` on a CLEAN CHECKOUT — tracked files only. A dev
+        # tree also holds gitignored build output (`target/` is >1 GB), and
+        # compiled dependency metadata embeds sample PEM blocks: scanning `.`
+        # here reports ~17 findings in `libpkcs8`/`libhttpmock` .rmeta files that
+        # CI never sees and that can never be committed. Scanning a throwaway
+        # export of HEAD reproduces CI's input exactly instead of muting rules.
+        export_dir="$(mktemp -d)"
+        trap 'rm -rf "$export_dir"' EXIT
+        git archive HEAD | tar -x -C "$export_dir"
+        gitleaks dir "$export_dir" --config "$PWD/.gitleaks.toml" --redact --no-banner --verbose
     else
         echo "!! gitleaks NOT INSTALLED — secret scan SKIPPED LOCALLY."
         echo "!! CI still enforces it and will fail the push if it finds anything."
