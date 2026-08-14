@@ -377,11 +377,39 @@ async fn real_ambient_fd_is_not_inherited() {
     drop(file);
     let _ = std::fs::remove_file(&path);
 
+    // Prove the OBSERVATION happened before concluding anything from an
+    // absence. Without this, an empty `stdout` — child never ran, `ls` failed,
+    // invocation returned nothing — satisfies the "path is absent" assertion
+    // below and certifies the claim from a dead child. The macOS twin has had
+    // an unguarded positive control since it was written; the Linux original
+    // never did, so this closes a gap rather than opening one.
+    let seen = listed_fds_long(&stdout);
+    assert_eq!(out["exit_code"], 0, "the confined `ls` must run: {out}");
+    assert!(
+        seen.contains(&1) && seen.contains(&2) && seen.len() >= 3,
+        "the child must report its OWN descriptor table (stdout, stderr and the \
+         handle `ls` opened on the directory); an empty or truncated listing \
+         would make the absence assertion below vacuous. fd 0 is not required — \
+         a confined stage\u{27}s stdin disposition is the caller\u{27}s choice.\n{stdout}"
+    );
+
     let path_str = path.to_string_lossy();
     assert!(
         !stdout.contains(path_str.as_ref()),
         "ambient descriptor {ambient_fd} ({path_str}) leaked into the confined child (agent-bridle#319):\n{stdout}"
     );
+}
+
+/// Descriptor numbers in an `ls -l /proc/self/fd` listing — the `N -> target`
+/// column. Used to prove the child produced a real descriptor table, so that an
+/// absence in that table is an observation rather than a void.
+#[cfg(target_os = "linux")]
+fn listed_fds_long(listing: &str) -> std::collections::BTreeSet<std::os::fd::RawFd> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_once(" -> "))
+        .filter_map(|(head, _)| head.rsplit(' ').next()?.parse().ok())
+        .collect()
 }
 
 /// macOS twin of `real_ambient_fd_is_not_inherited` (agent-bridle#319, macOS
@@ -456,8 +484,11 @@ async fn real_ambient_fd_is_not_inherited_macos() {
     let seen = listed_fds(&stdout);
     assert_eq!(out["exit_code"], 0, "the confined `ls` must run: {out}");
     assert!(
-        seen.contains(&1),
-        "the child must report a real descriptor table — otherwise this test is vacuous:\n{stdout}"
+        seen.contains(&1) && seen.contains(&2) && seen.len() >= 3,
+        "the child must report its OWN descriptor table (stdout, stderr and the \
+         handle `ls` opened on the directory); an empty or truncated listing \
+         would make the absence assertion below vacuous. fd 0 is not required — \
+         a confined stage\u{27}s stdin disposition is the caller\u{27}s choice.\n{stdout}"
     );
     assert!(
         !seen.contains(&ambient_fd),
