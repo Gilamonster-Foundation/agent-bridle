@@ -207,6 +207,11 @@ pub fn deny_inherited_fds(cmd: &mut std::process::Command) {
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 mod sweep;
 
+#[cfg(unix)]
+mod beneath;
+#[cfg(unix)]
+pub use beneath::{is_resolution_refusal, GrantedRoot, RootIdentity};
+
 /// No-op on platforms without an enforcement leg: the CLOEXEC-convention
 /// residual remains there (see the crate docs — on Windows the confined path
 /// spawns via `agent-bridle-aclaunch`'s explicit handle allowlist instead).

@@ -44,5 +44,53 @@ let child = cmd.spawn()?;
   the descriptor universe cannot be proven sweepable — the pre-exec hook returns
   an error, so `spawn` fails and the child never runs.
 
+## Bounded opens (`GrantedRoot`, agent-bridle#351/#354)
+
+The crate also hosts the race-free bounded-open seam. Its invariant:
+
+> **INV-BENEATH** — once authority over a directory has been resolved into a
+> `GrantedRoot`, no later filesystem-namespace mutation (ancestor rename,
+> ancestor replacement, a symlink planted anywhere on the old pathname, root
+> deletion and recreation) can redirect an open performed through that handle
+> to an object outside the subtree rooted at the directory object it holds.
+
+The handle **is** the authority. A pathname becomes authority exactly once, at
+`GrantedRoot::acquire`, and never again:
+
+```rust
+use agent_bridle_fdguard::GrantedRoot;
+
+// Once, at authority-resolution time — hold this for the grant's lifetime.
+let root = GrantedRoot::acquire(std::path::Path::new("/work/grant"))?;
+// Record the OBJECT identity in the authority-bearing record, not the path.
+let anchor = root.identity().to_bytes(); // (st_dev, st_ino), 16 bytes LE
+
+// Every bounded open goes through the descriptor.
+let f = root.open_read(std::path::Path::new("sub/in.txt"))?;
+let mut out = root.open_write(std::path::Path::new("sub/out.txt"), false)?;
+```
+
+Also available: `GrantedRoot::from_owned_fd` (adopt an already-authoritative
+directory descriptor — delegated, or received over a socket — with no pathname
+involved at all), `as_fd`, `try_clone`, and `provenance` (the acquisition path,
+kept as audit text only).
+
+- **Acquisition** refuses every symlink component of the root path, ancestors
+  included: `openat2(RESOLVE_NO_SYMLINKS)` on Linux, a per-component
+  `O_NOFOLLOW | O_DIRECTORY` walk from `/` elsewhere. Plain `open(path,
+  O_NOFOLLOW)` would guard only the final component and follow a swapped
+  ancestor into the wrong root. Relative roots are refused (they resolve
+  through the CWD — ambient authority).
+- **Each open** is relative to the held descriptor:
+  `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux, an `O_NOFOLLOW`
+  component walk on other Unix. `..`, absolute, and NUL components are refused
+  before any syscall.
+- `is_resolution_refusal` classifies a kernel refusal (`ELOOP`, `EXDEV`,
+  `EMLINK`, `ENOTDIR`) so callers report an authority denial rather than an
+  I/O error.
+- **Mount transitions**: a grant means the pathname subtree *including* nested
+  mounts, so `RESOLVE_NO_XDEV` is deliberately not set — see the module docs
+  for the theorem and its residual.
+
 Part of the [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle)
 capability-enforcement line. License: Apache-2.0.
