@@ -24,7 +24,7 @@ No single mechanism enforces everything. The projection is a *composition*.
 |---|---|---|
 | Landlock ABI-v4 | `sandbox.rs:928` (`landlock_impl`) | fs read/write beneath canonical roots; TCP port deny; exec via `Execute` |
 | seccomp (`seccompiler`) | `sandbox.rs:1433` | socket-family deny (AF_INET/6/PACKET) + `io_uring_*` deny, under `DenyDirect` |
-| `openat2(RESOLVE_*)` | (design; not yet wired) | beneath-root, no-symlink lookup |
+| `openat2(RESOLVE_*)` | `agent-bridle-fdguard/src/beneath.rs` (`open_beneath_*`, #351) | beneath-root, no-symlink lookup |
 | pidfd | (design) | stable process identity (pid-reuse-safe) |
 | mount/user/net namespaces | `agent-bridle-jaild` (unwired) | rootfs jail, netns egress fence |
 | egress proxy | `net_proxy.rs` | loopback-fenced HTTP CONNECT — **Seatbelt/AppContainer only**, refused on Linux (`sandbox.rs:478`) |
@@ -37,7 +37,7 @@ No single mechanism enforces everything. The projection is a *composition*.
 | File write (beneath canonical root) | Landlock `from_write` | **Faithful** | `Kernel` |
 | Directory create/delete/rename | Landlock (write on parent) | **Faithful** | rename covered by `Refer` (ABI≥3, `sandbox.rs:972`) |
 | Lookup with symlink/non-canonical root | object-stability check | **Unknown** | E1: non-canonical root ⇒ refuse (`sandbox.rs:1139`) |
-| Lookup `openat("..")` / `/proc/self/fd` reopen | `openat2(RESOLVE_BENEATH\|NO_SYMLINKS)` | **Conservative** (design) | re-mediates reopen against `effective`; not yet wired |
+| Lookup `openat("..")` / `/proc/self/fd` reopen | `openat2(RESOLVE_BENEATH\|NO_SYMLINKS)` | **Conservative** | wired (#351): `open_scoped_*` re-mediates the parent-side redirect opens against `effective` in one kernel-bounded step (fdguard `open_beneath_*`); in-root symlinks refused too |
 | Execute (resolved image) | Landlock `Execute` | **Conservative** | direct execve kernel-denied; strength `Interceptor` not `Kernel` — ld.so mmap trampoline (`sandbox.rs:1052`) |
 | `mmap(PROT_EXEC)` | — | **Unknown** | Landlock has no mmap hook |
 | Net: `net:none` under `DenyDirect` | Landlock TCP-deny + seccomp socket/io_uring deny | **Faithful** | `Kernel` (`report.rs:321`) |
