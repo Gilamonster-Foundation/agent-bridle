@@ -77,15 +77,27 @@
 //! ## Refusal classification
 //!
 //! [`is_resolution_refusal`] answers "did the *resolution itself* refuse?" so
-//! callers report an authority denial rather than an I/O error. `ENOTDIR` is
-//! classified as a refusal: on the `O_NOFOLLOW` walk (and in several
-//! kernel/libc spellings) a component that should have been a directory but is
-//! not — including a planted symlink surfacing as a non-directory — reports
-//! `ENOTDIR`. The spelling is ambiguous with an honest "intermediate component
-//! is a regular file", and the ambiguity is resolved toward the security
-//! reading: evidence must never under-report a refusal (fail-closed
-//! classification, matching what the hostile tests already accept as a
-//! legitimate refusal).
+//! callers report an authority denial rather than an I/O error. The two legs
+//! spell the same refusal differently — measured, not assumed:
+//!
+//! | case                           | Linux (`openat2`) | walk (`O_NOFOLLOW`)    |
+//! |--------------------------------|-------------------|------------------------|
+//! | intermediate-component symlink | `ELOOP`           | `ENOTDIR`              |
+//! | final-component symlink        | `ELOOP`           | `ELOOP` (BSD `EMLINK`) |
+//! | non-directory intermediate     | `ENOTDIR`         | `ENOTDIR`              |
+//!
+//! The walk leg answers `ENOTDIR` for an intermediate symlink because that
+//! component is opened `O_DIRECTORY | O_NOFOLLOW` and the not-a-directory
+//! check fires before `O_NOFOLLOW`'s `ELOOP`. The open still fails, so the
+//! symlink is never followed and the bound holds — but this makes `ENOTDIR`
+//! **load-bearing rather than cosmetic**: without it in the classifier, the
+//! walk leg's *primary* refusal spelling would be misreported as an ordinary
+//! I/O error on exactly the platform that leg serves (macOS). `ENOTDIR` is
+//! also ambiguous with an honest "intermediate component is a regular file";
+//! that ambiguity is resolved toward the security reading — evidence must
+//! never under-report a refusal. The tests assert the *specific* errno per
+//! leg, so a green boolean cannot hide a refusal that happened for an
+//! unintended reason.
 
 use std::ffi::{CString, OsStr};
 use std::fmt;
@@ -534,6 +546,63 @@ mod tests {
         s
     }
 
+    // ── Expected refusal spellings, per enforcement leg ──────────────────────
+    //
+    // The errno is part of what is under test (#354 item 6), so these tests
+    // assert the SPECIFIC value, not merely `is_resolution_refusal`. A boolean
+    // assertion cannot tell "refused as a symlink" from "refused for some other
+    // reason the classifier also accepts", and the two legs genuinely differ —
+    // measured, not assumed:
+    //
+    // | case                          | Linux (openat2) | walk (`O_NOFOLLOW`) |
+    // |-------------------------------|-----------------|---------------------|
+    // | intermediate-component symlink| `ELOOP`         | `ENOTDIR`           |
+    // | final-component symlink       | `ELOOP`         | `ELOOP` (BSD `EMLINK`)|
+    // | non-directory intermediate    | `ENOTDIR`       | `ENOTDIR`           |
+    //
+    // The walk leg reports `ENOTDIR` for an intermediate symlink because the
+    // component is opened `O_DIRECTORY | O_NOFOLLOW`: the not-a-directory check
+    // fires before `O_NOFOLLOW`'s `ELOOP`. The open still FAILS, so the symlink
+    // is never followed and the bound holds — but it makes #354 item 6
+    // load-bearing rather than cosmetic: without `ENOTDIR` in
+    // `is_resolution_refusal`, the walk leg's PRIMARY refusal would be
+    // misreported as an ordinary I/O error on exactly the platform that leg
+    // serves (macOS).
+
+    /// Refusal spellings accepted for a symlink at an INTERMEDIATE component.
+    #[cfg(target_os = "linux")]
+    const INTERMEDIATE_SYMLINK: &[i32] = &[libc::ELOOP];
+    /// The walk leg's spelling is platform-dependent (`ENOTDIR` on the
+    /// `O_DIRECTORY | O_NOFOLLOW` open; some BSDs answer `ELOOP`/`EMLINK`
+    /// first), so the set is wider here — but still excludes `EXDEV` and every
+    /// non-refusal errno.
+    #[cfg(not(target_os = "linux"))]
+    const INTERMEDIATE_SYMLINK: &[i32] = &[libc::ENOTDIR, libc::ELOOP, libc::EMLINK];
+
+    /// Refusal spellings accepted for a symlink as the FINAL component: no
+    /// `O_DIRECTORY` is involved, so `O_NOFOLLOW` answers directly.
+    const FINAL_SYMLINK: &[i32] = &[libc::ELOOP, libc::EMLINK];
+
+    /// Assert a refusal is BOTH classified as an authority denial AND spelled
+    /// the way this platform's leg is expected to spell it. Always prints the
+    /// observed errno, so a `--nocapture` run on any platform reports the
+    /// concrete spelling rather than leaving a green boolean to be trusted.
+    #[track_caller]
+    fn assert_refused_with(err: &io::Error, expected: &[i32], what: &str) {
+        let got = err.raw_os_error();
+        eprintln!("[refusal] {what}: errno={got:?} ({err})");
+        assert!(
+            is_resolution_refusal(err),
+            "{what}: must classify as a resolution refusal, got {err:?}"
+        );
+        assert!(
+            got.is_some_and(|n| expected.contains(&n)),
+            "{what}: expected one of {expected:?} (the spelling this leg is \
+             specified to produce), got {got:?} — a refusal for an unintended \
+             reason is not evidence for the intended one"
+        );
+    }
+
     /// In-scope opens work: create-truncate, append, then read back — all
     /// through one acquired handle.
     #[test]
@@ -583,17 +652,19 @@ mod tests {
         let err = granted
             .open_read(Path::new("sub/victim.txt"))
             .expect_err("bounded open must refuse the symlinked component");
-        assert!(
-            is_resolution_refusal(&err),
-            "escape refusal must classify as a resolution refusal, got {err:?}"
+        assert_refused_with(
+            &err,
+            INTERMEDIATE_SYMLINK,
+            "escape via intermediate symlink (read)",
         );
 
         let err = granted
             .open_write(Path::new("sub/victim.txt"), false)
             .expect_err("bounded write must refuse the symlinked component");
-        assert!(
-            is_resolution_refusal(&err),
-            "escape refusal must classify as a resolution refusal, got {err:?}"
+        assert_refused_with(
+            &err,
+            INTERMEDIATE_SYMLINK,
+            "escape via intermediate symlink (write)",
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
@@ -611,10 +682,7 @@ mod tests {
         let err = granted
             .open_read(Path::new("link.txt"))
             .expect_err("final symlink must be refused");
-        assert!(
-            is_resolution_refusal(&err),
-            "expected ELOOP-class refusal, got {err:?}"
-        );
+        assert_refused_with(&err, FINAL_SYMLINK, "final-component symlink");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -631,10 +699,7 @@ mod tests {
         let err = granted
             .open_read(Path::new("alias/f.txt"))
             .expect_err("in-root intermediate symlink must be refused");
-        assert!(
-            is_resolution_refusal(&err),
-            "expected a resolution refusal, got {err:?}"
-        );
+        assert_refused_with(&err, INTERMEDIATE_SYMLINK, "in-root intermediate symlink");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -714,9 +779,10 @@ mod tests {
 
         let err = GrantedRoot::acquire(&swapped_root)
             .expect_err("acquisition through a symlinked ancestor must be refused");
-        assert!(
-            is_resolution_refusal(&err),
-            "ancestor-symlink refusal must classify as a resolution refusal, got {err:?}"
+        assert_refused_with(
+            &err,
+            INTERMEDIATE_SYMLINK,
+            "ancestor symlink at acquisition",
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -861,15 +927,13 @@ mod tests {
         let err = granted
             .open_read(Path::new("afile/sub.txt"))
             .expect_err("a file used as an intermediate component must fail");
-        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
-        assert!(
-            is_resolution_refusal(&err),
-            "ENOTDIR must classify as a resolution refusal (fail-closed evidence)"
-        );
-        // Ordinary open failures stay ordinary.
+        assert_refused_with(&err, &[libc::ENOTDIR], "non-directory intermediate");
+        // Ordinary open failures stay ordinary — the classifier must not
+        // swallow everything, or "is a refusal" would carry no information.
         let missing = granted
             .open_read(Path::new("no-such-file.txt"))
             .expect_err("missing file");
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
         assert!(!is_resolution_refusal(&missing), "ENOENT is not a refusal");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -878,36 +942,73 @@ mod tests {
     /// nested mounts**, so a bounded open MAY traverse a mount transition
     /// beneath the root — and the same open WOULD be refused if
     /// `RESOLVE_NO_XDEV` were set. Both halves are asserted so the decision is
-    /// a tested theorem, not a comment. Uses `/dev` → `/dev/shm` (a distinct
-    /// tmpfs beneath it), which needs no privilege; skips if that mount
-    /// transition is absent on the host.
+    /// a tested theorem, not a comment.
+    ///
+    /// **Linux-only and ABSENT (not skipped) elsewhere**, because it needs a
+    /// mount transition reachable without privilege and the `RESOLVE_NO_XDEV`
+    /// flag, both Linux-specific. A `cfg`'d-out test never appears in the
+    /// `ignored` count, so record it where the platform coverage is read, not
+    /// only here: this decision is UNVERIFIED on the walk leg.
+    ///
+    /// It never self-skips. A silent early return reports as `ok`, which is
+    /// indistinguishable from a real pass ("SKIP is not PASS" — see
+    /// `formal/assurance/assumptions.md`), so an absent mount transition is a
+    /// hard failure instead.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_grant_includes_nested_mounts_and_no_xdev_would_refuse_them() {
-        let dev = Path::new("/dev");
-        let shm = Path::new("/dev/shm");
-        let (Ok(dev_md), Ok(shm_md)) = (dev.metadata(), shm.metadata()) else {
-            eprintln!("skipping: /dev or /dev/shm absent");
-            return;
+        // Any parent whose child sits on a different `st_dev` is a mount
+        // transition. `/dev` → `/dev/shm` is preferred because it is writable,
+        // so the traversal can be proven by reading content THROUGH it; the
+        // rest are read-only fallbacks that still prove the transition.
+        let writable = Path::new("/dev/shm");
+        let transition = [
+            (Path::new("/dev"), "shm"),
+            (Path::new("/"), "proc"),
+            (Path::new("/"), "sys"),
+            (Path::new("/"), "run"),
+            (Path::new("/"), "dev"),
+        ]
+        .into_iter()
+        .find(
+            |(parent, child)| match (parent.metadata(), parent.join(child).metadata()) {
+                (Ok(p), Ok(c)) => p.dev() != c.dev(),
+                _ => false,
+            },
+        );
+        let Some((parent, child)) = transition else {
+            panic!(
+                "no unprivileged mount transition found on this host — the mount \
+                 decision cannot be verified, and a silent skip would report as a pass"
+            );
         };
-        if dev_md.dev() == shm_md.dev() {
-            eprintln!("skipping: /dev/shm is not a separate mount on this host");
-            return;
-        }
+        eprintln!("[mount] using transition {}/{child}", parent.display());
 
-        let name = format!("fdguard-xdev-{}", std::process::id());
-        let file = shm.join(&name);
-        std::fs::write(&file, b"across-the-mount").unwrap();
-
-        let granted = GrantedRoot::acquire(dev).expect("acquire /dev");
-        let rel = PathBuf::from("shm").join(&name);
+        let granted = GrantedRoot::acquire(parent).expect("acquire the mount parent");
 
         // Decision (a): traversal into the nested mount is ALLOWED.
-        assert_eq!(
-            read_to_string(granted.open_read(&rel).expect("read across the mount")),
-            "across-the-mount",
-            "a grant covers the pathname subtree INCLUDING nested mounts"
-        );
+        let rel = if parent == Path::new("/dev") && child == "shm" {
+            // Prove content really flows across the transition.
+            let name = format!("fdguard-xdev-{}", std::process::id());
+            std::fs::write(writable.join(&name), b"across-the-mount")
+                .expect("write into the nested mount");
+            let rel = PathBuf::from(child).join(&name);
+            assert_eq!(
+                read_to_string(granted.open_read(&rel).expect("read across the mount")),
+                "across-the-mount",
+                "a grant covers the pathname subtree INCLUDING nested mounts"
+            );
+            let _ = std::fs::remove_file(writable.join(&name));
+            rel
+        } else {
+            // Read-only fallback: opening the mount point itself already
+            // crosses the transition.
+            let rel = PathBuf::from(child);
+            granted
+                .open_read(&rel)
+                .expect("opening the nested mount point must be allowed");
+            rel
+        };
 
         // …and RESOLVE_NO_XDEV would have refused exactly this open, which is
         // why it is deliberately not set (see the module docs).
@@ -920,8 +1021,6 @@ mod tests {
         let err = openat2_fd(granted.as_fd().as_raw_fd(), &c, &how)
             .expect_err("RESOLVE_NO_XDEV must refuse a crossing of the mount transition");
         assert_eq!(err.raw_os_error(), Some(libc::EXDEV));
-
-        let _ = std::fs::remove_file(&file);
     }
 
     /// Identity and clone semantics: a clone shares the object identity; the
