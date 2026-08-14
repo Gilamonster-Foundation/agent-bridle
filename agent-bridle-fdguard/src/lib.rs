@@ -122,13 +122,20 @@
 //!   including a separate exec-failure reporting path (`posix_spawn` returns
 //!   the error itself rather than through std's `CLOEXEC` status pipe) and
 //!   explicit stdio file actions, or the child silently loses stdout/stderr.
+//! - The blast radius is wider than the three spawn sites: `std::process` also
+//!   carries the timeout/reap semantics the confined path depends on (the
+//!   kill-the-process-group behaviour covered by agent-bridle#269 / AB-006) and
+//!   the trusted-worker control channel that rides in as the child's stdin.
+//!   Those come back into scope the moment `Child` is hand-rolled.
 //! - That is an architectural slice, not a mechanism swap, and it is tracked as
-//!   a follow-up. This crate's contract (a safe function that takes a
+//!   **agent-bridle#358**. This crate's contract (a safe function that takes a
 //!   `&mut Command`) is what the three confined-spawn sites are built on today.
 //!
 //! The sweep is what ships, so the concurrency answer above is the one this
 //! crate stands behind; the primitive would replace it with a kernel-side
-//! guarantee and delete the bound question entirely.
+//! guarantee and delete the bound question entirely — dissolving the
+//! `macos-rlimit-raise-race` residual rather than mitigating it, since it
+//! consults no bound at all (agent-bridle#358).
 
 /// Install a pre-exec step that marks every inherited descriptor `>= 3`
 /// close-on-exec, so the kernel closes them at `exec` in the child while

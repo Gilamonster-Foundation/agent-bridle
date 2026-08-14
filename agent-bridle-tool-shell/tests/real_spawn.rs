@@ -402,6 +402,11 @@ async fn real_ambient_fd_is_not_inherited() {
 /// `/bin/sh` (a *different* binary of the same family) does the same, silently,
 /// 3 times out of 3. Shells reserve descriptor numbers from 10 upward for their
 /// own save/restore slots; the oracle must be the child's descriptor table.
+///
+/// The `/bin/sh` -> `/bin/bash` switch in 38ca0d2 was treating the false-FAIL
+/// face of this same defect (dash parse-errors on multi-digit descriptor
+/// redirections), which is why changing shells did not help: the oracle, not
+/// the shell, was wrong.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn real_ambient_fd_is_not_inherited_macos() {

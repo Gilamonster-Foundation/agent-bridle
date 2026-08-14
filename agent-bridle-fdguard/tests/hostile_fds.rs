@@ -27,6 +27,13 @@
 //! numbers from 10 upward for their internal save/restore slots; do not probe
 //! there, and do not use a shell here at all.
 //!
+//! The two failure modes are one root cause. Commit 38ca0d2 had already moved
+//! these probes from `/bin/sh` to `/bin/bash` because dash rejects a
+//! multi-digit descriptor redirection at *parse* time — the false-FAIL face of
+//! the same unsound oracle. Switching shells treated the symptom; the
+//! false-PASS face (a shell answering `>&N` from a descriptor of its own)
+//! survived the switch, because the defect was never the choice of shell.
+//!
 //! Every ambient descriptor under test is also placed at a number this suite
 //! *owns* (above everything currently open), so a test never probes a
 //! descriptor belonging to the harness or to a concurrent test.
