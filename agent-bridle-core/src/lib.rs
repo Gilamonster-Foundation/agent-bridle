@@ -60,7 +60,7 @@ pub use config::{
     ChildNetworkPolicy, GatePolicy, HostMatch, LimitsPolicy, NetDefault, NetPolicy, NetRule,
     NormalizationPolicy, PathList, RootfsPolicy, SandboxPolicy, VmPolicy, WebPolicy,
 };
-pub use context::ToolContext;
+pub use context::{open_scoped_read, open_scoped_write, ToolContext};
 pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
