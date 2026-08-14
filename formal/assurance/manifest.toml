@@ -32,8 +32,8 @@ rust_test     = ["windows_write_without_read_triggers_widening_and_is_rejected",
 native_test   = ["agent-bridle-aclaunch/tests/kernel_proofs.rs"]
 evidence_cid  = "held:phase1d"
 impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"  # PR #338 head, MERGED to main @ ef74ee2
-premise       = "ASM-WIN-DACL: LANDED ON MAIN, NOT RC-CERTIFIED. The aclaunch DACL grants content read on every write path (main.rs:476, FILE_GENERIC_READ_WRITE); the native DACL proof (kernel_proofs.rs::fs_write_grant_confers_read_e2 + icacls AppContainer-SID mask (R,W)) landed on main via #338 (@ ef74ee2 / 523038d) under strict BRIDLE_REQUIRE_APPCONTAINER. But ef74ee2 is NOT the frozen RC SHA, and release doctrine forbids counting ancestor-SHA evidence as final RC evidence — so for RELEASE this premise is PENDING until it re-runs on BRIDLE_RC_SHA. Model half proved (Lean); OS-refinement half awaits RC-SHA evidence."
-status        = "partial"   # model PROVED; native probe landed on main, RC-SHA re-certification pending
+premise       = "ASM-WIN-DACL: LANDED ON MAIN, NOT RC-CERTIFIED. The aclaunch DACL grants content read on every write path (main.rs:476, FILE_GENERIC_READ_WRITE); the native DACL proof (kernel_proofs.rs::fs_write_grant_confers_read_e2 + icacls AppContainer-SID mask (R,W)) landed on main via #338 (@ ef74ee2 / 523038d) under strict BRIDLE_REQUIRE_APPCONTAINER. RC-SHA evidence COMPLETE: nightly-windows dispatched at the frozen tag v0.8.0-rc.1 (d1cb545) ran the same proofs green under strict BRIDLE_REQUIRE_APPCONTAINER (actions run 31761377346, 2026-08-13). Model half proved (Lean); OS-refinement half RC-certified. Remaining before proved: the evidence-CID layer is still held:phase1d (ASM-CID)."
+status        = "partial"   # model PROVED; native probe RC-certified at v0.8.0-rc.1 — held only on the evidence-CID freeze (phase1d)
 
 # ── #323 env-isolation controls (both directions) ────────────────────────────
 [[claim]]
@@ -47,7 +47,7 @@ native_test   = ["agent-bridle-tool-shell/tests/windows_env_isolation.rs", "agen
 evidence_cid  = "held:phase1d"
 impl_sha      = "523038d827a92bf564b9b115ef8449eb8555100a"
 premise       = "none — model theorem is unconditional; native test proves the OS refinement"
-status        = "partial"   # native env test landed on main (#338 merged); RC-SHA certification pending
+status        = "partial"   # native env test landed on main (#338 merged); RC-SHA certification pending — no dispatchable workflow runs the tool-shell env tests at a tag (ci.yml is push/PR-only), tracked for the next RC
 
 # ── macOS E4: narrow demonstrated-deputy result, not deputy-complete net:none ─
 [[claim]]
@@ -87,7 +87,7 @@ rust_test     = []
 native_test   = ["agent-bridle-tool-shell/tests/child_network_seccomp_real.rs"]
 native_test_fn = ["agent-bridle-tool-shell/tests/child_network_seccomp_real.rs::deny_direct_denies_a_childs_io_uring_setup_with_eacces", "agent-bridle-tool-shell/tests/child_network_seccomp_real.rs::deny_direct_denies_a_forked_descendants_io_uring_setup"]
 evidence_cid  = "held:phase1d"
-premise       = "ASM-SECCOMP-IOURING: native probe LANDED on main (green on gnuc, kernel 6.8; EACCES-exact; capability positive control). NOT RC-certified until it re-runs on the frozen RC SHA."
+premise       = "ASM-SECCOMP-IOURING: RC-CERTIFIED at v0.8.0-rc.1 (d1cb545), 2026-08-13: re-run at the frozen tag on gnuc kernel 6.8.0-134, 3/3 green (both deny probes EACCES-exact + capability positive control)."
 status        = "partial"
 
 # ── Portable authority-algebra claims (platform-neutral core) ────────────────
