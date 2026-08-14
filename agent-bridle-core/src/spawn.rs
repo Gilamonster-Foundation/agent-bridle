@@ -346,15 +346,20 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// rides in as stdin) is deliberately delegated; every *ambient* descriptor the
 /// parent left open (an already-open descriptor is itself an object capability)
 /// is closed at `exec` via [`agent_bridle_fdguard::deny_inherited_fds`], which
-/// installs an async-signal-safe `close_range(3, …, CLOSE_RANGE_CLOEXEC)` pre-exec
-/// that marks every ambient descriptor close-on-exec (preserving stdio, and
-/// preserving std's own exec-status pipe so a failed `exec` is still reported).
-/// The `unsafe` `close_range` is encapsulated in that crate so this crate stays
-/// `#![forbid(unsafe_code)]` (ADR 0026, slice-1 decision). Enforcement is
-/// **Linux-only** today (`close_range(2)`, kernel ≥ 5.11); on other platforms fd
-/// hygiene still relies on the CLOEXEC convention (macOS/Windows close-on-spawn is
-/// a tracked follow-up). The fix fails closed: if `close_range` errors, the spawn
-/// fails and the child never runs.
+/// installs an async-signal-safe pre-exec that marks every ambient descriptor
+/// close-on-exec (preserving stdio, and preserving std's own exec-status pipe so
+/// a failed `exec` is still reported). The `unsafe` pre-exec is encapsulated in
+/// that crate so this crate stays `#![forbid(unsafe_code)]` (ADR 0026, slice-1
+/// decision). Enforcement covers **Linux** (`close_range(2)`, kernel ≥ 5.11) and
+/// **macOS** (an `fcntl(F_SETFD, FD_CLOEXEC)` sweep over a bound derived from the
+/// kernel's own descriptor ceilings; a descriptor universe that cannot be bounded
+/// **refuses the spawn** rather than being swept short — see the fdguard crate
+/// docs for the derivation, the concurrency argument and the residual). On Windows the *confined* path
+/// spawns via `agent-bridle-aclaunch`'s explicit
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (only delegated handles are inheritable);
+/// a Windows spawn through this builder still relies on the handle-inheritance
+/// convention. The fix fails closed: if the marking step errors, the spawn fails
+/// and the child never runs.
 #[derive(Debug)]
 pub struct ConfinedCommand {
     program: String,
@@ -674,7 +679,9 @@ impl ConfinedCommand {
             // #319: close ambient descriptors the parent left open so they are not
             // inherited as un-delegated object capabilities. Encapsulated in
             // `agent-bridle-fdguard` (the single `unsafe` seam) so core stays
-            // `forbid(unsafe_code)`; Linux-enforced today, no-op elsewhere.
+            // `forbid(unsafe_code)`. Enforced on Linux (close_range) and macOS
+            // (planned FD_CLOEXEC sweep; an unbounded descriptor universe refuses
+            // the spawn, #352); no-op elsewhere.
             #[cfg(unix)]
             agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
             cmd.spawn().map_err(ToolError::from)

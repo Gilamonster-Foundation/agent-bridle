@@ -74,6 +74,7 @@ jobs:
       - name: Test — full feature power set (require Landlock proofs)
         env:
           BRIDLE_REQUIRE_LANDLOCK: "1"
+          BRIDLE_REQUIRE_FD_FIXTURES: "1"
         run: >-
           cargo hack --workspace --exclude agent-bridle-py
           --feature-powerset --optional-deps
@@ -108,6 +109,7 @@ jobs:
       - name: Test — full feature power set (require Seatbelt proofs)
         env:
           BRIDLE_REQUIRE_SEATBELT: "1"
+          BRIDLE_REQUIRE_FD_FIXTURES: "1"
         run: >-
           cargo hack --workspace --exclude agent-bridle-py
           --feature-powerset --optional-deps

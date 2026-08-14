@@ -5,12 +5,41 @@
 # .github/workflows/security-audit.yml, via the `check-security` / `check` /
 # `check-windows` / `publish-check` / `py-test` recipes in justfile. When editing the
 # security/lint/format/test/publish/python steps here, verify it still matches the CI
-# workflows and the justfile (HOOK PARITY rule). `check-windows` only does real work
+# workflows and the justfile (HOOK PARITY rule). That includes the REQUIRE_*
+# environment guards, not just the commands: a flag armed in the pipeline and not
+# here means the two gates test different properties. `check-windows` only does real work
 # on a Windows host (the AppContainer backend is Windows-only) and skips elsewhere.
 #
 # Do NOT bypass with --no-verify. If this fails, fix the issue.
 
 set -euo pipefail
+
+# Hook stdout is NOT a safe channel. Over Smart-HTTP, `git` drives the
+# `remote-curl` remote helper by writing commands on the same stdout this hook
+# inherits, so anything printed here — or by any child process a gate step
+# spawns, which `cargo test` does not capture — is injected into git's protocol
+# stream. That really happened: probe children in
+# agent-bridle-fdguard/tests/hostile_fds.rs wrote through an inherited
+# descriptor and git died on
+# `unknown command 'probeprobeprobepush HEAD:refs/heads/...'` AFTER a fully
+# green gate. Send every diagnostic to stderr: still visible to the operator,
+# harmless to the helper. This changes no gate step and no bound, so hook /
+# pipeline parity is untouched. MUST precede every `echo` below, including the
+# security gate's (agent-bridle#352 + #350).
+exec 1>&2
+
+# HOOK PARITY (agent-bridle#352): ci.yml arms BRIDLE_REQUIRE_FD_FIXTURES on its
+# test steps, so this hook must too. Without it the local gate runs the SKIP path
+# for the fdguard lib-target fixtures while CI runs the FAIL path — the hook
+# would stop mirroring the pipeline for exactly the property the flag exists to
+# enforce, and a developer on a low RLIMIT_NOFILE would see green locally and red
+# in CI. libtest captures a passing test's skip line, so the skip is otherwise
+# invisible. Siblings: BRIDLE_REQUIRE_LANDLOCK / BRIDLE_REQUIRE_SEATBELT are set
+# by the CI jobs themselves; this hook inherits the developer's environment for
+# those, which is deliberate (a local kernel may genuinely lack Landlock),
+# whereas descriptor headroom is a property of the shell you push from and is
+# fixable with `ulimit -n`.
+export BRIDLE_REQUIRE_FD_FIXTURES=1
 
 # First: the security gate (#350). Seconds, not minutes — a leak or an internal
 # specific should stop the push before the long build/test legs run, and a green

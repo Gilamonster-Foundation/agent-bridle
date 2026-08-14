@@ -336,7 +336,9 @@ fn shim_execute<SE: ShellExtensions>(
             cmd.stderr(std::process::Stdio::from(child_control));
             // #319: close ambient descriptors >= 3 in the child. The authenticated
             // control channel rides in as stderr (fd 2) and is preserved; only
-            // un-delegated ambient capabilities are closed. Linux-enforced today.
+            // un-delegated ambient capabilities are closed. Enforced on Linux
+            // (close_range) and macOS (planned FD_CLOEXEC sweep, refusing the
+            // spawn when the descriptor universe cannot be bounded, #352).
             #[cfg(unix)]
             agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
             let mut child = cmd.spawn().map_err(|error| {

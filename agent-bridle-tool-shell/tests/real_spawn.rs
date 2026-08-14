@@ -377,11 +377,157 @@ async fn real_ambient_fd_is_not_inherited() {
     drop(file);
     let _ = std::fs::remove_file(&path);
 
+    // Prove the OBSERVATION happened before concluding anything from an
+    // absence. Without this, an empty `stdout` — child never ran, `ls` failed,
+    // invocation returned nothing — satisfies the "path is absent" assertion
+    // below and certifies the claim from a dead child. The macOS twin has had
+    // an unguarded positive control since it was written; the Linux original
+    // never did, so this closes a gap rather than opening one.
+    let seen = listed_fds_long(&stdout);
+    assert_eq!(out["exit_code"], 0, "the confined `ls` must run: {out}");
+    assert!(
+        seen.contains(&1) && seen.contains(&2) && seen.len() >= 3,
+        "the child must report its OWN descriptor table (stdout, stderr and the \
+         handle `ls` opened on the directory); an empty or truncated listing \
+         would make the absence assertion below vacuous. fd 0 is not required — \
+         a confined stage\u{27}s stdin disposition is the caller\u{27}s choice.\n{stdout}"
+    );
+
     let path_str = path.to_string_lossy();
     assert!(
         !stdout.contains(path_str.as_ref()),
         "ambient descriptor {ambient_fd} ({path_str}) leaked into the confined child (agent-bridle#319):\n{stdout}"
     );
+}
+
+/// Descriptor numbers in an `ls -l /proc/self/fd` listing — the `N -> target`
+/// column. Used to prove the child produced a real descriptor table, so that an
+/// absence in that table is an observation rather than a void.
+#[cfg(target_os = "linux")]
+fn listed_fds_long(listing: &str) -> std::collections::BTreeSet<std::os::fd::RawFd> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_once(" -> "))
+        .filter_map(|(head, _)| head.rsplit(' ').next()?.parse().ok())
+        .collect()
+}
+
+/// macOS twin of `real_ambient_fd_is_not_inherited` (agent-bridle#319, macOS
+/// leg). macOS has no `/proc/self/fd` with symlink targets, so the confined
+/// child reports its OWN descriptor table via `ls /dev/fd` (devfs lists the
+/// calling process's open descriptors) and the ambient descriptor number must
+/// be absent from it. An unguarded positive control proves the descriptor
+/// really was inheritable, so the test measures the guard rather than a
+/// descriptor that was never at risk.
+///
+/// **Never probe this with a shell redirection** (`echo probe >&N`). That was
+/// the original oracle here and it is unsound on Darwin: with `N = 10` and the
+/// descriptor *provably closed* (verified in a standalone C replica — the
+/// child's inherited table was exactly `{0, 1, 2}` and the parent's file stayed
+/// empty), macOS `bash` 3.2.57 still resolved `>&10` to a descriptor of its own
+/// connected to stdout, printed `probe` and exited 0 — a false alarm on a
+/// working guard, and by the same mechanism a potential false pass. macOS
+/// `/bin/sh` (a *different* binary of the same family) does the same, silently,
+/// 3 times out of 3. Shells reserve descriptor numbers from 10 upward for their
+/// own save/restore slots; the oracle must be the child's descriptor table.
+///
+/// The `/bin/sh` -> `/bin/bash` switch in 38ca0d2 was treating the false-FAIL
+/// face of this same defect (dash parse-errors on multi-digit descriptor
+/// redirections), which is why changing shells did not help: the oracle, not
+/// the shell, was wrong.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn real_ambient_fd_is_not_inherited_macos() {
+    use std::os::fd::AsRawFd;
+
+    // A file the parent holds open with CLOEXEC CLEARED — an inheritable
+    // ambient descriptor (an object capability the child was never delegated).
+    let path = unique_temp("ab319-ambient-macos");
+    std::fs::write(&path, b"ambient-capability").expect("write temp");
+    let file = std::fs::File::open(&path).expect("open temp");
+
+    // ESTABLISH the descriptor number; do not assert about it. `open` in a
+    // freshly-spawned test process deterministically returns 3, and 3 is where
+    // `ls` puts its own handle on /dev/fd in the confined child —
+    // indistinguishable from an inherited one. Asserting `>= 4` would make the
+    // test's ability to RUN depend on how many descriptors the machine happened
+    // to have open: green on a CI runner, red on a quiet Mac, both correct
+    // reports of different worlds. Duplicating to a slot above everything
+    // currently open removes that environment dependence, exactly as
+    // `place_ambient` does in `agent-bridle-fdguard/tests/hostile_fds.rs`.
+    // Never depend on an fd number you did not choose.
+    let ambient = rustix::io::fcntl_dupfd_cloexec(&file, highest_open_fd() + 16)
+        .expect("place the ambient descriptor above the open table");
+    rustix::io::fcntl_setfd(&ambient, rustix::io::FdFlags::empty()).expect("clear cloexec");
+    let ambient_fd = ambient.as_raw_fd();
+
+    // Positive control: an UNGUARDED spawn inherits the descriptor, so the
+    // number really is visible in a child's table when nothing closes it.
+    let control = std::process::Command::new("/bin/ls")
+        .arg("/dev/fd")
+        .output()
+        .expect("spawn control ls");
+    let control_out = String::from_utf8_lossy(&control.stdout).into_owned();
+    assert!(
+        listed_fds(&control_out).contains(&ambient_fd),
+        "positive control: an unguarded child must inherit fd {ambient_fd}:\n{control_out}"
+    );
+
+    // The confined child must not see it. `top()` imposes no fs/exec fence,
+    // isolating fd hygiene as the only variable.
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({"program": "/bin/ls", "args": ["/dev/fd"]}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    // Keep the ambient fd open across the spawn, then release it.
+    let stdout = out["stdout"].as_str().unwrap_or_default().to_string();
+    drop(ambient);
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+
+    let seen = listed_fds(&stdout);
+    assert_eq!(out["exit_code"], 0, "the confined `ls` must run: {out}");
+    assert!(
+        seen.contains(&1) && seen.contains(&2) && seen.len() >= 3,
+        "the child must report its OWN descriptor table (stdout, stderr and the \
+         handle `ls` opened on the directory); an empty or truncated listing \
+         would make the absence assertion below vacuous. fd 0 is not required — \
+         a confined stage\u{27}s stdin disposition is the caller\u{27}s choice.\n{stdout}"
+    );
+    assert!(
+        !seen.contains(&ambient_fd),
+        "ambient descriptor {ambient_fd} leaked into the confined child (agent-bridle#319 macOS leg):\n{stdout}"
+    );
+}
+
+/// One past the highest descriptor currently open in this process — the floor
+/// for a descriptor slot the test can call its own.
+#[cfg(target_os = "macos")]
+fn highest_open_fd() -> std::os::fd::RawFd {
+    std::fs::read_dir("/dev/fd")
+        .expect("/dev/fd must be enumerable")
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<std::os::fd::RawFd>().ok())
+        })
+        .max()
+        .unwrap_or(2)
+}
+
+/// Descriptor numbers in an `ls /dev/fd` listing.
+#[cfg(target_os = "macos")]
+fn listed_fds(listing: &str) -> std::collections::BTreeSet<std::os::fd::RawFd> {
+    listing
+        .split_whitespace()
+        .filter_map(|token| token.parse().ok())
+        .collect()
 }
 
 /// #143 regression: the captured-output cap is config-driven (not a hard-coded
