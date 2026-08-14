@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # agent-bridle pre-push hook — the local equivalent of CI gates.
 #
-# PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml and the `check` /
+# PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml AND
+# .github/workflows/security-audit.yml, via the `check-security` / `check` /
 # `check-windows` / `publish-check` / `py-test` recipes in justfile. When editing the
-# lint/format/test/publish/python steps here, verify it still matches the CI
-# workflow and the justfile (HOOK PARITY rule). That includes the REQUIRE_*
+# security/lint/format/test/publish/python steps here, verify it still matches the CI
+# workflows and the justfile (HOOK PARITY rule). That includes the REQUIRE_*
 # environment guards, not just the commands: a flag armed in the pipeline and not
 # here means the two gates test different properties. `check-windows` only does real work
 # on a Windows host (the AppContainer backend is Windows-only) and skips elsewhere.
@@ -23,7 +24,8 @@ set -euo pipefail
 # `unknown command 'probeprobeprobepush HEAD:refs/heads/...'` AFTER a fully
 # green gate. Send every diagnostic to stderr: still visible to the operator,
 # harmless to the helper. This changes no gate step and no bound, so hook /
-# pipeline parity is untouched.
+# pipeline parity is untouched. MUST precede every `echo` below, including the
+# security gate's (agent-bridle#352 + #350).
 exec 1>&2
 
 # HOOK PARITY (agent-bridle#352): ci.yml arms BRIDLE_REQUIRE_FD_FIXTURES on its
@@ -38,6 +40,12 @@ exec 1>&2
 # whereas descriptor headroom is a property of the shell you push from and is
 # fixable with `ulimit -n`.
 export BRIDLE_REQUIRE_FD_FIXTURES=1
+
+# First: the security gate (#350). Seconds, not minutes — a leak or an internal
+# specific should stop the push before the long build/test legs run, and a green
+# local gate must never hand you a push that CI rejects on these checks.
+echo "[pre-push] running 'just check-security' (internal-specifics + docs-accuracy + gitleaks)"
+just check-security
 
 echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, including bare Brush)"
 just check

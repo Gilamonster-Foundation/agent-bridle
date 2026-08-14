@@ -5,6 +5,13 @@
 # hook run the `tla` job's TLC driver + assurance validation. Keep all in sync
 # when the proof commands change.
 #
+# TRIGGER COVERAGE IS MACHINE-CHECKED (#356). The `paths:` lists below are not
+# advisory: `formal/assurance/validate.sh` fails if any evidence path cited by
+# the assurance manifest is not covered by one of these patterns, or if the
+# `push` and `pull_request` lists disagree. Deleting a path here to "quiet" the
+# gate makes the gate fail instead — an evidence file that cannot trigger this
+# workflow can be renamed or deleted while its claim keeps its status.
+#
 # `lake build` also elaborates AxiomAudit (F-233-06): a `Lean.collectAxioms`
 # sweep that fails the build if any security theorem depends on a postulate
 # outside {propext, Quot.sound}. It runs here automatically because AxiomAudit
@@ -22,10 +29,18 @@ on:
       - "agent-bridle-core/src/spawn.rs"
       - "agent-bridle-core/src/report.rs"
       - "agent-bridle-core/src/net_proxy.rs"
+      - "agent-bridle-core/src/admitted.rs"
+      - "agent-bridle-core/tests/authority_lattice_correspondence.rs"
       - "agent-bridle-tool-shell/src/shell_tool.rs"
       - "agent-bridle-tool-shell/tests/real_spawn.rs"
       - "agent-bridle-tool-shell/tests/seatbelt_floor_evidence.rs"
       - "agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs"
+      - "agent-bridle-tool-shell/tests/child_network_seccomp_real.rs"
+      - "agent-bridle-tool-shell/tests/windows_env_isolation.rs"
+      - "agent-bridle-tool-shell/tests/windows_appcontainer_env.rs"
+      - "agent-bridle-aclaunch/tests/kernel_proofs.rs"
+      # ASM-POSIX-DESCRIPTOR's premise rests on this crate's seam (#319/#351).
+      - "agent-bridle-fdguard/**"
       - ".github/workflows/formal.yml"
       - ".githooks/pre-push"
       - "justfile"
@@ -36,10 +51,18 @@ on:
       - "agent-bridle-core/src/spawn.rs"
       - "agent-bridle-core/src/report.rs"
       - "agent-bridle-core/src/net_proxy.rs"
+      - "agent-bridle-core/src/admitted.rs"
+      - "agent-bridle-core/tests/authority_lattice_correspondence.rs"
       - "agent-bridle-tool-shell/src/shell_tool.rs"
       - "agent-bridle-tool-shell/tests/real_spawn.rs"
       - "agent-bridle-tool-shell/tests/seatbelt_floor_evidence.rs"
       - "agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs"
+      - "agent-bridle-tool-shell/tests/child_network_seccomp_real.rs"
+      - "agent-bridle-tool-shell/tests/windows_env_isolation.rs"
+      - "agent-bridle-tool-shell/tests/windows_appcontainer_env.rs"
+      - "agent-bridle-aclaunch/tests/kernel_proofs.rs"
+      # ASM-POSIX-DESCRIPTOR's premise rests on this crate's seam (#319/#351).
+      - "agent-bridle-fdguard/**"
       - ".github/workflows/formal.yml"
       - ".githooks/pre-push"
       - "justfile"

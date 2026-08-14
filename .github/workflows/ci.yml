@@ -17,11 +17,18 @@
 
 name: CI
 
+# TRIGGER COVERAGE (agent-bridle#356): `pull_request` deliberately carries NO
+# `branches:` filter. It used to be `branches: [main]`, which meant a PR based on
+# another feature branch matched neither trigger and ran NOTHING from this file —
+# no build, no clippy, no tests, no macOS/Windows/Lean/TLA+ — while GitHub still
+# reported `mergeStateStatus=CLEAN`. Stacked PRs are the normal shape of work
+# here, so this silently produced green check marks that measured nothing (#354's
+# bounded-open rework sat open for a day having never been compiled by any
+# runner). "No checks ran" must never render as CLEAN. Do not re-add the filter.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
