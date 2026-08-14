@@ -27,8 +27,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter, Read};
-#[cfg(windows)]
-use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -164,6 +162,10 @@ impl Spawner for OsSpawner {
                 cfg.max_output,
                 cfg.output.clone(),
                 cfg.timeout,
+                // Unbridled: dropping the mechanism is what the operator
+                // acknowledged — redirect opens stay unbounded (#351).
+                &Scope::All,
+                &Scope::All,
             );
         }
         // A general remote-host `net` allow-list that cannot be named in SBPL is
@@ -185,6 +187,8 @@ impl Spawner for OsSpawner {
                 cfg.max_output,
                 cfg.output.clone(),
                 cfg.timeout,
+                &caveats.fs_read,
+                &caveats.fs_write,
             )
         } else {
             run_confined(stages, cwd, caveats, env, cfg)
@@ -258,6 +262,8 @@ fn run_with_egress_proxy(
                 max_output,
                 output,
                 timeout,
+                &fenced.fs_read,
+                &fenced.fs_write,
             )
         })
         .map_err(ToolError::Exec)?
@@ -350,6 +356,8 @@ fn run_confined(
                 max_output,
                 output,
                 timeout,
+                &caveats.fs_read,
+                &caveats.fs_write,
             )
         })
         .map_err(ToolError::Exec)?
@@ -1514,27 +1522,6 @@ fn match_class(p: &[char], c: char) -> Option<(bool, &[char])> {
 
 // ── process execution ───────────────────────────────────────────────────────
 
-/// Open a file for an `fs_write` redirect target (`>` truncates, `>>` appends).
-fn open_for_write(path: &str, append: bool) -> std::io::Result<std::fs::File> {
-    #[cfg(windows)]
-    if append {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        file.seek(SeekFrom::End(0))?;
-        return Ok(file);
-    }
-
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(!append)
-        .append(append)
-        .open(path)
-}
-
 /// Kill (and reap) any stages already spawned, so a mid-pipeline error does not
 /// orphan processes.
 fn kill_all(children: &mut [Child]) {
@@ -1602,6 +1589,7 @@ fn kill_pipeline_stage(child: &mut Child) {
     let _ = child.kill();
 }
 
+#[allow(clippy::too_many_arguments)] // house precedent (shell_inspect/gate): flat args over a one-off bag
 fn run_pipeline(
     stages: &[Command],
     cwd: Option<&str>,
@@ -1610,6 +1598,12 @@ fn run_pipeline(
     max_output: usize,
     output: OutputEmitter,
     timeout: Duration,
+    // #351: the effective fs axes bound the PARENT-side redirect opens below —
+    // `open_scoped_*` resolves-and-opens beneath the granted roots in one
+    // kernel-checked step, so a component swapped for a symlink after the leash
+    // check cannot steer the open (the check→open TOCTOU).
+    fs_read: &Scope<String>,
+    fs_write: &Scope<String>,
 ) -> ToolResult<Captured> {
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
@@ -1696,7 +1690,11 @@ fn run_pipeline(
 
         // ── stdin: a `< file` redirect wins over the incoming pipe ──────────
         if let Some(path) = stage.stdin_path() {
-            let file = ok_or_kill(std::fs::File::open(path), &mut children)?;
+            // #351: bounded open beneath the granted fs_read roots.
+            let file = ok_or_kill_tool(
+                agent_bridle_core::open_scoped_read(fs_read, Path::new(path)),
+                &mut children,
+            )?;
             cmd.stdin(Stdio::from(file));
             prev_stdin = None;
         } else {
@@ -1711,7 +1709,11 @@ fn run_pipeline(
         // used so its writer can be cloned for `2>&1` in any position.
         let dup_source: DupSource;
         if let Some((path, append)) = stage.stdout_redirect() {
-            let file = ok_or_kill(open_for_write(path, append), &mut children)?;
+            // #351: bounded open beneath the granted fs_write roots.
+            let file = ok_or_kill_tool(
+                agent_bridle_core::open_scoped_write(fs_write, Path::new(path), append),
+                &mut children,
+            )?;
             let clone = ok_or_kill(file.try_clone(), &mut children)?;
             cmd.stdout(Stdio::from(file));
             dup_source = DupSource::File(clone);
@@ -1741,7 +1743,11 @@ fn run_pipeline(
             },
             // `2> file`: stderr to its own file.
             StderrTo::File { path, append } => {
-                let file = ok_or_kill(open_for_write(&path, append), &mut children)?;
+                // #351: bounded open beneath the granted fs_write roots.
+                let file = ok_or_kill_tool(
+                    agent_bridle_core::open_scoped_write(fs_write, Path::new(&path), append),
+                    &mut children,
+                )?;
                 cmd.stderr(Stdio::from(file));
                 // `dup_source` is dropped here (unused) — never retain a writer.
             }
@@ -1868,6 +1874,12 @@ fn ok_or_kill<T>(result: std::io::Result<T>, children: &mut [Child]) -> ToolResu
         kill_all(children);
         ToolError::Exec(e)
     })
+}
+
+/// [`ok_or_kill`] for results that already carry a [`ToolError`] (the mediated
+/// redirect opens, #351): kill spawned stages, keep the denial/error as-is.
+fn ok_or_kill_tool<T>(result: ToolResult<T>, children: &mut [Child]) -> ToolResult<T> {
+    result.inspect_err(|_| kill_all(children))
 }
 
 /// Read **at most** `max_output` bytes from `reader` into memory, then probe one

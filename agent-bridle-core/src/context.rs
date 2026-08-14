@@ -169,6 +169,187 @@ impl ToolContext {
             canon.display(),
         )))
     }
+
+    /// Mediated open (read): check *and* open in one authority-bounded step.
+    ///
+    /// See [`open_scoped_read`] — this is the [`ToolContext`] convenience over
+    /// the effective `fs_read` axis.
+    pub fn open_path_read(&self, path: &Path) -> ToolResult<std::fs::File> {
+        open_scoped_read(&self.effective.fs_read, path)
+    }
+
+    /// Mediated open (write): check *and* open in one authority-bounded step
+    /// (`append` appends, otherwise create-truncate — the `>>` / `>` shapes).
+    ///
+    /// See [`open_scoped_write`] — this is the [`ToolContext`] convenience over
+    /// the effective `fs_write` axis.
+    pub fn open_path_write(&self, path: &Path, append: bool) -> ToolResult<std::fs::File> {
+        open_scoped_write(&self.effective.fs_write, path, append)
+    }
+}
+
+/// Mediated open (read) against an `fs_read` scope (#351, ADR 0026 slice 2).
+///
+/// [`ToolContext::check_path_read`] then a plain `open` is a check→open TOCTOU:
+/// the open re-resolves the pathname with the caller's full ambient authority,
+/// so a component swapped for a symlink between check and open escapes the
+/// grant. This function performs the same canonicalize-and-contain admission,
+/// then opens **beneath the matched scope entry** with resolution bounded by
+/// the kernel (`openat2(RESOLVE_BENEATH|NO_SYMLINKS)` on Linux, an
+/// `O_NOFOLLOW` component walk on other Unix — see `agent-bridle-fdguard`), so
+/// the descriptor returned is bounded by the grant no matter what the
+/// filesystem did in between. A kernel resolution refusal surfaces as
+/// [`ToolError::Denied`]; ordinary open failures surface as
+/// [`ToolError::Exec`].
+///
+/// `Scope::All` performs a plain open — an unrestricted axis has no fence to
+/// preserve. On non-Unix platforms the bounded step is unavailable and this
+/// falls back to check-then-open (the pre-#351 posture, documented residual).
+pub fn open_scoped_read(axis: &Scope<String>, path: &Path) -> ToolResult<std::fs::File> {
+    open_scoped(axis, path, "read", None)
+}
+
+/// Mediated open (write) against an `fs_write` scope (#351, ADR 0026 slice 2).
+///
+/// Create-if-absent; `append` appends, otherwise truncates. See
+/// [`open_scoped_read`] for the guarantee and platform mechanisms.
+pub fn open_scoped_write(
+    axis: &Scope<String>,
+    path: &Path,
+    append: bool,
+) -> ToolResult<std::fs::File> {
+    open_scoped(axis, path, "write", Some(append))
+}
+
+/// Shared mediated-open logic; `write_append` is `None` for read, or
+/// `Some(append)` for write.
+fn open_scoped(
+    axis: &Scope<String>,
+    path: &Path,
+    op: &str,
+    write_append: Option<bool>,
+) -> ToolResult<std::fs::File> {
+    let allowed = match axis {
+        // Unrestricted axis: no fence to preserve — plain open.
+        Scope::All => return plain_open(path, write_append).map_err(ToolError::Exec),
+        Scope::Only(set) => set,
+    };
+
+    let canon = canonicalize_for_check(path).map_err(|e| {
+        ToolError::denied(format!(
+            "{op} of {path:?} denied: cannot canonicalize ({e})"
+        ))
+    })?;
+
+    for entry in allowed {
+        let Ok(base) = canonicalize_for_check(Path::new(entry)) else {
+            continue;
+        };
+        if path_is_within(&canon, &base) {
+            let rel = canon
+                .strip_prefix(&base)
+                .expect("path_is_within implies base is a prefix");
+            return bounded_open(&base, rel, write_append).map_err(|e| {
+                // A kernel resolution refusal (escape/symlink planted since
+                // canonicalization) is an authority denial, not an ordinary
+                // I/O failure. Same for a component our own validation refused.
+                if is_refusal(&e) || e.kind() == std::io::ErrorKind::InvalidInput {
+                    ToolError::denied(format!(
+                        "{op} of {} escaped the granted fs_{op} scope during resolution ({e})",
+                        path.display(),
+                    ))
+                } else {
+                    ToolError::Exec(e)
+                }
+            });
+        }
+    }
+
+    Err(ToolError::denied(format!(
+        "{op} of {} (resolved {}) is not within the granted fs_{op} scope",
+        path.display(),
+        canon.display(),
+    )))
+}
+
+/// Platform shim for `agent_bridle_fdguard::is_resolution_refusal` (the errno
+/// vocabulary lives with the mechanism; absent on non-Unix, where the bounded
+/// step itself is unavailable).
+fn is_refusal(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        agent_bridle_fdguard::is_resolution_refusal(err)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// The bounded open step: kernel-mediated beneath `base` on Unix; plain open on
+/// platforms without the primitive (the admission above already ran — the
+/// pre-#351 posture, kept as a documented residual).
+fn bounded_open(
+    base: &Path,
+    rel: &Path,
+    write_append: Option<bool>,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        // `GrantedRoot::acquire` is the single pathname→descriptor conversion
+        // (#354): it refuses every symlink component, and once held, no later
+        // namespace mutation can redirect opens made through it (INV-BENEATH).
+        //
+        // RESIDUAL, stated rather than assumed: acquiring here — per open,
+        // just after the scope match — leaves the window between *this*
+        // canonicalization and the acquire, which fdguard documents as
+        // indistinguishable at the syscall level. Closing it fully means
+        // holding the `GrantedRoot` for the authority's lifetime, i.e. minting
+        // it at `Gate::authorize` alongside the scope it came from, so a
+        // pathname is never authority twice. That is a `ToolContext` shape
+        // change and is deliberately NOT in this slice.
+        let root = agent_bridle_fdguard::GrantedRoot::acquire(base)?;
+        match write_append {
+            None => root.open_read(rel),
+            Some(append) => root.open_write(rel, append),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        plain_open(&base.join(rel), write_append)
+    }
+}
+
+/// Unbounded open with the same create/truncate/append shape as the mediated
+/// path (used for `Scope::All` and the non-Unix fallback).
+fn plain_open(path: &Path, write_append: Option<bool>) -> std::io::Result<std::fs::File> {
+    match write_append {
+        None => std::fs::File::open(path),
+        Some(append) => {
+            // On Windows an `.append(true)` handle interacts badly with the
+            // AppContainer DACL story, so append is emulated: open for write
+            // without truncation, then seek to the end (mirrors the tool-shell
+            // `open_for_write` behavior this API replaces).
+            #[cfg(windows)]
+            if append {
+                use std::io::{Seek, SeekFrom};
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)?;
+                file.seek(SeekFrom::End(0))?;
+                return Ok(file);
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(!append)
+                .append(append)
+                .open(path)
+        }
+    }
 }
 
 /// `scope.contains(item)` for the exact string axis (`net` host matching).
@@ -390,6 +571,64 @@ mod tests {
         });
         assert!(cx.check_net("example.com").is_ok());
         assert!(cx.check_net("evil.test").is_err());
+    }
+
+    /// #351: the mediated open admits in-scope targets (create, append, read
+    /// back) and refuses out-of-scope targets — check and open are one step.
+    #[test]
+    fn open_path_write_and_read_are_scope_bounded() {
+        use std::io::{Read, Write};
+        let root = std::env::temp_dir().join(format!("ab351-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([root.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([root.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+
+        let target = root.join("out.txt");
+        cx.open_path_write(&target, false)
+            .expect("in-scope create")
+            .write_all(b"one")
+            .unwrap();
+        cx.open_path_write(&target, true)
+            .expect("in-scope append")
+            .write_all(b"two")
+            .unwrap();
+        let mut s = String::new();
+        cx.open_path_read(&target)
+            .expect("in-scope read")
+            .read_to_string(&mut s)
+            .unwrap();
+        assert_eq!(s, "onetwo");
+
+        assert!(
+            cx.open_path_write(Path::new("/etc/ab351-denied"), false)
+                .is_err(),
+            "out-of-scope write open must be denied"
+        );
+        assert!(
+            cx.open_path_read(Path::new("/etc/hostname")).is_err(),
+            "out-of-scope read open must be denied"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #351: an unrestricted (`Scope::All`) axis has no fence to preserve — the
+    /// mediated open degrades to a plain open and still works anywhere.
+    #[test]
+    fn open_path_all_axis_is_unbounded() {
+        use std::io::Write;
+        let cx = ctx(Caveats::top());
+        let path = std::env::temp_dir().join(format!("ab351-all-{}", std::process::id()));
+        cx.open_path_write(&path, false)
+            .expect("Scope::All write")
+            .write_all(b"x")
+            .unwrap();
+        cx.open_path_read(&path).expect("Scope::All read");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
