@@ -445,14 +445,21 @@ async fn real_ambient_fd_is_not_inherited_macos() {
     let path = unique_temp("ab319-ambient-macos");
     std::fs::write(&path, b"ambient-capability").expect("write temp");
     let file = std::fs::File::open(&path).expect("open temp");
-    rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).expect("clear cloexec");
-    let ambient_fd = file.as_raw_fd();
-    // 3 is where `ls` puts its own handle on /dev/fd in a confined child, so a
-    // descriptor down there could not be told apart from the child's own.
-    assert!(
-        ambient_fd >= 4,
-        "ambient fd should be >= 4 for this probe, got {ambient_fd}"
-    );
+
+    // ESTABLISH the descriptor number; do not assert about it. `open` in a
+    // freshly-spawned test process deterministically returns 3, and 3 is where
+    // `ls` puts its own handle on /dev/fd in the confined child —
+    // indistinguishable from an inherited one. Asserting `>= 4` would make the
+    // test's ability to RUN depend on how many descriptors the machine happened
+    // to have open: green on a CI runner, red on a quiet Mac, both correct
+    // reports of different worlds. Duplicating to a slot above everything
+    // currently open removes that environment dependence, exactly as
+    // `place_ambient` does in `agent-bridle-fdguard/tests/hostile_fds.rs`.
+    // Never depend on an fd number you did not choose.
+    let ambient = rustix::io::fcntl_dupfd_cloexec(&file, highest_open_fd() + 16)
+        .expect("place the ambient descriptor above the open table");
+    rustix::io::fcntl_setfd(&ambient, rustix::io::FdFlags::empty()).expect("clear cloexec");
+    let ambient_fd = ambient.as_raw_fd();
 
     // Positive control: an UNGUARDED spawn inherits the descriptor, so the
     // number really is visible in a child's table when nothing closes it.
@@ -478,6 +485,7 @@ async fn real_ambient_fd_is_not_inherited_macos() {
 
     // Keep the ambient fd open across the spawn, then release it.
     let stdout = out["stdout"].as_str().unwrap_or_default().to_string();
+    drop(ambient);
     drop(file);
     let _ = std::fs::remove_file(&path);
 
@@ -494,6 +502,23 @@ async fn real_ambient_fd_is_not_inherited_macos() {
         !seen.contains(&ambient_fd),
         "ambient descriptor {ambient_fd} leaked into the confined child (agent-bridle#319 macOS leg):\n{stdout}"
     );
+}
+
+/// One past the highest descriptor currently open in this process — the floor
+/// for a descriptor slot the test can call its own.
+#[cfg(target_os = "macos")]
+fn highest_open_fd() -> std::os::fd::RawFd {
+    std::fs::read_dir("/dev/fd")
+        .expect("/dev/fd must be enumerable")
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<std::os::fd::RawFd>().ok())
+        })
+        .max()
+        .unwrap_or(2)
 }
 
 /// Descriptor numbers in an `ls /dev/fd` listing.
