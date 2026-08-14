@@ -7,6 +7,11 @@
 # the references are unique tokens. HOOK/PIPELINE PARITY: run by `just check-tla`
 # (bundled with the assurance gate) and the `tla` job in formal.yml.
 #
+# Section 7 additionally validates formal.yml's OWN trigger paths (#356): adding
+# an evidence reference to the manifest without adding its path to that workflow
+# fails here, so the register cannot come to depend on a file that cannot make
+# this validator run.
+#
 # NOTE: no `set -e`. This script legitimately runs greps that return 1 (a token
 # not found is a normal branch, not a script error), so it tracks `fail`
 # explicitly and ends with `exit "$fail"`. `set -e` here would abort on the first
@@ -117,6 +122,60 @@ cert_out="$(awk -v rc="$RC_SHA" '
 printf '%s\n' "$cert_out" | sed 's/^/  /'
 printf '%s\n' "$cert_out" | grep -q '^FAIL' && fail=1
 
-if [ "$fail" -eq 0 ]; then echo "assurance manifest: all references resolve; no certified claim depends on pending/placeholder evidence"; else
+# 7. Trigger coverage (#356). Sections 1-6 only prove the manifest is honest WHEN
+#    THEY RUN, and formal.yml is path-filtered: an evidence file outside those
+#    filters can be renamed or deleted without this validator ever running, so a
+#    claim keeps its status while its evidence evaporates — a gate reporting green
+#    by never running. Require every implementation/evidence path the manifest
+#    depends on to be covered by a trigger pattern, so the register enforces its
+#    own trigger coverage instead of trusting a human to remember. `formal/**`
+#    always triggers, so any future manifest edit runs this check.
+WF="$REPO/.github/workflows/formal.yml"
+if [ ! -f "$WF" ]; then
+  note FAIL "formal workflow missing: .github/workflows/formal.yml"; fail=1
+else
+  # `<event>\t<pattern>` for every quoted item under an `on: <event>: paths:` list.
+  wf_paths="$(awk '
+    /^on:/ { inon=1; next }
+    /^[^ \t]/ { inon=0 }
+    inon && /^  [a-z_]*:/ { sect=$1; sub(/:$/,"",sect); inpaths=0; next }
+    inon && /^    paths:/ { inpaths=1; next }
+    inon && inpaths && /^      - "/ { s=$0; sub(/^      - "/,"",s); sub(/".*/,"",s); print sect "\t" s; next }
+    inon && inpaths && /^    [a-z_]*:/ { inpaths=0 }
+  ' "$WF")"
+  push_p="$(printf '%s\n' "$wf_paths" | awk -F'\t' '$1=="push"{print $2}' | sort -u)"
+  pr_p="$(printf '%s\n' "$wf_paths" | awk -F'\t' '$1=="pull_request"{print $2}' | sort -u)"
+  if [ -z "$pr_p" ]; then
+    note FAIL "formal.yml: no pull_request paths parsed (filter format changed?)"; fail=1
+  elif [ "$push_p" != "$pr_p" ]; then
+    note FAIL "formal.yml: push and pull_request path filters differ (one event would skip the gate)"; fail=1
+  else
+    note PASS "formal.yml push/pull_request path filters agree"
+  fi
+  # Everything the validator itself reads from the tree, plus every cited
+  # native-evidence file. RUST_SRC counts: it carries the model≈production
+  # correspondence tests named by `rust_test` entries.
+  covered_ok=1
+  rust_src_rel="${RUST_SRC#$REPO/}"
+  for f in $( { grep -oE 'agent-bridle[A-Za-z0-9/._-]+\.rs' "$MAN" | sed 's/^pending://'
+                printf '%s\n' "$rust_src_rel"; } | sort -u ); do
+    hit=0
+    for p in $pr_p; do
+      case "$p" in
+        */'**') case "$f" in "${p%/\*\*}"/*) hit=1 ;; esac ;;
+        '**') hit=1 ;;
+        *)    [ "$f" = "$p" ] && hit=1 ;;
+      esac
+      [ "$hit" -eq 1 ] && break
+    done
+    if [ "$hit" -eq 0 ]; then
+      note FAIL "evidence not covered by a formal.yml trigger path: $f"
+      fail=1; covered_ok=0
+    fi
+  done
+  [ "$covered_ok" -eq 1 ] && note PASS "every cited evidence path triggers the formal gate"
+fi
+
+if [ "$fail" -eq 0 ]; then echo "assurance manifest: all references resolve; every cited evidence path triggers the gate; no certified claim depends on pending/placeholder evidence"; else
   echo "assurance manifest: violations above"; fi
 exit "$fail"
