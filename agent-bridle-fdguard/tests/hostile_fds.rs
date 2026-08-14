@@ -54,13 +54,22 @@
 //! to agent-bridle#358 on its own native probe evidence.
 //!
 //! What it does show is why the defect stayed hidden: the trigger is a function
-//! of **suite size**, not of the guard. Natural failures over 100 runs per SHA,
-//! isolated target dirs throughout, with no difference in guard behaviour
-//! between them — 38ca0d2 (2 tests) 0/100, the probe landing on fd 3 in 95 runs
-//! and fd 4 in the other 5; b04ca39 (7 tests) 0/100; 80f2213 (16 tests) 10/100,
-//! every failure at fd 10. A green baseline was luck, not soundness: nothing
-//! competed for descriptors, so the probe never reached the number where the
-//! shell answers for itself.
+//! of **suite size**, not of the guard. Three CHECKOUTS — not three successive
+//! states of one branch; `38ca0d2` is on the #319/#352 line while `b04ca39` and
+//! `80f2213` are on the #351/#354 line — each run 100 times naturally, with
+//! isolated target dirs and identical guard code throughout:
+//!
+//! | checkout | line | crate tests | natural failures / 100 |
+//! |---|---|---|---|
+//! | `38ca0d2` | #319/#352 | 2 | 0 — probe fd was 3 in 95 runs, 4 in the other 5 |
+//! | `b04ca39` | #351/#354 | 7 | 0 — fd 10 never came up |
+//! | `80f2213` | #351/#354 | 16 | 10 — every one at fd 10 |
+//!
+//! Do not read that as a trend line: this rework reports 12/13 lib tests, which
+//! is not a fourth row and not a regression. The axis is how many descriptors
+//! the suite already holds when the probe is allocated, and nothing else moved.
+//! A green baseline was luck, not soundness: nothing competed for descriptors,
+//! so the probe never reached the number where the shell answers for itself.
 //!
 //! Every ambient descriptor under test is also placed at a number this suite
 //! *owns* (above everything currently open), so a test never probes a
