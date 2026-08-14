@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # agent-bridle pre-push hook — the local equivalent of CI gates.
 #
-# PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml and the `check` /
+# PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml AND
+# .github/workflows/security-audit.yml, via the `check-security` / `check` /
 # `check-windows` / `publish-check` / `py-test` recipes in justfile. When editing the
-# lint/format/test/publish/python steps here, verify it still matches the CI
-# workflow and the justfile (HOOK PARITY rule). `check-windows` only does real work
+# security/lint/format/test/publish/python steps here, verify it still matches the CI
+# workflows and the justfile (HOOK PARITY rule). `check-windows` only does real work
 # on a Windows host (the AppContainer backend is Windows-only) and skips elsewhere.
 #
 # Do NOT bypass with --no-verify. If this fails, fix the issue.
 
 set -euo pipefail
+
+# First: the security gate (#350). Seconds, not minutes — a leak or an internal
+# specific should stop the push before the long build/test legs run, and a green
+# local gate must never hand you a push that CI rejects on these checks.
+echo "[pre-push] running 'just check-security' (internal-specifics + docs-accuracy + gitleaks)"
+just check-security
 
 echo "[pre-push] running 'just check' (fmt + clippy -D warnings + tests, including bare Brush)"
 just check
