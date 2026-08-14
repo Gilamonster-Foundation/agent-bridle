@@ -3,9 +3,13 @@ name: security-audit
 # Privacy + secret-leak guardrails. This MUST stay green: it is the gate that
 # keeps secrets and internal/operational specifics out of this public repository.
 #
-# HOOK PARITY: the secret-scan + internal-specifics checks here are mirrored
-# locally by .pre-commit-config.yaml (gitleaks hook + scripts/check-internal-specifics.sh).
-# When editing this file, update the pre-commit config to match.
+# HOOK PARITY: all three jobs here are mirrored locally by the `check-security`
+# recipe in justfile (run by .githooks/pre-push) and by .pre-commit-config.yaml.
+# When editing this file, update BOTH to match — the push hook is the gate that
+# stops a leak before it leaves the machine (#350).
+#
+# This workflow stays the authoritative gate: the local hook skips the gitleaks
+# leg when the binary is absent, so a green push does not imply a local scan ran.
 
 on:
   push:

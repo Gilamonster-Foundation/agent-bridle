@@ -97,6 +97,44 @@ check-refinement:
     set -e
     ( cd formal/refinement && ./setup.sh && "$LAKE" build )
 
+# Security-audit gate — the local mirror of .github/workflows/security-audit.yml
+# (#350): the checks that keep secrets and internal/operational specifics out of
+# this public repo. Fast (seconds), so the push hook runs it FIRST.
+#
+# The two bash linters always run — they need nothing but bash, so there is no
+# skip path. `gitleaks` skips when the binary is absent, and says so loudly: a
+# silent skip on a secret scan is exactly the fail-open this repo refuses
+# elsewhere. The hook is a fast pre-flight; the workflow remains the
+# authoritative gate, and it runs gitleaks unconditionally.
+#
+# HOOK PARITY: run by .githooks/pre-push, mirrored by the `security-audit` CI
+# workflow and by .pre-commit-config.yaml. When editing any of the four, update
+# the others.
+check-security:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> internal-specifics linter"
+    bash scripts/check-internal-specifics.sh
+    echo ">>> docs-accuracy guard"
+    bash scripts/check-docs-accuracy.sh
+    if command -v gitleaks >/dev/null 2>&1; then
+        echo ">>> gitleaks secret scan"
+        # CI runs `gitleaks dir .` on a CLEAN CHECKOUT — tracked files only. A dev
+        # tree also holds gitignored build output (`target/` is >1 GB), and
+        # compiled dependency metadata embeds sample PEM blocks: scanning `.`
+        # here reports ~17 findings in `libpkcs8`/`libhttpmock` .rmeta files that
+        # CI never sees and that can never be committed. Scanning a throwaway
+        # export of HEAD reproduces CI's input exactly instead of muting rules.
+        export_dir="$(mktemp -d)"
+        trap 'rm -rf "$export_dir"' EXIT
+        git archive HEAD | tar -x -C "$export_dir"
+        gitleaks dir "$export_dir" --config "$PWD/.gitleaks.toml" --redact --no-banner --verbose
+    else
+        echo "!! gitleaks NOT INSTALLED — secret scan SKIPPED LOCALLY."
+        echo "!! CI still enforces it and will fail the push if it finds anything."
+        echo "!! Install: https://github.com/gitleaks/gitleaks/releases (CI pins v8.30.1)"
+    fi
+
 # Windows AppContainer L3 backend checks — the local mirror of the `check-windows`
 # job in .github/workflows/ci.yml (and nightly-windows.yml). The `appcontainer_impl`
 # module and the `agent-bridle-aclaunch` launcher only compile on Windows, so this
