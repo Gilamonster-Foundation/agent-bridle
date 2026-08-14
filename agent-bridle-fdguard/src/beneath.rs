@@ -1,61 +1,302 @@
-//! Race-free bounded opens beneath a granted root (agent-bridle#351, ADR 0026
-//! slice 2).
+//! Race-free bounded opens beneath a granted root (agent-bridle#351/#354,
+//! ADR 0026 slice 2).
+//!
+//! ## The invariant
+//!
+//! **INV-BENEATH: once authority over a directory has been resolved into a
+//! [`GrantedRoot`], no later filesystem-namespace mutation — renaming or
+//! replacing an ancestor, planting a symlink anywhere on the old pathname,
+//! deleting and recreating the root — can redirect an open performed through
+//! that handle to an object outside the subtree rooted at the directory object
+//! it holds.** The handle *is* the authority; the pathname it was resolved
+//! from is provenance (audit text, display, diagnostics) and is never used to
+//! re-derive authority.
+//!
+//! ## Why a pathname must not become authority twice (agent-bridle#354)
 //!
 //! A leash check (`check_path_*`) canonicalizes and tests membership — correct,
-//! but *advisory about the future*: a plain `open` afterwards re-resolves the
-//! pathname from scratch, and a component swapped for a symlink in between is
-//! followed with the caller's full ambient authority (the check→open TOCTOU).
-//! These functions make the resolution itself carry the bound: the kernel (or a
-//! per-component `O_NOFOLLOW` walk) refuses any escape from `root` **at open
-//! time**, so the descriptor handed back is bounded by the grant no matter what
-//! the filesystem did in between.
+//! but *advisory about the future*. The first cut of this module then re-opened
+//! the canonical root **by pathname** with only final-component `O_NOFOLLOW`
+//! protection. `O_NOFOLLOW` guards the last component alone: an *ancestor* of
+//! the canonical root swapped for a symlink (or renamed and replaced) between
+//! authority resolution and that re-open redirects the whole walk, and the
+//! subsequent `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` then operates
+//! perfectly beneath the WRONG root. The fix is architectural, not a flag:
+//!
+//! ```text
+//! authority resolution ──▶ GrantedRoot::acquire (the LAST pathname use)
+//!                              │  OwnedFd + RootIdentity
+//!                              ▼
+//!            every bounded open is relative to that descriptor
+//! ```
+//!
+//! [`GrantedRoot::acquire`] is the single point where a pathname is converted
+//! into a descriptor, and even that conversion refuses every symlink component
+//! (`RESOLVE_NO_SYMLINKS` on Linux; a per-component `O_NOFOLLOW | O_DIRECTORY`
+//! walk elsewhere), so a swapped ancestor at acquisition time is refused rather
+//! than followed. After acquisition, opens go through the held descriptor and
+//! the namespace can mutate freely without redirecting them.
+//!
+//! ## Per-open mechanism
 //!
 //! - **Linux**: one `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`
-//!   from an `O_DIRECTORY` handle on `root` — the kernel refuses `..`-escapes,
-//!   absolute jumps, every symlink (magic `/proc/self/fd` reopen links
-//!   included) atomically. `ENOSYS` (pre-5.6 kernel) fails closed: the repo's
-//!   Linux floor has the syscall.
+//!   relative to the held root descriptor — the kernel refuses `..`-escapes,
+//!   absolute jumps, and every symlink (magic `/proc/self/fd` reopen links
+//!   included; `RESOLVE_NO_SYMLINKS` subsumes `RESOLVE_NO_MAGICLINKS`)
+//!   atomically. `ENOSYS` (pre-5.6 kernel) fails closed: the repo's Linux
+//!   floor has the syscall. `EAGAIN` (openat2's detected-race result) retries
+//!   bounded, then fails closed.
 //! - **Other Unix (macOS)**: no `openat2`, so an equivalent walk: each
 //!   component is opened `openat(dirfd, comp, O_NOFOLLOW | O_DIRECTORY)`
-//!   relative to the previous handle, and the final component with the caller's
-//!   flags plus `O_NOFOLLOW`. `..`/absolute components are refused up front, so
-//!   resolution can never leave `root`; any symlink terminates it (`ELOOP`).
+//!   relative to the previous handle, and the final component with the
+//!   caller's flags plus `O_NOFOLLOW`. `..`/absolute components are refused up
+//!   front, so resolution can never leave the root; any symlink terminates it.
 //!
-//! Both legs are **Conservative** in the projection vocabulary: an in-`root`
-//! symlink is refused too (the caller is expected to pass *canonical* `root`
-//! and `rel`, so honest paths contain none). Callers run in the parent, not a
-//! fork child — no async-signal-safety constraint here; the `unsafe` is plain
-//! FFI, encapsulated so `agent-bridle-core` stays `forbid(unsafe_code)`.
+//! Both legs are **Conservative** in the projection vocabulary: an in-root
+//! symlink is refused too (honest callers pass *canonical* `rel` paths, which
+//! contain none). Callers run in the parent, not a fork child — no
+//! async-signal-safety constraint here; the `unsafe` is plain FFI,
+//! encapsulated so `agent-bridle-core` stays `forbid(unsafe_code)`.
+//!
+//! ## What a grant means at a mount boundary (decided, agent-bridle#354)
+//!
+//! A grant on a root means the **pathname subtree beneath that root in the
+//! mount namespace, *including* any filesystems mounted beneath it** — not
+//! "the filesystem subtree up to the first mount transition". Rationale: the
+//! grantor granted a *place in the namespace* ("you may write beneath
+//! `/work`"); a scratch tmpfs or an overlay checkout legitimately mounted
+//! inside the grant is inside what was granted, and refusing it would make the
+//! projection lie about the grantor's intent. `RESOLVE_NO_XDEV` is therefore
+//! deliberately **not** set. The residual this accepts: an attacker who can
+//! *plant a new mount* beneath the root (bind-mounting `/etc` into the grant)
+//! could redirect a bounded open — but mounting requires `CAP_SYS_ADMIN` in
+//! the mount namespace, an authority the confined agent must never hold; an
+//! attacker with mount authority has already escaped the model this seam
+//! enforces. Recorded as a residual, not silently assumed.
+//!
+//! ## Refusal classification
+//!
+//! [`is_resolution_refusal`] answers "did the *resolution itself* refuse?" so
+//! callers report an authority denial rather than an I/O error. `ENOTDIR` is
+//! classified as a refusal: on the `O_NOFOLLOW` walk (and in several
+//! kernel/libc spellings) a component that should have been a directory but is
+//! not — including a planted symlink surfacing as a non-directory — reports
+//! `ENOTDIR`. The spelling is ambiguous with an honest "intermediate component
+//! is a regular file", and the ambiguity is resolved toward the security
+//! reading: evidence must never under-report a refusal (fail-closed
+//! classification, matching what the hostile tests already accept as a
+//! legitimate refusal).
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
+use std::fmt;
 use std::fs::File;
 use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 
-/// Open `root/rel` for reading, with resolution bounded beneath `root`.
+/// The stable identity of the directory object a [`GrantedRoot`] holds —
+/// `(st_dev, st_ino)` observed **from the held descriptor**, never from a
+/// pathname.
 ///
-/// An empty `rel` opens `root` itself. See the module docs for the guarantee
-/// and platform mechanisms.
-pub fn open_beneath_read(root: &Path, rel: &Path) -> io::Result<File> {
-    open_beneath(root, rel, OpenKind::Read)
+/// This is the CID-grade anchor for authority-bearing records (grants,
+/// admitted fences, audit events): a pathname re-resolving to a different
+/// object cannot silently change it, because it names the object, not the
+/// name. Two identities are equal iff they name the same filesystem object.
+///
+/// Caveats, stated so they cannot be over-claimed:
+/// - The identity names the *object*, not its contents; it is not a content
+///   hash. Feed [`RootIdentity::to_bytes`] into a fence CID as the *namespace
+///   anchor* component, alongside whatever content addressing the record
+///   already carries.
+/// - `(dev, ino)` is pinned only while some descriptor holds the object open.
+///   A [`GrantedRoot`] holds one, so comparisons against a *live* handle are
+///   sound; comparing two identities when neither object is pinned admits
+///   inode reuse and is only advisory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RootIdentity {
+    /// Device number (`st_dev`) of the root directory object.
+    pub device: u64,
+    /// Inode number (`st_ino`) of the root directory object.
+    pub inode: u64,
 }
 
-/// Open `root/rel` for writing (create if absent; `append` appends, otherwise
-/// truncates — the `>` / `>>` shapes), with resolution bounded beneath `root`.
-pub fn open_beneath_write(root: &Path, rel: &Path, append: bool) -> io::Result<File> {
-    open_beneath(root, rel, OpenKind::Write { append })
+impl RootIdentity {
+    /// Canonical byte encoding for content addressing: `device` then `inode`,
+    /// each little-endian `u64` (16 bytes total).
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.device.to_le_bytes());
+        out[8..].copy_from_slice(&self.inode.to_le_bytes());
+        out
+    }
 }
 
-/// True iff `err` is the kernel refusing the *resolution itself* — an escape
-/// or planted symlink stopped by `RESOLVE_BENEATH`/`RESOLVE_NO_SYMLINKS`/
-/// `O_NOFOLLOW` (`EXDEV`, `ELOOP`, and BSD's `EMLINK` spelling) — as opposed
-/// to an ordinary open failure (`ENOENT`, `EACCES`, …). Callers use this to
-/// report an authority denial rather than an I/O error.
+impl fmt::Display for RootIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dev{}:ino{}", self.device, self.inode)
+    }
+}
+
+/// An authoritative handle on a granted root directory: an `OwnedFd` plus the
+/// [`RootIdentity`] observed from it at acquisition.
+///
+/// This is the seam's authority object. Acquire it **once, at authority
+/// resolution time** (when the grant is admitted / the leash check passes) via
+/// [`GrantedRoot::acquire`], hold it for the lifetime of the resolved
+/// authority, and perform every bounded open through it. Dropping it closes
+/// the descriptor and ends the authority. The pathname it was acquired from is
+/// retained only as [`provenance`](Self::provenance) — audit text — and is
+/// never used to re-derive authority.
+#[derive(Debug)]
+pub struct GrantedRoot {
+    dir: OwnedFd,
+    identity: RootIdentity,
+    provenance: PathBuf,
+}
+
+impl GrantedRoot {
+    /// Resolve `root` — an **absolute, canonical** directory path — into an
+    /// authoritative descriptor. This is the one place in the seam where a
+    /// pathname becomes authority, so it happens under the strictest available
+    /// resolution: on Linux a single `openat2(RESOLVE_NO_SYMLINKS)`, elsewhere
+    /// a per-component `O_NOFOLLOW | O_DIRECTORY` walk from `/`. Any symlink
+    /// component — including an ancestor swapped for one after the caller's
+    /// canonicalization — is refused ([`is_resolution_refusal`]), never
+    /// followed.
+    ///
+    /// A relative `root` is refused up front: relative paths resolve through
+    /// the current working directory, which is ambient authority this seam
+    /// exists to exclude.
+    ///
+    /// What acquisition can and cannot promise: a swapped-in *symlink* on the
+    /// path is refused; an ancestor renamed and replaced by a **real
+    /// directory** between the caller's resolution and this call is
+    /// indistinguishable at the syscall level (pathnames are not capabilities
+    /// — that is the point of this type). Acquire as close to authority
+    /// resolution as possible, record the returned [`identity`](Self::identity)
+    /// in the authority-bearing record, and hold the handle from then on:
+    /// after acquisition the window is closed for good.
+    pub fn acquire(root: &Path) -> io::Result<Self> {
+        if !root.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "GrantedRoot::acquire requires an absolute canonical root, got {root:?} \
+                     (a relative root resolves through the CWD — ambient authority)"
+                ),
+            ));
+        }
+        let fd = acquire_root_fd(root)?;
+        Self::from_owned_fd(fd, root)
+    }
+
+    /// Adopt an **already-authoritative** directory descriptor — one delegated
+    /// by a parent, received over a socket, or produced by an earlier bounded
+    /// open — without ever consulting a pathname. Verifies the descriptor
+    /// refers to a directory (`ENOTDIR` otherwise) and records its identity.
+    /// `provenance` is audit text only.
+    pub fn from_owned_fd(fd: OwnedFd, provenance: impl Into<PathBuf>) -> io::Result<Self> {
+        let file = File::from(fd);
+        let md = file.metadata()?;
+        if !md.file_type().is_dir() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        Ok(GrantedRoot {
+            identity: RootIdentity {
+                device: md.dev(),
+                inode: md.ino(),
+            },
+            dir: OwnedFd::from(file),
+            provenance: provenance.into(),
+        })
+    }
+
+    /// Open `rel` for reading, with resolution bounded beneath this root.
+    /// An empty `rel` opens the root directory itself.
+    pub fn open_read(&self, rel: &Path) -> io::Result<File> {
+        self.open_beneath(rel, OpenKind::Read)
+    }
+
+    /// Open `rel` for writing (create if absent; `append` appends, otherwise
+    /// truncates — the `>` / `>>` shapes), bounded beneath this root.
+    pub fn open_write(&self, rel: &Path, append: bool) -> io::Result<File> {
+        self.open_beneath(rel, OpenKind::Write { append })
+    }
+
+    /// The identity of the directory object this handle holds — the value an
+    /// authority-bearing record (grant, admitted fence, audit event) should
+    /// carry instead of the pathname. See [`RootIdentity`].
+    pub fn identity(&self) -> RootIdentity {
+        self.identity
+    }
+
+    /// The pathname this authority was resolved from — **provenance only**
+    /// (display, audit, diagnostics). After a namespace mutation it may no
+    /// longer name the held object; it is never used to re-derive authority.
+    pub fn provenance(&self) -> &Path {
+        &self.provenance
+    }
+
+    /// Borrow the underlying root descriptor (e.g. to pass across an
+    /// enforcement seam that speaks raw descriptors).
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.dir.as_fd()
+    }
+
+    /// Duplicate the handle (same directory object, same identity).
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(GrantedRoot {
+            dir: self.dir.try_clone()?,
+            identity: self.identity,
+            provenance: self.provenance.clone(),
+        })
+    }
+
+    fn open_beneath(&self, rel: &Path, kind: OpenKind) -> io::Result<File> {
+        // Fail closed on any component that could steer resolution by itself;
+        // the kernel-side flags below then only have to stop *filesystem*
+        // tricks (symlinks planted after the caller's check).
+        let mut components: Vec<&OsStr> = Vec::new();
+        for comp in rel.components() {
+            match comp {
+                Component::Normal(name) => components.push(name),
+                Component::CurDir => {}
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("bounded open refuses non-normal path component {other:?}"),
+                    ));
+                }
+            }
+        }
+        if components.is_empty() && matches!(kind, OpenKind::Write { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded write open of the root directory itself",
+            ));
+        }
+        open_beneath_impl(self.dir.as_fd(), &components, kind)
+    }
+}
+
+/// True iff `err` is the *resolution itself* refusing — an escape or planted
+/// symlink stopped by `RESOLVE_BENEATH` / `RESOLVE_NO_SYMLINKS` / `O_NOFOLLOW`
+/// — as opposed to an ordinary open failure (`ENOENT`, `EACCES`, …). Callers
+/// use this to report an authority denial rather than an I/O error.
+///
+/// Spellings: `ELOOP` (Linux, macOS symlink refusal), `EXDEV`
+/// (`RESOLVE_BENEATH` escape), `EMLINK` (BSD `O_NOFOLLOW` spelling), and
+/// `ENOTDIR` — a component that should have been a directory but is not,
+/// which is both how some paths surface a refused symlink and an honest
+/// non-directory intermediate. The ambiguity is classified toward the
+/// security reading (see the module docs): evidence must never under-report
+/// a refusal.
 pub fn is_resolution_refusal(err: &io::Error) -> bool {
     matches!(
         err.raw_os_error(),
-        Some(libc::ELOOP) | Some(libc::EXDEV) | Some(libc::EMLINK)
+        Some(libc::ELOOP) | Some(libc::EXDEV) | Some(libc::EMLINK) | Some(libc::ENOTDIR)
     )
 }
 
@@ -82,61 +323,82 @@ impl OpenKind {
     }
 }
 
-fn open_beneath(root: &Path, rel: &Path, kind: OpenKind) -> io::Result<File> {
-    // Fail closed on any component that could steer resolution by itself; the
-    // kernel-side flags below then only have to stop *filesystem* tricks
-    // (symlinks planted after the caller's check).
-    let mut components: Vec<&std::ffi::OsStr> = Vec::new();
-    for comp in rel.components() {
-        match comp {
-            Component::Normal(name) => components.push(name),
-            Component::CurDir => {}
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("bounded open refuses non-normal path component {other:?}"),
-                ));
-            }
-        }
-    }
-    open_beneath_impl(root, &components, kind)
-}
-
-fn cstr(bytes: &std::ffi::OsStr) -> io::Result<CString> {
+fn cstr(bytes: &OsStr) -> io::Result<CString> {
     CString::new(bytes.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
-/// `open(2)` an `O_DIRECTORY` handle on the root itself. `O_NOFOLLOW` is safe
-/// here because callers pass a canonical root (its final component is not a
-/// symlink); a root swapped for a symlink since canonicalization is refused.
-fn open_root(root: &Path) -> io::Result<File> {
-    let c = cstr(root.as_os_str())?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+// ── Linux: openat2 for both acquisition and per-open enforcement ─────────────
+
+/// The stable openat2(2) ABI (`struct open_how`): three u64s. Defined locally
+/// because libc's `open_how` is #[non_exhaustive] and cannot be constructed by
+/// literal.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// Raw `openat2` with the retry policy shared by acquisition and bounded
+/// opens: `EINTR` retries; `EAGAIN` (openat2's documented detected-race
+/// result) retries a bounded number of times, then surfaces (fail closed,
+/// never a fallback to an unbounded open).
+#[cfg(target_os = "linux")]
+fn openat2_fd(dirfd: libc::c_int, path: &std::ffi::CStr, how: &OpenHow) -> io::Result<OwnedFd> {
+    let mut attempts = 0;
     loop {
-        // SAFETY: plain `open` FFI on a valid NUL-terminated path; the returned
-        // descriptor is immediately owned by `File`.
-        let fd = unsafe { libc::open(c.as_ptr(), flags) };
-        if fd >= 0 {
-            // SAFETY: `fd` is a freshly opened, owned descriptor.
-            return Ok(unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+        // SAFETY: raw `openat2` syscall with a valid dirfd, NUL-terminated
+        // path, and a properly sized `open_how`; the returned descriptor is
+        // immediately owned.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dirfd,
+                path.as_ptr(),
+                std::ptr::addr_of!(*how),
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if rc >= 0 {
+            // SAFETY: `rc` is a freshly opened, owned descriptor.
+            return Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(rc as i32) });
         }
         let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) if attempts < 8 => {
+                attempts += 1;
+                continue;
+            }
+            _ => return Err(err),
         }
     }
 }
 
+/// Acquire the root descriptor from an absolute pathname with every symlink
+/// component refused: `openat2(RESOLVE_NO_SYMLINKS)` resolves the WHOLE path
+/// — ancestors included — in one kernel-checked pass. (An absolute pathname
+/// makes openat2 ignore `dirfd`; `RESOLVE_BENEATH` is deliberately absent
+/// here, since this is the one authorized absolute resolution.)
+#[cfg(target_os = "linux")]
+fn acquire_root_fd(root: &Path) -> io::Result<OwnedFd> {
+    let c = cstr(root.as_os_str())?;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: libc::RESOLVE_NO_SYMLINKS,
+    };
+    openat2_fd(libc::AT_FDCWD, &c, &how)
+}
+
 #[cfg(target_os = "linux")]
 fn open_beneath_impl(
-    root: &Path,
-    components: &[&std::ffi::OsStr],
+    root: BorrowedFd<'_>,
+    components: &[&OsStr],
     kind: OpenKind,
 ) -> io::Result<File> {
-    use std::os::fd::AsRawFd;
-
-    let root_dir = open_root(root)?;
     // Join the validated components into one relative path; `openat2` resolves
     // it in a single kernel-checked pass. Empty → the root itself (".").
     let mut rel_bytes: Vec<u8> = Vec::new();
@@ -152,15 +414,6 @@ fn open_beneath_impl(
     let rel_c = CString::new(rel_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
 
-    // The stable openat2(2) ABI (`struct open_how`): three u64s. Defined
-    // locally because libc's `open_how` is #[non_exhaustive] and cannot be
-    // constructed by literal.
-    #[repr(C)]
-    struct OpenHow {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
-    }
     let how = OpenHow {
         flags: (kind.flags() | libc::O_CLOEXEC) as u64,
         mode: match kind {
@@ -169,87 +422,88 @@ fn open_beneath_impl(
         },
         resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS,
     };
+    openat2_fd(root.as_raw_fd(), &rel_c, &how).map(File::from)
+}
 
-    // `openat2` may return EAGAIN when it detects a racing rename/mount during
-    // resolution (its documented "retry" result) — retry a bounded number of
-    // times, then surface the error (fail closed, never fall back to an
-    // unbounded open). EINTR retries as usual.
-    let mut attempts = 0;
+// ── Other Unix (macOS): O_NOFOLLOW component walks ───────────────────────────
+
+/// `openat` one directory component `O_NOFOLLOW | O_DIRECTORY` relative to
+/// `dirfd`; any symlink terminates resolution.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn openat_dir_nofollow(dirfd: libc::c_int, comp: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     loop {
-        // SAFETY: raw `openat2` syscall with a valid dirfd, NUL-terminated
-        // relative path, and a properly sized `open_how`; the returned
-        // descriptor is immediately owned by `File`.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_openat2,
-                root_dir.as_raw_fd(),
-                rel_c.as_ptr(),
-                std::ptr::addr_of!(how),
-                std::mem::size_of::<OpenHow>(),
-            )
-        };
-        if rc >= 0 {
-            // SAFETY: `rc` is a freshly opened, owned descriptor.
-            return Ok(unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(rc as i32) });
+        // SAFETY: `openat` FFI relative to a live directory descriptor; the
+        // returned descriptor is immediately owned.
+        let fd = unsafe { libc::openat(dirfd, comp.as_ptr(), flags) };
+        if fd >= 0 {
+            // SAFETY: freshly opened, owned descriptor.
+            return Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
         }
         let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EAGAIN) if attempts < 8 => {
-                attempts += 1;
-                continue;
-            }
-            _ => return Err(err),
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
         }
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn open_beneath_impl(
-    root: &Path,
-    components: &[&std::ffi::OsStr],
-    kind: OpenKind,
-) -> io::Result<File> {
-    use std::os::fd::AsRawFd;
+/// Acquire the root descriptor from an absolute pathname with every symlink
+/// component refused: a per-component `O_NOFOLLOW | O_DIRECTORY` walk from
+/// `/`, the walk equivalent of Linux's `RESOLVE_NO_SYMLINKS` acquisition.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn acquire_root_fd(root: &Path) -> io::Result<OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let mut dir = open_root(root)?;
-    let Some((last, intermediate)) = components.split_last() else {
-        // Empty `rel`: the root itself (only meaningful for read; a write open
-        // of a directory fails EISDIR from the flags below via reopen).
-        return match kind {
-            OpenKind::Read => Ok(dir),
-            OpenKind::Write { .. } => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bounded write open of the root directory itself",
-            )),
-        };
-    };
-
-    for comp in intermediate {
-        let c = cstr(comp)?;
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        loop {
-            // SAFETY: `openat` FFI relative to an owned directory handle; the
-            // returned descriptor is immediately owned by `File`.
-            let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
-            if fd >= 0 {
-                // SAFETY: freshly opened, owned descriptor.
-                dir = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-                break;
+    // `/` itself cannot be a symlink; no O_NOFOLLOW needed for the anchor.
+    let mut dir = OwnedFd::from(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open("/")?,
+    );
+    for comp in root.components() {
+        match comp {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                dir = openat_dir_nofollow(dir.as_raw_fd(), &cstr(name)?)?;
             }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("root acquisition refuses non-normal path component {other:?}"),
+                ));
             }
         }
     }
+    Ok(dir)
+}
 
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_beneath_impl(
+    root: BorrowedFd<'_>,
+    components: &[&OsStr],
+    kind: OpenKind,
+) -> io::Result<File> {
+    let Some((last, intermediate)) = components.split_last() else {
+        // Empty `rel`, read (write of the root was refused up front): reopen
+        // the root itself via "." — descriptor-relative, no pathname.
+        return openat_dir_nofollow(root.as_raw_fd(), &cstr(OsStr::new("."))?).map(File::from);
+    };
+
+    let mut owned: Option<OwnedFd> = None;
+    for comp in intermediate {
+        let cur = owned.as_ref().map_or(root.as_raw_fd(), AsRawFd::as_raw_fd);
+        owned = Some(openat_dir_nofollow(cur, &cstr(comp)?)?);
+    }
+
+    let cur = owned.as_ref().map_or(root.as_raw_fd(), AsRawFd::as_raw_fd);
     let c = cstr(last)?;
     let flags = kind.flags() | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     loop {
-        // SAFETY: `openat` FFI relative to an owned directory handle; the
+        // SAFETY: `openat` FFI relative to a live directory descriptor; the
         // returned descriptor is immediately owned by `File`.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o666 as libc::c_uint) };
+        let fd = unsafe { libc::openat(cur, c.as_ptr(), flags, 0o666 as libc::c_uint) };
         if fd >= 0 {
             // SAFETY: freshly opened, owned descriptor.
             return Ok(unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
@@ -274,38 +528,48 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
-    /// In-scope opens work: create-truncate, append, then read back.
+    fn read_to_string(mut f: File) -> String {
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    /// In-scope opens work: create-truncate, append, then read back — all
+    /// through one acquired handle.
     #[test]
     fn in_scope_write_append_read_roundtrip() {
         let root = tmp_root("roundtrip");
         std::fs::create_dir(root.join("sub")).unwrap();
         let rel = Path::new("sub/out.txt");
 
-        let mut f = open_beneath_write(&root, rel, false).expect("create");
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
+        let mut f = granted.open_write(rel, false).expect("create");
         f.write_all(b"one").unwrap();
         drop(f);
-        let mut f = open_beneath_write(&root, rel, true).expect("append");
+        let mut f = granted.open_write(rel, true).expect("append");
         f.write_all(b"two").unwrap();
         drop(f);
 
-        let mut s = String::new();
-        open_beneath_read(&root, rel)
-            .expect("read")
-            .read_to_string(&mut s)
-            .unwrap();
-        assert_eq!(s, "onetwo");
+        assert_eq!(
+            read_to_string(granted.open_read(rel).expect("read")),
+            "onetwo"
+        );
+        assert_eq!(granted.provenance(), root.as_path());
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The TOCTOU regression (agent-bridle#351): a path component swapped for a
-    /// symlink pointing OUTSIDE the root after the caller's check must be
-    /// refused at open time — a plain `open` would follow it.
+    /// The check→open TOCTOU regression (agent-bridle#351): a path component
+    /// swapped for a symlink pointing OUTSIDE the root after the caller's
+    /// check must be refused at open time — a plain `open` would follow it —
+    /// and the refusal must classify as a resolution refusal (#354 item 6:
+    /// enforcement outcome and evidence classification agree).
     #[test]
     fn symlink_component_escape_is_refused() {
         let root = tmp_root("swap");
         let outside = tmp_root("swap-outside");
         std::fs::write(outside.join("victim.txt"), b"outside").unwrap();
 
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
         // The "swap": what the check saw as a real directory is now a symlink.
         std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
 
@@ -316,24 +580,20 @@ mod tests {
             "positive control: a plain open follows the planted symlink"
         );
 
-        let err = open_beneath_read(&root, Path::new("sub/victim.txt"))
+        let err = granted
+            .open_read(Path::new("sub/victim.txt"))
             .expect_err("bounded open must refuse the symlinked component");
         assert!(
-            matches!(
-                err.raw_os_error(),
-                Some(libc::ELOOP) | Some(libc::EXDEV) | Some(libc::ENOTDIR)
-            ),
-            "expected a kernel resolution refusal, got {err:?}"
+            is_resolution_refusal(&err),
+            "escape refusal must classify as a resolution refusal, got {err:?}"
         );
 
-        let err = open_beneath_write(&root, Path::new("sub/victim.txt"), false)
+        let err = granted
+            .open_write(Path::new("sub/victim.txt"), false)
             .expect_err("bounded write must refuse the symlinked component");
         assert!(
-            matches!(
-                err.raw_os_error(),
-                Some(libc::ELOOP) | Some(libc::EXDEV) | Some(libc::ENOTDIR)
-            ),
-            "expected a kernel resolution refusal, got {err:?}"
+            is_resolution_refusal(&err),
+            "escape refusal must classify as a resolution refusal, got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
@@ -347,11 +607,33 @@ mod tests {
         std::fs::write(root.join("real.txt"), b"real").unwrap();
         std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
 
-        let err = open_beneath_read(&root, Path::new("link.txt"))
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
+        let err = granted
+            .open_read(Path::new("link.txt"))
             .expect_err("final symlink must be refused");
         assert!(
-            matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)),
+            is_resolution_refusal(&err),
             "expected ELOOP-class refusal, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An in-root symlink at an INTERMEDIATE component is refused too — the
+    /// Conservative posture is about symlinks per se, not only escapes.
+    #[test]
+    fn symlink_intermediate_in_root_is_refused() {
+        let root = tmp_root("mid");
+        std::fs::create_dir(root.join("realdir")).unwrap();
+        std::fs::write(root.join("realdir/f.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.join("realdir"), root.join("alias")).unwrap();
+
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
+        let err = granted
+            .open_read(Path::new("alias/f.txt"))
+            .expect_err("in-root intermediate symlink must be refused");
+        assert!(
+            is_resolution_refusal(&err),
+            "expected a resolution refusal, got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -360,14 +642,17 @@ mod tests {
     #[test]
     fn dotdot_and_absolute_rel_are_refused() {
         let root = tmp_root("dotdot");
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
         assert_eq!(
-            open_beneath_read(&root, Path::new("../etc/hosts"))
+            granted
+                .open_read(Path::new("../etc/hosts"))
                 .expect_err("..-escape must be refused")
                 .kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            open_beneath_read(&root, Path::new("/etc/hosts"))
+            granted
+                .open_read(Path::new("/etc/hosts"))
                 .expect_err("absolute rel must be refused")
                 .kind(),
             io::ErrorKind::InvalidInput
@@ -375,11 +660,292 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An empty `rel` reads the root directory handle itself.
+    /// An empty `rel` reads the root directory handle itself; a write open of
+    /// the root itself is refused up front on every platform.
     #[test]
-    fn empty_rel_opens_the_root_for_read() {
+    fn empty_rel_opens_the_root_for_read_and_refuses_write() {
         let root = tmp_root("self");
-        open_beneath_read(&root, Path::new("")).expect("open root");
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
+        granted.open_read(Path::new("")).expect("open root");
+        assert_eq!(
+            granted
+                .open_write(Path::new(""), false)
+                .expect_err("write open of the root itself must be refused")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── #354 hostile-mutation suite: the pathname must not become authority
+    //    again after acquisition ─────────────────────────────────────────────
+
+    /// THE #354 regression: an ANCESTOR of the canonical root swapped for a
+    /// symlink after authority resolution. The old acquisition (`open(path,
+    /// O_NOFOLLOW)`) protects only the final component — the positive control
+    /// proves that exact open follows the swapped ancestor and lands on the
+    /// wrong root — so `GrantedRoot::acquire` must refuse the symlink
+    /// component instead of walking through it. This test FAILS against the
+    /// pathname-reopen design and PASSES with symlink-free acquisition.
+    #[test]
+    fn ancestor_symlink_swap_at_acquisition_is_refused() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let base = tmp_root("anc-swap");
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("root")).unwrap();
+        std::fs::write(real.join("root/victim.txt"), b"wrong-root").unwrap();
+        // The swap: the ancestor `parent` the caller canonicalized through is
+        // now a symlink to somewhere else entirely.
+        std::os::unix::fs::symlink(&real, base.join("parent")).unwrap();
+        let swapped_root = base.join("parent").join("root");
+
+        // Positive control: the OLD acquisition — a pathname re-open with only
+        // final-component O_NOFOLLOW — follows the swapped ancestor and
+        // happily opens the WRONG root.
+        assert!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(&swapped_root)
+                .is_ok(),
+            "positive control: final-component O_NOFOLLOW follows a swapped ancestor"
+        );
+
+        let err = GrantedRoot::acquire(&swapped_root)
+            .expect_err("acquisition through a symlinked ancestor must be refused");
+        assert!(
+            is_resolution_refusal(&err),
+            "ancestor-symlink refusal must classify as a resolution refusal, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Ancestor RENAME after acquisition: authority tracks the directory
+    /// object, not the name. Opens through the handle keep reaching the real
+    /// (moved) tree; an imposter placed at the old pathname is unreachable
+    /// through the handle, while pathname re-resolution (the old failure mode)
+    /// is redirected to the imposter.
+    #[test]
+    fn ancestor_rename_after_acquisition_does_not_redirect() {
+        let base = tmp_root("anc-rename");
+        std::fs::create_dir_all(base.join("parent/root")).unwrap();
+        std::fs::write(base.join("parent/root/data.txt"), b"real").unwrap();
+        let root_path = base.join("parent/root");
+
+        let granted = GrantedRoot::acquire(&root_path).expect("acquire");
+
+        // Namespace mutation: rename the ancestor, then rebuild an imposter
+        // tree at the ORIGINAL pathname.
+        std::fs::rename(base.join("parent"), base.join("parent-moved")).unwrap();
+        std::fs::create_dir_all(base.join("parent/root")).unwrap();
+        std::fs::write(base.join("parent/root/data.txt"), b"imposter").unwrap();
+
+        // Positive control: pathname re-resolution now yields the imposter —
+        // exactly what reconstructing authority from the path would open.
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("data.txt")).unwrap(),
+            "imposter",
+            "positive control: the pathname now names the imposter"
+        );
+
+        // The handle still opens the REAL tree (moved with its ancestor).
+        assert_eq!(
+            read_to_string(granted.open_read(Path::new("data.txt")).expect("read")),
+            "real",
+            "authority must track the directory object, not the pathname"
+        );
+
+        // A fresh pathname acquisition observes a DIFFERENT identity: the
+        // redirection cannot hide from the identity anchor.
+        let re = GrantedRoot::acquire(&root_path).expect("acquire imposter");
+        assert_ne!(
+            re.identity(),
+            granted.identity(),
+            "the imposter root must not share the resolved authority's identity"
+        );
+        assert_ne!(re.identity().to_bytes(), granted.identity().to_bytes());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Root DELETION + replacement after acquisition: the handle keeps naming
+    /// the (now unlinked) original object — opens fail closed with ENOENT and
+    /// can never be redirected into the imposter, while pathname
+    /// re-resolution reaches the imposter.
+    #[test]
+    fn root_replacement_after_acquisition_fails_closed() {
+        let base = tmp_root("root-replace");
+        let root_path = base.join("root");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("f.txt"), b"real").unwrap();
+
+        let granted = GrantedRoot::acquire(&root_path).expect("acquire");
+
+        // Delete the granted root entirely, then recreate an imposter at the
+        // same pathname.
+        std::fs::remove_dir_all(&root_path).unwrap();
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("f.txt"), b"imposter").unwrap();
+
+        // Positive control: the pathname reaches the imposter.
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("f.txt")).unwrap(),
+            "imposter"
+        );
+
+        // The handle must NOT be redirected: the original object is gone, so
+        // reads and creates beneath it fail closed (never the imposter).
+        let err = granted
+            .open_read(Path::new("f.txt"))
+            .expect_err("the deleted root's handle must not see the imposter");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        let err = granted
+            .open_write(Path::new("g.txt"), false)
+            .expect_err("creating beneath a deleted root must fail closed");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+
+        // And the imposter's identity differs from the resolved authority's.
+        let re = GrantedRoot::acquire(&root_path).expect("acquire imposter");
+        assert_ne!(re.identity(), granted.identity());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A relative root is ambient authority (CWD-dependent) and is refused.
+    #[test]
+    fn relative_root_is_refused() {
+        assert_eq!(
+            GrantedRoot::acquire(Path::new("some/relative/dir"))
+                .expect_err("relative root must be refused")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// Adopting a non-directory descriptor is refused (ENOTDIR): a file fd is
+    /// not a root authority.
+    #[test]
+    fn from_owned_fd_refuses_a_non_directory() {
+        let root = tmp_root("adopt");
+        std::fs::write(root.join("f.txt"), b"x").unwrap();
+        let fd = OwnedFd::from(std::fs::File::open(root.join("f.txt")).unwrap());
+        let err = GrantedRoot::from_owned_fd(fd, root.join("f.txt"))
+            .expect_err("a file descriptor must be refused as a root");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Adopting an already-authoritative directory descriptor works and never
+    /// consults the pathname (the provenance is deliberately wrong here).
+    #[test]
+    fn from_owned_fd_adopts_a_directory_without_pathname_authority() {
+        let root = tmp_root("adopt-dir");
+        std::fs::write(root.join("f.txt"), b"via-fd").unwrap();
+        let fd = OwnedFd::from(std::fs::File::open(&root).unwrap());
+        let granted = GrantedRoot::from_owned_fd(fd, "/definitely/not/the/path").expect("adopt");
+        assert_eq!(
+            read_to_string(granted.open_read(Path::new("f.txt")).expect("read")),
+            "via-fd"
+        );
+        assert_eq!(granted.provenance(), Path::new("/definitely/not/the/path"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #354 item 6: `ENOTDIR` — the kernel refusing to treat a non-directory
+    /// as a path component — classifies as a resolution refusal, so
+    /// enforcement outcome and evidence classification agree.
+    #[test]
+    fn enotdir_classifies_as_a_resolution_refusal() {
+        let root = tmp_root("enotdir");
+        std::fs::write(root.join("afile"), b"not a dir").unwrap();
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
+        let err = granted
+            .open_read(Path::new("afile/sub.txt"))
+            .expect_err("a file used as an intermediate component must fail");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+        assert!(
+            is_resolution_refusal(&err),
+            "ENOTDIR must classify as a resolution refusal (fail-closed evidence)"
+        );
+        // Ordinary open failures stay ordinary.
+        let missing = granted
+            .open_read(Path::new("no-such-file.txt"))
+            .expect_err("missing file");
+        assert!(!is_resolution_refusal(&missing), "ENOENT is not a refusal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #354 item 7, executable: a grant means the **pathname subtree including
+    /// nested mounts**, so a bounded open MAY traverse a mount transition
+    /// beneath the root — and the same open WOULD be refused if
+    /// `RESOLVE_NO_XDEV` were set. Both halves are asserted so the decision is
+    /// a tested theorem, not a comment. Uses `/dev` → `/dev/shm` (a distinct
+    /// tmpfs beneath it), which needs no privilege; skips if that mount
+    /// transition is absent on the host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_grant_includes_nested_mounts_and_no_xdev_would_refuse_them() {
+        let dev = Path::new("/dev");
+        let shm = Path::new("/dev/shm");
+        let (Ok(dev_md), Ok(shm_md)) = (dev.metadata(), shm.metadata()) else {
+            eprintln!("skipping: /dev or /dev/shm absent");
+            return;
+        };
+        if dev_md.dev() == shm_md.dev() {
+            eprintln!("skipping: /dev/shm is not a separate mount on this host");
+            return;
+        }
+
+        let name = format!("fdguard-xdev-{}", std::process::id());
+        let file = shm.join(&name);
+        std::fs::write(&file, b"across-the-mount").unwrap();
+
+        let granted = GrantedRoot::acquire(dev).expect("acquire /dev");
+        let rel = PathBuf::from("shm").join(&name);
+
+        // Decision (a): traversal into the nested mount is ALLOWED.
+        assert_eq!(
+            read_to_string(granted.open_read(&rel).expect("read across the mount")),
+            "across-the-mount",
+            "a grant covers the pathname subtree INCLUDING nested mounts"
+        );
+
+        // …and RESOLVE_NO_XDEV would have refused exactly this open, which is
+        // why it is deliberately not set (see the module docs).
+        let c = CString::new(rel.as_os_str().as_bytes()).unwrap();
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_XDEV,
+        };
+        let err = openat2_fd(granted.as_fd().as_raw_fd(), &c, &how)
+            .expect_err("RESOLVE_NO_XDEV must refuse a crossing of the mount transition");
+        assert_eq!(err.raw_os_error(), Some(libc::EXDEV));
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Identity and clone semantics: a clone shares the object identity; the
+    /// identity survives (is unchanged by) namespace mutation of the pathname.
+    #[test]
+    fn identity_is_stable_and_shared_by_clones() {
+        let base = tmp_root("identity");
+        let root_path = base.join("root");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("f.txt"), b"real").unwrap();
+
+        let granted = GrantedRoot::acquire(&root_path).expect("acquire");
+        let clone = granted.try_clone().expect("clone");
+        assert_eq!(granted.identity(), clone.identity());
+
+        // Mutate the namespace: the held identity does not change.
+        let before = granted.identity();
+        std::fs::rename(&root_path, base.join("root-moved")).unwrap();
+        assert_eq!(granted.identity(), before);
+        assert_eq!(
+            read_to_string(clone.open_read(Path::new("f.txt")).expect("read")),
+            "real",
+            "a clone holds the same authority object"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
