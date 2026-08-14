@@ -78,26 +78,62 @@
 //!
 //! [`is_resolution_refusal`] answers "did the *resolution itself* refuse?" so
 //! callers report an authority denial rather than an I/O error. The two legs
-//! spell the same refusal differently — measured, not assumed:
+//! spell the same refusal differently — **measured natively on both**, Linux
+//! on gnuc and the walk leg on macOS 26.5.2 / xnu-12377 arm64:
 //!
-//! | case                           | Linux (`openat2`) | walk (`O_NOFOLLOW`)    |
-//! |--------------------------------|-------------------|------------------------|
-//! | intermediate-component symlink | `ELOOP`           | `ENOTDIR`              |
-//! | final-component symlink        | `ELOOP`           | `ELOOP` (BSD `EMLINK`) |
-//! | non-directory intermediate     | `ENOTDIR`         | `ENOTDIR`              |
+//! | case                           | Linux (`openat2`) | walk (`O_NOFOLLOW`, Darwin) |
+//! |--------------------------------|-------------------|-----------------------------|
+//! | intermediate symlink → dir     | `ELOOP`           | `ENOTDIR`                   |
+//! | intermediate symlink → file    | `ELOOP`           | `ENOTDIR`                   |
+//! | intermediate symlink, dangling | `ELOOP`           | `ENOTDIR`                   |
+//! | intermediate, honestly non-dir | `ENOTDIR`         | `ENOTDIR`                   |
+//! | intermediate, genuinely absent | `ENOENT`          | `ENOENT`                    |
+//! | final-component symlink        | `ELOOP`           | `ELOOP`                     |
 //!
 //! The walk leg answers `ENOTDIR` for an intermediate symlink because that
 //! component is opened `O_DIRECTORY | O_NOFOLLOW` and the not-a-directory
 //! check fires before `O_NOFOLLOW`'s `ELOOP`. The open still fails, so the
 //! symlink is never followed and the bound holds — but this makes `ENOTDIR`
-//! **load-bearing rather than cosmetic**: without it in the classifier, the
-//! walk leg's *primary* refusal spelling would be misreported as an ordinary
-//! I/O error on exactly the platform that leg serves (macOS). `ENOTDIR` is
-//! also ambiguous with an honest "intermediate component is a regular file";
-//! that ambiguity is resolved toward the security reading — evidence must
-//! never under-report a refusal. The tests assert the *specific* errno per
-//! leg, so a green boolean cannot hide a refusal that happened for an
-//! unintended reason.
+//! **load-bearing rather than cosmetic**: it is *the* primary refusal spelling
+//! for an intermediate symlink on Darwin, so without it in the classifier the
+//! walk leg's most common denial would be misreported as an ordinary I/O error
+//! on exactly the platform that leg serves.
+//!
+//! **Epistemic limit — errno proves THAT, not WHY.** On the walk leg `ENOTDIR`
+//! is a single spelling covering at least four distinct situations
+//! (symlink→dir refused, symlink→file refused, dangling symlink refused, and an
+//! honestly non-directory component). Asserting `ENOTDIR` therefore proves the
+//! open was **refused**; it does **not** prove a *symlink* was refused. That is
+//! strictly stronger than a boolean — it closes the refusal-vs-ordinary-error
+//! gap — but a test that wants to prove specifically that a symlink was not
+//! followed cannot get that from errno: it must compare the resulting
+//! descriptor's **identity** (`fstat` dev/ino, or `F_GETPATH`) against the
+//! intended target. Note also that a *dangling* intermediate symlink answers
+//! `ENOTDIR`, not `ENOENT` — never model "missing component" with a dangling
+//! link in a fixture, or it will fail on Darwin for an entirely correct reason.
+//!
+//! `EMLINK` stays in the accepted set for other BSDs that spell `O_NOFOLLOW`
+//! that way, but it was **never observed on Darwin** — every final-component
+//! symlink there answered `ELOOP`. A passing test is not evidence that the
+//! `EMLINK` arm is exercised.
+//!
+//! ## Errno tells you *that*; identity tells you *what*
+//!
+//! The point above generalizes, and it is the same idea [`RootIdentity`] rests
+//! on. An errno or an exit status reports that an operation was **refused or
+//! permitted**. It cannot report **which object you got** — and for every
+//! property of the form "resolution did/did not land outside the grant", the
+//! object is the claim. So:
+//!
+//! - a **refusal** may be asserted from errno, because a refused open yields
+//!   no descriptor at all, and "no object" is the whole claim;
+//! - a **success** must be asserted from identity — `fstat` `(dev, ino)`, or
+//!   `F_GETPATH` on Darwin — because "it opened" is true of the intended
+//!   object and of an attacker's substitute alike.
+//!
+//! [`RootIdentity`] applies this to an authority record (the grant names an
+//! object, not a path); the walk leg's positive-control test applies the same
+//! oracle to a test. Both exist because a name is not an identity.
 
 use std::ffi::{CString, OsStr};
 use std::fmt;
@@ -298,13 +334,26 @@ impl GrantedRoot {
 /// — as opposed to an ordinary open failure (`ENOENT`, `EACCES`, …). Callers
 /// use this to report an authority denial rather than an I/O error.
 ///
-/// Spellings: `ELOOP` (Linux, macOS symlink refusal), `EXDEV`
-/// (`RESOLVE_BENEATH` escape), `EMLINK` (BSD `O_NOFOLLOW` spelling), and
-/// `ENOTDIR` — a component that should have been a directory but is not,
-/// which is both how some paths surface a refused symlink and an honest
-/// non-directory intermediate. The ambiguity is classified toward the
-/// security reading (see the module docs): evidence must never under-report
-/// a refusal.
+/// Spellings: `ELOOP` (`openat2`'s symlink refusal, and the walk leg's answer
+/// for a *final*-component symlink on both Linux and Darwin), `EXDEV`
+/// (`RESOLVE_BENEATH` escape), `EMLINK` (the `O_NOFOLLOW` spelling on some
+/// BSDs — retained for them, but **never observed on Darwin**), and `ENOTDIR`.
+///
+/// `ENOTDIR` is not a courtesy inclusion: measured on macOS 26.5.2 /
+/// xnu-12377 arm64, it is **the** spelling the walk leg returns for an
+/// *intermediate* symlink (to a directory, to a file, or dangling), because
+/// those components are opened `O_DIRECTORY | O_NOFOLLOW` and the
+/// not-a-directory check fires first. Omitting it would misreport the walk
+/// leg's most common denial as an ordinary I/O error on the very platform
+/// that leg exists for.
+///
+/// **This predicate answers "was the resolution refused?", never "why?".** On
+/// the walk leg `ENOTDIR` covers a refused symlink *and* an honestly
+/// non-directory component; the ambiguity is resolved toward the security
+/// reading (evidence must never under-report a refusal). A caller — or a test
+/// — that needs to establish that a *symlink specifically* was not followed
+/// must compare descriptor identity (`fstat` dev/ino), not errno. See the
+/// module docs.
 pub fn is_resolution_refusal(err: &io::Error) -> bool {
     matches!(
         err.raw_os_error(),
@@ -503,9 +552,28 @@ fn open_beneath_impl(
         return openat_dir_nofollow(root.as_raw_fd(), &cstr(OsStr::new("."))?).map(File::from);
     };
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  DO NOT COLLAPSE THIS LOOP INTO A SINGLE MULTI-COMPONENT `openat`.
+    //
+    //  `O_NOFOLLOW` constrains ONLY the final component. Measured natively on
+    //  both Linux and macOS 26.5.2/xnu-12377:
+    //
+    //      openat(root, "symdir/leaf", O_RDONLY|O_DIRECTORY|O_NOFOLLOW)
+    //          SUCCEEDS, and the fd it returns is the object BENEATH the
+    //          symlink — i.e. resolution walked straight through it.
+    //
+    //  One component at a time is therefore the entire enforcement mechanism
+    //  on this leg, not a stylistic choice: `"a/b/c"` in one call would leave
+    //  `a` and `b` unguarded and silently reopen the confinement hole this
+    //  module exists to close — while every refusal test kept passing, because
+    //  they exercise single-component refusals. That vacuity is exactly why
+    //  `o_nofollow_alone_opens_through_an_intermediate_symlink` exists: it is
+    //  a positive control that FAILS if this walk is ever flattened.
+    // ══════════════════════════════════════════════════════════════════════
     let mut owned: Option<OwnedFd> = None;
     for comp in intermediate {
         let cur = owned.as_ref().map_or(root.as_raw_fd(), AsRawFd::as_raw_fd);
+        // Exactly one component per call — see the banner above.
         owned = Some(openat_dir_nofollow(cur, &cstr(comp)?)?);
     }
 
@@ -583,10 +651,42 @@ mod tests {
     /// `O_DIRECTORY` is involved, so `O_NOFOLLOW` answers directly.
     const FINAL_SYMLINK: &[i32] = &[libc::ELOOP, libc::EMLINK];
 
+    /// Spelling for a RAW `openat(.., O_DIRECTORY | O_NOFOLLOW)` on a lone
+    /// symlink component. Distinct from [`INTERMEDIATE_SYMLINK`], which
+    /// describes what the *seam* returns: on Linux the seam uses `openat2` and
+    /// answers `ELOOP`, but this raw syscall is the walk-leg shape and answers
+    /// `ENOTDIR` on **both** platforms (measured: Linux on gnuc, macOS 26.5.2 /
+    /// xnu-12377 arm64). Conflating the two is a real trap — it cost this test
+    /// a red run.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const RAW_NOFOLLOW_DIR_SYMLINK: &[i32] = &[libc::ENOTDIR];
+    /// Untested BSDs may answer with the `O_NOFOLLOW` spellings instead.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const RAW_NOFOLLOW_DIR_SYMLINK: &[i32] = &[libc::ENOTDIR, libc::ELOOP, libc::EMLINK];
+
+    /// `(dev, ino)` of a path, for identity comparisons. Errno cannot say WHY
+    /// a resolution refused (see the module docs), so where a test needs to
+    /// prove *which object* an open landed on, it compares identity instead.
+    fn ident_of(p: &Path) -> (u64, u64) {
+        let md = p.metadata().expect("stat fixture");
+        (md.dev(), md.ino())
+    }
+
+    /// `(dev, ino)` of an open descriptor.
+    fn ident_of_fd(f: &File) -> (u64, u64) {
+        let md = f.metadata().expect("fstat");
+        (md.dev(), md.ino())
+    }
+
     /// Assert a refusal is BOTH classified as an authority denial AND spelled
     /// the way this platform's leg is expected to spell it. Always prints the
     /// observed errno, so a `--nocapture` run on any platform reports the
     /// concrete spelling rather than leaving a green boolean to be trusted.
+    ///
+    /// Note the limit this cannot exceed: on the walk leg `ENOTDIR` is one
+    /// spelling for several distinct refusals, so a pass here proves the open
+    /// was REFUSED, not that a *symlink* was refused. Tests needing the latter
+    /// compare identity via [`ident_of`] / [`ident_of_fd`].
     #[track_caller]
     fn assert_refused_with(err: &io::Error, expected: &[i32], what: &str) {
         let got = err.raw_os_error();
@@ -619,10 +719,11 @@ mod tests {
         f.write_all(b"two").unwrap();
         drop(f);
 
-        assert_eq!(
-            read_to_string(granted.open_read(rel).expect("read")),
-            "onetwo"
-        );
+        // Content proves the bytes; identity proves it is the INTENDED object
+        // rather than a same-content substitute (errno/success cannot).
+        let opened = granted.open_read(rel).expect("read");
+        assert_eq!(ident_of_fd(&opened), ident_of(&root.join("sub/out.txt")));
+        assert_eq!(read_to_string(opened), "onetwo");
         assert_eq!(granted.provenance(), root.as_path());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -913,6 +1014,103 @@ mod tests {
             "via-fd"
         );
         assert_eq!(granted.provenance(), Path::new("/definitely/not/the/path"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Positive control for the walk leg's per-component discipline.**
+    ///
+    /// `O_NOFOLLOW` constrains only the FINAL component, so a single
+    /// multi-component `openat` walks straight through an intermediate
+    /// symlink. This test measures that directly — the open SUCCEEDS and the
+    /// descriptor it returns is the object *beneath* the symlink (proven by
+    /// identity, since errno cannot speak here and success has no errno at
+    /// all) — while the same component opened on its own is refused.
+    ///
+    /// Why it exists: it is the load-bearing justification for opening one
+    /// component at a time in `open_beneath_impl`'s walk leg, and it fails
+    /// loudly if anyone ever "simplifies" that loop into a single call. Every
+    /// *refusal* test would stay green through such a change, because they
+    /// exercise single-component refusals — the same vacuous-oracle shape this
+    /// PR already had to fix once. Verified natively on Linux and on macOS
+    /// 26.5.2 / xnu-12377 arm64.
+    #[test]
+    fn o_nofollow_alone_opens_through_an_intermediate_symlink() {
+        let root = tmp_root("nofollow-control");
+        std::fs::create_dir_all(root.join("real/leaf")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("symdir")).unwrap();
+
+        let granted = GrantedRoot::acquire(&root).expect("acquire");
+        let rootfd = granted.as_fd().as_raw_fd();
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+        // THE MEASUREMENT: two components in one call defeats `O_NOFOLLOW`.
+        //
+        // DO NOT "TIDY" THE NEXT THREE LINES. The shape under test is a
+        // RELATIVE, MULTI-COMPONENT path resolved from a directory fd. Two
+        // rewrites a reviewer may suggest in good faith both destroy it while
+        // staying green:
+        //   * an ABSOLUTE path — changes the resolution root, so the property
+        //     being measured (relative resolution beneath a dirfd) is gone;
+        //   * a COMPONENT-AT-A-TIME sequence — that IS the walk, and it will
+        //     correctly refuse, turning the positive control into a second
+        //     refusal test that proves nothing about why the walk is needed.
+        let multi = cstr(OsStr::new("symdir/leaf")).unwrap();
+        // SAFETY: `openat` FFI on a live root descriptor; the fd is owned
+        // immediately. Test-only: this is the UNSAFE shape, exercised on
+        // purpose to prove it is unsafe.
+        let fd = unsafe { libc::openat(rootfd, multi.as_ptr(), flags) };
+        assert!(
+            fd >= 0,
+            "positive control: a multi-component openat with O_NOFOLLOW must \
+             traverse the intermediate symlink (errno {:?}) — if this now \
+             refuses, the platform changed and the walk's rationale needs \
+             re-measuring, not deleting",
+            io::Error::last_os_error().raw_os_error()
+        );
+        // SAFETY: freshly opened, owned descriptor.
+        let via_symlink = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+
+        // IDENTITY, not the success bit. "It opened" would stay true if the
+        // fixture ever grew a real `symdir` directory, or if `symdir/leaf`
+        // came to resolve somewhere else — the control would be green while
+        // the property it guards had evaporated (the vacuous-oracle shape).
+        // Opening BOTH paths and comparing (dev, ino) cannot be satisfied by
+        // an accidental success: it asserts the two names reached the SAME
+        // object, which is precisely what "traversed the symlink" means.
+        let intended = cstr(OsStr::new("real/leaf")).unwrap();
+        // SAFETY: `openat` FFI on a live root descriptor; fd owned immediately.
+        let fd2 = unsafe { libc::openat(rootfd, intended.as_ptr(), flags) };
+        assert!(fd2 >= 0, "the intended target must open");
+        // SAFETY: freshly opened, owned descriptor.
+        let direct = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd2) };
+
+        assert_eq!(
+            ident_of_fd(&via_symlink),
+            ident_of_fd(&direct),
+            "`symdir/leaf` and `real/leaf` must be the SAME object (dev, ino) \
+             — that is what 'followed the symlink' means, and neither errno \
+             nor a success bit can establish it"
+        );
+        // Belt and braces: and that object is the fixture's real leaf.
+        assert_eq!(ident_of_fd(&direct), ident_of(&root.join("real/leaf")));
+
+        // …whereas the walk's actual discipline — one component per call —
+        // refuses that same symlink outright.
+        let single = cstr(OsStr::new("symdir")).unwrap();
+        // SAFETY: `openat` FFI on a live root descriptor.
+        let refused = unsafe { libc::openat(rootfd, single.as_ptr(), flags) };
+        assert!(refused < 0, "a lone symlink component must be refused");
+        assert_refused_with(
+            &io::Error::last_os_error(),
+            RAW_NOFOLLOW_DIR_SYMLINK,
+            "lone symlink component under raw O_DIRECTORY|O_NOFOLLOW",
+        );
+
+        // And the seam itself refuses the whole path, on either leg.
+        let err = granted
+            .open_read(Path::new("symdir/leaf"))
+            .expect_err("the bounded open must refuse what raw openat allows");
+        assert_refused_with(&err, INTERMEDIATE_SYMLINK, "bounded open of symdir/leaf");
         let _ = std::fs::remove_dir_all(&root);
     }
 
