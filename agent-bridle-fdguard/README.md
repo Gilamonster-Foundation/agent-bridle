@@ -26,12 +26,17 @@ let child = cmd.spawn()?;
 
 ## Scope
 
-- **Enforcement is Linux-only** for now (`close_range(2)` with
-  `CLOSE_RANGE_CLOEXEC`, kernel ≥ 5.11 — the only child-safe, race-free
-  primitive). On other platforms `deny_inherited_fds` is a no-op and the
-  CLOEXEC-convention residual remains.
-- **Fail-closed**: if `close_range` fails at spawn time, the pre-exec hook returns
-  an error, so `spawn` fails and the child never runs.
+- **Linux**: `close_range(2)` with `CLOSE_RANGE_CLOEXEC` (kernel ≥ 5.11) — one
+  race-free syscall marks the whole range.
+- **macOS**: no `close_range` exists, so the pre-exec hook sweeps
+  `fcntl(F_SETFD, FD_CLOEXEC)` over a bound computed in the parent (the larger
+  of `RLIMIT_NOFILE.rlim_cur` and one past the highest open descriptor); see the
+  crate docs for the bound's rationale and residual.
+- On other platforms `deny_inherited_fds` is a no-op and the CLOEXEC-convention
+  residual remains (on Windows the confined path spawns via
+  `agent-bridle-aclaunch`'s explicit handle allowlist instead).
+- **Fail-closed**: if the marking step fails at spawn time, the pre-exec hook
+  returns an error, so `spawn` fails and the child never runs.
 
 Part of the [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle)
 capability-enforcement line. License: Apache-2.0.
