@@ -297,9 +297,22 @@ fn bounded_open(
 ) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
+        // `GrantedRoot::acquire` is the single pathname→descriptor conversion
+        // (#354): it refuses every symlink component, and once held, no later
+        // namespace mutation can redirect opens made through it (INV-BENEATH).
+        //
+        // RESIDUAL, stated rather than assumed: acquiring here — per open,
+        // just after the scope match — leaves the window between *this*
+        // canonicalization and the acquire, which fdguard documents as
+        // indistinguishable at the syscall level. Closing it fully means
+        // holding the `GrantedRoot` for the authority's lifetime, i.e. minting
+        // it at `Gate::authorize` alongside the scope it came from, so a
+        // pathname is never authority twice. That is a `ToolContext` shape
+        // change and is deliberately NOT in this slice.
+        let root = agent_bridle_fdguard::GrantedRoot::acquire(base)?;
         match write_append {
-            None => agent_bridle_fdguard::open_beneath_read(base, rel),
-            Some(append) => agent_bridle_fdguard::open_beneath_write(base, rel, append),
+            None => root.open_read(rel),
+            Some(append) => root.open_write(rel, append),
         }
     }
     #[cfg(not(unix))]
