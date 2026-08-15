@@ -183,7 +183,15 @@ impl LocalExecutionBackend {
         control.arm(pid);
         // `Started` means a real process tree exists — it is emitted here,
         // after the spawn returned a live child, never before.
-        sink.started(pid, fence.clone())?;
+        //
+        // A live child now exists, so from here until the reaper thread owns it
+        // every early return must terminate and reap it. `Child::drop` does NOT
+        // kill, so a bare `?` would leave a detached process behind an error the
+        // caller sees as "nothing started".
+        if let Err(error) = sink.started(pid, fence.clone()) {
+            abandon_unattached(&mut child, pid, proxy);
+            return Err(error);
+        }
 
         let limits = request.limits;
         let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -273,10 +281,13 @@ fn spawn_drainer<R: Read + Send + 'static>(
                 // The sink never blocks: if the bounded queue is full the chunk
                 // is counted as dropped and we keep reading, so a stalled
                 // consumer can never fill the child's pipe buffer and wedge it.
+                //
+                // A sink ERROR is likewise not a reason to stop reading. The
+                // drainer's other job is to keep the pipe empty; abandoning it
+                // would let the child block on a full pipe buffer and never
+                // exit, converting a reporting fault into a hang.
                 Ok(n) => {
-                    if sink.output(stream, &buf[..n]).is_err() {
-                        break;
-                    }
+                    let _ = sink.output(stream, &buf[..n]);
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(_) => break,
@@ -286,7 +297,44 @@ fn spawn_drainer<R: Read + Send + 'static>(
     })
 }
 
+/// Guarantees a terminal exists once the reaper is gone.
+///
+/// `wait()` blocks until a terminal is published, so a reaper that dies without
+/// publishing one — a panic in any step, a poisoned lock turned fatal — would
+/// leave every waiter blocked forever. This guard runs on unwind as well as on
+/// the normal path and publishes a `Failed` terminal if nothing else did.
+/// `publish` keeps the FIRST terminal, so this can never overwrite a real one.
+pub(super) struct TerminalGuard {
+    sink: ExecutionEventSink,
+    control: Arc<LocalControl>,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.control.publish(
+            &self.sink,
+            ExecutionTerminal::Failed {
+                message: "the execution owner terminated without publishing a result".to_string(),
+            },
+        );
+    }
+}
+
+/// Terminate and reap a child that was spawned but never handed to a reaper.
+fn abandon_unattached(child: &mut Child, pid: u32, proxy: Option<crate::net_proxy::ProxyHandle>) {
+    signal_tree(pid, TreeSignal::Forced);
+    let _ = child.kill();
+    let _ = child.wait();
+    // `ProxyHandle::drop` force-closes and blocks until its workers are joined
+    // (#372), so the proxy is quiesced here rather than detached.
+    drop(proxy);
+}
+
 fn reap(child: &mut Child, mut ctx: Reaping) {
+    let guard = TerminalGuard {
+        sink: ctx.sink.clone(),
+        control: Arc::clone(&ctx.control),
+    };
     let status = child.wait();
     // The leader is reaped: no later signal may target this pid as a group id.
     ctx.control.leader_reaped();
@@ -358,6 +406,9 @@ fn reap(child: &mut Child, mut ctx: Reaping) {
     );
 
     let _ = ctx.control.publish(&ctx.sink, terminal);
+    // The real terminal is published; the guard's fallback is now a no-op
+    // because `publish` keeps the first record.
+    drop(guard);
 }
 
 /// Decide the terminal record from a quiescent execution's parts.
@@ -422,7 +473,7 @@ struct TreeState {
     escalating: bool,
 }
 
-pub(crate) struct LocalControl {
+pub(super) struct LocalControl {
     limits: ExecutionLimits,
     /// Shared so the bounded cancel-escalation timer can re-check liveness
     /// *under the same lock* that gates `leader_reaped` before it signals.
@@ -493,20 +544,44 @@ impl LocalControl {
         }
     }
 
-    fn publish(&self, sink: &ExecutionEventSink, terminal: ExecutionTerminal) -> ToolResult<()> {
+    pub(super) fn publish(
+        &self,
+        sink: &ExecutionEventSink,
+        terminal: ExecutionTerminal,
+    ) -> ToolResult<()> {
         {
             let mut slot = self
                 .terminal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if slot.is_none() {
-                *slot = Some(terminal.clone());
+            if slot.is_some() {
+                // A terminal is already cached: this is the guard's fallback
+                // arriving after the real result. Never overwrite it, and never
+                // emit a second terminal event.
+                return Ok(());
             }
+            *slot = Some(terminal.clone());
             // Wake `wait()` before the event becomes visible, so a consumer that
             // sees the terminal event and then calls `wait()` never races.
             self.terminal_ready.notify_all();
         }
         sink.publish_terminal(terminal)
+    }
+}
+
+#[cfg(test)]
+impl LocalControl {
+    /// A control with no process attached, for exercising terminal publication
+    /// without spawning anything.
+    pub(super) fn for_test() -> Self {
+        Self::new(ExecutionLimits::default())
+    }
+}
+
+#[cfg(test)]
+impl TerminalGuard {
+    pub(super) fn for_test(sink: ExecutionEventSink, control: Arc<LocalControl>) -> Self {
+        Self { sink, control }
     }
 }
 
