@@ -186,6 +186,32 @@ else
   [ "$covered_ok" -eq 1 ] && note PASS "every cited evidence path triggers the formal gate"
 fi
 
+# 8. Probe liveness (#361). Sections 1-7 prove a cited test EXISTS and that the
+#    gate which validates it can TRIGGER. None of them prove the probe actually
+#    RAN on the certifying run: a test that skipped, or whose child never
+#    executed, reports the same green and exit 0 as one that observed the
+#    mechanism (newt-agent#1687 is the worked example — a kernel-enforcement
+#    conclusion drawn from a PowerShell child that never started).
+#
+#    A static validator cannot execute anything, so it cannot check liveness
+#    directly. What it CAN refuse is SILENCE: any claim citing native evidence
+#    must DECLARE how that probe distinguishes "enforced" from "did not run".
+#    The declaration is auditable prose (name the control, the env guard, or say
+#    WEAK and why) — this converts an invisible property into a stated one and
+#    forces the question at authoring time. It does not verify the control works;
+#    it verifies the author was made to answer.
+for cid in $(awk '/^\[\[claim\]\]/{id="";live=0;nat=0}
+                  /^id[ \t]*=/{ s=$0; sub(/^[^=]*=[ \t]*/,"",s); gsub(/"/,"",s); id=s }
+                  /^native_test(_fn)?[ \t]*=[ \t]*\[[^]]/{ nat=1 }
+                  /^liveness[ \t]*=[ \t]*"[^"]/{ live=1 }
+                  /^status[ \t]*=/{ if(nat==1 && live==0) print id }' "$MAN"); do
+  note FAIL "claim $cid cites native evidence but declares no \`liveness\`: state how the probe distinguishes enforced from did-not-run"
+  fail=1
+done
+if [ "$fail" -eq 0 ]; then
+  note PASS "every claim citing native evidence declares its probe liveness"
+fi
+
 if [ "$fail" -eq 0 ]; then echo "assurance manifest: all references resolve; every cited evidence path triggers the gate; no certified claim depends on pending/placeholder evidence"; else
   echo "assurance manifest: violations above"; fi
 exit "$fail"
