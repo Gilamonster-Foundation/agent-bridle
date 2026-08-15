@@ -119,6 +119,12 @@ tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
 # `close_range` pre-exec so core stays `forbid(unsafe_code)` (ADR 0026 slice 1).
 # Unix-only: it is a no-op off-Linux today, so Windows core stays clean.
 [target.'cfg(unix)'.dependencies]
+# Safe wrappers for the POSIX process-group signal used by the managed
+# execution owner's bounded tree termination (`src/execution/tree.rs`). Core is
+# `forbid(unsafe_code)`, so the signal cannot be a raw `libc` FFI call; rustix
+# provides it as a safe fn. Same primitive `agent-bridle-tool-shell` already
+# uses to reap a Brush worker tree, and already in the lockfile.
+rustix = { version = "1", features = ["process"] }
 agent-bridle-fdguard = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
