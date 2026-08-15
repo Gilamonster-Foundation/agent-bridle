@@ -30,6 +30,8 @@
 #![warn(missing_docs)]
 
 #[cfg(feature = "brush")]
+mod brush_protocol;
+#[cfg(feature = "brush")]
 mod brush_shell;
 #[cfg(feature = "brush")]
 mod brush_worker;

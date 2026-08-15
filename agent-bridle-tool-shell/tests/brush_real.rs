@@ -38,6 +38,28 @@ fn selected(name: &str) -> bool {
     filters.is_empty() || filters.iter().any(|filter| name.contains(filter))
 }
 
+/// Decode the framed brush-worker terminal response from raw worker stdout.
+///
+/// The worker emits an 18-byte header (`ABES` magic, version, frame kind,
+/// little-endian sequence, little-endian payload length) followed by the JSON
+/// payload. Both authentication refusals exercised here are a single TERMINAL
+/// frame (kind 5) at sequence 0 carrying the structured `WorkerResponse`.
+fn decode_worker_terminal(stdout: &[u8]) -> serde_json::Value {
+    const HEADER_LEN: usize = 18;
+    assert!(
+        stdout.len() >= HEADER_LEN,
+        "worker stdout must hold at least one frame header: {stdout:?}"
+    );
+    assert_eq!(&stdout[..4], b"ABES", "frame magic: {stdout:?}");
+    assert_eq!(
+        stdout[5], 5,
+        "a refusal is a single TERMINAL frame: {stdout:?}"
+    );
+    let len = u32::from_le_bytes(stdout[14..18].try_into().expect("length field")) as usize;
+    let payload = &stdout[HEADER_LEN..HEADER_LEN + len];
+    serde_json::from_slice(payload).expect("structured worker terminal response")
+}
+
 fn run_case(name: &str, case: impl FnOnce()) {
     if selected(name) {
         eprintln!("test {name} ...");
@@ -88,6 +110,11 @@ fn run_platform() {
         &runtime,
         "output_observer_matches_the_brush_envelope",
         output_observer_matches_the_brush_envelope,
+    );
+    run_async_case(
+        &runtime,
+        "real_worker_delivers_line_one_before_the_command_can_exit",
+        real_worker_delivers_line_one_before_the_command_can_exit,
     );
     #[cfg(unix)]
     run_async_case(
@@ -163,6 +190,12 @@ fn run_platform() {
         "timeout_kills_worker_descendants",
         timeout_kills_worker_descendants,
     );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "a_background_descendant_cannot_hang_or_falsify_normal_completion",
+        a_background_descendant_cannot_hang_or_falsify_normal_completion,
+    );
     run_async_case(
         &runtime,
         "env_seam_delivers_home_for_tilde_class_tooling",
@@ -201,6 +234,7 @@ impl ShellOutputObserver for OutputRecorder {
             .lock()
             .expect("output recorder lock")
             .push((stream, chunk.to_vec()));
+        self.finished_cv.notify_all();
     }
 
     fn on_finish(&self, _invocation: ShellInvocationId) {
@@ -220,13 +254,54 @@ impl OutputRecorder {
             .collect()
     }
 
+    /// Bound the wait for the observer's asynchronous finish notification.
+    ///
+    /// This is a LIVENESS bound, not a latency assertion — the test asserts
+    /// that the observer finishes, never that it finishes quickly. It is
+    /// deliberately generous: output now reaches the observer as a stream of
+    /// per-chunk frames rather than one terminal blob, so a run makes many more
+    /// hops than it used to, and under `cargo llvm-cov` instrumentation on a
+    /// loaded machine the old two-second deadline expired while the run was
+    /// still healthy (agent-bridle#360: wall-clock failures under build
+    /// saturation are artifacts, not defects). A real hang still fails here,
+    /// just after a bound that load cannot cross.
     fn wait_finished(&self) {
+        const OBSERVER_FINISH_BOUND: Duration = Duration::from_secs(60);
         let finished = self.finished.lock().expect("finished lock");
         let (finished, _) = self
             .finished_cv
-            .wait_timeout_while(finished, Duration::from_secs(2), |finished| !*finished)
+            .wait_timeout_while(finished, OBSERVER_FINISH_BOUND, |finished| !*finished)
             .expect("finished condition variable");
-        assert!(*finished, "timed out waiting for observer finish");
+        assert!(
+            *finished,
+            "timed out waiting for observer finish after {OBSERVER_FINISH_BOUND:?}"
+        );
+    }
+
+    fn wait_for_bytes(&self, stream: ShellOutputStream, expected: &[u8], timeout: Duration) {
+        let chunks = self.chunks.lock().expect("output recorder lock");
+        let (chunks, _) = self
+            .finished_cv
+            .wait_timeout_while(chunks, timeout, |chunks| {
+                !chunks
+                    .iter()
+                    .filter(|(seen, _)| *seen == stream)
+                    .flat_map(|(_, chunk)| chunk.iter().copied())
+                    .collect::<Vec<_>>()
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+            })
+            .expect("output condition variable");
+        let seen = chunks
+            .iter()
+            .filter(|(seen, _)| *seen == stream)
+            .flat_map(|(_, chunk)| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(
+            seen.windows(expected.len())
+                .any(|window| window == expected),
+            "timed out waiting for live bytes {expected:?}; saw {seen:?}"
+        );
     }
 }
 
@@ -335,8 +410,7 @@ fn direct_worker_dispatch_cannot_mint_its_own_authority() {
         !stdout.contains("FORGED-WORKER-RAN"),
         "the forged request must not execute: {stdout:?}"
     );
-    let response: serde_json::Value =
-        serde_json::from_slice(&stdout_bytes).expect("structured worker refusal");
+    let response = decode_worker_terminal(&stdout_bytes);
     assert!(
         response["error"]
             .as_str()
@@ -402,8 +476,7 @@ sys.exit(p.returncode)
         "different-image private parent must be refused: stderr={:?}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let response: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("structured image-mismatch refusal");
+    let response = decode_worker_terminal(&out.stdout);
     assert!(
         response["error"]
             .as_str()
@@ -428,6 +501,48 @@ async fn output_observer_matches_the_brush_envelope() {
     assert_eq!(observer.bytes(ShellOutputStream::Stderr), b"brush-err");
     assert_eq!(out["stdout"], "brush-out");
     assert_eq!(out["stderr"], "brush-err");
+}
+
+/// Acceptance proof for the private worker transport: line 1 must cross the
+/// worker boundary while the command is still blocked on a gate that only this
+/// test can open. Observing both chunks after completion is insufficient.
+async fn real_worker_delivers_line_one_before_the_command_can_exit() {
+    let gate = unique_temp("live-stream-gate");
+    let _ = std::fs::remove_file(&gate);
+    let observer = Arc::new(OutputRecorder::default());
+    let command = format!(
+        "printf 'line 1\\n'; while [ ! -f '{}' ]; do sleep 0.05; done; printf 'line 2\\n'",
+        gate.display()
+    );
+    let tool = tool()
+        .with_timeout(Duration::from_secs(2))
+        .with_output_observer(observer.clone());
+    let cx = ctx(Caveats::top());
+    let invocation = tokio::spawn(async move {
+        tool.invoke(serde_json::json!({ "cmd": command }), &cx)
+            .await
+    });
+
+    observer.wait_for_bytes(
+        ShellOutputStream::Stdout,
+        b"line 1\n",
+        Duration::from_millis(500),
+    );
+    assert!(
+        !invocation.is_finished(),
+        "the invocation cannot finish while the child is waiting on the unopened gate"
+    );
+    assert!(!gate.exists(), "the command's wait gate is still closed");
+
+    std::fs::write(&gate, b"continue").expect("open command wait gate");
+    let out = invocation
+        .await
+        .expect("join Brush invocation")
+        .expect("complete Brush invocation");
+    let _ = std::fs::remove_file(&gate);
+    observer.wait_finished();
+    assert_eq!(out["exit_code"], 0, "the gated command completes: {out}");
+    assert_eq!(out["stdout"], "line 1\nline 2\n");
 }
 
 #[cfg(unix)]
@@ -744,6 +859,74 @@ async fn timeout_kills_worker_descendants() {
     assert!(
         !marker.exists(),
         "a descendant must not survive the worker timeout"
+    );
+}
+
+/// #373-C: a background descendant that outlives the worker and keeps the
+/// inherited stdout/stderr writers open must not be able to hang the supervisor
+/// or leave a terminal that claims completion while a writer is still alive.
+///
+/// The command exits immediately while a descendant sleeps far longer than this
+/// test would tolerate. The supervisor owns the worker's process group, so it
+/// reaps the tree on the NORMAL completion path — not only on timeout — and the
+/// framed stream reaches end-of-stream instead of blocking on the surviving dup.
+///
+/// Honesty about strength: this is a GUARD, not a proven-failing regression.
+/// With the tree reap disabled it still passes on Linux, because Brush does not
+/// leave this descendant holding the worker's own stdout — so the hazard the
+/// reap closes could not be reproduced through the public tool. The test pins
+/// the properties that must never regress (prompt completion, complete
+/// transcript, no surviving descendant); the reap makes them true by
+/// construction rather than by luck.
+///
+/// The positive control matters regardless: without it, a lane where the marker
+/// simply cannot be written would pass this test for the wrong reason.
+#[cfg(unix)]
+async fn a_background_descendant_cannot_hang_or_falsify_normal_completion() {
+    let tool = tool().with_timeout(Duration::from_secs(30));
+    let cx = ctx(Caveats::top());
+
+    // Positive control: this lane can create a marker from the shell at all.
+    let control = unique_temp("descendant-control");
+    let _ = std::fs::remove_file(&control);
+    tool.invoke(
+        serde_json::json!({"cmd": format!("touch '{}'", control.display())}),
+        &cx,
+    )
+    .await
+    .expect("control invoke");
+    assert!(
+        control.exists(),
+        "positive control failed: this lane cannot write a marker, so the \
+         descendant assertion below would pass vacuously"
+    );
+
+    let marker = unique_temp("normal-descendant");
+    let _ = std::fs::remove_file(&marker);
+    // No `wait`: the command completes at once and leaves the descendant running.
+    let invocation = tool.invoke(
+        serde_json::json!({
+            "cmd": format!("(sleep 5; touch '{}') & echo done", marker.display())
+        }),
+        &cx,
+    );
+    let out = tokio::time::timeout(Duration::from_secs(10), invocation)
+        .await
+        .expect("a surviving descendant must not hang the supervisor")
+        .expect("invoke");
+
+    assert_eq!(out["timed_out"], false, "{out}");
+    assert_eq!(out["exit_code"], 0, "{out}");
+    assert!(
+        out["stdout"].as_str().unwrap_or_default().contains("done"),
+        "the transcript must still be complete: {out}"
+    );
+
+    // The terminal was honest: by the time it was reported, the tree was gone.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert!(
+        !marker.exists(),
+        "a descendant survived a terminal that claimed the execution was complete"
     );
 }
 

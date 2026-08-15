@@ -38,7 +38,8 @@ use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::variables::ShellVariable;
 use brush_core::{Shell, ShellFd};
 
-use crate::brush_worker::{WorkerPayload, WorkerResponse};
+use crate::brush_protocol::{read_stream, stream_limits, WorkerOutcome};
+use crate::brush_worker::WorkerPayload;
 use crate::caveat_interceptor::CaveatInterceptor;
 use crate::output_observer::{drain_capped, output_session, OutputEmitter};
 
@@ -251,26 +252,35 @@ impl Tool for BrushShellTool {
         // `DenyDirect`), never over-claiming from the kind alone.
         let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network);
         let timeout = self.timeout;
+        let worker_output = output.clone();
         let supervised = tokio::task::spawn_blocking(move || {
-            supervise_worker(confined, &payload, timeout, max_output)
+            supervise_worker(confined, &payload, timeout, max_output, worker_output)
         })
         .await
         .map_err(|error| ToolError::Exec(std::io::Error::other(format!("join: {error}"))))??;
         match supervised {
-            Supervised::Complete(response) => {
+            Supervised::Complete(outcome) => {
+                let WorkerOutcome {
+                    response,
+                    stdout,
+                    stderr,
+                    dropped: _,
+                } = outcome;
                 if let Some(error) = response.error {
                     return Err(ToolError::denied(format!(
                         "brush worker refused request: {error}"
                     )));
                 }
-                output.emit(crate::ShellOutputStream::Stdout, response.stdout.as_bytes());
-                output.emit(crate::ShellOutputStream::Stderr, response.stderr.as_bytes());
+                // The transcript is the accumulation of the frames an observer
+                // already saw live. The terminal contributes status, denials,
+                // and drop accounting — never a second copy of the output that
+                // could disagree with what was displayed.
                 let envelope = ToolEnvelope::new(sandbox_kind)
                     .with_enforcement(enforcement_report(&caveats, mechanism))
                     .with_disclosure(self.disclosure())
                     .with_exit_code(response.exit_code)
-                    .with_stdout(response.stdout)
-                    .with_stderr(response.stderr)
+                    .with_stdout(String::from_utf8_lossy(&stdout).into_owned())
+                    .with_stderr(String::from_utf8_lossy(&stderr).into_owned())
                     .with_timed_out(false)
                     .with_denials(response.denials)
                     .into_json();
@@ -292,7 +302,7 @@ impl Tool for BrushShellTool {
 }
 
 enum Supervised {
-    Complete(WorkerResponse),
+    Complete(WorkerOutcome),
     TimedOut,
 }
 
@@ -301,6 +311,7 @@ fn supervise_worker(
     payload: &WorkerPayload,
     timeout: Duration,
     max_output: usize,
+    output: OutputEmitter,
 ) -> ToolResult<Supervised> {
     let auth_started = std::time::Instant::now();
     if let Err(error) = confined.send_payload(payload, timeout) {
@@ -342,14 +353,18 @@ fn supervise_worker(
         .take()
         .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
 
-    let protocol_cap = max_output.saturating_mul(4).saturating_add(1024 * 1024);
-    let stdout_reader = std::thread::spawn(move || read_capped(stdout, protocol_cap));
+    let limits = stream_limits(max_output)?;
+    let stdout_reader = std::thread::spawn(move || {
+        read_stream(stdout, limits, |stream, chunk| {
+            output.emit(stream, chunk);
+        })
+    });
     let stderr_reader =
         std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
 
     let deadline = auth_started + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(ToolError::from)? {
+        if let Some(status) = reap_worker_tree_if_exited(&mut child)? {
             break Some(status);
         }
         let now = std::time::Instant::now();
@@ -369,20 +384,22 @@ fn supervise_worker(
         let _ = stderr_reader.join();
         return Ok(Supervised::TimedOut);
     }
-    let stdout = stdout_reader
+    let outcome = stdout_reader
         .join()
         .map_err(|_| ToolError::denied("brush worker stdout reader panicked"))??;
     let stderr = stderr_reader
         .join()
         .map_err(|_| ToolError::denied("brush worker stderr reader panicked"))??;
-    serde_json::from_slice::<WorkerResponse>(&stdout)
-        .map(Supervised::Complete)
-        .map_err(|error| {
-            ToolError::denied(format!(
-                "invalid brush worker response ({error}); worker stderr: {}",
-                String::from_utf8_lossy(&stderr)
-            ))
-        })
+    let response = &outcome.response;
+    if response.error.is_some() && !stderr.is_empty() {
+        // Keep the authenticated terminal error authoritative. Worker stderr is
+        // diagnostic-only and must never become a second result channel.
+        eprintln!(
+            "brush worker diagnostic stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    Ok(Supervised::Complete(outcome))
 }
 
 fn brush_worker_handshake_error_message(
@@ -390,7 +407,10 @@ fn brush_worker_handshake_error_message(
     stdout: &[u8],
     stderr: &[u8],
 ) -> String {
-    if let Ok(response) = serde_json::from_slice::<WorkerResponse>(stdout) {
+    if let Ok(outcome) =
+        stream_limits(stdout.len().max(1)).and_then(|limits| read_stream(stdout, limits, |_, _| {}))
+    {
+        let response = outcome.response;
         if let Some(reason) = response.error {
             return reason;
         }
@@ -424,6 +444,50 @@ fn read_capped(reader: impl Read, cap: usize) -> ToolResult<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Poll for the worker's exit and, the instant it has exited, reap its **whole
+/// process group** before reaping the leader.
+///
+/// Bounded tree ownership on the NORMAL completion path, not only on timeout: a
+/// descendant the command backgrounded would otherwise outlive the worker while
+/// still holding dups of its inherited pipe writers, so a terminal could be
+/// reported with an output writer — and a process — still alive.
+///
+/// The ordering is the load-bearing part. `Child::try_wait` *reaps*, which frees
+/// the pid; signalling the group afterwards means signalling a process-group id
+/// that is no longer ours, and a recycled pid would take the signal. So exit is
+/// detected with `waitid(WNOWAIT)`, which leaves the leader in a waitable state:
+/// while it is un-reaped its pid cannot be reused, the group id is still ours to
+/// signal, and only then is the leader reaped.
+#[cfg(unix)]
+fn reap_worker_tree_if_exited(child: &mut Child) -> ToolResult<Option<std::process::ExitStatus>> {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+
+    let Ok(raw) = i32::try_from(child.id()) else {
+        return child.try_wait().map_err(ToolError::from);
+    };
+    let Some(pid) = Pid::from_raw(raw) else {
+        return child.try_wait().map_err(ToolError::from);
+    };
+    let exited = matches!(
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ),
+        Ok(Some(_))
+    );
+    if !exited {
+        return Ok(None);
+    }
+    kill_worker_tree(child);
+    child.wait().map(Some).map_err(ToolError::from)
+}
+
+/// No process groups with POSIX semantics here; fall back to the direct child.
+#[cfg(not(unix))]
+fn reap_worker_tree_if_exited(child: &mut Child) -> ToolResult<Option<std::process::ExitStatus>> {
+    child.try_wait().map_err(ToolError::from)
+}
+
 #[cfg(unix)]
 fn kill_worker_tree(child: &mut Child) {
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
@@ -438,11 +502,22 @@ fn kill_worker_tree(child: &mut Child) {
 }
 
 /// What a finished brush run produced.
+///
+/// Deliberately no stdout/stderr: the run's output already went out over the
+/// framed result channel as it was produced, and that stream is the single
+/// authoritative transcript. Returning a second copy here would recreate
+/// exactly the two-truths problem the protocol removes — and it would be the
+/// WORSE copy, because a detached drain (below) leaves it silently short while
+/// the live stream already carried the bytes.
 #[derive(Debug)]
 pub(crate) struct Captured {
     pub(crate) exit_code: i32,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
+    /// A drain thread had to be detached because a surviving writer kept the
+    /// pipe open, so output produced after that point reached neither the
+    /// stream nor this result. Reported so the terminal can say output was
+    /// omitted instead of presenting a short transcript as complete.
+    pub(crate) stdout_detached: bool,
+    pub(crate) stderr_detached: bool,
 }
 
 /// Drive a brush shell to completion for one command, capturing stdout/stderr
@@ -614,13 +689,16 @@ pub(crate) fn run_in_brush(
         Ok::<i32, ToolError>(i32::from(u8::from(result.exit_code)))
     })?;
 
-    let stdout = collect_drained(&out_rx, "stdout")?;
-    let stderr = collect_drained(&err_rx, "stderr")?;
+    // Still waited on, even though the captured text is discarded: the wait is
+    // what synchronizes the drain threads' emission into the framed stream
+    // before the worker writes its terminal.
+    let (_, stdout_detached) = collect_drained(&out_rx, "stdout")?;
+    let (_, stderr_detached) = collect_drained(&err_rx, "stderr")?;
 
     Ok(Captured {
         exit_code,
-        stdout,
-        stderr,
+        stdout_detached,
+        stderr_detached,
     })
 }
 
@@ -643,13 +721,15 @@ const DRAIN_DETACH_DEADLINE: Duration = Duration::from_millis(500);
 fn collect_drained(
     rx: &std::sync::mpsc::Receiver<ToolResult<String>>,
     stream: &str,
-) -> ToolResult<String> {
+) -> ToolResult<(String, bool)> {
     use std::sync::mpsc::RecvTimeoutError;
     match rx.recv_timeout(DRAIN_DETACH_DEADLINE) {
         // The drain finished and reported its captured output (or a drain error).
-        Ok(result) => result,
+        Ok(result) => result.map(|text| (text, false)),
         // A background child still holds the write pipe: detach, free the worker.
-        Err(RecvTimeoutError::Timeout) => Ok(String::new()),
+        // Reported as detached so the caller can record that output was omitted
+        // rather than letting a short transcript read as a complete one.
+        Err(RecvTimeoutError::Timeout) => Ok((String::new(), true)),
         // The drain thread dropped its sender without reporting — it panicked.
         Err(RecvTimeoutError::Disconnected) => Err(ToolError::denied(format!(
             "{stream} reader thread panicked"
@@ -932,7 +1012,12 @@ mod drain_tests {
                 && elapsed < DRAIN_DETACH_DEADLINE + Duration::from_secs(2),
             "must detach ~at the deadline, not block on the held-open writer: {elapsed:?}"
         );
-        assert_eq!(out, "", "detached before EOF → empty captured output");
+        assert_eq!(
+            out,
+            (String::new(), true),
+            "detached before EOF → empty capture, and the detach is REPORTED so \
+             the terminal can record that output was omitted"
+        );
 
         // Releasing the writer lets the detached drain thread reach EOF and end.
         drop(writer);
@@ -959,7 +1044,11 @@ mod drain_tests {
 
         let start = Instant::now();
         let out = collect_drained(&rx, "stdout").expect("no drain error");
-        assert_eq!(out, "captured-output", "full foreground output is captured");
+        assert_eq!(
+            out,
+            ("captured-output".to_string(), false),
+            "full foreground output is captured, with no detach reported"
+        );
         assert!(
             start.elapsed() < DRAIN_DETACH_DEADLINE,
             "must return as soon as the drain EOFs, not wait out the detach deadline"
@@ -970,18 +1059,14 @@ mod drain_tests {
 #[cfg(test)]
 mod handshake_error_tests {
     use super::*;
+    use crate::brush_protocol::{write_pre_start_terminal, WorkerResponse};
     use std::io::ErrorKind;
 
     #[test]
     fn handshake_error_prefers_worker_error_over_transport_error() {
-        let response = WorkerResponse {
-            exit_code: 126,
-            stdout: String::new(),
-            stderr: String::new(),
-            denials: Vec::new(),
-            error: Some("worker nonce mismatch".to_string()),
-        };
-        let stdout = serde_json::to_vec(&response).expect("serialize response");
+        let response = WorkerResponse::failure("worker nonce mismatch");
+        let mut stdout = Vec::new();
+        write_pre_start_terminal(&mut stdout, &response).expect("frame terminal response");
         let reason = brush_worker_handshake_error_message("transport failed", &stdout, &[]);
         assert_eq!(reason, "worker nonce mismatch");
     }
