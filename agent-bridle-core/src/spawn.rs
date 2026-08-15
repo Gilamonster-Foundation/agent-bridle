@@ -1023,6 +1023,15 @@ mod tokio_spawn {
                     let _ = child.wait();
                 });
             }
+            // #372: `ProxyHandle`'s own `Drop` now force-closes and BLOCKS
+            // joining every connection worker (bounded by `CONN_TIMEOUT` each),
+            // not just the accept thread — dropping it inline here could block
+            // this (possibly async, possibly-on-the-Tokio-reactor) drop far
+            // longer than before. Move the teardown to a detached thread, the
+            // same fix already applied to the child reap above.
+            if let Some(proxy) = self.proxy.take() {
+                std::thread::spawn(move || drop(proxy));
+            }
         }
     }
 
