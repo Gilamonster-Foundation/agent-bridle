@@ -173,7 +173,12 @@ pub struct AdmittedFence {
 /// over its canonical body, using the SAME `content-addressable` machinery
 /// `agent-mesh-protocol` uses for `AuthorityId`/`GrantId` (not a parallel hash).
 /// A distinct newtype so a stray `AdmittedFenceId(grant_id.0)` will not compile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so a managed execution can carry the identity of the fence it
+/// actually ran under into its `Started` and final evidence (#370) — the CID
+/// round-trips through `ContentId`'s own frozen base32-lower form, so the
+/// evidence names the same object on the wire that admission stamped in memory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdmittedFenceId(pub ContentId);
 
 /// The canonical, serializable body an [`AdmittedFenceId`] is computed over: the
