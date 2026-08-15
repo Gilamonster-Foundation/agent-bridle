@@ -17,6 +17,25 @@ construction.
 - `Gate` + `ToolContext` — mint-token enforcement; no public constructor
 - `Sandbox` — honest `NoopSandbox` fallback plus opt-in native Landlock,
   Seatbelt, and AppContainer process boundaries
+- `LocalExecutionBackend` + `ExecutionHandle` — the backend-neutral managed
+  execution lifecycle (#370). `ExecutionRequest` carries mechanism inputs only
+  (executable, argv, cwd, explicit env, stdin, limits) and **no authority**:
+  starting an execution requires a `ToolContext` and goes through the same
+  `ConfinedCommand` admission → sandbox → `verify_applied` funnel as every
+  other confined spawn, with the applied `AdmittedFenceId` carried into
+  `Started` and the final evidence. The stream is `Accepted`, `Started`,
+  ordered stdout/stderr, `OutputTruncated`, denials, and exactly one terminal
+  (`Exited`/`Denied`/`Failed`) under one strictly increasing sequence, with
+  idempotent `wait`/`cancel`/`kill` and a drop that terminates and *joins* the
+  process tree rather than detaching it. Buffering is physically bounded by
+  queued event count *and* queued bytes, with exact dropped-byte accounting;
+  the terminal is held out of band so a full queue cannot lose it. `Exited` is
+  published only after the tree is reaped, both pipes are at EOF, and any
+  egress proxy has been joined to quiescence via `ProxyHandle::shutdown_and_join`
+  — a proxy that cannot be finalized becomes `Failed`, never a successful exit.
+  Only Local is implemented: a remote fence needs the sandbox-grain
+  identity/provenance binding of RFC 5b first, so there is no
+  execution-location axis on `ConfinedCommand` to route on.
 - `step_up` — human-presence step-up (the `attest` outcome): `Gate::evaluate` / `authorize_with_discharge` / `authorize_step_up`, the `DischargeProvider` ceremony seam and `DischargeVerifier` proof check. The production `Ed25519Verifier` is behind the off-by-default `verifier-ed25519` feature; WebAuthn EdDSA and ES256 assertion verifiers are behind `verifier-webauthn` and `verifier-webauthn-es256` (ADR 0007)
 - Deliberately tiny dependency budget (`anyhow`, `serde`, `serde_json`, `async-trait`, `agent-mesh-protocol`); no tokio by default — heavy runtimes live in leaf tool crates. Optional, off-by-default deps include `landlock` (`linux-landlock`) and `ed25519-dalek` (`verifier-ed25519`)
 

@@ -56,6 +56,7 @@ dependencies = [
  "landlock",
  "libc",
  "p256",
+ "rustix",
  "seccompiler",
  "serde",
  "serde_json",

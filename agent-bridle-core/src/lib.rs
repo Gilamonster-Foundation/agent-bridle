@@ -30,6 +30,7 @@ mod config;
 mod context;
 mod envelope;
 mod error;
+mod execution;
 mod gate;
 // The loopback egress proxy (#124/#257, ADR 0016) — moved here from
 // agent-bridle-tool-shell so BOTH the shell engine and external long-lived
@@ -63,6 +64,14 @@ pub use config::{
 pub use context::{open_scoped_read, open_scoped_write, ToolContext};
 pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
+pub use execution::{
+    execution_stream, local_tree_containment, DroppedEvidence, ExecutionControl, ExecutionEmit,
+    ExecutionEvent, ExecutionEventKind, ExecutionEventSink, ExecutionHandle, ExecutionId,
+    ExecutionLimits, ExecutionRequest, ExecutionStdin, ExecutionTerminal, ExitDisposition,
+    ExitEvidence, FenceEvidence, LocalExecutionBackend, LocalTreeContainment, OutputStream,
+    MAX_ARGV_ENTRIES, MAX_ARG_BYTES, MAX_ENV_ENTRIES, MAX_OUTPUT_CHUNK_BYTES_CEILING,
+    MAX_QUEUED_EVENTS_CEILING, MAX_QUEUED_OUTPUT_BYTES_CEILING, MAX_STDIN_BYTES_CEILING,
+};
 pub use gate::Gate;
 pub use net_proxy::{start_egress_proxy, ProxyFinalEvidence, ProxyFinalizeError, ProxyHandle};
 pub use provenance::{
@@ -88,7 +97,7 @@ pub use spawn::{
     confinement_unenforceable, decode_trusted_worker_frame_header, decode_trusted_worker_hello,
     decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,
     spawn_confined_subprocess, trusted_worker_frame_digest, ConfinedChild, ConfinedCommand,
-    SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind, TrustedWorkerRequest,
+    ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind, TrustedWorkerRequest,
     TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP, TRUSTED_WORKER_FRAME_HEADER_LEN,
     TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY, TRUSTED_WORKER_PROTOCOL_VERSION,
 };
