@@ -746,6 +746,15 @@ impl ProxyHandle {
     /// failure along the way; otherwise `Err` — never an `Ok` evidence value
     /// that silently omits a failure (#372 §7).
     ///
+    /// **Bound on an idle/tunnel connection.** The force-close is a `shutdown`
+    /// on this proxy's own socket end, called from this process — on
+    /// Linux/macOS that interrupts an in-flight blocked read on a duplicated
+    /// handle promptly; that prompt-interrupt behavior is not guaranteed on
+    /// every platform. The portable, honest upper bound is each connection's
+    /// own read/write timeout (`CONN_TIMEOUT`, set when it was accepted or
+    /// dialed): this call never hangs past it, even where `shutdown` alone
+    /// does not immediately unblock the read.
+    ///
     /// Blocking, std-only. An async caller must run this on a blocking
     /// executor/thread and await it before emitting its own terminal result —
     /// never call it directly from a Tokio reactor thread.
@@ -2067,6 +2076,27 @@ mod tests {
         panic!("active worker count never reached {want}");
     }
 
+    /// Poll (bounded) until every currently-tracked connection worker's
+    /// `JoinHandle` reports finished — used where a test needs the worker to
+    /// have ALREADY run to completion (e.g. panicked) before finalizing, so
+    /// `shutdown_and_join`'s own force-close sweep cannot race ahead of it and
+    /// abort a connection before it ever reached the code under test.
+    /// `wait_for_active_count` only proves a worker was *spawned*, which can
+    /// be true before it has executed a single line of `handle_conn`.
+    fn wait_for_worker_finished(proxy: &ProxyHandle) {
+        for _ in 0..500 {
+            let all_finished = {
+                let book = lock(&proxy.shared.workers);
+                !book.active.is_empty() && book.active.values().all(|(h, _)| h.is_finished())
+            };
+            if all_finished {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("worker never finished");
+    }
+
     #[test]
     fn proxy_env_points_at_the_bound_loopback_addr() {
         // A REAL-socket test: `proxy_env` is derived from the actually-bound
@@ -2243,8 +2273,16 @@ mod tests {
         let finalize = thread::spawn(move || {
             let _ = tx.send(proxy.shutdown_and_join());
         });
+        // `shutdown()` interrupts an in-flight blocked read promptly on
+        // Linux/macOS; that prompt-interrupt behavior for a socket duplicated
+        // within the same process is not guaranteed on every platform. The
+        // honest, PORTABLE upper bound is each connection's own `CONN_TIMEOUT`
+        // (30s, set on both the client and origin sockets when the connection
+        // was accepted/dialed) — so this waits comfortably past it rather than
+        // assuming an immediate interrupt everywhere. What must never happen,
+        // and what the assertions below actually check, is an unbounded hang.
         let evidence = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(CONN_TIMEOUT + Duration::from_secs(5))
             .expect("finalize must not hang on an idle tunnel")
             .expect("finalize on an idle tunnel must still succeed");
         let _ = finalize.join();
@@ -2333,10 +2371,15 @@ mod tests {
         let _ = c.write_all(b"CONNECT allowed.test:443 HTTP/1.1\r\n\r\n");
         drop(c);
         // Synchronize with the accept loop: wait until it has actually admitted
-        // this connection as a worker (whether or not that worker has panicked
-        // yet) before finalizing, so shutdown doesn't race past an accept that
-        // simply hasn't happened on its background thread yet.
+        // this connection as a worker AND for that worker to have actually run
+        // to completion (panicked) before finalizing. Waiting only for
+        // admission (`wait_for_active_count`) is not enough: `shutdown_and_join`
+        // force-closes the connection as part of finalizing, and if that races
+        // ahead of the worker's own read, the worker fails on the now-dead
+        // socket, is accounted as a shutdown-abort, and `PanicConnector::connect`
+        // is never reached at all — the exact flake this wait eliminates.
         wait_for_active_count(&proxy, 1);
+        wait_for_worker_finished(&proxy);
 
         match proxy.shutdown_and_join() {
             Err(ProxyFinalizeError::Incomplete { partial, .. }) => {
