@@ -4,16 +4,18 @@
 //! has created a fresh process through the L3-aware spawn funnel. When the
 //! effective caveats engage a native backend, the worker inherits that boundary;
 //! otherwise its result honestly reports no L3. It accepts one bounded JSON
-//! request on stdin and emits one JSON response on stdout.
+//! request on stdin and emits a framed execution-event stream on stdout.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use agent_bridle_core::{Denial, Gate, Scope, Tool, ToolContext, ToolResult, TrustedWorkerRequest};
+use agent_bridle_core::{Gate, Scope, Tool, ToolContext, ToolResult, TrustedWorkerRequest};
 use serde::{Deserialize, Serialize};
 
+use crate::brush_protocol::{
+    stream_limits, write_pre_start_terminal, WorkerEmitter, WorkerResponse,
+};
 use crate::brush_shell::run_in_brush;
 use crate::caveat_interceptor::{CaveatInterceptor, DenialSink};
 use crate::output_observer::OutputEmitter;
@@ -48,33 +50,24 @@ impl WorkerPayload {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct WorkerResponse {
-    pub(crate) exit_code: i32,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-    pub(crate) denials: Vec<Denial>,
-    pub(crate) error: Option<String>,
-}
-
 /// Serve exactly one Brush request and return the process exit status.
 pub(crate) fn main() -> i32 {
-    match serve_one() {
-        Ok(response) => write_response(&response, 0),
+    match receive_request() {
+        Ok((payload, cx)) => run(payload, cx),
         Err(error) => {
-            let response = WorkerResponse {
-                exit_code: 126,
-                stdout: String::new(),
-                stderr: String::new(),
-                denials: Vec::new(),
-                error: Some(error),
-            };
-            write_response(&response, 126)
+            let response = WorkerResponse::failure(error);
+            match write_pre_start_terminal(&mut std::io::stdout().lock(), &response) {
+                Ok(()) => 126,
+                Err(error) => {
+                    eprintln!("brush worker terminal frame failed: {error}");
+                    125
+                }
+            }
         }
     }
 }
 
-fn serve_one() -> Result<WorkerResponse, String> {
+fn receive_request() -> Result<(WorkerPayload, ToolContext), String> {
     let request: TrustedWorkerRequest<WorkerPayload> =
         crate::private_control::receive_worker_request()
             .map_err(|error| format!("trusted worker authentication failed: {error}"))?;
@@ -103,45 +96,104 @@ fn serve_one() -> Result<WorkerResponse, String> {
         .with_enforcement_floor(strength_floor)
         .authorize(&tool, &caveats)
         .map_err(|error| format!("worker authorization failed: {error}"))?;
-    run(payload, cx)
+    Ok((payload, cx))
 }
 
-fn run(request: WorkerPayload, cx: ToolContext) -> Result<WorkerResponse, String> {
+fn run(request: WorkerPayload, cx: ToolContext) -> i32 {
+    // Bounds are validated BEFORE anything is emitted: an unreasonable
+    // `max_output` is refused rather than silently turned into an unbounded cap
+    // by saturating arithmetic.
+    let limits = match stream_limits(request.max_output) {
+        Ok(limits) => limits,
+        Err(error) => {
+            let response = WorkerResponse::failure(error.to_string());
+            let _ = write_pre_start_terminal(&mut std::io::stdout().lock(), &response);
+            return 126;
+        }
+    };
+
     let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
     let cancel = Arc::new(AtomicBool::new(false));
     let interceptor =
         CaveatInterceptor::new(cx, Arc::clone(&sink)).with_cancel(Arc::clone(&cancel));
-    let captured = run_in_brush(
+
+    // One emitter owns the whole frame sequence, so the shell engine's live
+    // output and the terminal cannot interleave out of order or race a second
+    // terminal. It writes straight to stdout under its own lock — there is no
+    // intermediate queue to grow, and the pipe is the backpressure.
+    let emitter = WorkerEmitter::new(std::io::stdout(), limits);
+    if let Err(error) = emitter.started() {
+        eprintln!("brush worker started frame failed: {error}");
+        return 125;
+    }
+
+    let output = {
+        let emitter = emitter.clone();
+        OutputEmitter::to_worker_channel(Arc::new(move |stream, chunk: &[u8]| {
+            emitter.output(stream, chunk);
+        }))
+    };
+
+    let result = run_in_brush(
         request.cmd,
         request.cwd,
         request.path,
         request.env,
         interceptor,
         request.max_output,
-        OutputEmitter::default(),
-    )
-    .map_err(|error| error.to_string())?;
+        output,
+    );
+
     let denials = sink
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    Ok(WorkerResponse {
-        exit_code: captured.exit_code,
-        stdout: captured.stdout,
-        stderr: captured.stderr,
-        denials,
-        error: None,
-    })
-}
-
-fn write_response(response: &WorkerResponse, process_code: i32) -> i32 {
-    match serde_json::to_writer(std::io::stdout().lock(), response) {
-        Ok(()) => {
-            let _ = std::io::stdout().flush();
-            process_code
+    for denial in &denials {
+        if let Err(error) = emitter.denial(denial) {
+            eprintln!("brush worker denial frame failed: {error}");
+            return 125;
         }
+    }
+
+    // The terminal carries status, denials, error text, and the emitter's exact
+    // drop accounting — NOT a second copy of stdout/stderr. The supervisor's
+    // accumulation of the frames above is the one output history.
+    let (response, process_code) = match result {
+        Ok(captured) => {
+            // A detached drain means output was produced that reached neither
+            // the stream nor any capture. The byte count is unknowable, so
+            // record the omission as an event rather than invent a number —
+            // the terminal must not present a short transcript as complete.
+            if captured.stdout_detached {
+                emitter.note_omitted_stream();
+            }
+            if captured.stderr_detached {
+                emitter.note_omitted_stream();
+            }
+            (
+                WorkerResponse {
+                    exit_code: captured.exit_code,
+                    denials,
+                    error: None,
+                    dropped: Default::default(),
+                },
+                0,
+            )
+        }
+        Err(error) => (
+            WorkerResponse {
+                exit_code: 126,
+                denials,
+                error: Some(error.to_string()),
+                dropped: Default::default(),
+            },
+            126,
+        ),
+    };
+    match emitter.terminal(response) {
+        Ok(()) => process_code,
         Err(error) => {
-            eprintln!("brush worker response failed: {error}");
+            eprintln!("brush worker terminal frame failed: {error}");
             125
         }
     }

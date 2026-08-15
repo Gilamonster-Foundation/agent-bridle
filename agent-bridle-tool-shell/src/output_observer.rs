@@ -149,15 +149,37 @@ impl Drop for OutputGuard {
 #[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
 pub(crate) struct OutputEmitter {
     session: Option<Arc<Session>>,
+    /// The worker-side result channel, when this emitter is running inside the
+    /// Brush worker. A plain sink callback rather than a concrete stream type:
+    /// the emitter's job is to *fan out* a chunk, and it must not become a
+    /// second place where lifecycle or bounding decisions are made.
+    #[cfg(feature = "brush")]
+    execution: Option<WorkerChannelSink>,
 }
+
+/// The worker-side result-channel sink an [`OutputEmitter`] fans chunks into.
+#[cfg(feature = "brush")]
+pub(crate) type WorkerChannelSink = Arc<dyn Fn(ShellOutputStream, &[u8]) + Send + Sync>;
 
 #[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
 impl OutputEmitter {
     pub(crate) fn emit(&self, stream: ShellOutputStream, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        // The worker's framed result channel is the AUTHORITY for what this run
+        // produced. The observer session below is presentation only, and its
+        // own byte budget never governs what the result channel carries.
+        #[cfg(feature = "brush")]
+        if let Some(execution) = &self.execution {
+            execution(stream, chunk);
+        }
+
         let Some(session) = &self.session else {
             return;
         };
-        if chunk.is_empty() || session.phase.load(Ordering::Acquire) != ACTIVE {
+        if session.phase.load(Ordering::Acquire) != ACTIVE {
             return;
         }
 
@@ -186,6 +208,15 @@ impl OutputEmitter {
         // memory remains bounded by the per-stream accounting above.
         if session.phase.load(Ordering::Acquire) == ACTIVE {
             let _ = session.sender.send(Dispatch::Output(stream, retained));
+        }
+    }
+
+    /// An emitter that feeds only the worker's framed result channel.
+    #[cfg(feature = "brush")]
+    pub(crate) fn to_worker_channel(sink: WorkerChannelSink) -> Self {
+        Self {
+            session: None,
+            execution: Some(sink),
         }
     }
 }
@@ -242,7 +273,11 @@ pub(crate) fn output_session(
         OutputGuard {
             session: session.clone(),
         },
-        OutputEmitter { session },
+        OutputEmitter {
+            session,
+            #[cfg(feature = "brush")]
+            execution: None,
+        },
     )
 }
 
