@@ -167,6 +167,40 @@ check-windows:
 check-windows:
     @echo "not a Windows host - skipping check-windows (AppContainer backend is Windows-only)"
 
+# Windows cross-COMPILE check (#367). `check-windows` above only does real work
+# ON a Windows host, so a Linux-only local gate is structurally blind to
+# Windows-only compile errors — and CI builds Windows with `-D warnings`, where
+# an orphaned import is a HARD error, not a lint.
+#
+# Not hypothetical: #366 passed the FULL local gate and then failed Windows CI
+# on `unused imports: SeekFrom and Seek`, left behind when the code using them
+# moved to another crate. The gate's silence was about its own coverage, not
+# about the code. (And the imports were load-bearing: had that move dropped the
+# Windows append emulation instead of relocating it, the same red would have
+# been silent `>>` TRUNCATION on Windows — data loss wearing an unused-import
+# costume.)
+#
+# This is NOT a substitute for the real Windows job: no tests run, no
+# AppContainer, and `-gnu` is not `-msvc`, so MSVC-specific breakage still
+# surfaces only in CI. It catches the compile-error class, in seconds, before
+# the push.
+#
+# HOOK PARITY: run by .githooks/pre-push; partial mirror (compile leg only) of
+# the `check-windows` job in .github/workflows/ci.yml.
+[unix]
+check-windows-cross:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    target=x86_64-pc-windows-gnu
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+        echo "!! $target NOT INSTALLED — Windows cross-check SKIPPED locally."
+        echo "!! A Windows-only compile error will not surface until CI."
+        echo "!! Install once with: rustup target add $target"
+        exit 0
+    fi
+    RUSTFLAGS="-D warnings" cargo check --workspace --exclude agent-bridle-py \
+        --all-features --target "$target"
+
 # Coverage gate. Uses cargo-llvm-cov if installed; skips gracefully otherwise
 # so the recipe never blocks a machine that lacks the tool. Also skips when
 # there are no tests yet (e.g. a fresh scaffold) — llvm-cov reports "no

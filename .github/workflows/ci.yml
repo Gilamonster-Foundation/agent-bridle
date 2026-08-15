@@ -14,6 +14,14 @@
 # `check-windows` job (windows-latest) is the ONLY place the Windows-only
 # `AppContainerSandbox` + the `agent-bridle-aclaunch` launcher are compiled and the
 # AppContainer unbridle honesty leg runs (ADR 0009 / agent-bridle#51; ADR 0018 R9).
+#
+# HOOK PARITY (agent-bridle#367): `just check-windows-cross` in .githooks/pre-push
+# partially mirrors this job's COMPILE leg — a `cargo check --target
+# x86_64-pc-windows-gnu` under `-D warnings`, so a Linux developer catches
+# Windows-only compile errors before the push instead of here. It is a partial
+# mirror on purpose and must not be described as a substitute: no tests run, no
+# AppContainer boundary, and `-gnu` is not `-msvc`. This job remains the
+# authoritative Windows gate.
 
 name: CI
 
