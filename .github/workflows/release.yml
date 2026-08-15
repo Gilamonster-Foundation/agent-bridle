@@ -32,9 +32,15 @@ jobs:
   release-preflight:
     name: Verify release identity
     runs-on: ubuntu-latest
+    outputs:
+      # Whether this release is a SemVer pre-release, derived from the version
+      # itself rather than hard-coded. Consumed by `github-release` so an RC can
+      # never be published as a stable release.
+      prerelease: ${{ steps.identity.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
       - name: Require tag to match the workspace version
+        id: identity
         env:
           RELEASE_REF: ${{ github.ref }}
           RELEASE_TAG: ${{ github.ref_name }}
@@ -42,6 +48,7 @@ jobs:
           python3 - <<'PY'
           import os
           import pathlib
+          import re
           import tomllib
 
           manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
@@ -56,8 +63,29 @@ jobs:
                   f"workspace version {version!r}; expected {expected!r}"
               )
 
+          # SemVer 2.0.0 §9: the optional dot-separated identifiers after the
+          # first '-' following patch ARE the pre-release. Parsed rather than
+          # sniffed for a substring, so a malformed version fails the preflight
+          # instead of silently deciding the release's public status.
+          semver = re.fullmatch(
+              r"(?P<core>\d+\.\d+\.\d+)"
+              r"(?:-(?P<pre>[0-9A-Za-z.-]+))?"
+              r"(?:\+(?P<build>[0-9A-Za-z.-]+))?",
+              version,
+          )
+          if semver is None:
+              raise SystemExit(
+                  f"workspace version {version!r} is not valid SemVer; refusing to "
+                  f"guess whether this release is a pre-release"
+              )
+          prerelease = semver.group("pre") is not None
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"prerelease={'true' if prerelease else 'false'}\n")
+
           if release_ref.startswith("refs/tags/"):
-              print(f"release identity verified: {release_tag}")
+              kind = "pre-release" if prerelease else "stable release"
+              print(f"release identity verified: {release_tag} ({kind})")
           else:
               print(f"manual build for workspace version {version}")
           PY
@@ -141,7 +169,10 @@ jobs:
   github-release:
     name: GitHub release (${{ github.ref_name }})
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: [build-mcp-binary]
+    # `release-preflight` is a needs-dependency for its `prerelease` OUTPUT, not
+    # only for ordering: without it the expression below resolves to empty and
+    # an RC would be published as a stable release.
+    needs: [release-preflight, build-mcp-binary]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -162,7 +193,11 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "agent-bridle ${{ github.ref_name }}"
           draft: true
-          prerelease: false
+          # Derived from the workspace version's SemVer pre-release field by
+          # `release-preflight` — `v0.8.0-rc.N` is a pre-release, `v0.8.0` is
+          # not. Previously hard-coded to `false`, which would have marked every
+          # RC on the 0.8.0 train as a stable release.
+          prerelease: ${{ needs.release-preflight.outputs.prerelease }}
           generate_release_notes: true
           files: dist/*
 
