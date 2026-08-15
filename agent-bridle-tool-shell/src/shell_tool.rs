@@ -215,8 +215,11 @@ fn egress_proxy_plan(
 /// the fence prefix from the loopback-`fenced` caveats — fail-closed if the
 /// wrapper is missing; (3) injects `*_PROXY` into a clone of the env-seam map so
 /// the child routes its HTTP/HTTPS out through the proxy. The [`ProxyHandle`] is
-/// held until the confined child has been reaped, then dropped (tearing the
-/// listener down) — so the proxy's lifetime brackets the child's.
+/// held until the confined child has been reaped, then explicitly finalized via
+/// [`agent_bridle_core::net_proxy::ProxyHandle::shutdown_and_join`] (#372) — so
+/// the proxy's lifetime brackets the child's, and the `net_denials` this
+/// function reports come from FROZEN evidence, not a live snapshot that could
+/// still be mutating.
 fn run_with_egress_proxy(
     stages: &[Command],
     cwd: Option<&str>,
@@ -271,13 +274,23 @@ fn run_with_egress_proxy(
         .map_err(|_| {
             ToolError::Exec(std::io::Error::other("confined execution thread panicked"))
         })?;
-    // #196: the child is reaped, so every proxy connection is complete — read the
-    // hosts the proxy refused (out of the allow-list) BEFORE tearing it down, and
-    // surface each as a structured `net` denial on the capture.
-    let refused = proxy.refused_hosts();
-    drop(proxy); // hold the proxy until the child is reaped, then tear it down
+    // #372: the child is reaped, but that does NOT mean every proxy connection
+    // is complete — a connection worker can still be finishing (or, for an idle
+    // tunnel, blocked until force-closed). Finalize explicitly: this blocks
+    // until every proxy worker is joined and returns FROZEN evidence, never a
+    // live snapshot that could race a worker still recording its decision.
+    // Finalize regardless of the child's own outcome (never leak the proxy on a
+    // child failure), but let a child failure take precedence over a
+    // finalization failure when surfacing the error.
+    let finalized = proxy.shutdown_and_join();
     let mut captured = captured?;
-    captured.net_denials = refused
+    let evidence = finalized.map_err(|e| {
+        ToolError::Exec(std::io::Error::other(format!(
+            "egress proxy finalization failed: {e}"
+        )))
+    })?;
+    captured.net_denials = evidence
+        .refused_hosts
         .into_iter()
         .map(|host| Denial {
             kind: DenialKind::Net,

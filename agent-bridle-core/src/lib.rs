@@ -64,7 +64,7 @@ pub use context::{open_scoped_read, open_scoped_write, ToolContext};
 pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
 pub use error::{ToolError, ToolResult};
 pub use gate::Gate;
-pub use net_proxy::{start_egress_proxy, ProxyHandle};
+pub use net_proxy::{start_egress_proxy, ProxyFinalEvidence, ProxyFinalizeError, ProxyHandle};
 pub use provenance::{
     admit, empty_closure, relate, AdmissionDecision, AdmissionReject, ConfinedAxis,
     ResolvedAuthority, ResolvedScope, ScopeRelation,

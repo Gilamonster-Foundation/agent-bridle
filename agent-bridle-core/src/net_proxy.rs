@@ -18,17 +18,31 @@
 //! tools ignoring `*_PROXY`) is kernel-fenced to loopback and therefore blocked
 //! off-box — fail-closed, the safe direction.
 //!
-//! Std-only (`std::net` + `std::thread`); no async runtime, no new dependency —
-//! so [`ProxyHandle`] is a plain RAII value whose `Drop` tears the listener down.
+//! Std-only (`std::net` + `std::thread`); no async runtime, no new dependency.
+//!
+//! ## Bounded, joinable lifecycle (#372)
+//!
+//! Every accept, connection, and splice worker this module spawns is retained
+//! and joined — never fire-and-forget, and never unbounded. The proxy moves
+//! through one internal lifecycle, `Running -> ShuttingDown -> Quiescent`.
+//! [`ProxyHandle::shutdown_and_join`] is the explicit, consuming finalizer that
+//! drives that transition and returns [`ProxyFinalEvidence`] — bounded,
+//! serializable, and frozen the instant it is returned (the handle that produced
+//! it no longer exists). `Drop` stays fail-safe: it performs the SAME shutdown
+//! and join as the finalizer, so nothing is ever detached, but it discards the
+//! evidence rather than returning it — a live [`ProxyHandle::refused_hosts`]
+//! snapshot is for diagnostics only and must never stand in for terminal
+//! evidence.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 /// Longest request line / header block the proxy will buffer before giving up
@@ -36,6 +50,19 @@ use serde::{Deserialize, Serialize};
 const MAX_HEAD: usize = 8 * 1024;
 /// Per-connection socket timeout, so a stuck peer cannot pin a proxy thread.
 const CONN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// #372 §3: the most refused-host entries [`ProxyFinalEvidence`] retains.
+/// Anything past this bound is counted in `omitted_refused_attempts`, never
+/// silently dropped.
+pub const MAX_REFUSED_HOSTS: usize = 64;
+/// #372 §3: the most bytes one retained refused-host string may occupy. A
+/// longer attempt is counted as omitted rather than truncated (truncation could
+/// fold two distinct hostile hosts into one retained entry).
+pub const MAX_REFUSED_HOST_BYTES: usize = 255;
+/// #372 §1: the default cap on simultaneously active connection workers. A
+/// fixed, tracked bound — never an unbounded per-connection thread — so a
+/// hostile or buggy client cannot make the proxy spawn without limit.
+pub const DEFAULT_WORKER_CAP: usize = 256;
 
 // ── Audit (#124, ADR 0016): the proxy is the child's sole egress chokepoint, so
 // every proxy-visible connection is recorded through an operator-supplied sink.
@@ -142,10 +169,39 @@ pub struct StdResolver;
 
 impl Resolver for StdResolver {
     fn resolve(&self, host: &str, port: u16) -> io::Result<SocketAddr> {
-        (host, port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for host"))
+        // `to_socket_addrs` (getaddrinfo) has no std timeout of its own. A
+        // black-holed/unresponsive resolver would otherwise hang this call —
+        // and therefore the connection worker calling it — forever, which
+        // `ProxyHandle::shutdown_and_join` can never join past (#372 §2: every
+        // connection/splice worker must be joined for Quiescent). Run it on its
+        // own thread and bound the wait to CONN_TIMEOUT, the same honest
+        // worst-case bound every other blocking step in this module already
+        // uses; on timeout the resolution thread is abandoned (it holds no
+        // proxy-tracked resources) and the dial fails closed.
+        let host = host.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::Builder::new()
+            .name("agent-bridle-egress-resolve".to_string())
+            .spawn(move || {
+                let _ = tx.send(
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(|mut it| it.next()),
+                );
+            })
+            .map_err(|e| io::Error::other(format!("failed to spawn resolver thread: {e}")))?;
+        match rx.recv_timeout(CONN_TIMEOUT) {
+            Ok(Ok(Some(addr))) => Ok(addr),
+            Ok(Ok(None)) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no address for host",
+            )),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DNS resolution timed out",
+            )),
+        }
     }
 }
 
@@ -159,7 +215,8 @@ impl Resolver for StdResolver {
 /// `TcpStream`-specific operations the forward/tunnel path needs beyond
 /// `Read`/`Write` — a second owned handle ([`Self::dup`], for the read/write
 /// split and the origin clone), directional [`Self::shutdown`] (how the copy
-/// threads signal EOF), and the per-connection timeouts ([`Self::set_timeouts`]).
+/// threads signal EOF, and how #372's shutdown path force-closes an idle
+/// connection), and the per-connection timeouts ([`Self::set_timeouts`]).
 /// `TcpStream` implements it for production; an in-memory scripted stream
 /// implements it for tests.
 pub trait Conn: Read + Write + Send {
@@ -169,7 +226,8 @@ pub trait Conn: Read + Write + Send {
     /// origin write direction.
     fn dup(&self) -> io::Result<Box<dyn Conn>>;
     /// Shut down the read half, write half, or both — how a copy thread signals
-    /// EOF to its peer and how a response closes the client.
+    /// EOF to its peer and how #372's finalizer force-closes a proxy-owned
+    /// socket end during shutdown.
     fn shutdown(&self, how: Shutdown) -> io::Result<()>;
     /// Apply the per-connection read+write timeouts. A no-op for in-memory
     /// fakes, which never block on a real socket.
@@ -294,16 +352,372 @@ impl HostPolicy {
     }
 }
 
-/// A running loopback egress proxy. Dropping the handle shuts it down.
+// ── #372: lifecycle, bounded worker ownership, and frozen final evidence ───────
+
+const LIFECYCLE_RUNNING: u8 = 0;
+const LIFECYCLE_SHUTTING_DOWN: u8 = 1;
+const LIFECYCLE_QUIESCENT: u8 = 2;
+
+/// Lock a `Mutex`, recovering from poisoning rather than propagating it — none
+/// of the critical sections in this module can panic while holding the lock, so
+/// poisoning should never occur; this just keeps a stray panic elsewhere from
+/// cascading into every subsequent lock attempt.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bounded, serializable evidence returned by [`ProxyHandle::shutdown_and_join`]
+/// — the proxy's TERMINAL account of everything it did, frozen the moment the
+/// proxy reached `Quiescent`. Every accepted connection is reflected in exactly
+/// one of the counters below (#372 §3); nothing here can mutate after it is
+/// returned, because the [`ProxyHandle`] that produced it has been consumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyFinalEvidence {
+    /// Distinct hosts refused (denied by the allow-list), deduped, sorted, and
+    /// bounded to at most [`MAX_REFUSED_HOSTS`] entries of at most
+    /// [`MAX_REFUSED_HOST_BYTES`] bytes each.
+    #[serde(deserialize_with = "deserialize_bounded_hosts")]
+    pub refused_hosts: Vec<String>,
+    /// Refusal attempts NOT reflected in `refused_hosts` because the host-count
+    /// bound or the per-host byte bound was already reached — the exact count,
+    /// never silently dropped.
+    pub omitted_refused_attempts: u64,
+    /// Connections handed to a connection worker (i.e. they passed the capacity
+    /// check and a worker thread was successfully spawned for them).
+    pub accepted: u64,
+    /// Connections whose worker reached a terminal accounting outcome. Equal to
+    /// `accepted` in any `Ok` result; a shortfall can only appear attached to a
+    /// [`ProxyFinalizeError::Incomplete`], never in a successful result.
+    pub completed: u64,
+    /// Connections refused purely for being over the worker cap — counted as
+    /// overload, never mislabeled as an authority denial.
+    pub capacity_rejects: u64,
+    /// Completed connections whose proxy-owned sockets were force-closed by
+    /// shutdown before they reached their own natural terminal point (e.g. an
+    /// idle tunnel with no data flowing either way).
+    pub shutdown_aborts: u64,
+    /// Connection-worker thread-spawn failures observed during this proxy's
+    /// lifetime.
+    pub worker_spawn_failures: u64,
+    /// Connection-worker panics observed (a failed `JoinHandle::join`).
+    pub worker_panics: u64,
+    /// The configured worker cap in force for this proxy.
+    pub worker_cap: usize,
+    /// The highest number of simultaneously active connection workers observed.
+    pub high_water_workers: usize,
+}
+
+/// Bounded `Vec<String>` deserialization for [`ProxyFinalEvidence::refused_hosts`]
+/// (#372 §3/acceptance: "hostile oversized evidence deserialization"). Rejects a
+/// payload with more than [`MAX_REFUSED_HOSTS`] entries, or any entry longer
+/// than [`MAX_REFUSED_HOST_BYTES`], as soon as the offending element is seen —
+/// never after collecting the whole hostile array.
+fn deserialize_bounded_hosts<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedHosts;
+    impl<'de> Visitor<'de> for BoundedHosts {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "at most {MAX_REFUSED_HOSTS} host strings, each at most {MAX_REFUSED_HOST_BYTES} bytes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let hint = seq.size_hint().unwrap_or(0).min(MAX_REFUSED_HOSTS);
+            let mut out = Vec::with_capacity(hint);
+            while let Some(host) = seq.next_element::<String>()? {
+                if out.len() >= MAX_REFUSED_HOSTS {
+                    return Err(de::Error::custom(format!(
+                        "refused_hosts exceeds the {MAX_REFUSED_HOSTS}-host bound"
+                    )));
+                }
+                if host.len() > MAX_REFUSED_HOST_BYTES {
+                    return Err(de::Error::custom(format!(
+                        "refused_hosts entry exceeds the {MAX_REFUSED_HOST_BYTES}-byte bound"
+                    )));
+                }
+                out.push(host);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_seq(BoundedHosts)
+}
+
+/// Why [`ProxyHandle::shutdown_and_join`] could not return complete, trustworthy
+/// evidence. Both variants mean completeness is NOT provable — callers must
+/// treat this as a failure, never fall back to reading `partial` as if it were
+/// terminal (#372 §3/§7).
 #[derive(Debug)]
+pub enum ProxyFinalizeError {
+    /// The accept supervisor thread itself panicked (its `JoinHandle::join`
+    /// failed).
+    SupervisorFailed {
+        /// Human-readable detail.
+        reason: String,
+    },
+    /// One or more connection workers could not be spawned or panicked, so
+    /// "every accepted connection has exactly one terminal accounting outcome"
+    /// is not provable. `partial` is the best-effort evidence gathered before
+    /// that became true — bounded and serializable like [`ProxyFinalEvidence`],
+    /// but explicitly NOT terminal.
+    Incomplete {
+        /// The evidence gathered before completeness became unprovable.
+        partial: ProxyFinalEvidence,
+        /// Human-readable detail.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ProxyFinalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SupervisorFailed { reason } => {
+                write!(f, "egress proxy accept supervisor failed: {reason}")
+            }
+            Self::Incomplete { reason, .. } => {
+                write!(f, "egress proxy finalization is incomplete: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProxyFinalizeError {}
+
+/// The live (mutable, pre-`Quiescent`) evidence accumulator. One instance is
+/// shared (behind a `Mutex`) across the accept loop and every connection
+/// worker; [`Self::snapshot`] freezes it into a [`ProxyFinalEvidence`].
+#[derive(Debug, Default)]
+struct Evidence {
+    refused: BTreeSet<String>,
+    omitted_refused: u64,
+    accepted: u64,
+    completed: u64,
+    capacity_rejects: u64,
+    shutdown_aborts: u64,
+    worker_spawn_failures: u64,
+    worker_panics: u64,
+}
+
+impl Evidence {
+    /// Record one refused (denied) host, respecting the #372 §3 bounds. A host
+    /// already retained is not re-counted as omitted — it carries no new
+    /// information.
+    fn record_refused(&mut self, host: &str) {
+        if self.refused.contains(host) {
+            return;
+        }
+        if host.len() > MAX_REFUSED_HOST_BYTES || self.refused.len() >= MAX_REFUSED_HOSTS {
+            self.omitted_refused += 1;
+            return;
+        }
+        self.refused.insert(host.to_string());
+    }
+
+    fn refused_sorted(&self) -> Vec<String> {
+        self.refused.iter().cloned().collect()
+    }
+
+    fn snapshot(&self, worker_cap: usize, high_water_workers: usize) -> ProxyFinalEvidence {
+        ProxyFinalEvidence {
+            refused_hosts: self.refused_sorted(),
+            omitted_refused_attempts: self.omitted_refused,
+            accepted: self.accepted,
+            completed: self.completed,
+            capacity_rejects: self.capacity_rejects,
+            shutdown_aborts: self.shutdown_aborts,
+            worker_spawn_failures: self.worker_spawn_failures,
+            worker_panics: self.worker_panics,
+            worker_cap,
+            high_water_workers,
+        }
+    }
+}
+
+/// A connection worker's terminal outcome, as seen by the supervisor that joins
+/// it — distinct from the connection's *protocol* outcome (`NetDecision`, which
+/// the audit sink sees): this is about whether the worker reached that outcome
+/// on its own, or was force-closed by shutdown first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnOutcome {
+    /// The worker returned on its own (whatever the protocol outcome was).
+    Completed,
+    /// Shutdown force-closed this connection's proxy-owned sockets before (or
+    /// concurrently with) the worker's own completion.
+    Aborted,
+}
+
+/// A proxy-owned handle to force-close one connection's sockets during
+/// shutdown (#372 §2) — how an idle/tunnel connection's blocked read is made to
+/// unblock instead of hanging finalization forever. Registered per active
+/// worker; `client` is fixed at construction, `origin` is set once the worker
+/// actually dials out (CONNECT/HTTP paths only reach that after an allow-list
+/// pass). Every field is behind a `Mutex` purely so `Arc<ConnCloser>` is `Sync`
+/// (`Box<dyn Conn>` is `Send` but not `Sync`) — `close_all` is the only method
+/// that ever touches them after construction, and it is safe to call more than
+/// once (shutting down an already-shut-down socket is a harmless error we
+/// discard).
+struct ConnCloser {
+    client: Mutex<Box<dyn Conn>>,
+    origin: Mutex<Option<Box<dyn Conn>>>,
+    /// Set by `close_all`; read by the owning worker after `handle_conn`
+    /// returns to classify its own outcome as [`ConnOutcome::Aborted`].
+    aborted: AtomicBool,
+}
+
+impl ConnCloser {
+    fn new(client: Box<dyn Conn>) -> Self {
+        Self {
+            client: Mutex::new(client),
+            origin: Mutex::new(None),
+            aborted: AtomicBool::new(false),
+        }
+    }
+
+    fn set_origin(&self, origin: Box<dyn Conn>) {
+        *lock(&self.origin) = Some(origin);
+    }
+
+    /// Force-close every proxy-owned socket end for this connection. Idempotent
+    /// and safe to call from a thread other than the one running `handle_conn`.
+    fn close_all(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        let _ = lock(&self.client).shutdown(Shutdown::Both);
+        if let Some(o) = lock(&self.origin).as_deref() {
+            let _ = o.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// Test-only synchronization seam (#372 acceptance tests): production always
+/// runs with [`ConnHooks::default`] (both hooks `None`, zero overhead beyond an
+/// `Option` check). A test can pause a connection worker at a chosen point —
+/// right on entry, or right after its allow-list decision is recorded — to
+/// drive the proxy's shutdown path against a worker that is deterministically
+/// still busy.
+#[derive(Clone, Default)]
+struct ConnHooks {
+    /// Fired as the very first action inside `handle_conn`.
+    entered: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Fired immediately after the connection's allow-list decision (and its
+    /// audit record / refused-host bookkeeping) is finalized, before the
+    /// response is written.
+    decided: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ConnHooks {
+    fn fire_entered(&self) {
+        if let Some(f) = &self.entered {
+            f();
+        }
+    }
+    fn fire_decided(&self) {
+        if let Some(f) = &self.decided {
+            f();
+        }
+    }
+}
+
+/// The set of currently-active connection workers, plus the id counter used to
+/// key them. Behind one `Mutex` on [`Shared`]; the accept loop inserts and
+/// opportunistically reaps, [`ProxyHandle::teardown`] drains the rest.
+#[derive(Default)]
+struct WorkerBook {
+    next_id: u64,
+    active: HashMap<u64, (JoinHandle<ConnOutcome>, Arc<ConnCloser>)>,
+}
+
+/// State shared between [`ProxyHandle`], the accept-loop thread, and every
+/// connection-worker thread it spawns.
+struct Shared {
+    lifecycle: AtomicU8,
+    workers: Mutex<WorkerBook>,
+    evidence: Mutex<Evidence>,
+    /// The configured worker cap (#372 §1) — immutable for the proxy's lifetime.
+    cap: usize,
+    high_water: AtomicUsize,
+    /// Test-only fault injection (#372 acceptance: "injected spawn failure"): a
+    /// positive count here makes the accept loop simulate that many connection
+    /// worker spawn failures instead of actually spawning, without needing to
+    /// exhaust real OS thread resources. Zero (the production default) never
+    /// engages this path.
+    inject_spawn_failures: AtomicUsize,
+}
+
+impl Shared {
+    fn new(cap: usize) -> Self {
+        Self {
+            lifecycle: AtomicU8::new(LIFECYCLE_RUNNING),
+            workers: Mutex::new(WorkerBook::default()),
+            evidence: Mutex::new(Evidence::default()),
+            cap,
+            high_water: AtomicUsize::new(0),
+            inject_spawn_failures: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Reap every connection worker that has already finished, tallying each into
+/// `shared.evidence`. Non-blocking: only workers whose `JoinHandle::is_finished`
+/// is already `true` are joined, so this never stalls the accept loop.
+fn reap_finished(shared: &Shared) {
+    let reaped: Vec<JoinHandle<ConnOutcome>> = {
+        let mut book = lock(&shared.workers);
+        let done: Vec<u64> = book
+            .active
+            .iter()
+            .filter_map(|(id, (h, _))| h.is_finished().then_some(*id))
+            .collect();
+        done.into_iter()
+            .filter_map(|id| book.active.remove(&id).map(|(h, _)| h))
+            .collect()
+    };
+    for h in reaped {
+        tally_join(shared, h.join());
+    }
+}
+
+/// Tally one worker's `JoinHandle::join` result into `shared.evidence` — the
+/// ONLY place a connection worker's terminal outcome is recorded, whether
+/// reaped opportunistically by [`reap_finished`] or drained by
+/// [`ProxyHandle::teardown`].
+fn tally_join(shared: &Shared, result: std::thread::Result<ConnOutcome>) {
+    let mut ev = lock(&shared.evidence);
+    match result {
+        Ok(ConnOutcome::Completed) => ev.completed += 1,
+        Ok(ConnOutcome::Aborted) => {
+            ev.completed += 1;
+            ev.shutdown_aborts += 1;
+        }
+        Err(_) => ev.worker_panics += 1,
+    }
+}
+
+/// A running loopback egress proxy. Bounded and joinable (#372): every worker it
+/// spawns is retained until reaped or drained, and [`Self::shutdown_and_join`]
+/// is the explicit finalizer that proves so. Dropping the handle without calling
+/// it still shuts everything down and joins every worker (fail-safe), but
+/// discards the evidence — see the module-level lifecycle note.
 pub struct ProxyHandle {
     addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
-    /// #196: out-of-allow-list hosts the child tried to reach — refused with 403.
-    /// Accumulated across all connections (independent of the opt-in audit sink)
-    /// so the shell tool can surface them as structured `net` denials.
-    refused: Arc<Mutex<HashSet<String>>>,
+    shared: Arc<Shared>,
+}
+
+impl std::fmt::Debug for ProxyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyHandle")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProxyHandle {
@@ -315,21 +729,18 @@ impl ProxyHandle {
         self.addr
     }
 
-    /// #196: the CONNECT hosts this proxy REFUSED (not on the allow-list),
-    /// deduplicated and sorted. The shell tool reads this after the child is
-    /// reaped and turns each into a `Denial { kind: Net, target: host }` so a
-    /// consumer can prompt per-host. Empty when the child only reached
-    /// allow-listed hosts (or none).
+    /// #196: the CONNECT/HTTP hosts this proxy has REFUSED so far (not on the
+    /// allow-list), deduplicated and sorted, bounded as documented on
+    /// [`ProxyFinalEvidence::refused_hosts`].
+    ///
+    /// **Provisional** (#372 §2): this is a LIVE snapshot that can still change
+    /// while the proxy is `Running`/`ShuttingDown` — a connection worker may
+    /// record a denial after this call returns. A caller that needs TERMINAL,
+    /// frozen evidence must call [`Self::shutdown_and_join`] instead; this
+    /// method remains for best-effort diagnostics only.
     #[must_use]
     pub fn refused_hosts(&self) -> Vec<String> {
-        self.refused
-            .lock()
-            .map(|s| {
-                let mut v: Vec<String> = s.iter().cloned().collect();
-                v.sort();
-                v
-            })
-            .unwrap_or_default()
+        lock(&self.shared.evidence).refused_sorted()
     }
 
     /// The `*_PROXY` environment the child needs to route through this proxy.
@@ -351,23 +762,145 @@ impl ProxyHandle {
         .map(|k| ((*k).to_string(), url.clone()))
         .collect()
     }
+
+    /// #372: the explicit, consuming finalizer. Drives `Running -> ShuttingDown
+    /// -> Quiescent`: stops admission, force-closes every proxy-owned socket end
+    /// still open (so an idle/tunnel connection cannot hang this call forever),
+    /// then BLOCKS until the accept worker and every connection/splice worker
+    /// have been joined — including one deliberately paused mid-decision by a
+    /// test, which this call waits for rather than racing past.
+    ///
+    /// Returns `Ok` only when every accepted connection reached exactly one
+    /// terminal accounting outcome with no spawn failure, panic, or join
+    /// failure along the way; otherwise `Err` — never an `Ok` evidence value
+    /// that silently omits a failure (#372 §7).
+    ///
+    /// **Bound on an idle/tunnel connection.** The force-close is a `shutdown`
+    /// on this proxy's own socket end, called from this process — on
+    /// Linux/macOS that interrupts an in-flight blocked read on a duplicated
+    /// handle promptly; that prompt-interrupt behavior is not guaranteed on
+    /// every platform. The portable, honest upper bound is each connection's
+    /// own read/write timeout (`CONN_TIMEOUT`, set when it was accepted or
+    /// dialed): this call never hangs past it, even where `shutdown` alone
+    /// does not immediately unblock the read.
+    ///
+    /// Blocking, std-only. An async caller must run this on a blocking
+    /// executor/thread and await it before emitting its own terminal result —
+    /// never call it directly from a Tokio reactor thread.
+    pub fn shutdown_and_join(mut self) -> Result<ProxyFinalEvidence, ProxyFinalizeError> {
+        self.teardown()
+    }
+
+    /// The shared shutdown-and-join engine behind both [`Self::shutdown_and_join`]
+    /// and `Drop` — see the module-level lifecycle note for why the two share
+    /// this rather than Drop being a distinct, weaker path. Idempotent: once the
+    /// first call has drained `accept`/`workers`, a second call (Drop running
+    /// after `shutdown_and_join` already did the real work) finds nothing left
+    /// to do and returns the same frozen snapshot cheaply.
+    fn teardown(&mut self) -> Result<ProxyFinalEvidence, ProxyFinalizeError> {
+        // Idempotent fast path: `Drop` always runs `teardown` again after
+        // `shutdown_and_join` already did the real work (see the module-level
+        // lifecycle note) — by then `accept`/`workers` are already empty, so
+        // this would just re-lock and re-scan for nothing. The returned value
+        // is discarded by `Drop` either way; skip straight to a cheap snapshot.
+        if self.shared.lifecycle.load(Ordering::SeqCst) == LIFECYCLE_QUIESCENT {
+            let ev = lock(&self.shared.evidence);
+            return Ok(ev.snapshot(
+                self.shared.cap,
+                self.shared.high_water.load(Ordering::SeqCst),
+            ));
+        }
+
+        // Linearize: stop admitting new connections. Idempotent — a failed CAS
+        // just means shutdown was already signaled (or is already Quiescent).
+        let _ = self.shared.lifecycle.compare_exchange(
+            LIFECYCLE_RUNNING,
+            LIFECYCLE_SHUTTING_DOWN,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+
+        // Force-close every currently-tracked connection's proxy-owned sockets
+        // FIRST, before joining anything — an idle/tunnel connection is blocked
+        // on a read that only this unblocks (#372 acceptance: "occupied/idle
+        // tunnel shutdown"). A connection paused by a test hook on purpose (not
+        // blocked on I/O) is unaffected by this and is instead waited for below.
+        {
+            let book = lock(&self.shared.workers);
+            for (_, closer) in book.active.values() {
+                closer.close_all();
+            }
+        }
+
+        // Wake and join the accept worker. The listener itself is owned by that
+        // thread's closure, so it is closed the moment the thread returns.
+        let mut supervisor_failure = None;
+        if let Some(h) = self.accept.take() {
+            // Best-effort wake for a blocking accept(): if this dial fails the
+            // listener may already be gone, and the join below still completes
+            // once the OS delivers shutdown some other way.
+            let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(200));
+            if h.join().is_err() {
+                supervisor_failure = Some("accept supervisor thread panicked".to_string());
+            }
+        }
+
+        // Drain and join every remaining connection worker — including any the
+        // accept loop admitted right up to observing shutdown, and any still
+        // blocked (an idle tunnel just force-closed above, or a test-paused
+        // decision). This BLOCKS until each one returns; it does not race past
+        // a worker that is still legitimately in flight.
+        let remaining: Vec<(JoinHandle<ConnOutcome>, Arc<ConnCloser>)> = {
+            let mut book = lock(&self.shared.workers);
+            book.active.drain().map(|(_, v)| v).collect()
+        };
+        for (handle, closer) in remaining {
+            // Cover anything admitted after the sweep above raced ahead of it.
+            closer.close_all();
+            tally_join(&self.shared, handle.join());
+        }
+
+        let snapshot = {
+            let ev = lock(&self.shared.evidence);
+            ev.snapshot(
+                self.shared.cap,
+                self.shared.high_water.load(Ordering::SeqCst),
+            )
+        };
+        self.shared
+            .lifecycle
+            .store(LIFECYCLE_QUIESCENT, Ordering::SeqCst);
+
+        if let Some(reason) = supervisor_failure {
+            return Err(ProxyFinalizeError::SupervisorFailed { reason });
+        }
+        if snapshot.worker_panics > 0 || snapshot.worker_spawn_failures > 0 {
+            return Err(ProxyFinalizeError::Incomplete {
+                reason: format!(
+                    "{} worker panic(s) and {} spawn failure(s): completeness is not provable",
+                    snapshot.worker_panics, snapshot.worker_spawn_failures
+                ),
+                partial: snapshot,
+            });
+        }
+        Ok(snapshot)
+    }
 }
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Wake the blocking `accept()` so the loop observes the flag and exits.
-        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(200));
-        if let Some(h) = self.accept.take() {
-            let _ = h.join();
-        }
+        // Fail-safe: same shutdown-and-join as the explicit finalizer, evidence
+        // discarded. See the module-level lifecycle note.
+        let _ = self.teardown();
     }
 }
 
 /// Start a loopback forward proxy that admits only `allow_hosts`, resolving via
 /// `resolver` and auditing every connection through `sink` ([`NullSink`] for no
 /// audit). Binds `127.0.0.1:0` (an ephemeral port — concurrent runs never
-/// collide) and serves until the returned [`ProxyHandle`] is dropped.
+/// collide) and serves — bounded to [`DEFAULT_WORKER_CAP`] simultaneously active
+/// connection workers — until the returned [`ProxyHandle`] is finalized or
+/// dropped.
 ///
 /// Fail-closed: an error binding the listener is returned so the caller refuses
 /// the run rather than spawning an unfenced child.
@@ -376,55 +909,14 @@ pub fn start(
     resolver: Arc<dyn Resolver>,
     sink: Arc<dyn AuditSink>,
 ) -> io::Result<ProxyHandle> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let addr = listener.local_addr()?;
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let policy = HostPolicy::new(allow_hosts);
-    // The production origin dialer — a real TCP connect. Tests bypass `start`
-    // entirely and drive `handle_conn` with a scripted in-memory connector.
-    let connector: Arc<dyn Connector> = Arc::new(TcpConnector);
-    // #196: shared refused-host accumulator, populated by each connection thread.
-    let refused: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-
-    let accept = {
-        let shutdown = Arc::clone(&shutdown);
-        let refused = Arc::clone(&refused);
-        thread::Builder::new()
-            .name("agent-bridle-egress-proxy".to_string())
-            .spawn(move || {
-                for stream in listener.incoming() {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let Ok(client) = stream else { continue };
-                    let policy = policy.clone();
-                    let resolver = Arc::clone(&resolver);
-                    let connector = Arc::clone(&connector);
-                    let sink = Arc::clone(&sink);
-                    let refused = Arc::clone(&refused);
-                    // One detached thread per connection; it ends at EOF.
-                    let _ = thread::Builder::new()
-                        .name("agent-bridle-egress-conn".to_string())
-                        .spawn(move || {
-                            let _ = handle_conn(
-                                Box::new(client),
-                                &policy,
-                                connector.as_ref(),
-                                resolver.as_ref(),
-                                sink.as_ref(),
-                                &refused,
-                            );
-                        });
-                }
-            })?
-    };
-
-    Ok(ProxyHandle {
-        addr,
-        shutdown,
-        accept: Some(accept),
-        refused,
-    })
+    start_internal(
+        allow_hosts,
+        resolver,
+        sink,
+        Arc::new(TcpConnector),
+        DEFAULT_WORKER_CAP,
+        ConnHooks::default(),
+    )
 }
 
 /// Start the egress proxy for a **general remote-host** `net` grant (#257) — the
@@ -463,17 +955,165 @@ pub fn start_for_hosts(allow_hosts: impl IntoIterator<Item = String>) -> io::Res
     start(allow_hosts, Arc::new(StdResolver), Arc::new(NullSink))
 }
 
+/// The real engine behind [`start`] — parameterized over the worker cap,
+/// connector, and test hooks so the acceptance-test suite can drive the exact
+/// same accept-loop/lifecycle machinery production uses, deterministically.
+fn start_internal(
+    allow_hosts: impl IntoIterator<Item = String>,
+    resolver: Arc<dyn Resolver>,
+    sink: Arc<dyn AuditSink>,
+    connector: Arc<dyn Connector>,
+    cap: usize,
+    hooks: ConnHooks,
+) -> io::Result<ProxyHandle> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let addr = listener.local_addr()?;
+    let policy = HostPolicy::new(allow_hosts);
+    let shared = Arc::new(Shared::new(cap));
+
+    let accept = {
+        let shared = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("agent-bridle-egress-proxy".to_string())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    if shared.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_RUNNING {
+                        break;
+                    }
+                    let Ok(client) = stream else { continue };
+                    let client: Box<dyn Conn> = Box::new(client);
+                    // Bound every write this accept loop itself might make
+                    // (capacity/spawn-failure 503s below) to CONN_TIMEOUT — a
+                    // hostile client that never reads could otherwise block
+                    // this single accept thread's write forever, wedging
+                    // admission for every other connection and making
+                    // `shutdown_and_join`'s accept-thread join hang too.
+                    // `handle_conn` also sets this on its own dup; harmless.
+                    let _ = client.set_timeouts(CONN_TIMEOUT);
+
+                    // Bound #1: reap anything already finished before deciding
+                    // whether there is room for one more active worker.
+                    reap_finished(&shared);
+
+                    let active_len = lock(&shared.workers).active.len();
+                    if active_len >= shared.cap {
+                        lock(&shared.evidence).capacity_rejects += 1;
+                        let _ = respond(client.as_ref(), 503, "Service Unavailable");
+                        continue;
+                    }
+
+                    // Test-only fault injection (#372 acceptance): simulate a
+                    // spawn failure without touching real OS thread limits.
+                    let injected = if shared.inject_spawn_failures.load(Ordering::SeqCst) > 0 {
+                        shared.inject_spawn_failures.fetch_sub(1, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    };
+                    if injected {
+                        lock(&shared.evidence).worker_spawn_failures += 1;
+                        let _ = respond(client.as_ref(), 503, "Service Unavailable");
+                        continue;
+                    }
+
+                    let closer = match client.dup() {
+                        Ok(dup) => Arc::new(ConnCloser::new(dup)),
+                        Err(_) => {
+                            // Cannot even register a closer for this connection —
+                            // treat identically to a spawn failure: it will never
+                            // be serviced or accounted as accepted.
+                            lock(&shared.evidence).worker_spawn_failures += 1;
+                            continue;
+                        }
+                    };
+
+                    let policy = policy.clone();
+                    let resolver = Arc::clone(&resolver);
+                    let connector = Arc::clone(&connector);
+                    let sink = Arc::clone(&sink);
+                    let shared_for_worker = Arc::clone(&shared);
+                    let hooks_for_worker = hooks.clone();
+                    let closer_for_worker = Arc::clone(&closer);
+                    let spawn_result = thread::Builder::new()
+                        .name("agent-bridle-egress-conn".to_string())
+                        .spawn(move || {
+                            let env = ConnEnv {
+                                policy: &policy,
+                                connector: connector.as_ref(),
+                                resolver: resolver.as_ref(),
+                                sink: sink.as_ref(),
+                            };
+                            let _ = handle_conn(
+                                client,
+                                &env,
+                                &shared_for_worker.evidence,
+                                &closer_for_worker,
+                                &hooks_for_worker,
+                            );
+                            if closer_for_worker.aborted.load(Ordering::SeqCst) {
+                                ConnOutcome::Aborted
+                            } else {
+                                ConnOutcome::Completed
+                            }
+                        });
+                    match spawn_result {
+                        Ok(handle) => {
+                            let count = {
+                                let mut book = lock(&shared.workers);
+                                let id = book.next_id;
+                                book.next_id += 1;
+                                book.active.insert(id, (handle, closer));
+                                book.active.len()
+                            };
+                            shared.high_water.fetch_max(count, Ordering::SeqCst);
+                            lock(&shared.evidence).accepted += 1;
+                        }
+                        Err(_) => {
+                            // `client` was moved into the failed spawn attempt's
+                            // closure and is gone with it; `closer` (not yet
+                            // registered anywhere) still holds a live dup, so the
+                            // client gets the same 503 the capacity/injected
+                            // paths give it rather than a bare reset.
+                            lock(&shared.evidence).worker_spawn_failures += 1;
+                            let guard = lock(&closer.client);
+                            let _ = respond(guard.as_ref(), 503, "Service Unavailable");
+                        }
+                    }
+                }
+            })?
+    };
+
+    Ok(ProxyHandle {
+        addr,
+        accept: Some(accept),
+        shared,
+    })
+}
+
 /// Serve one client connection: parse its request line, enforce the allow-list,
 /// and either tunnel (`CONNECT`) or forward (`http://`) to the resolved origin.
-/// Every connection with a parsed host is recorded through `sink`.
+/// Every connection with a parsed host is recorded through `sink`. `closer` is
+/// this connection's #372 shutdown handle (its `origin` half is populated once
+/// dialed); `hooks` is the test-only pause seam (a no-op in production).
+/// Immutable per-connection dependencies `handle_conn` needs — bundled into one
+/// borrow so the function stays under clippy's argument-count lint without
+/// losing the #166 seam-based testability (each field is still a trait
+/// object/reference a test can substitute).
+struct ConnEnv<'a> {
+    policy: &'a HostPolicy,
+    connector: &'a dyn Connector,
+    resolver: &'a dyn Resolver,
+    sink: &'a dyn AuditSink,
+}
+
 fn handle_conn(
     client: Box<dyn Conn>,
-    policy: &HostPolicy,
-    connector: &dyn Connector,
-    resolver: &dyn Resolver,
-    sink: &dyn AuditSink,
-    refused: &Mutex<HashSet<String>>,
+    env: &ConnEnv<'_>,
+    evidence: &Mutex<Evidence>,
+    closer: &ConnCloser,
+    hooks: &ConnHooks,
 ) -> io::Result<()> {
+    hooks.fire_entered();
     client.set_timeouts(CONN_TIMEOUT)?;
     let mut reader = BufReader::new(client.dup()?);
     let t0 = Instant::now();
@@ -490,7 +1130,7 @@ fn handle_conn(
     };
     // Emit the audit record once, whatever the outcome.
     let audit = |decision: NetDecision, up: u64, down: u64| {
-        sink.record(&NetAuditEvent {
+        env.sink.record(&NetAuditEvent {
             ts_ms: now_ms(),
             host: host.clone(),
             port,
@@ -502,13 +1142,13 @@ fn handle_conn(
         });
     };
 
-    if !policy.allows(&host) {
+    if !env.policy.allows(&host) {
         audit(NetDecision::Denied, 0, 0); // the exfil-attempt signal
-                                          // #196: record the refused host so the shell tool can surface it as a
-                                          // structured `net` denial (the audit sink is opt-in; this is always on).
-        if let Ok(mut set) = refused.lock() {
-            set.insert(host.clone());
-        }
+                                          // #196/#372: record the refused host (bounded, #372 §3) so a consumer
+                                          // can surface it as a structured `net` denial. Always on, independent
+                                          // of the opt-in audit sink.
+        lock(evidence).record_refused(&host);
+        hooks.fire_decided();
         return respond(client.as_ref(), 403, "Forbidden");
     }
 
@@ -517,17 +1157,30 @@ fn handle_conn(
             // CONNECT: drain the remaining request headers (up to the blank line)
             // before the tunnel begins — the client waits for our 200 first.
             drain_headers(&mut reader)?;
-            let origin = match resolver
+            let origin = match env
+                .resolver
                 .resolve(&host, port)
                 .and_then(guard_target)
-                .and_then(|addr| connector.connect(addr))
+                .and_then(|addr| env.connector.connect(addr))
             {
                 Ok(o) => o,
                 Err(_) => {
                     audit(NetDecision::Error, 0, 0);
+                    hooks.fire_decided();
                     return respond(client.as_ref(), 502, "Bad Gateway");
                 }
             };
+            // #372: register the dialed origin so shutdown can force-close it
+            // too (an idle tunnel is blocked on THIS socket, not just the
+            // client's).
+            if let Ok(dup) = origin.dup() {
+                closer.set_origin(dup);
+            }
+            // Fire BEFORE the client-visible write (matching every other
+            // branch), not after — a write that fails (`?`, below) would
+            // otherwise return early and skip it, and the seam contract is
+            // "decision recorded", not "response delivered".
+            hooks.fire_decided();
             // A CONNECT success is a *bare* status line — no body, no
             // `Content-Length` — after which the socket is an opaque tunnel. (Do
             // NOT use `respond`, which appends a body that would corrupt it.)
@@ -552,17 +1205,23 @@ fn handle_conn(
             // own Host, derived from the *validated* authority, so the origin only
             // ever sees the host the allow-list approved.
             let headers = read_headers(&mut reader)?;
-            let mut origin = match resolver
+            let mut origin = match env
+                .resolver
                 .resolve(&host, port)
                 .and_then(guard_target)
-                .and_then(|addr| connector.connect(addr))
+                .and_then(|addr| env.connector.connect(addr))
             {
                 Ok(o) => o,
                 Err(_) => {
                     audit(NetDecision::Error, 0, 0);
+                    hooks.fire_decided();
                     return respond(client.as_ref(), 502, "Bad Gateway");
                 }
             };
+            if let Ok(dup) = origin.dup() {
+                closer.set_origin(dup);
+            }
+            hooks.fire_decided();
             let host_hdr = if port == 80 {
                 format!("Host: {host}\r\n")
             } else {
@@ -728,7 +1387,16 @@ fn splice_buffered(
     // test, since the audit fires only once `up` joins). `Both` gives `up`'s read
     // on the shared socket an immediate EOF.
     let _ = c_write.shutdown(Shutdown::Both);
-    let up = up.join().unwrap_or(0);
+    // #372 §7: a panic on the `up` copy thread must not be silently folded into
+    // "0 bytes forwarded" — that would let a splice-worker panic produce
+    // apparently-complete evidence. Resume it on THIS thread (the owning
+    // connection worker), so it propagates to the same `JoinHandle<ConnOutcome>`
+    // `tally_join` already inspects, and is counted in `worker_panics` exactly
+    // like any other connection-worker panic — no separate accounting needed.
+    let up = match up.join() {
+        Ok(n) => n,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
     Ok((up, down))
 }
 
@@ -736,6 +1404,8 @@ fn splice_buffered(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::sync::Condvar;
 
     // ── #257: the caveats-level public entry ────────────────────────────────
 
@@ -920,12 +1590,20 @@ mod tests {
         }
     }
 
-    /// Start the proxy with no audit sink (most tests don't inspect the audit).
+    /// Start the proxy with no audit sink and production defaults (most tests
+    /// don't inspect the audit, the worker cap, or the connector).
     fn start_null(
         hosts: impl IntoIterator<Item = String>,
         resolver: Arc<dyn Resolver>,
     ) -> io::Result<ProxyHandle> {
-        start(hosts, resolver, Arc::new(NullSink))
+        start_internal(
+            hosts,
+            resolver,
+            Arc::new(NullSink),
+            Arc::new(TcpConnector),
+            DEFAULT_WORKER_CAP,
+            ConnHooks::default(),
+        )
     }
 
     /// An audit sink that collects every event into a shared vec, for assertions.
@@ -1034,6 +1712,15 @@ mod tests {
         }
     }
 
+    /// A connector whose dial always panics — for proving worker-panic evidence
+    /// and finalize failure (#372 §7) without exhausting real OS threads.
+    struct PanicConnector;
+    impl Connector for PanicConnector {
+        fn connect(&self, _addr: SocketAddr) -> io::Result<Box<dyn Conn>> {
+            panic!("injected connector panic (test)");
+        }
+    }
+
     /// The outcome of driving one connection through the real `handle_conn`.
     struct Driven {
         /// What the proxy sent back to the client (response / forwarded origin bytes).
@@ -1057,21 +1744,25 @@ mod tests {
         let policy = HostPolicy::new(allow.iter().map(|s| s.to_string()));
         let resolver = FixedResolver("127.0.0.1:9".parse().unwrap());
         let sink = CapturingSink::default();
-        let refused = Mutex::new(HashSet::new());
+        let evidence = Mutex::new(Evidence::default());
+        let closer = ConnCloser::new(Box::new(client.clone()));
+        let env = ConnEnv {
+            policy: &policy,
+            connector,
+            resolver: &resolver,
+            sink: &sink,
+        };
         let _ = handle_conn(
             Box::new(client.clone()),
-            &policy,
-            connector,
-            &resolver,
-            &sink,
-            &refused,
+            &env,
+            &evidence,
+            &closer,
+            &ConnHooks::default(),
         );
-        let mut refused: Vec<String> = refused.into_inner().unwrap().into_iter().collect();
-        refused.sort();
         Driven {
             client,
             origin: ScriptedConn::default(),
-            refused,
+            refused: evidence.into_inner().unwrap().refused_sorted(),
             audit: sink.events(),
         }
     }
@@ -1084,22 +1775,26 @@ mod tests {
         let policy = HostPolicy::new(allow.iter().map(|s| s.to_string()));
         let resolver = FixedResolver("127.0.0.1:9".parse().unwrap());
         let sink = CapturingSink::default();
-        let refused = Mutex::new(HashSet::new());
+        let evidence = Mutex::new(Evidence::default());
+        let closer = ConnCloser::new(Box::new(client.clone()));
         let connector = FakeConnector(origin.clone());
+        let env = ConnEnv {
+            policy: &policy,
+            connector: &connector,
+            resolver: &resolver,
+            sink: &sink,
+        };
         let _ = handle_conn(
             Box::new(client.clone()),
-            &policy,
-            &connector,
-            &resolver,
-            &sink,
-            &refused,
+            &env,
+            &evidence,
+            &closer,
+            &ConnHooks::default(),
         );
-        let mut refused: Vec<String> = refused.into_inner().unwrap().into_iter().collect();
-        refused.sort();
         Driven {
             client,
             origin,
-            refused,
+            refused: evidence.into_inner().unwrap().refused_sorted(),
             audit: sink.events(),
         }
     }
@@ -1187,12 +1882,12 @@ mod tests {
     /// `refused_hosts()` (deduped, sorted); allowed hosts are never listed.
     #[test]
     fn refused_hosts_surfaces_denied_hosts_deduped_and_omits_allowed() {
-        // Drive three requests through ONE shared refused-set: allowed (forwarded),
-        // then the same denied host twice (must dedupe to a single entry).
+        // Drive three requests through ONE shared evidence accumulator: allowed
+        // (forwarded), then the same denied host twice (must dedupe to one entry).
         let policy = HostPolicy::new(["allowed.test".to_string()]);
         let resolver = FixedResolver("127.0.0.1:9".parse().unwrap());
         let sink = NullSink;
-        let refused = Mutex::new(HashSet::new());
+        let evidence = Mutex::new(Evidence::default());
         let origin = ScriptedConn::with_script(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         let connector = FakeConnector(origin);
 
@@ -1211,11 +1906,23 @@ mod tests {
             ),
         ] {
             let client = ScriptedConn::with_script(req);
-            let _ = handle_conn(Box::new(client), &policy, conn, &resolver, &sink, &refused);
+            let closer = ConnCloser::new(Box::new(client.clone()));
+            let env = ConnEnv {
+                policy: &policy,
+                connector: conn,
+                resolver: &resolver,
+                sink: &sink,
+            };
+            let _ = handle_conn(
+                Box::new(client),
+                &env,
+                &evidence,
+                &closer,
+                &ConnHooks::default(),
+            );
         }
 
-        let mut got: Vec<String> = refused.into_inner().unwrap().into_iter().collect();
-        got.sort();
+        let got = evidence.into_inner().unwrap().refused_sorted();
         assert_eq!(
             got,
             vec!["evil.test".to_string()],
@@ -1402,6 +2109,64 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A one-shot gate: `wait()` blocks until `release()` is called (possibly
+    /// from another thread) — the #372 test seam for deterministically pausing
+    /// a connection worker at a chosen [`ConnHooks`] phase.
+    #[derive(Clone, Default)]
+    struct Gate(Arc<(Mutex<bool>, Condvar)>);
+    impl Gate {
+        fn wait(&self) {
+            let (m, cvar) = &*self.0;
+            let mut released = m.lock().unwrap();
+            while !*released {
+                released = cvar.wait(released).unwrap();
+            }
+        }
+        fn release(&self) {
+            let (m, cvar) = &*self.0;
+            *m.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        fn as_hook(&self) -> Arc<dyn Fn() + Send + Sync> {
+            let g = self.clone();
+            Arc::new(move || g.wait())
+        }
+    }
+
+    /// Poll (bounded) until the proxy's active-worker count reaches `want` —
+    /// synchronizes a test with the accept loop's own admission bookkeeping,
+    /// which happens on a background thread.
+    fn wait_for_active_count(proxy: &ProxyHandle, want: usize) {
+        for _ in 0..500 {
+            if lock(&proxy.shared.workers).active.len() >= want {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("active worker count never reached {want}");
+    }
+
+    /// Poll (bounded) until every currently-tracked connection worker's
+    /// `JoinHandle` reports finished — used where a test needs the worker to
+    /// have ALREADY run to completion (e.g. panicked) before finalizing, so
+    /// `shutdown_and_join`'s own force-close sweep cannot race ahead of it and
+    /// abort a connection before it ever reached the code under test.
+    /// `wait_for_active_count` only proves a worker was *spawned*, which can
+    /// be true before it has executed a single line of `handle_conn`.
+    fn wait_for_worker_finished(proxy: &ProxyHandle) {
+        for _ in 0..500 {
+            let all_finished = {
+                let book = lock(&proxy.shared.workers);
+                !book.active.is_empty() && book.active.values().all(|(h, _)| h.is_finished())
+            };
+            if all_finished {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("worker never finished");
+    }
+
     #[test]
     fn proxy_env_points_at_the_bound_loopback_addr() {
         // A REAL-socket test: `proxy_env` is derived from the actually-bound
@@ -1415,6 +2180,382 @@ mod tests {
         assert!(env.iter().any(|(k, v)| k == "https_proxy" && *v == url));
         assert!(env.iter().any(|(k, v)| k == "HTTPS_PROXY" && *v == url));
         assert!(env.iter().all(|(_, v)| v.starts_with("http://127.0.0.1:")));
+    }
+
+    // ── #372: bounded ownership + explicit lifecycle acceptance tests ──────
+
+    /// #372 §1: with worker cap `N`, `N` deliberately held-open connections plus
+    /// several excess ones must show a high-water mark that never exceeds `N`,
+    /// and every excess connection must be counted as capacity overload — never
+    /// mislabeled as an authority denial.
+    #[test]
+    fn worker_cap_bounds_active_workers_and_counts_excess_as_capacity_overload() {
+        let _serial = net_test_lock();
+        const CAP: usize = 2;
+        let gate = Gate::default();
+        let hooks = ConnHooks {
+            entered: Some(gate.as_hook()),
+            decided: None,
+        };
+        let proxy = start_internal(
+            ["x".to_string()],
+            Arc::new(StdResolver),
+            Arc::new(NullSink),
+            Arc::new(TcpConnector),
+            CAP,
+            hooks,
+        )
+        .unwrap();
+
+        // CAP held-open connections: each worker parks at `Entered` until released.
+        let mut held = Vec::new();
+        for _ in 0..CAP {
+            let c = TcpStream::connect(proxy.addr()).unwrap();
+            held.push(c);
+            wait_for_active_count(&proxy, held.len());
+        }
+
+        // Present substantially more connections than the cap.
+        let excess_attempts = CAP + 3;
+        let mut excess_responses = Vec::new();
+        for _ in 0..excess_attempts {
+            let mut c = TcpStream::connect(proxy.addr()).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut resp = String::new();
+            let _ = c.read_to_string(&mut resp);
+            excess_responses.push(resp);
+        }
+        assert!(
+            excess_responses.iter().all(|r| r.contains("503")),
+            "every excess connection over the cap must be refused as overload: {excess_responses:?}"
+        );
+
+        gate.release();
+        drop(held);
+
+        let evidence = proxy.shutdown_and_join().expect("finalize");
+        assert_eq!(
+            evidence.high_water_workers, CAP,
+            "high-water must equal the cap, never exceed it: {evidence:?}"
+        );
+        assert_eq!(
+            evidence.capacity_rejects, excess_attempts as u64,
+            "every excess connection must be counted: {evidence:?}"
+        );
+    }
+
+    /// #372 §2 acceptance ("denied CONNECT paused across finalization"):
+    /// pausing a worker AFTER it has recorded its denial, then finalizing, must
+    /// BLOCK finalization until the worker is released — never return evidence
+    /// that races past an in-flight decision (the snapshot-plus-`Drop` design
+    /// this issue replaces could not make this guarantee).
+    #[test]
+    fn finalize_waits_for_a_denied_connect_paused_after_its_decision() {
+        let _serial = net_test_lock();
+        let gate = Gate::default();
+        let hooks = ConnHooks {
+            entered: None,
+            decided: Some(gate.as_hook()),
+        };
+        let proxy = start_internal(
+            ["allowed.test".to_string()],
+            Arc::new(StdResolver),
+            Arc::new(NullSink),
+            Arc::new(TcpConnector),
+            DEFAULT_WORKER_CAP,
+            hooks,
+        )
+        .unwrap();
+
+        let mut client = TcpStream::connect(proxy.addr()).unwrap();
+        client
+            .write_all(b"CONNECT evil.test:443 HTTP/1.1\r\n\r\n")
+            .unwrap();
+        wait_for_active_count(&proxy, 1);
+
+        let (tx, rx) = mpsc::channel();
+        let finalize = thread::spawn(move || {
+            let _ = tx.send(proxy.shutdown_and_join());
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "finalization must wait for the paused worker, not return early"
+        );
+
+        gate.release();
+        let evidence = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("finalize must complete after release")
+            .expect("finalize succeeds");
+        let _ = finalize.join();
+        assert!(
+            evidence.refused_hosts.contains(&"evil.test".to_string()),
+            "the denial decided before the pause must be in the frozen evidence: {evidence:?}"
+        );
+    }
+
+    /// #372 §2 acceptance ("occupied/idle tunnel shutdown"): finalizing while an
+    /// allow-listed CONNECT tunnel sits idle (no data flowing either way) must
+    /// not hang. Shutdown force-closes the proxy-owned socket ends, the splice
+    /// threads see EOF, and finalize returns with the connection accounted as a
+    /// shutdown-abort.
+    #[test]
+    fn finalize_force_closes_and_joins_an_idle_tunnel_connection() {
+        let _serial = net_test_lock();
+        // A real loopback origin that accepts and then holds the connection open,
+        // sending/reading nothing — the honest "idle tunnel" shape.
+        let origin_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for s in origin_listener.incoming().flatten() {
+                // Hold the socket open; never read or write.
+                std::mem::forget(s);
+            }
+        });
+
+        let proxy = start_internal(
+            ["allowed.test".to_string()],
+            Arc::new(FixedResolver(origin_addr)),
+            Arc::new(NullSink),
+            Arc::new(TcpConnector),
+            DEFAULT_WORKER_CAP,
+            ConnHooks::default(),
+        )
+        .unwrap();
+
+        let mut client = TcpStream::connect(proxy.addr()).unwrap();
+        client
+            .write_all(b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reply = [0u8; 64];
+        let n = client.read(&mut reply).unwrap();
+        assert!(
+            String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 200"),
+            "the tunnel must open before it goes idle"
+        );
+        wait_for_active_count(&proxy, 1);
+
+        let (tx, rx) = mpsc::channel();
+        let finalize = thread::spawn(move || {
+            let _ = tx.send(proxy.shutdown_and_join());
+        });
+        // `shutdown()` interrupts an in-flight blocked read promptly on
+        // Linux/macOS; that prompt-interrupt behavior for a socket duplicated
+        // within the same process is not guaranteed on every platform. The
+        // honest, PORTABLE upper bound is each connection's own `CONN_TIMEOUT`
+        // (30s, set on both the client and origin sockets when the connection
+        // was accepted/dialed) — so this waits comfortably past it rather than
+        // assuming an immediate interrupt everywhere. What must never happen,
+        // and what the assertions below actually check, is an unbounded hang.
+        let evidence = rx
+            .recv_timeout(CONN_TIMEOUT + Duration::from_secs(5))
+            .expect("finalize must not hang on an idle tunnel")
+            .expect("finalize on an idle tunnel must still succeed");
+        let _ = finalize.join();
+
+        assert_eq!(
+            evidence.shutdown_aborts, 1,
+            "the idle tunnel must be accounted as a shutdown-abort, not left dangling: {evidence:?}"
+        );
+        assert_eq!(evidence.completed, evidence.accepted);
+    }
+
+    /// #372 §2: after `shutdown_and_join` returns, no worker remains active and
+    /// the listener is gone — a fresh connect must not be served.
+    #[test]
+    fn finalize_leaves_zero_active_workers_and_an_unreachable_listener() {
+        let _serial = net_test_lock();
+        let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
+        let addr = proxy.addr();
+        let shared = Arc::clone(&proxy.shared);
+        let evidence = proxy.shutdown_and_join().expect("finalize");
+        assert!(
+            lock(&shared.workers).active.is_empty(),
+            "no worker may remain active after finalize"
+        );
+        assert_eq!(evidence.completed, evidence.accepted);
+
+        thread::sleep(Duration::from_millis(100));
+        if let Ok(mut c) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            c.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let _ = write!(c, "GET http://x/ HTTP/1.1\r\n\r\n");
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            assert!(resp.is_empty(), "a quiescent proxy must not serve requests");
+        }
+    }
+
+    /// #372 §7: a connection-worker spawn failure must be surfaced/counted and
+    /// must fail finalization — never silently folded into apparently-complete
+    /// evidence.
+    #[test]
+    fn injected_worker_spawn_failure_is_counted_and_fails_finalize() {
+        let _serial = net_test_lock();
+        let proxy = start_null(["x".to_string()], Arc::new(StdResolver)).unwrap();
+        proxy
+            .shared
+            .inject_spawn_failures
+            .store(1, Ordering::SeqCst);
+
+        let mut c = TcpStream::connect(proxy.addr()).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut resp = String::new();
+        let _ = c.read_to_string(&mut resp);
+        assert!(
+            resp.contains("503"),
+            "an injected spawn failure must be refused safely: {resp:?}"
+        );
+
+        match proxy.shutdown_and_join() {
+            Err(ProxyFinalizeError::Incomplete { partial, .. }) => {
+                assert_eq!(partial.worker_spawn_failures, 1);
+            }
+            other => panic!("expected Incomplete due to the injected spawn failure: {other:?}"),
+        }
+    }
+
+    /// #372 §7: a connection-worker panic must be surfaced/counted and must
+    /// fail finalization.
+    #[test]
+    fn injected_worker_panic_is_counted_and_fails_finalize() {
+        let _serial = net_test_lock();
+        let proxy = start_internal(
+            ["allowed.test".to_string()],
+            Arc::new(FixedResolver("127.0.0.1:9".parse().unwrap())),
+            Arc::new(NullSink),
+            Arc::new(PanicConnector),
+            DEFAULT_WORKER_CAP,
+            ConnHooks::default(),
+        )
+        .unwrap();
+
+        // Triggers PanicConnector::connect inside the connection-worker thread; a
+        // panic there is EXPECTED and prints its usual message to stderr — the
+        // test itself does not panic, since we only ever observe it via `join`.
+        let mut c = TcpStream::connect(proxy.addr()).unwrap();
+        let _ = c.write_all(b"CONNECT allowed.test:443 HTTP/1.1\r\n\r\n");
+        drop(c);
+        // Synchronize with the accept loop: wait until it has actually admitted
+        // this connection as a worker AND for that worker to have actually run
+        // to completion (panicked) before finalizing. Waiting only for
+        // admission (`wait_for_active_count`) is not enough: `shutdown_and_join`
+        // force-closes the connection as part of finalizing, and if that races
+        // ahead of the worker's own read, the worker fails on the now-dead
+        // socket, is accounted as a shutdown-abort, and `PanicConnector::connect`
+        // is never reached at all — the exact flake this wait eliminates.
+        wait_for_active_count(&proxy, 1);
+        wait_for_worker_finished(&proxy);
+
+        match proxy.shutdown_and_join() {
+            Err(ProxyFinalizeError::Incomplete { partial, .. }) => {
+                assert_eq!(
+                    partial.worker_panics, 1,
+                    "the panic must be counted: {partial:?}"
+                );
+            }
+            other => panic!("expected Incomplete due to the injected worker panic: {other:?}"),
+        }
+    }
+
+    /// #372 §7 (adversarial review finding): a panic on the `up` (splice)
+    /// copy thread must propagate, not be folded into "0 bytes forwarded" by
+    /// `.unwrap_or(0)` — that would let a splice-worker panic produce
+    /// apparently-complete evidence, exactly what §7 forbids. Drives
+    /// `splice_buffered` directly (no accept loop needed) with a client whose
+    /// read always panics; the up thread reads that client, so the panic must
+    /// resurface on this (the calling/owning) thread.
+    #[test]
+    #[should_panic(expected = "injected read panic (test)")]
+    fn splice_buffered_propagates_a_panic_on_the_up_thread_read() {
+        struct PanicOnRead;
+        impl Read for PanicOnRead {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                panic!("injected read panic (test)");
+            }
+        }
+        impl Write for PanicOnRead {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Conn for PanicOnRead {
+            fn dup(&self) -> io::Result<Box<dyn Conn>> {
+                Ok(Box::new(PanicOnRead))
+            }
+            fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_timeouts(&self, _dur: Duration) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let client_reader = BufReader::new(Box::new(PanicOnRead) as Box<dyn Conn>);
+        let client: Box<dyn Conn> = Box::new(PanicOnRead);
+        let origin: Box<dyn Conn> = Box::new(ScriptedConn::default());
+        let _ = splice_buffered(client_reader, client, origin);
+    }
+
+    /// #372 §3/acceptance ("hostile oversized evidence deserialization"): too
+    /// many refused-host entries, or one oversized entry, must be rejected
+    /// during deserialization rather than accepted and silently truncated.
+    #[test]
+    fn hostile_evidence_deserialization_rejects_too_many_and_oversized_hosts() {
+        let base = serde_json::json!({
+            "omitted_refused_attempts": 0,
+            "accepted": 0,
+            "completed": 0,
+            "capacity_rejects": 0,
+            "shutdown_aborts": 0,
+            "worker_spawn_failures": 0,
+            "worker_panics": 0,
+            "worker_cap": 1,
+            "high_water_workers": 0,
+        });
+
+        let mut too_many = base.clone();
+        let hosts: Vec<String> = (0..(MAX_REFUSED_HOSTS + 1))
+            .map(|i| format!("h{i}.test"))
+            .collect();
+        too_many["refused_hosts"] = serde_json::json!(hosts);
+        assert!(
+            serde_json::from_value::<ProxyFinalEvidence>(too_many).is_err(),
+            "more than {MAX_REFUSED_HOSTS} refused hosts must be rejected"
+        );
+
+        let mut oversized = base;
+        oversized["refused_hosts"] = serde_json::json!(["x".repeat(MAX_REFUSED_HOST_BYTES + 1)]);
+        assert!(
+            serde_json::from_value::<ProxyFinalEvidence>(oversized).is_err(),
+            "a host over {MAX_REFUSED_HOST_BYTES} bytes must be rejected"
+        );
+    }
+
+    #[test]
+    fn evidence_round_trips_within_bounds() {
+        let e = ProxyFinalEvidence {
+            refused_hosts: vec!["a.test".to_string(), "b.test".to_string()],
+            omitted_refused_attempts: 3,
+            accepted: 10,
+            completed: 10,
+            capacity_rejects: 1,
+            shutdown_aborts: 2,
+            worker_spawn_failures: 0,
+            worker_panics: 0,
+            worker_cap: 64,
+            high_water_workers: 5,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: ProxyFinalEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
     }
 
     /// A one-shot HTTP origin on loopback that replies 200 with a marker body —
