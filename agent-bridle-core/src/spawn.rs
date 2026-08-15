@@ -36,8 +36,9 @@ use std::time::Duration;
 
 use crate::{
     best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AdmittedFence,
-    AxisEnforcement, BackendProjection, Caveats, ConfinementMechanism, EnforcementFloor,
-    RuntimeClosure, SandboxKind, SandboxPolicy, ToolContext, ToolError, ToolResult,
+    AdmittedFenceId, AxisEnforcement, BackendProjection, Caveats, ConfinementMechanism,
+    EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy, ToolContext, ToolError,
+    ToolResult,
 };
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
@@ -59,6 +60,37 @@ pub struct ConfinedChild {
     pub child: Child,
     /// The OS-level sandbox actually applied to the child.
     pub sandbox_kind: SandboxKind,
+    /// The content-addressed identity of the fence this spawn was **admitted**
+    /// under and that `verify_applied` confirmed at the admit→apply handoff.
+    ///
+    /// Carried out of the funnel rather than recomputed by a caller: an
+    /// execution layer that wants to put fence identity in its evidence must
+    /// report the object this spawn actually ran under, never one it derived
+    /// for itself afterwards (#370 "preserve `AdmittedFenceId`").
+    pub fence_id: AdmittedFenceId,
+}
+
+/// A confined child together with **every** fence whose lifetime brackets it.
+///
+/// [`ConfinedChild`] hands back the process and the identity it was admitted
+/// under, but a child under a proxied-net grant is also fenced by a live
+/// loopback egress proxy whose own finalization produces the authoritative
+/// egress evidence (#372/#374). A managed execution owner must hold that proxy
+/// for exactly as long as the child and join it to quiescence before it may
+/// call any result final — so the funnel hands the proxy out here rather than
+/// dropping it on a detached teardown thread.
+#[derive(Debug)]
+pub struct ManagedSpawn {
+    /// The spawned process.
+    pub child: Child,
+    /// The OS-level sandbox actually applied to the child.
+    pub sandbox_kind: SandboxKind,
+    /// The identity of the admitted, verified-applied fence.
+    pub fence_id: AdmittedFenceId,
+    /// The live egress proxy fencing this child's network, when the grant
+    /// engaged one. The receiver owns it and **must** finalize it with
+    /// [`crate::ProxyHandle::shutdown_and_join`] before publishing a terminal.
+    pub proxy: Option<crate::net_proxy::ProxyHandle>,
 }
 
 /// A fixed internal worker together with its take-once parent control channel.
@@ -692,6 +724,57 @@ impl ConfinedCommand {
         Ok(ConfinedChild {
             child: spawned?,
             sandbox_kind: reported_kind,
+            // The identity of the object admission produced and `verify_applied`
+            // confirmed above — copied out, never recomputed downstream.
+            fence_id: admitted.fence_id().clone(),
+        })
+    }
+
+    /// Admission-check, confine, spawn, **and hand back every fence that
+    /// brackets the child** — the entry point a managed execution owner uses.
+    ///
+    /// Identical confinement to [`Self::spawn`]: same exec admission, same
+    /// `AdmittedFence::admit`, same `verify_applied`, same env scrub. It differs
+    /// only in what it *returns*: the proxy handle stays owned by the caller (so
+    /// the caller can join it to quiescence and put frozen egress evidence in a
+    /// terminal record) instead of being torn down on a detached thread.
+    ///
+    /// This is the same egress-proxy decision `spawn_tokio` makes — one shared
+    /// `egress_proxy_plan` call — so a managed execution and an async MCP child
+    /// cannot disagree about when a fence engages.
+    pub fn spawn_managed(mut self, cx: &ToolContext) -> ToolResult<ManagedSpawn> {
+        let mut proxy = None;
+        let mut effective = cx.caveats().clone();
+        if let Some((hosts, fenced)) = crate::egress_proxy_plan(&effective, &self.sandbox_policy) {
+            // Fail-closed: the grant calls for a fence + proxy; a proxy that
+            // cannot bind must refuse the spawn, never run unfenced.
+            let handle = crate::net_proxy::start_for_hosts(hosts).map_err(|e| {
+                ToolError::Exec(std::io::Error::other(format!(
+                    "refusing to spawn {:?}: the egress proxy could not bind loopback ({e})",
+                    self.program
+                )))
+            })?;
+            for (k, v) in handle.proxy_env() {
+                self = self.env(k, v);
+            }
+            proxy = Some(handle);
+            effective = fenced;
+        }
+
+        // A refusal here must not leave the proxy running: `proxy` drops on the
+        // error path, and `ProxyHandle::Drop` force-closes and blocks until its
+        // workers are done (#372), so a denied spawn leaks no listener.
+        let ConfinedChild {
+            child,
+            sandbox_kind,
+            fence_id,
+        } = self.spawn_with_effective(cx, effective)?;
+
+        Ok(ManagedSpawn {
+            child,
+            sandbox_kind,
+            fence_id,
+            proxy,
         })
     }
 }
@@ -1083,6 +1166,7 @@ mod tokio_spawn {
             let ConfinedChild {
                 mut child,
                 sandbox_kind,
+                fence_id: _,
             } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
