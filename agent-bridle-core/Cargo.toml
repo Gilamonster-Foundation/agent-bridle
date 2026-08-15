@@ -133,3 +133,11 @@ seccompiler = { version = "0.5", optional = true }
 # filter — no `unsafe` calls, so `unsafe_code = forbid` still holds. Gated with
 # seccompiler under `linux-landlock`.
 libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Test-only: proves the #372 async-consumer contract (`net_proxy` tests/
+# net_proxy_async_finalize.rs) — an async caller must finalize the blocking
+# proxy off the Tokio reactor. Dev-only, so a non-async embedder's build graph
+# stays tokio-free unless `spawn-tokio` is also enabled (core's production code
+# remains std-only regardless).
+tokio = { workspace = true }
