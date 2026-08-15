@@ -3,7 +3,7 @@
 #
 # PIPELINE PARITY: this hook mirrors .github/workflows/ci.yml AND
 # .github/workflows/security-audit.yml, via the `check-security` / `check` /
-# `check-windows` / `publish-check` / `py-test` recipes in justfile. When editing the
+# `check-windows` / `check-windows-cross` / `publish-check` / `py-test` recipes in justfile. When editing the
 # security/lint/format/test/publish/python steps here, verify it still matches the CI
 # workflows and the justfile (HOOK PARITY rule). That includes the REQUIRE_*
 # environment guards, not just the commands: a flag armed in the pipeline and not
@@ -52,6 +52,13 @@ just check
 
 echo "[pre-push] running 'just check-windows' (AppContainer backend + kernel proofs; skips off Windows)"
 just check-windows
+
+# #367: the step above does real work only ON Windows, so a Linux-only gate is
+# blind to Windows-only COMPILE errors — and CI builds Windows with
+# `-D warnings`. #366 passed this whole gate and failed Windows CI on an
+# orphaned import. Seconds when the target is installed; skips loudly when not.
+echo "[pre-push] running 'just check-windows-cross' (Windows cross-compile; skips if the target is absent)"
+just check-windows-cross
 
 echo "[pre-push] running coverage gate (skips gracefully if cargo-llvm-cov absent)"
 just cov-ci
