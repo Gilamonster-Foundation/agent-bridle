@@ -169,10 +169,39 @@ pub struct StdResolver;
 
 impl Resolver for StdResolver {
     fn resolve(&self, host: &str, port: u16) -> io::Result<SocketAddr> {
-        (host, port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for host"))
+        // `to_socket_addrs` (getaddrinfo) has no std timeout of its own. A
+        // black-holed/unresponsive resolver would otherwise hang this call —
+        // and therefore the connection worker calling it — forever, which
+        // `ProxyHandle::shutdown_and_join` can never join past (#372 §2: every
+        // connection/splice worker must be joined for Quiescent). Run it on its
+        // own thread and bound the wait to CONN_TIMEOUT, the same honest
+        // worst-case bound every other blocking step in this module already
+        // uses; on timeout the resolution thread is abandoned (it holds no
+        // proxy-tracked resources) and the dial fails closed.
+        let host = host.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::Builder::new()
+            .name("agent-bridle-egress-resolve".to_string())
+            .spawn(move || {
+                let _ = tx.send(
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(|mut it| it.next()),
+                );
+            })
+            .map_err(|e| io::Error::other(format!("failed to spawn resolver thread: {e}")))?;
+        match rx.recv_timeout(CONN_TIMEOUT) {
+            Ok(Ok(Some(addr))) => Ok(addr),
+            Ok(Ok(None)) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no address for host",
+            )),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DNS resolution timed out",
+            )),
+        }
     }
 }
 
@@ -769,6 +798,19 @@ impl ProxyHandle {
     /// after `shutdown_and_join` already did the real work) finds nothing left
     /// to do and returns the same frozen snapshot cheaply.
     fn teardown(&mut self) -> Result<ProxyFinalEvidence, ProxyFinalizeError> {
+        // Idempotent fast path: `Drop` always runs `teardown` again after
+        // `shutdown_and_join` already did the real work (see the module-level
+        // lifecycle note) — by then `accept`/`workers` are already empty, so
+        // this would just re-lock and re-scan for nothing. The returned value
+        // is discarded by `Drop` either way; skip straight to a cheap snapshot.
+        if self.shared.lifecycle.load(Ordering::SeqCst) == LIFECYCLE_QUIESCENT {
+            let ev = lock(&self.shared.evidence);
+            return Ok(ev.snapshot(
+                self.shared.cap,
+                self.shared.high_water.load(Ordering::SeqCst),
+            ));
+        }
+
         // Linearize: stop admitting new connections. Idempotent — a failed CAS
         // just means shutdown was already signaled (or is already Quiescent).
         let _ = self.shared.lifecycle.compare_exchange(
@@ -940,6 +982,14 @@ fn start_internal(
                     }
                     let Ok(client) = stream else { continue };
                     let client: Box<dyn Conn> = Box::new(client);
+                    // Bound every write this accept loop itself might make
+                    // (capacity/spawn-failure 503s below) to CONN_TIMEOUT — a
+                    // hostile client that never reads could otherwise block
+                    // this single accept thread's write forever, wedging
+                    // admission for every other connection and making
+                    // `shutdown_and_join`'s accept-thread join hang too.
+                    // `handle_conn` also sets this on its own dup; harmless.
+                    let _ = client.set_timeouts(CONN_TIMEOUT);
 
                     // Bound #1: reap anything already finished before deciding
                     // whether there is room for one more active worker.
@@ -1019,7 +1069,14 @@ fn start_internal(
                             lock(&shared.evidence).accepted += 1;
                         }
                         Err(_) => {
+                            // `client` was moved into the failed spawn attempt's
+                            // closure and is gone with it; `closer` (not yet
+                            // registered anywhere) still holds a live dup, so the
+                            // client gets the same 503 the capacity/injected
+                            // paths give it rather than a bare reset.
                             lock(&shared.evidence).worker_spawn_failures += 1;
+                            let guard = lock(&closer.client);
+                            let _ = respond(guard.as_ref(), 503, "Service Unavailable");
                         }
                     }
                 }
@@ -1119,12 +1176,16 @@ fn handle_conn(
             if let Ok(dup) = origin.dup() {
                 closer.set_origin(dup);
             }
+            // Fire BEFORE the client-visible write (matching every other
+            // branch), not after — a write that fails (`?`, below) would
+            // otherwise return early and skip it, and the seam contract is
+            // "decision recorded", not "response delivered".
+            hooks.fire_decided();
             // A CONNECT success is a *bare* status line — no body, no
             // `Content-Length` — after which the socket is an opaque tunnel. (Do
             // NOT use `respond`, which appends a body that would corrupt it.)
             let mut client = client;
             client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-            hooks.fire_decided();
             // Forward via `splice_buffered` (not a raw `tunnel`) so any bytes the
             // client already pipelined past the CONNECT header block — buffered in
             // `reader` — reach the origin (a TLS ClientHello sent with the CONNECT;
@@ -1326,7 +1387,16 @@ fn splice_buffered(
     // test, since the audit fires only once `up` joins). `Both` gives `up`'s read
     // on the shared socket an immediate EOF.
     let _ = c_write.shutdown(Shutdown::Both);
-    let up = up.join().unwrap_or(0);
+    // #372 §7: a panic on the `up` copy thread must not be silently folded into
+    // "0 bytes forwarded" — that would let a splice-worker panic produce
+    // apparently-complete evidence. Resume it on THIS thread (the owning
+    // connection worker), so it propagates to the same `JoinHandle<ConnOutcome>`
+    // `tally_join` already inspects, and is counted in `worker_panics` exactly
+    // like any other connection-worker panic — no separate accounting needed.
+    let up = match up.join() {
+        Ok(n) => n,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
     Ok((up, down))
 }
 
@@ -2390,6 +2460,48 @@ mod tests {
             }
             other => panic!("expected Incomplete due to the injected worker panic: {other:?}"),
         }
+    }
+
+    /// #372 §7 (adversarial review finding): a panic on the `up` (splice)
+    /// copy thread must propagate, not be folded into "0 bytes forwarded" by
+    /// `.unwrap_or(0)` — that would let a splice-worker panic produce
+    /// apparently-complete evidence, exactly what §7 forbids. Drives
+    /// `splice_buffered` directly (no accept loop needed) with a client whose
+    /// read always panics; the up thread reads that client, so the panic must
+    /// resurface on this (the calling/owning) thread.
+    #[test]
+    #[should_panic(expected = "injected read panic (test)")]
+    fn splice_buffered_propagates_a_panic_on_the_up_thread_read() {
+        struct PanicOnRead;
+        impl Read for PanicOnRead {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                panic!("injected read panic (test)");
+            }
+        }
+        impl Write for PanicOnRead {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Conn for PanicOnRead {
+            fn dup(&self) -> io::Result<Box<dyn Conn>> {
+                Ok(Box::new(PanicOnRead))
+            }
+            fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_timeouts(&self, _dur: Duration) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let client_reader = BufReader::new(Box::new(PanicOnRead) as Box<dyn Conn>);
+        let client: Box<dyn Conn> = Box::new(PanicOnRead);
+        let origin: Box<dyn Conn> = Box::new(ScriptedConn::default());
+        let _ = splice_buffered(client_reader, client, origin);
     }
 
     /// #372 §3/acceptance ("hostile oversized evidence deserialization"): too
