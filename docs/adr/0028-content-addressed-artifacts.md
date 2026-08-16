@@ -27,10 +27,18 @@
   template: no new authority carrier; `Unknown ⇒ refuse`; native evidence
   before merge), and P5 OB-10 (seal a `file` by identity, never by mutable
   handle). Identity contract: the `content-addressable` crate is the *single*
-  home of content identity for the whole line; codec/text/algorithm policy for
-  raw artifacts is decided there
-  ([content-addressable#84](https://github.com/hartsock/content-addressable/issues/84)),
-  not here.
+  home of content identity for the whole line. Codec/text/algorithm policy is
+  decided there —
+  [content-addressable#84](https://github.com/hartsock/content-addressable/issues/84),
+  **resolved 2026-08-16**: two typed mintable profiles, `ContentId` =
+  CIDv1(dag-cbor, BLAKE3-256) for canonical structured values and
+  `RawContentId` = CIDv1(raw, BLAKE3-256) for opaque byte artifacts; a
+  `VerifiedCid { Content | Raw | Foreign(Cid) }` for identities the crate
+  verifies but does not mint; canonical text output only, legacy forms behind
+  explicit edge adapters; and the law **"CID profile is semantic, not
+  cosmetic"** — codec + multihash + digest jointly constitute identity, and
+  `RawContentId(X)` never equals `ContentId(X)` on digest bytes alone. This ADR
+  consumes that decision; it mints nothing of its own.
 - Scope: how content identity enters *fs authority* and *evidence*. It does
   **not** add a `Caveats` axis, does not replace path authority for working
   trees, and does not decide the store's on-disk format.
@@ -76,7 +84,12 @@ what, and with what residuals?
 No new `Caveats` axis. A CID enters authority only as a member of an existing
 scope set (D2, D4) and enters evidence as a link in a signed record (D5). Any
 notion of "the model holds a CID, therefore it may read it" is rejected
-(finding 3).
+(finding 3). Artifact identity in authority is the typed
+`RawContentId` (an `ArtifactRef<RawContentId>` in grants and evidence);
+authorization compares **typed, normalized CID bytes**, never textual forms
+and never bare digests — `RawContentId(X)` and `ContentId(X)` are different
+identities even when the digest bytes coincide (#84 law 6). This closes the
+"same digest, different interpretation" family at the OCAP boundary.
 
 ### D2 — Read authority over immutable artifacts is `fs_read` on a harness-owned store
 
@@ -86,7 +99,9 @@ notion of "the model holds a CID, therefore it may read it" is rejected
   ingest (content == name), and never rewritten (grow-only; the
   `content-addressable` `NodeStore` laws PO-STORE-1..3).
 - A grant to read an artifact is the ordinary token
-  `fs_read: Only({"<store>/<cid>"})` (or the materialized tree root). It is
+  `fs_read: Only({"<store>/<cid>"})` where `<cid>` is the `RawContentId`
+  canonical text (base32-lower `b…`) — one spelling, derived from the typed id,
+  never a legacy hex form — or the materialized tree root for a tree CID. It is
   enforced by the **existing fs fence** — Landlock rules on single files or on
   the tree root — at its existing `Kernel` grade (finding 4). Because the child
   holds no `fs_write` on the store, integrity of what it reads is guaranteed
@@ -101,9 +116,10 @@ A tree CID is the root of the `content-addressable` chunked-file/directory DAG
 (`DirNode`/`FileNode`/`ChunkLeaf`, content-addressable#53). Materialization
 writes the closure under `<store>/<cid>/`; the granted read set *is* the leaf
 closure. Bridle defines no tree object of its own (no NAR, no bespoke tree
-encoding); artifact identity — including whether raw byte leaves carry a raw
-codec or stay dag-cbor-wrapped — is decided in content-addressable#84 and
-consumed here.
+encoding). Per #84, byte artifacts and leaves are `RawContentId`s (identity
+of the bytes themselves, not of a wrapper), while `DirNode`/`FileNode` and
+every Bridle evidence record are `ContentId`s (canonical dag-cbor values) whose
+links to artifacts are typed raw links.
 
 ### D4 — Writes are `append(store) + bind(ref → CID)`; `fs_write` never targets a CID
 
@@ -176,8 +192,10 @@ change, no mesh bump.
 **Negative / cost.** A harness-owned store and ref namespace to build and
 back up; ingest cost (hash once, at ingest — never per open); every edit of a
 live artifact is a new CID (working trees deliberately stay path-shaped); one
-more place (`refs/`) where a name is a location; identity policy for raw
-artifacts is blocked on content-addressable#84.
+more place (`refs/`) where a name is a location; and a hard sequencing rule:
+**#84's `RawContentId` + profile-inequality law ship before any grant carries
+an artifact id** — changing what an identity means after grants reference it
+is the expensive direction.
 
 ## Alternatives considered
 
@@ -187,6 +205,9 @@ artifacts is blocked on content-addressable#84.
 - **CIDs as bearer capabilities (Tahoe read-caps).** Rejected: a content hash
   is guessable for low-entropy content and public for shared content; it is a
   name (finding 3).
+- **Bare 32-byte digests or textual ids in grants/evidence.** Rejected: a bare
+  digest is codec-ambiguous (the `from_blake3_content_digest` footgun #84 names)
+  and text has four dialects; identity is the typed CID (D1).
 - **A Bridle-local artifact digest / tree format** (e.g. nessie `Digest`/`Tree`,
   kyln raw-codec ids). Rejected: the line standardizes on the
   `content-addressable` crate; foreign conventions are subsumed there (#84),
@@ -200,7 +221,8 @@ artifacts is blocked on content-addressable#84.
 
 - **Tier 1 (property):** granted read set for a tree CID == DAG leaf closure;
   `Scope::meet` over CID tokens is exact (already covered upstream; add a CID
-  vector).
+  vector); `ArtifactRef` equality is typed-bytes equality and
+  `Raw(X) != Content(X)` (vector shared with content-addressable#84).
 - **Tier 2 (native, hostile child):** under Landlock, a child with
   `fs_read = {<store>/<cid>}` reads that object, is denied a sibling object,
   is denied `bind`/`link`/`write` in the store; a same-name replacement of a
@@ -211,6 +233,9 @@ artifacts is blocked on content-addressable#84.
   updated from *partial* to name the two hops this closes.
 
 ## Notes
+
+- content-addressable#84 resolution (2026-08-16):
+  https://github.com/hartsock/content-addressable/issues/84#issuecomment-5310244273
 
 - Consistent with the "a CID identifies, never authorizes" law stated on the
   unmerged `adr/0025` branch, but this ADR does not depend on that document;
