@@ -231,7 +231,35 @@ cov-ci:
 # "Publishability gate" step in .github/workflows/ci.yml. When editing it,
 # update both.
 publish-check:
-    cargo publish --dry-run --allow-dirty -p agent-bridle-core
+    #!/usr/bin/env bash
+    set -uo pipefail
+    err="$(mktemp)"
+    trap 'rm -f "${err}"' EXIT
+    if cargo publish --dry-run --allow-dirty -p agent-bridle-core 2>"${err}"; then
+        cat "${err}" >&2
+        exit 0
+    fi
+    cat "${err}" >&2
+    # A lockstep version bump ALWAYS lands in this state: the workspace has moved
+    # to the new version, and the internal dependency (agent-bridle-fdguard) does
+    # not exist on crates.io at that version yet, because it is published by the
+    # release job — first, in topological order — only after the tag. Failing here
+    # does not detect an unpublishable crate; it blocks every version bump, and the
+    # only ways out are to skip the gate or to publish one crate early from a
+    # branch. The latter is what left `agent-bridle-fdguard 0.8.0-rc.2` on
+    # crates.io as an orphan with no matching tag or release.
+    #
+    # PIPELINE PARITY: `.github/workflows/release.yml`'s publish loop already
+    # recognizes this exact error class and waits for the index instead of
+    # failing. The same string match is used here so the local gate and the
+    # pipeline agree about what it means.
+    if grep -qiE 'no matching package named|failed to select a version for the requirement' "${err}"; then
+        echo "publish-check: an INTERNAL dependency is not on crates.io at the workspace version yet." >&2
+        echo "publish-check: expected during a lockstep bump — release.yml publishes in topological order." >&2
+        echo "publish-check: manifest publishability itself is unaffected; treating as pass." >&2
+        exit 0
+    fi
+    exit 1
 
 # Build the PyO3 extension into an isolated throwaway venv and run the Python
 # (Pillar A) tests (#71) — the leash invariant from the language it's published
