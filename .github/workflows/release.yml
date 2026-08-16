@@ -322,8 +322,27 @@ jobs:
             echo "${crate}: LICENSE + NOTICE present"
           done
 
+      # PIPELINE PARITY: same tolerance as the `publish-check` recipe in justfile
+      # and the publishability gate in ci.yml (#377), and as the publish loop
+      # below. On a lockstep version bump `agent-bridle-core` requires
+      # `agent-bridle-fdguard` at a version that does not exist on crates.io yet
+      # — fdguard is published by the very next step, first in topological
+      # order — so resolution failure here says nothing about publishability and
+      # must not block the release. Every other failure still fails.
       - name: Verify the independent root package without publish credentials
-        run: cargo publish --dry-run --locked -p agent-bridle-core
+        run: |
+          set -uo pipefail
+          err="$(mktemp)"
+          if cargo publish --dry-run --locked -p agent-bridle-core 2>"${err}"; then
+            cat "${err}" >&2
+            exit 0
+          fi
+          cat "${err}" >&2
+          if grep -qiE 'no matching package named|failed to select a version for the requirement' "${err}"; then
+            echo "::notice::an internal dependency is not on crates.io at the workspace version yet — expected during a lockstep bump; the publish step below resolves it in topological order"
+            exit 0
+          fi
+          exit 1
 
       - name: Confirm CARGO_REGISTRY_TOKEN is mounted
         env:
