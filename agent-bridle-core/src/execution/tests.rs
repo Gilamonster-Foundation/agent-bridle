@@ -9,6 +9,7 @@
 //! the test says so and skips explicitly rather than asserting something
 //! weaker and calling it a pass.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
@@ -171,6 +172,63 @@ fn the_platform_reports_the_tree_containment_it_actually_provides() {
     );
     #[cfg(all(not(unix), not(windows)))]
     assert_eq!(containment, LocalTreeContainment::DirectChildOnly);
+}
+
+/// A reaper that dies without publishing a result must not leave `wait()`
+/// blocked forever.
+///
+/// `wait()` is the one call with no timeout in its contract, so "the owner
+/// died" has to become a terminal rather than an indefinite block. The
+/// guard publishes `Failed`; `publish` keeps the first terminal, so this
+/// can never mask a real result.
+#[test]
+fn an_owner_that_dies_without_a_result_still_produces_a_terminal() {
+    let control = Arc::new(super::local::LocalControl::for_test());
+    let (sink, handle) = execution_stream(
+        ExecutionId::next(),
+        ExecutionLimits::default(),
+        Arc::clone(&control) as Arc<_>,
+    );
+    sink.accepted().expect("accepted");
+
+    // Simulate the owner thread vanishing mid-flight.
+    {
+        let _guard = super::local::TerminalGuard::for_test(sink.clone(), control);
+    }
+
+    let terminal = handle.wait().expect("wait must not block forever");
+    assert!(
+        matches!(terminal, ExecutionTerminal::Failed { .. }),
+        "a vanished owner must surface as Failed, not as a hang: {terminal:?}"
+    );
+}
+
+/// The fallback terminal must never overwrite a real one.
+#[test]
+fn the_fallback_terminal_never_masks_a_real_result() {
+    let control = Arc::new(super::local::LocalControl::for_test());
+    let (sink, handle) = execution_stream(
+        ExecutionId::next(),
+        ExecutionLimits::default(),
+        Arc::clone(&control) as Arc<_>,
+    );
+    sink.accepted().expect("accepted");
+    let real = ExecutionTerminal::Denied {
+        denial: Denial {
+            kind: DenialKind::Exec,
+            target: "nope".to_string(),
+            reason: "outside grant".to_string(),
+        },
+    };
+    control.publish(&sink, real.clone()).expect("publish");
+    {
+        let _guard = super::local::TerminalGuard::for_test(sink.clone(), control);
+    }
+    assert_eq!(
+        handle.wait().expect("terminal"),
+        real,
+        "the guard's fallback must not replace a published result"
+    );
 }
 
 // ── real processes: POSIX only ──────────────────────────────────────────────
@@ -1037,4 +1095,46 @@ mod real_process {
     }
 
     // ── platform containment, stated rather than assumed ────────────────────────
+    // ── owner hardening: no hang, no leak, no wedge ─────────────────────────
+
+    /// A consumer that never reads, with a child that writes far more than the
+    /// queue holds, must still run to completion — the drainer keeps emptying
+    /// the pipe even when the sink refuses every chunk.
+    ///
+    /// This is the wedge the bounded queue exists to prevent: a drainer that
+    /// stopped reading on a sink fault would let the child block on a full pipe
+    /// buffer and never exit, turning a reporting problem into a hang.
+    #[test]
+    fn a_child_never_wedges_on_a_full_queue() {
+        let limits = ExecutionLimits::new(
+            1,
+            64,
+            64,
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        )
+        .expect("within ceilings");
+        let Some(request) =
+            shell_request("i=0; while [ $i -lt 256 ]; do printf '%01024d' $i; i=$((i+1)); done")
+        else {
+            eprintln!("skipped: no POSIX shell on this host");
+            return;
+        };
+        let started = Instant::now();
+        let handle = backend()
+            .start(&open_ctx(), request.limits(limits))
+            .expect("start");
+        let terminal = handle.wait().expect("the child must not wedge");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the child wedged on a full queue: {:?}",
+            started.elapsed()
+        );
+        let evidence = terminal.exit_evidence().expect("exited");
+        assert_eq!(evidence.code, Some(0));
+        assert!(
+            evidence.dropped.stdout_bytes > 0,
+            "the tiny queue must have forced drops"
+        );
+    }
 }
