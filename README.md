@@ -326,32 +326,16 @@ The fetch to `example.com` returns markdown; the cloud-metadata SSRF probe to
 `169.254.169.254` is **denied** by the host allowlist (and would be SSRF-blocked
 even under `net: "all"`).
 
-## Status
+## Documents
 
-This is **P0** plus the **MCP frontend** (DESIGN §4 frontend 2): the core leash,
-a confined carried Brush shell (with the argv + safe-subset alternative), and
-an `agent-bridle-mcp` stdio JSON-RPC server, with tests proving the leash
-*denies* out-of-scope exec, exhausted budgets, generation mismatch, and
-path-escape (`..` / symlink) attempts — including a through-MCP integration test
-that drives the real binary over stdio and proves an out-of-scope `tools/call`
-is denied across the protocol boundary.
-
-The **`net` enforcer** (`agent-bridle-tool-web`, `web` feature) is also landed:
-a confined `web_fetch` whose host allowlist, SSRF IP screen, per-redirect
-re-check, and DNS-rebinding IP pin are unit-tested in isolation and exercised
-end-to-end against a localhost mock server (a disallowed host, a private/loopback
-address, and a redirect to a disallowed host are all proven *denied*).
-
-Landlock `fs_write`/`fs_read` kernel enforcement is landed on Linux, along with
-direct-exec narrowing (still honestly reported `Interceptor` because of the
-loader trampoline) and deny-all TCP on ABI-v4 kernels. On macOS, Seatbelt
-kernel-confines both filesystem axes, restricted exec, and deny-all or
-loopback-only network scopes. On Windows, the wired AppContainer launcher
-confines filesystem paths, deny-all or loopback-only network scopes, and exec
-deny-all; non-empty exec allowlists remain `Interceptor`. General remote-host
-network allowlists retain their documented proxy/advisory posture. Stronger
-Linux exec identity, the Python sidecar/tools-dir pillar, browse,
-`web_search`, and scm tools remain later phases (see `docs/DESIGN.md` §12).
+| | |
+|---|---|
+| [`docs/DESIGN.md`](docs/DESIGN.md) | the design blueprint — thesis, invariants, crate layout, phase plan |
+| [`docs/status.md`](docs/status.md) | what has landed on each platform, and what remains |
+| [`AGENTS.md`](AGENTS.md) | operating rules for agents and contributors working in this repo |
+| [`SECURITY.md`](SECURITY.md) | security policy, vulnerability reporting, L3 host hardening |
+| [`docs/security/`](docs/security) | per-platform enforcement evidence and the OCAP deviation register |
+| [`docs/adr/`](docs/adr) | architecture decision records |
 
 ## License
 
