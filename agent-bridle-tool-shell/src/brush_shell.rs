@@ -96,6 +96,7 @@ pub struct BrushShellTool {
     /// and reported `timed_out:true` with exit 124.
     timeout: Duration,
     sandbox_policy: Arc<SandboxPolicy>,
+    named_host_roots: bool,
 }
 
 impl std::fmt::Debug for BrushShellTool {
@@ -120,6 +121,7 @@ impl BrushShellTool {
             output_observer: None,
             timeout: default_timeout(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
+            named_host_roots: false,
         }
     }
 
@@ -137,6 +139,21 @@ impl BrushShellTool {
     #[must_use]
     pub fn with_sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
         self.sandbox_policy = policy;
+        self
+    }
+
+    /// Enable exact, absolute, literal host roots in the trusted parent.
+    ///
+    /// A candidate still needs an exact effective exec grant and an admitted
+    /// inherited filesystem/network fence. Its descendants may choose their
+    /// executable identities within that fence; root exec admission reports
+    /// Interceptor strength. Ordinary and dynamic Brush commands keep their
+    /// existing execution mechanism. The sandbox policy must also supply its
+    /// explicit [`SandboxPolicy::named_root_protected_roots`] inventory; omission
+    /// refuses the new operation. This option defaults off.
+    #[must_use]
+    pub fn with_named_host_roots(mut self) -> Self {
+        self.named_host_roots = true;
         self
     }
 
@@ -224,6 +241,31 @@ impl Tool for BrushShellTool {
         } else {
             RESTRICTED_PATH.to_string()
         };
+
+        if let Some((root, argv)) = crate::named_host_root::select_named_host_root(
+            self.named_host_roots,
+            &cmd,
+            cx.caveats(),
+        )
+        .map_err(|error| ToolError::denied(format!("brush: {error}")))?
+        {
+            let mut request = agent_bridle_core::ExecutionRequest::new(root)
+                .args(argv)
+                .cwd(cwd);
+            let mut env = env;
+            env.entry("PATH".to_string()).or_insert(path_value);
+            request.env = env.into_iter().collect();
+            return crate::named_host_root_execution::invoke_named_host_root(
+                cx,
+                request,
+                Arc::clone(&self.sandbox_policy),
+                self.timeout,
+                self.max_output,
+                self.output_observer.clone(),
+                self.disclosure(),
+            )
+            .await;
+        }
 
         let max_output = self.max_output;
         let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
@@ -1083,3 +1125,5 @@ mod handshake_error_tests {
         assert!(reason.contains("stderr text"));
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

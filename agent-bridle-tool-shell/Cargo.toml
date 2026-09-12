@@ -23,6 +23,12 @@ harness = false
 required-features = ["brush"]
 
 [[test]]
+name = "named_host_root_real"
+path = "tests/named_host_root_real.rs"
+harness = false
+required-features = ["brush"]
+
+[[test]]
 name = "carried_coreutils"
 path = "tests/carried_coreutils.rs"
 harness = false

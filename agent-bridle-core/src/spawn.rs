@@ -36,9 +36,9 @@ use std::time::Duration;
 
 use crate::{
     best_available_sandbox, effective_sandbox_kind, unenforceable_axis, AdmittedFence,
-    AdmittedFenceId, AxisEnforcement, BackendProjection, Caveats, ConfinementMechanism,
-    EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy, ToolContext, ToolError,
-    ToolResult,
+    AdmittedFenceBody, AdmittedFenceId, AxisEnforcement, BackendProjection, Caveats,
+    ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy,
+    ToolContext, ToolError, ToolResult,
 };
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
@@ -68,6 +68,8 @@ pub struct ConfinedChild {
     /// report the object this spawn actually ran under, never one it derived
     /// for itself afterwards (#370 "preserve `AdmittedFenceId`").
     pub fence_id: AdmittedFenceId,
+    /// The inspectable body verified at the actual NamedRoot launch boundary.
+    pub admitted: Option<AdmittedFenceBody>,
 }
 
 /// A confined child together with **every** fence whose lifetime brackets it.
@@ -87,6 +89,8 @@ pub struct ManagedSpawn {
     pub sandbox_kind: SandboxKind,
     /// The identity of the admitted, verified-applied fence.
     pub fence_id: AdmittedFenceId,
+    /// Inspectable NamedRoot proof transported from the actual spawn.
+    pub admitted: Option<AdmittedFenceBody>,
     /// The live egress proxy fencing this child's network, when the grant
     /// engaged one. The receiver owns it and **must** finalize it with
     /// [`crate::ProxyHandle::shutdown_and_join`] before publishing a terminal.
@@ -538,11 +542,15 @@ impl ConfinedCommand {
         // (1) Admission: model-selected programs must be in the exec grant.
         // A trusted worker transition is not model-selected; its fixed program
         // is added only to the mechanism policy below.
-        if authority == SpawnAuthority::ModelSelected {
+        if authority != SpawnAuthority::TrustedWorker {
             cx.check_exec(&self.program)?;
         }
 
-        let sandbox = best_available_sandbox(&self.sandbox_policy);
+        let sandbox = if authority == SpawnAuthority::NamedRoot {
+            crate::sandbox::named_root_sandbox(&self.sandbox_policy)?
+        } else {
+            best_available_sandbox(&self.sandbox_policy)
+        };
         let kind = sandbox.kind();
         // The kind that actually GOVERNS this spawn: the backend's kind only when
         // it will actually confine something (fs or net restricted), else `None`.
@@ -560,7 +568,15 @@ impl ConfinedCommand {
         // installs the seccomp `DenyDirect` leg at apply time. So the net witness
         // (Landlock `net:none` = Kernel only under `DenyDirect`) cannot diverge
         // from the mechanism actually applied to the spawn.
-        let mechanism = ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network);
+        let mechanism = match sandbox.exec_boundary() {
+            crate::ExecBoundary::ProcessTree => {
+                ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network)
+            }
+            crate::ExecBoundary::NamedRoot => ConfinementMechanism::for_named_root(
+                reported_kind,
+                self.sandbox_policy.child_network,
+            ),
+        };
 
         // (2) The declared runtime closure — the ONLY door for authority beyond
         // the delegated grant. A fixed worker executable is an internal
@@ -579,55 +595,69 @@ impl ConfinedCommand {
         // class), and checks the per-axis strength floor (L4). What it returns
         // is the object the sandbox applies below; nothing is re-derived after
         // admission (L2 non-equivocation).
-        let admitted = AdmittedFence::admit(
-            &effective,
-            closure,
-            mechanism,
-            cx.strength_floor(),
-            |mechanism_caveats| {
-                // Mechanism selection for the projection: the authority a spawn is
-                // bounded by is EITHER the OS sandbox OR, for a trusted worker, the
-                // in-process brush-ocap engine (a VERIFIED interceptor for exec/fs).
-                // Brush cannot mediate sockets or ambient IPC used by an external
-                // descendant, so the net axis must always come from the OS backend's
-                // conservative projection. This exemption is keyed on the TRUSTED-WORKER
-                // route, NOT on `SandboxKind::None`: an arbitrary Noop spawn is
-                // bounded by NOTHING and must fall through to the backend
-                // projection below (Noop ⇒ Unbounded ⇒ refuse a restricted axis).
-                if authority == SpawnAuthority::TrustedWorker {
-                    // brush-ocap bounds the child to the DELEGATED grant itself —
-                    // NOT `mechanism_caveats`, which folds the trusted-worker binary
-                    // into the exec axis for the OS layer only. Projecting the
-                    // delegated grant keeps that OS-layer fold from reading as a
-                    // widening (resolved.exec ⊋ delegated.exec) under this mechanism.
-                    // Preserve the backend's net result: an Unknown/Unbounded native
-                    // network boundary cannot borrow Brush's fs/exec interception.
-                    let mut resolved = crate::ResolvedAuthority::from_delegated(&effective);
-                    resolved.net = sandbox.resolved_authority(mechanism_caveats).net;
-                    return BackendProjection {
-                        resolved,
-                        runtime_closure: crate::empty_closure(),
-                    };
-                }
+        let admitted = if authority == SpawnAuthority::NamedRoot {
+            AdmittedFence::admit_named_root(
+                &effective,
+                &self.program,
+                &self.sandbox_policy.resolve_named_root_protected_roots()?,
+                mechanism,
+                cx.strength_floor(),
+                |caveats| BackendProjection {
+                    resolved: sandbox.resolved_authority(caveats),
+                    runtime_closure: sandbox.runtime_closure(caveats),
+                },
+            )
+        } else {
+            AdmittedFence::admit(
+                &effective,
+                closure,
+                mechanism,
+                cx.strength_floor(),
+                |mechanism_caveats| {
+                    // Mechanism selection for the projection: the authority a spawn is
+                    // bounded by is EITHER the OS sandbox OR, for a trusted worker, the
+                    // in-process brush-ocap engine (a VERIFIED interceptor for exec/fs).
+                    // Brush cannot mediate sockets or ambient IPC used by an external
+                    // descendant, so the net axis must always come from the OS backend's
+                    // conservative projection. This exemption is keyed on the TRUSTED-WORKER
+                    // route, NOT on `SandboxKind::None`: an arbitrary Noop spawn is
+                    // bounded by NOTHING and must fall through to the backend
+                    // projection below (Noop ⇒ Unbounded ⇒ refuse a restricted axis).
+                    if authority == SpawnAuthority::TrustedWorker {
+                        // brush-ocap bounds the child to the DELEGATED grant itself —
+                        // NOT `mechanism_caveats`, which folds the trusted-worker binary
+                        // into the exec axis for the OS layer only. Projecting the
+                        // delegated grant keeps that OS-layer fold from reading as a
+                        // widening (resolved.exec ⊋ delegated.exec) under this mechanism.
+                        // Preserve the backend's net result: an Unknown/Unbounded native
+                        // network boundary cannot borrow Brush's fs/exec interception.
+                        let mut resolved = crate::ResolvedAuthority::from_delegated(&effective);
+                        resolved.net = sandbox.resolved_authority(mechanism_caveats).net;
+                        return BackendProjection {
+                            resolved,
+                            runtime_closure: crate::empty_closure(),
+                        };
+                    }
 
-                // The backend's CONSERVATIVE projection of what it will actually
-                // install for these caveats (ruleset grain; the shared root-set
-                // derivation cannot independently drift from `apply`) plus the
-                // harness-added substrate the resolution rests on. This is the #317
-                // fix — admission now sees authority the ruleset installs beyond the
-                // grant (Landlock's `base_read` loader/library trees; a symlinked
-                // grant root that resolves `Unknown`) instead of the caveats-grain
-                // blind spot. A backend that enforces nothing (Noop ⇒ all-Unbounded)
-                // refuses a restricted axis here; the net axis resolves `Unknown`
-                // for a restricted grant (E3 io_uring — not yet provable) and so
-                // fails closed until the io_uring egress floor lands (PR-1). No
-                // caveats-grain net override: `resolved` is the honest projection.
-                BackendProjection {
-                    resolved: sandbox.resolved_authority(mechanism_caveats),
-                    runtime_closure: sandbox.runtime_closure(mechanism_caveats),
-                }
-            },
-        )
+                    // The backend's CONSERVATIVE projection of what it will actually
+                    // install for these caveats (ruleset grain; the shared root-set
+                    // derivation cannot independently drift from `apply`) plus the
+                    // harness-added substrate the resolution rests on. This is the #317
+                    // fix — admission now sees authority the ruleset installs beyond the
+                    // grant (Landlock's `base_read` loader/library trees; a symlinked
+                    // grant root that resolves `Unknown`) instead of the caveats-grain
+                    // blind spot. A backend that enforces nothing (Noop ⇒ all-Unbounded)
+                    // refuses a restricted axis here; the net axis resolves `Unknown`
+                    // for a restricted grant (E3 io_uring — not yet provable) and so
+                    // fails closed until the io_uring egress floor lands (PR-1). No
+                    // caveats-grain net override: `resolved` is the honest projection.
+                    BackendProjection {
+                        resolved: sandbox.resolved_authority(mechanism_caveats),
+                        runtime_closure: sandbox.runtime_closure(mechanism_caveats),
+                    }
+                },
+            )
+        }
         .map_err(|e| match e {
             ToolError::Denied { reason } => {
                 ToolError::denied(format!("{reason} (program: {:?})", self.program))
@@ -640,7 +670,9 @@ impl ConfinedCommand {
         // content-address to the fence admission stamped. Same object today, so
         // this holds by construction; it is the cryptographic backstop that a
         // future re-derivation between admit and apply (the #317 bug) cannot pass.
-        admitted.verify_applied(&mechanism_effective)?;
+        if authority != SpawnAuthority::NamedRoot {
+            admitted.verify_applied(&mechanism_effective)?;
+        }
 
         // For a wrapper-based backend (Seatbelt/AppContainer) this is the argv
         // prefix that confines the child; empty for thread-confining backends
@@ -652,6 +684,7 @@ impl ConfinedCommand {
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
         //     child inherits the OS confinement — the per-thread, fork/exec-
         //     inherited Landlock domain or the selected process wrapper.
+        let apply_policy = Arc::clone(&self.sandbox_policy);
         let Self {
             program,
             args,
@@ -665,24 +698,16 @@ impl ConfinedCommand {
             sandbox_policy: _,
         } = self;
 
+        let apply_admitted = admitted.clone();
         let spawned = std::thread::spawn(move || -> ToolResult<Child> {
-            // Thread-confining backends (Landlock): apply the sandbox on this
-            // throwaway thread before the spawn so the child inherits the
-            // Landlock domain. `apply` is fail-closed: if the kernel did not
-            // actually enforce, it returns Err and we never spawn.
-            //
-            // Wrapper-based backends (Seatbelt, AppContainer): confinement is
-            // achieved by the `command_prefix` wrapper — no per-thread state is
-            // involved, and calling `apply` would be wrong (AppContainer fails
-            // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
-            // non-empty.
-            if prefix.is_empty() {
-                sandbox.apply(&mechanism_effective)?;
-            }
+            // Prepare the exact Command operand first. NamedRoot currently
+            // supports only Landlock (no wrapper), so the actual program operand
+            // is the root; unsupported wrappers refuse rather than guessing at
+            // a second target string. Verification consumes fresh backend state.
+            let (spawn_program, spawn_args) = wrap_argv(&prefix, &program, &args);
 
             // Wrap the child in the backend's command prefix when it confines via
             // a wrapper (Seatbelt, AppContainer); otherwise spawn the program directly.
-            let (spawn_program, spawn_args) = wrap_argv(&prefix, &program, &args);
             let mut cmd = Command::new(&spawn_program);
             cmd.args(&spawn_args);
             cmd.env_clear(); // no ambient environment crosses the boundary …
@@ -716,6 +741,36 @@ impl ConfinedCommand {
             // the spawn, #352); no-op elsewhere.
             #[cfg(unix)]
             agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
+
+            if authority == SpawnAuthority::NamedRoot {
+                if !prefix.is_empty() || sandbox.exec_boundary() != crate::ExecBoundary::NamedRoot {
+                    return Err(ToolError::denied("named-root actual launch requires its supported unwrapped native mechanism"));
+                }
+                apply_admitted.verify_named_root_applied(
+                    &mechanism_effective,
+                    cmd.get_program().to_str().ok_or_else(|| ToolError::denied("named-root launch operand is not UTF-8"))?,
+                    &apply_policy.resolve_named_root_protected_roots()?,
+                    mechanism,
+                    BackendProjection {
+                        resolved: sandbox.resolved_authority(&mechanism_effective),
+                        runtime_closure: sandbox.runtime_closure(&mechanism_effective),
+                    },
+                )?;
+            }
+            // Thread-confining backends (Landlock): apply the sandbox on this
+            // throwaway thread before the spawn so the child inherits the
+            // Landlock domain. `apply` is fail-closed: if the kernel did not
+            // actually enforce, it returns Err and we never spawn.
+            //
+            // Wrapper-based backends (Seatbelt, AppContainer): confinement is
+            // achieved by the `command_prefix` wrapper — no per-thread state is
+            // involved, and calling `apply` would be wrong (AppContainer fails
+            // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
+            // non-empty.
+            if prefix.is_empty() {
+                sandbox.apply(&mechanism_effective)?;
+            }
+
             cmd.spawn().map_err(ToolError::from)
         })
         .join()
@@ -727,6 +782,7 @@ impl ConfinedCommand {
             // The identity of the object admission produced and `verify_applied`
             // confirmed above — copied out, never recomputed downstream.
             fence_id: admitted.fence_id().clone(),
+            admitted: admitted.admitted_body().cloned(),
         })
     }
 
@@ -742,23 +798,42 @@ impl ConfinedCommand {
     /// This is the same egress-proxy decision `spawn_tokio` makes — one shared
     /// `egress_proxy_plan` call — so a managed execution and an async MCP child
     /// cannot disagree about when a fence engages.
-    pub fn spawn_managed(mut self, cx: &ToolContext) -> ToolResult<ManagedSpawn> {
+    pub fn spawn_managed(self, cx: &ToolContext) -> ToolResult<ManagedSpawn> {
+        self.spawn_managed_authorized(cx, SpawnAuthority::ModelSelected)
+    }
+
+    /// Exact named root admission with unchanged caveats and a confined tree.
+    pub(crate) fn spawn_named_root_managed(self, cx: &ToolContext) -> ToolResult<ManagedSpawn> {
+        self.spawn_managed_authorized(cx, SpawnAuthority::NamedRoot)
+    }
+
+    fn spawn_managed_authorized(
+        mut self,
+        cx: &ToolContext,
+        authority: SpawnAuthority,
+    ) -> ToolResult<ManagedSpawn> {
         let mut proxy = None;
         let mut effective = cx.caveats().clone();
-        if let Some((hosts, fenced)) = crate::egress_proxy_plan(&effective, &self.sandbox_policy) {
-            // Fail-closed: the grant calls for a fence + proxy; a proxy that
-            // cannot bind must refuse the spawn, never run unfenced.
-            let handle = crate::net_proxy::start_for_hosts(hosts).map_err(|e| {
-                ToolError::Exec(std::io::Error::other(format!(
-                    "refusing to spawn {:?}: the egress proxy could not bind loopback ({e})",
-                    self.program
-                )))
-            })?;
-            for (k, v) in handle.proxy_env() {
-                self = self.env(k, v);
+        // NamedRoot preserves the effective caveats exactly. Unsupported native
+        // network shapes refuse admission; no loopback rewrite changes its body.
+        if authority != SpawnAuthority::NamedRoot {
+            if let Some((hosts, fenced)) =
+                crate::egress_proxy_plan(&effective, &self.sandbox_policy)
+            {
+                // Fail-closed: the grant calls for a fence + proxy; a proxy that
+                // cannot bind must refuse the spawn, never run unfenced.
+                let handle = crate::net_proxy::start_for_hosts(hosts).map_err(|e| {
+                    ToolError::Exec(std::io::Error::other(format!(
+                        "refusing to spawn {:?}: the egress proxy could not bind loopback ({e})",
+                        self.program
+                    )))
+                })?;
+                for (k, v) in handle.proxy_env() {
+                    self = self.env(k, v);
+                }
+                proxy = Some(handle);
+                effective = fenced;
             }
-            proxy = Some(handle);
-            effective = fenced;
         }
 
         // A refusal here must not leave the proxy running: `proxy` drops on the
@@ -768,12 +843,14 @@ impl ConfinedCommand {
             child,
             sandbox_kind,
             fence_id,
-        } = self.spawn_with_effective(cx, effective)?;
+            admitted,
+        } = self.spawn_authorized(cx, effective, authority)?;
 
         Ok(ManagedSpawn {
             child,
             sandbox_kind,
             fence_id,
+            admitted,
             proxy,
         })
     }
@@ -783,6 +860,7 @@ impl ConfinedCommand {
 enum SpawnAuthority {
     ModelSelected,
     TrustedWorker,
+    NamedRoot,
 }
 
 /// A closed set of internal worker entrypoints. The caller cannot supply
@@ -1167,6 +1245,7 @@ mod tokio_spawn {
                 mut child,
                 sandbox_kind,
                 fence_id: _,
+                admitted: _,
             } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
@@ -2274,3 +2353,5 @@ mod seatbelt_child_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

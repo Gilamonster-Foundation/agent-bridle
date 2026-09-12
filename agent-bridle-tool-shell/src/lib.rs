@@ -39,6 +39,10 @@ mod brush_worker;
 mod caveat_interceptor;
 #[cfg(feature = "brush")]
 mod coreutils_dispatch;
+#[cfg(feature = "brush")]
+mod named_host_root;
+#[cfg(feature = "brush")]
+mod named_host_root_execution;
 #[cfg(all(feature = "brush", any(target_os = "linux", target_os = "macos")))]
 mod private_control;
 #[cfg(all(feature = "brush", not(any(target_os = "linux", target_os = "macos"))))]
@@ -93,6 +97,8 @@ pub use host_shell::HostShellTool;
 /// (reubeno/brush#1184).
 #[cfg(feature = "brush")]
 pub use brush_shell::BrushShellTool;
+#[cfg(feature = "brush")]
+pub use named_host_root::lower_named_host_root_command;
 
 /// Whether this target provides the kernel-authenticated private transport
 /// required by [`BrushShellTool`] and carried-coreutils re-exec.
@@ -130,3 +136,5 @@ pub use coreutils_dispatch::{install_default_providers, register_shims};
 /// binary renders the JSON-lines stream as a live monitor.
 #[cfg(feature = "shell")]
 pub use net_proxy::{AuditSink, JsonlSink, NetAuditEvent, NetDecision, NetKind, NullSink};
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

@@ -55,7 +55,9 @@ mod step_up;
 mod tool;
 mod unbridle;
 
-pub use admitted::{AdmittedFence, AdmittedFenceId, BackendProjection, RuntimeClosure};
+pub use admitted::{
+    AdmittedFence, AdmittedFenceBody, AdmittedFenceId, BackendProjection, RuntimeClosure,
+};
 pub use config::{
     default_env_denylist, default_exec_path, fence_env, BackendToggles, BridleConfig, BridleMode,
     ChildNetworkPolicy, GatePolicy, HostMatch, LimitsPolicy, NetDefault, NetPolicy, NetRule,
@@ -81,7 +83,7 @@ pub use provenance::{
 pub use registry::{Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
-    EnforcementFloor, EnforcementReport, UnenforceableAxis,
+    EnforcementFloor, EnforcementReport, ExecBoundary, UnenforceableAxis,
 };
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
@@ -186,3 +188,5 @@ mod tests {
     /// ```
     fn _mint_token_is_unconstructible_doctests() {}
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

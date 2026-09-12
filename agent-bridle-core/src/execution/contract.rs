@@ -415,6 +415,34 @@ pub struct FenceEvidence {
     pub sandbox_kind: SandboxKind,
     /// Whether the child's egress was fenced through the loopback proxy.
     pub egress_proxied: bool,
+    /// Actual verified NamedRoot body; absent for the ordinary operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted: Option<Box<crate::AdmittedFenceBody>>,
+}
+
+impl FenceEvidence {
+    /// Check content integrity and binding to the trusted invocation's root and
+    /// effective authority. A local CID/ExecutionId is not sender authentication.
+    pub fn verify_named_root(
+        &self,
+        expected_root: &str,
+        effective: &crate::Caveats,
+        protected_roots: &std::collections::BTreeSet<String>,
+    ) -> crate::ToolResult<&crate::AdmittedFenceBody> {
+        let body = self.admitted.as_ref().ok_or_else(|| {
+            crate::ToolError::denied("named-root evidence lacks its admitted body")
+        })?;
+        if body.fence_id()? != self.fence_id
+            || body.mechanism.kind() != self.sandbox_kind
+            || self.egress_proxied
+        {
+            return Err(crate::ToolError::denied(
+                "named-root body does not match its fence CID or actual backend",
+            ));
+        }
+        body.verify(expected_root, effective, protected_roots)?;
+        Ok(body)
+    }
 }
 
 /// How the process tree reached its terminal state.
@@ -700,3 +728,5 @@ fn bounded_env<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(String, String)>,
     }
     d.deserialize_seq(BoundedEnv)
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

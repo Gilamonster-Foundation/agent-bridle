@@ -28,6 +28,11 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+mod named_root;
+mod protected_roots;
+pub use named_root::AdmittedFenceBody;
+pub(crate) use protected_roots::canonicalize_protected_roots;
+
 use content_addressable::{ContentAddressable, ContentError, ContentId};
 
 use crate::provenance::{
@@ -139,7 +144,7 @@ impl RuntimeClosure {
 /// is blind to authority the ruleset installs beyond the grant (e.g. Landlock's
 /// `base_read` loader/library trees). A backend that cannot honestly bound an
 /// axis returns `Unknown` on it here, and admission fails closed (L7).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendProjection {
     /// What the fence actually permits — the conservative upper bound.
     pub resolved: ResolvedAuthority,
@@ -151,22 +156,24 @@ pub struct BackendProjection {
 /// The one admitted fence: delegated authority + declared closure + governing
 /// mechanism, with the mechanism caveats derived exactly once at admission.
 ///
-/// Constructible only via [`AdmittedFence::admit`], which is where the L3 scope
-/// bound and the L4 strength floor are both checked — so holding an
-/// `AdmittedFence` *is* the proof that what the sandbox will apply was
-/// admitted. The spawn path consumes [`Self::mechanism_caveats`] for both the
+/// Constructed through [`AdmittedFence::admit`] for the ordinary process-tree
+/// scope obligation, or [`AdmittedFence::admit_named_root`] for the explicit root
+/// domain and inherited filesystem/network obligation. Both check their stated
+/// scope and strength floor; the NamedRoot body records its trusted inventory.
+/// The spawn path consumes [`Self::mechanism_caveats`] for both the
 /// wrapper prefix and `apply`; it performs no further derivation (L2).
 #[derive(Debug, Clone)]
 pub struct AdmittedFence {
     mechanism: ConfinementMechanism,
     mechanism_caveats: Caveats,
     /// The content-addressed identity of this fence (ASM-CID). Computed ONCE at
-    /// admission over the canonical `(mechanism_caveats, mechanism)` body; the
+    /// admission over the canonical default body or complete NamedRoot body; the
     /// admit→apply handoff re-derives it from the caveats actually being applied
     /// and refuses on mismatch. This makes #340's T7 a RUNTIME property, not just
     /// `Cid(x)=x` in the model: a re-derivation between admit and apply (the #317
     /// class of bug) yields a different CID and cannot hide.
     fence_id: AdmittedFenceId,
+    admitted_body: Option<AdmittedFenceBody>,
 }
 
 /// The typed content-addressed identity of an [`AdmittedFence`] — a BLAKE3 CIDv1
@@ -254,6 +261,11 @@ impl AdmittedFence {
         floor: EnforcementFloor,
         project: impl FnOnce(&Caveats) -> BackendProjection,
     ) -> ToolResult<Self> {
+        if mechanism.exec_boundary() != crate::ExecBoundary::ProcessTree {
+            return Err(ToolError::denied(
+                "ordinary admission requires the ProcessTree exec boundary",
+            ));
+        }
         // THE one derivation (L2): delegated ∪ declared closure, exec axis.
         let mut mechanism_caveats = delegated.clone();
         if let Scope::Only(programs) = &mut mechanism_caveats.exec {
@@ -316,6 +328,7 @@ impl AdmittedFence {
             mechanism,
             mechanism_caveats,
             fence_id,
+            admitted_body: None,
         })
     }
 
@@ -339,6 +352,12 @@ impl AdmittedFence {
         &self.fence_id
     }
 
+    /// Inspectable NamedRoot evidence; ordinary fence encoding remains unchanged.
+    #[must_use]
+    pub fn admitted_body(&self) -> Option<&AdmittedFenceBody> {
+        self.admitted_body.as_ref()
+    }
+
     /// Verify that the caveats about to be APPLIED recompute to the admitted
     /// fence's CID (L2 non-equivocation, at runtime). The spawn path applies
     /// [`Self::mechanism_caveats`] — the same object admitted — so this holds by
@@ -349,6 +368,9 @@ impl AdmittedFence {
     /// [`ToolError::Denied`] if the applied caveats do not content-address to the
     /// admitted fence id (a substitution/widening between admit and apply).
     pub fn verify_applied(&self, applied: &Caveats) -> ToolResult<()> {
+        if self.admitted_body.is_some() {
+            return Err(ToolError::denied("NamedRoot apply verification requires the actual root and fresh backend projection"));
+        }
         let recomputed = compute_fence_id(applied, self.mechanism)?;
         if recomputed == self.fence_id {
             Ok(())
@@ -696,3 +718,5 @@ mod tests {
         assert!(err.is_err(), "kernel floor with no backend must refuse");
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12
