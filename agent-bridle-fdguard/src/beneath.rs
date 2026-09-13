@@ -79,7 +79,7 @@
 //! [`is_resolution_refusal`] answers "did the *resolution itself* refuse?" so
 //! callers report an authority denial rather than an I/O error. The two legs
 //! spell the same refusal differently — **measured natively on both**, Linux
-//! on gnuc and the walk leg on macOS 26.5.2 / xnu-12377 arm64:
+//! on the Linux test host and the walk leg on macOS 26.5.2 / xnu-12377 arm64:
 //!
 //! | case                           | Linux (`openat2`) | walk (`O_NOFOLLOW`, Darwin) |
 //! |--------------------------------|-------------------|-----------------------------|
@@ -655,7 +655,7 @@ mod tests {
     /// symlink component. Distinct from [`INTERMEDIATE_SYMLINK`], which
     /// describes what the *seam* returns: on Linux the seam uses `openat2` and
     /// answers `ELOOP`, but this raw syscall is the walk-leg shape and answers
-    /// `ENOTDIR` on **both** platforms (measured: Linux on gnuc, macOS 26.5.2 /
+    /// `ENOTDIR` on **both** platforms (measured: the Linux test host, macOS 26.5.2 /
     /// xnu-12377 arm64). Conflating the two is a real trap — it cost this test
     /// a red run.
     #[cfg(any(target_os = "linux", target_os = "macos"))]

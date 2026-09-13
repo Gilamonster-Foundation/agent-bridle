@@ -34,7 +34,7 @@ Tamarin/ProVerif, Tier-1 assumed crypto).
 | 0.3 | **Lean P0 authority model** — `formal/Ceremony/P0/Authority.lean`, 25 theorems, 0 `sorry` | ✅ |
 | 0.4 | **TLA+ store model** — `formal/tla/CeremonyStore.tla` (CAS + anti-rollback invariants) | ✅ |
 | 0.5 | **Lean P1 signed-object contracts** + Lake project + `formalGate` proof-escape gate + CI (`formal.yml`) + `just check-formal` | ✅ (harvested from PR #233 / GPT-5, integrated with P0) |
-| 0.6 | Aeneas/Charon toolchain green on gnuc (opam/OCaml leg) | ✅ built on gnuc; `agent-bridle-ceremony` extracts Rust→LLBC→Lean and the first refinement proofs pass (`formal/refinement/`) |
+| 0.6 | Aeneas/Charon toolchain green on the Linux development host (opam/OCaml leg) | ✅ built on the Linux development host; `agent-bridle-ceremony` extracts Rust→LLBC→Lean and the first refinement proofs pass (`formal/refinement/`) |
 
 **Exit:** ADRs merged; the unified Lean project (P0 + P1) builds under CI + the
 pre-push gate; TLA+ store model in place; only the opam leg remains before

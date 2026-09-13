@@ -265,7 +265,7 @@ Scores: ✅ strong · ⚠️ conditional/partial · ❌ weak/blocked. "≈" = sa
 | **Docker/Podman** | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | **microVM** | ✅ | ✅ strongest isolation for the fence | ✅ | ⚠️ | ✅ |
 | **Kubernetes** | ✅ (gateway on k3s, sandboxes as pods) | ✅ | ✅ | ⚠️ | ✅ (the swarm's natural substrate) |
-| **Local inference (Ollama/vLLM/dgx1)** | ✅ config-only redirect | ✅ | ✅ | ⚠️ | ⚠️ `inference.local:443` bypasses OPA — must be a projected route |
+| **Local inference server (Ollama/vLLM)** | ✅ config-only redirect | ✅ | ✅ | ⚠️ | ⚠️ `inference.local:443` bypasses OPA — must be a projected route |
 | **Remote inference** | ✅ | ✅ | ✅ | ⚠️ | ✅ credential-stripped at proxy |
 | **Credential handling** | ✅ placeholder+proxy substitution | ✅ (invariant 3 ~solved by OpenShell) | ✅ | ⚠️ interceptor sees redacted only | ✅ workers never hold secrets |
 | **Observability** | ⚠️ unsigned/lossy OCSF | ⚠️ same | ⚠️ same | ⚠️ | ⚠️ same + mesh provenance gaps |
@@ -330,7 +330,7 @@ Consequences that must be built, not assumed:
    └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **C — interop demo (smallest vertical proof).** One OpenShell sandbox on gnuc (or nuc k3s). Inside it: a headless `newt-acp-worker` (or wyvern) whose only tool authority is an `agent-bridle-mcp` server. The sandbox is the outer fence. Prove one allowed op, one denied op, evidence returned, and — the load-bearing test — an **adversarial attempt to perform the denied op *without* going through the mcp tool path** (direct `bash`, direct socket, inherited fd). Because wyvern's `run_command` is unconfined, this test *is* the sandbox-completeness proof. Separate "demo works" from "certified."
+1. **C — interop demo (smallest vertical proof).** One OpenShell sandbox on the development host (or the Kubernetes host running k3s). Inside it: a headless `newt-acp-worker` (or wyvern) whose only tool authority is an `agent-bridle-mcp` server. The sandbox is the outer fence. Prove one allowed op, one denied op, evidence returned, and — the load-bearing test — an **adversarial attempt to perform the denied op *without* going through the mcp tool path** (direct `bash`, direct socket, inherited fd). Because wyvern's `run_command` is unconfined, this test *is* the sandbox-completeness proof. Separate "demo works" from "certified."
 2. **B — OpenShell backend.** Land `agent-bridle-openshell` + the templated core PR. Now Newt's confined exec can target an OpenShell fence via the existing `bridle_registry` seam, invisible to `newt_core`. This is the integration.
 3. **A — compiler as a service.** Expose the backend's `project` as a standalone policy-compilation service for non-Newt callers. Pure repackaging once B is solid.
 4. **E — the swarm.** Only after **E-0**: a `Transport` impl that tunnels signed mesh envelopes over TCP/TLS or WebSocket (CONNECT-relayable), *plus* a per-AgentKey dock allowlist on the responder (the newt dock-registry pattern, since agent-mesh's built-in team gate is UserKey-only and residual-1-weak). Then E is B with mesh as the tool channel and wyvern workers as the sandboxed principals — the Drake Swarm, with roles enforced as Caveats attenuations rather than convention.
@@ -341,7 +341,7 @@ Consequences that must be built, not assumed:
 
 ### 5.1 Process boundaries (topology B / E)
 ```
- TRUSTED HOST (gnuc / desk)                          UNTRUSTED SANDBOX (OpenShell)
+ TRUSTED HOST                                        UNTRUSTED SANDBOX (OpenShell)
  ┌───────────────────────────────────┐               ┌──────────────────────────────┐
  │ Newt reasoning loop (newt_core)   │               │ supervisor (root, PID1)  ▓TCB▓│
  │  └ Gate::authorize → AdmittedFence │   gRPC/mTLS   │  ├ Landlock+seccomp+netns     │
@@ -468,7 +468,7 @@ Consequences that must be built, not assumed:
 
 **Goal:** `Newt/worker → Bridle authorization → OpenShell sandbox → one allowed op → one denied op → evidence returned → CID chain verified`, plus an adversarial bypass test.
 
-1. **Substrate:** one OpenShell gateway on gnuc (Docker driver) *or* nuc k3s (verify nuc reachability first — env notes flag nuc1 SSH refusal / nuc2 subnet). OIDC or mTLS configured (never the unauth default). One dedicated workspace. `proposal_approval_mode: manual` (T21).
+1. **Substrate:** one OpenShell gateway on the development host (Docker driver) *or* the Kubernetes host running k3s. OIDC or mTLS configured (never the unauth default). One dedicated workspace. `proposal_approval_mode: manual` (T21).
 2. **Inside the sandbox: use wyvern `2fb7107`, NOT `newt-acp-worker` (C3/T20)** — wyvern needs no identity key and has no confinement to break, so it is the honest first slice. Its only tool authority is an `agent-bridle-mcp` endpoint. **Pin `agent-bridle-mcp` placement:** for slice 1 it runs *in-sandbox over stdio* and every "evidence" claim from it is explicitly **demonstrative only** (attacker-writable inside the fence); the trustworthy desk-side variant needs an agent-bridle-mcp *server* transport that does not exist yet (a mini-E-0, out of scope for slice 1, noted in the writeup). Pin `template.image` by digest.
 3. **Identity:** if a later slice uses a newt worker, the desk mints an **attenuated AgentKey** (child ⊑ parent) and injects only that; the operator root key `~/.newt/identity.pem` **never crosses the boundary** (T20).
 4. **In-image capability probe (new, blocking):** before trusting any Bridle-nested confinement, probe inside the pinned image for Landlock ABI availability and whether `seccomp(SET_MODE_FILTER)` is permitted — OpenShell's workload seccomp conditionally EPERMs it, which would make a nested Bridle `ConstrainedExecutor` spawn **fail closed** (non-functional), not merely weaker (C3). Record the result; if nested confinement is unavailable, the design is "outer-fence-only" and must say so.
@@ -485,7 +485,7 @@ Separate prototype success from security certification explicitly in the writeup
 ## 9. PR train (small, independently reviewable; owner per PR)
 
 **Track 1 — C interop demo**
-1. `[OpenShell-ops, docs]` Reproducible gateway-on-gnuc + dedicated-workspace + `proposal_approval_mode:manual` + digest-pinned image recipe (no code). — *owner: workspace/newt*
+1. `[OpenShell-ops, docs]` Reproducible gateway on the development host + dedicated-workspace + `proposal_approval_mode:manual` + digest-pinned image recipe (no code). — *owner: workspace/newt*
 2. `[wyvern-agent]` A wyvern launch profile whose only tool authority is an `agent-bridle-mcp` endpoint (no other tools). **Not** newt-acp-worker for slice 1 (T20). — *owner: wyvern-agent*
 3. `[agent-bridle]` `agent-bridle-mcp` caveats profile + example for the in-sandbox worker; document the in-sandbox-stdio-vs-desk-side trust distinction (C3.3). — *owner: agent-bridle*
 4. `[workspace, tests]` In-image capability probe (Landlock ABI + `seccomp(SET_MODE_FILTER)` permitted?) + Native hostile-child bypass test harness (the §8.7 test) + `ASM-OPENSHELL-BYPASS` assurance row. — *owner: newt-agent*
