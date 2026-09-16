@@ -353,6 +353,8 @@ pub struct ConfinedCommand {
     /// NOT the `ToolContext`, which carries only authority (I5-B, #144, ADR 0017
     /// D2). Defaults to today's built-in allow-lists.
     sandbox_policy: Arc<SandboxPolicy>,
+    #[cfg(all(unix, feature = "spawn-tokio"))]
+    private_hosts: std::collections::HashSet<String>,
 }
 
 impl ConfinedCommand {
@@ -368,6 +370,8 @@ impl ConfinedCommand {
             stderr: None,
             new_process_group: false,
             sandbox_policy: Arc::new(SandboxPolicy::default()),
+            #[cfg(all(unix, feature = "spawn-tokio"))]
+            private_hosts: std::collections::HashSet::new(),
         }
     }
 
@@ -542,6 +546,8 @@ impl ConfinedCommand {
             new_process_group,
             // Already consumed above into `sandbox` via `best_available_sandbox`.
             sandbox_policy: _,
+            #[cfg(all(unix, feature = "spawn-tokio"))]
+                private_hosts: _,
         } = self;
 
         let spawned = std::thread::spawn(move || -> ToolResult<Child> {
@@ -933,6 +939,22 @@ mod tokio_spawn {
     }
 
     impl ConfinedCommand {
+        /// Approve exact names for RFC1918/ULA resolution by this command's
+        /// `spawn_tokio` egress proxy. The owning harness supplies these names
+        /// after an explicit operator decision; server metadata is not authority.
+        /// The context's ordinary net allow-list must independently permit them.
+        ///
+        /// Empty by default. This neither starts a proxy where no loopback fence
+        /// exists nor changes synchronous `spawn` or any filesystem/exec caveat.
+        /// No wildcard or global private-space approval is accepted.
+        pub fn with_private_hosts(
+            mut self,
+            hosts: impl IntoIterator<Item = String>,
+        ) -> std::io::Result<Self> {
+            self.private_hosts = crate::net_proxy::canonical_private_hosts(hosts)?;
+            Ok(self)
+        }
+
         /// Admission-check, confine, and spawn the child — like
         /// [`spawn`](ConfinedCommand::spawn), but the stdio pipes are returned as
         /// **tokio-native** handles wrapped in a kill-on-drop
@@ -961,7 +983,13 @@ mod tokio_spawn {
             if let Some((hosts, fenced)) = egress_proxy_plan(&effective, &self.sandbox_policy) {
                 // Fail-closed: the grant calls for a fence + proxy; a proxy
                 // that cannot bind must refuse the spawn, never run unfenced.
-                let handle = crate::net_proxy::start_for_hosts(hosts).map_err(|e| {
+                let handle = crate::net_proxy::start_with_private_hosts(
+                    hosts,
+                    self.private_hosts.iter().cloned(),
+                    std::sync::Arc::new(crate::net_proxy::StdResolver),
+                    std::sync::Arc::new(crate::net_proxy::NullSink),
+                )
+                .map_err(|e| {
                     ToolError::Exec(std::io::Error::other(format!(
                         "refusing to spawn {:?}: the egress proxy could not bind \
                          loopback ({e})",
@@ -1107,6 +1135,19 @@ mod tokio_spawn_tests {
             .find(|p| Path::new(p).exists())
     }
 
+    #[test]
+    fn exact_private_hosts_builder_defaults_closed_and_validates_names() {
+        let command = ConfinedCommand::new("cat");
+        assert!(command.private_hosts.is_empty());
+        let command = command
+            .with_private_hosts(["SERVICE.TEST.".to_string()])
+            .unwrap();
+        assert_eq!(command.private_hosts, ["service.test".to_string()].into());
+        assert!(ConfinedCommand::new("cat")
+            .with_private_hosts(["*".to_string()])
+            .is_err());
+    }
+
     /// The MCP-transport use case: a newline-delimited JSON-RPC line written to
     /// the child's tokio stdin comes back on its tokio stdout (`cat` echoes),
     /// proving the std→tokio pipe conversion preserves a working duplex stream.
@@ -1243,6 +1284,9 @@ mod tokio_spawn_tests {
         // curl honors the lowercase `https_proxy` the proxy env grant sets; the
         // off-list CONNECT is refused at the allow-list (403) before any dial.
         let child = ConfinedCommand::new(curl)
+            // A private-space approval cannot grant an off-list hostname.
+            .with_private_hosts(["evil.example.net".to_string()])
+            .expect("exact private host")
             .arg("-s")
             .arg("-m")
             .arg("5")

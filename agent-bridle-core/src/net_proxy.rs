@@ -283,15 +283,85 @@ fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> 
 
 /// The exact-hostname allow-list, mirroring `ToolContext::check_net`'s membership.
 #[derive(Clone)]
-struct HostPolicy(Arc<HashSet<String>>);
+struct HostPolicy {
+    allowed: Arc<HashSet<String>>,
+    private: Arc<HashSet<String>>,
+}
 
 impl HostPolicy {
     fn new(hosts: impl IntoIterator<Item = String>) -> Self {
-        Self(Arc::new(hosts.into_iter().collect()))
+        Self {
+            allowed: Arc::new(hosts.into_iter().collect()),
+            private: Arc::new(HashSet::new()),
+        }
     }
     fn allows(&self, host: &str) -> bool {
-        self.0.contains(host)
+        self.allowed.contains(host)
     }
+    fn with_private_hosts(
+        hosts: impl IntoIterator<Item = String>,
+        private_hosts: impl IntoIterator<Item = String>,
+    ) -> io::Result<Self> {
+        let mut policy = Self::new(hosts);
+        policy.private = Arc::new(canonical_private_hosts(private_hosts)?);
+        Ok(policy)
+    }
+    fn allows_private(&self, host: &str) -> bool {
+        self.allows(host)
+            && canonical_private_host(host).is_some_and(|host| self.private.contains(&host))
+    }
+}
+
+// Exact names only: no wildcard, URL, port, path, or ambiguous numeric address.
+// ASCII DNS labels include ACE/punycode; embedders must IDNA-normalize Unicode.
+fn canonical_private_host(host: &str) -> Option<String> {
+    use std::net::IpAddr;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return ip
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|ip| ip.to_string());
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return None;
+    }
+    let labels: Vec<_> = host.split('.').collect();
+    if labels.iter().any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) || labels.last().is_some_and(|label| {
+        label.bytes().all(|b| b.is_ascii_digit())
+            || label.starts_with("0x")
+            || label.starts_with("0X")
+    }) {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+pub(crate) fn canonical_private_hosts(
+    hosts: impl IntoIterator<Item = String>,
+) -> io::Result<HashSet<String>> {
+    hosts
+        .into_iter()
+        .map(|host| {
+            canonical_private_host(&host).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private-host grants require exact DNS names or IP addresses",
+                )
+            })
+        })
+        .collect()
 }
 
 /// A running loopback egress proxy. Dropping the handle shuts it down.
@@ -376,10 +446,28 @@ pub fn start(
     resolver: Arc<dyn Resolver>,
     sink: Arc<dyn AuditSink>,
 ) -> io::Result<ProxyHandle> {
+    start_with_private_hosts(allow_hosts, [], resolver, sink)
+}
+
+/// Start the same fenced egress proxy with an additional, exact private-host
+/// approval supplied by the owning harness. Both the ordinary host allow-list
+/// and this independent approval must permit the requested name. Only RFC1918
+/// and IPv6 unique-local destinations may be opted in; metadata/link-local,
+/// unspecified, multicast, and other reserved ranges remain blocked.
+///
+/// The default constructors pass an empty set. This is transient host policy,
+/// not a new caveat or a substitute for the child's kernel loopback fence.
+/// Malformed names, URLs, ports and wildcard patterns fail before binding.
+pub fn start_with_private_hosts(
+    allow_hosts: impl IntoIterator<Item = String>,
+    private_hosts: impl IntoIterator<Item = String>,
+    resolver: Arc<dyn Resolver>,
+    sink: Arc<dyn AuditSink>,
+) -> io::Result<ProxyHandle> {
+    let policy = HostPolicy::with_private_hosts(allow_hosts, private_hosts)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
-    let policy = HostPolicy::new(allow_hosts);
     // The production origin dialer — a real TCP connect. Tests bypass `start`
     // entirely and drive `handle_conn` with a scripted in-memory connector.
     let connector: Arc<dyn Connector> = Arc::new(TcpConnector);
@@ -519,7 +607,7 @@ fn handle_conn(
             drain_headers(&mut reader)?;
             let origin = match resolver
                 .resolve(&host, port)
-                .and_then(guard_target)
+                .and_then(|addr| guard_target(addr, &host, policy))
                 .and_then(|addr| connector.connect(addr))
             {
                 Ok(o) => o,
@@ -554,7 +642,7 @@ fn handle_conn(
             let headers = read_headers(&mut reader)?;
             let mut origin = match resolver
                 .resolve(&host, port)
-                .and_then(guard_target)
+                .and_then(|addr| guard_target(addr, &host, policy))
                 .and_then(|addr| connector.connect(addr))
             {
                 Ok(o) => o,
@@ -668,10 +756,22 @@ fn copy_counted(from: &mut impl Read, to: &mut impl Write) -> u64 {
 /// **allowed** (the fenced child can already reach loopback directly, and the test
 /// origins live there) and global addresses are allowed.
 ///
-/// Default-on and unconditional today; a `NetPolicy` opt-out is future work (I13,
-/// #152). Returns the address unchanged when permitted, else `PermissionDenied`.
-fn guard_target(addr: SocketAddr) -> io::Result<SocketAddr> {
-    if is_internal_ip(&addr.ip()) {
+/// Default-on: only a separately approved exact host may resolve to RFC1918 or
+/// ULA space. Returns the address unchanged when permitted, else PermissionDenied.
+fn guard_target(addr: SocketAddr, host: &str, policy: &HostPolicy) -> io::Result<SocketAddr> {
+    let ip = match addr.ip() {
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(addr.ip(), std::net::IpAddr::V4),
+        ip => ip,
+    };
+    let approvable = match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private(),
+        std::net::IpAddr::V6(ip) => {
+            (ip.segments()[0] & 0xfe00) == 0xfc00
+                // EC2's IPv6 metadata endpoint lies inside ULA, not link-local.
+                && ip.segments() != [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+        }
+    };
+    if is_internal_ip(&ip) && !(approvable && policy.allows_private(host)) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "SSRF-guard: refusing to proxy to an internal (non-loopback) address",
@@ -690,14 +790,24 @@ fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || o[0] == 0 || o[0] >= 240
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
                 // 100.64.0.0/10 (CGNAT) — not covered by the std predicates.
                 || (o[0] == 100 && (64..=127).contains(&o[1]))
         }
         std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_internal_ip(&std::net::IpAddr::V4(v4));
+            }
             let seg0 = v6.segments()[0];
             v6.is_unspecified()
+                || v6.is_multicast()
                 || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (seg0 & 0xffc0) == 0xfec0 // deprecated site-local
+                || (seg0 == 0x2001 && v6.segments()[1] == 0x0db8) // documentation
         }
     }
 }
@@ -829,7 +939,7 @@ mod tests {
         for ip in refused {
             assert!(is_internal_ip(&ip), "{ip} must classify as internal");
             assert!(
-                guard_target(SocketAddr::new(ip, 80)).is_err(),
+                guard_target(SocketAddr::new(ip, 80), "", &HostPolicy::new([])).is_err(),
                 "{ip} must be refused"
             );
         }
@@ -844,7 +954,7 @@ mod tests {
             let ip: IpAddr = s.parse().unwrap();
             assert!(!is_internal_ip(&ip), "{s} must be permitted");
             assert!(
-                guard_target(SocketAddr::new(ip, 443)).is_ok(),
+                guard_target(SocketAddr::new(ip, 443), "", &HostPolicy::new([])).is_ok(),
                 "{s} must be permitted"
             );
         }
@@ -1125,6 +1235,171 @@ mod tests {
             out.origin.written_str()
         );
         assert!(out.refused.is_empty(), "an allowed host is not refused");
+    }
+
+    /// Grounds the exact-private-host policy through the production connection
+    /// handler; only DNS and the destination socket are in-memory seams.
+    #[test]
+    fn exact_private_hosts_require_both_grants_and_pin_the_screened_address() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        for request in [
+            &b"CONNECT service.test:443 HTTP/1.1\r\n\r\nPING"[..],
+            &b"GET http://service.test:443/x HTTP/1.1\r\n\r\n"[..],
+        ] {
+            // Synthetic address classes, following the existing guard fixtures.
+            for ip in [
+                IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)),
+                IpAddr::V4(Ipv4Addr::new(172, 16, 10, 20)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 50, 10)),
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x1234)),
+                IpAddr::V6(Ipv4Addr::new(10, 20, 30, 40).to_ipv6_mapped()),
+            ] {
+                let address = SocketAddr::new(ip, 443);
+                for (allow, private, expected) in [
+                    (vec!["service.test"], vec!["SERVICE.TEST."], 200),
+                    (vec!["service.test"], vec![], 502),
+                    (vec!["service.test"], vec!["other.test"], 502),
+                    (vec!["other.test"], vec!["service.test"], 403),
+                ] {
+                    struct CountResolver(SocketAddr, std::sync::atomic::AtomicUsize);
+                    impl Resolver for CountResolver {
+                        fn resolve(&self, _: &str, _: u16) -> io::Result<SocketAddr> {
+                            assert_eq!(self.1.fetch_add(1, Ordering::SeqCst), 0, "resolve once");
+                            Ok(self.0)
+                        }
+                    }
+                    struct PinnedConnector(SocketAddr, std::sync::atomic::AtomicUsize);
+                    impl Connector for PinnedConnector {
+                        fn connect(&self, address: SocketAddr) -> io::Result<Box<dyn Conn>> {
+                            assert_eq!(address, self.0, "dial the screened address without DNS");
+                            self.1.fetch_add(1, Ordering::SeqCst);
+                            Ok(Box::new(ScriptedConn::with_script(
+                                b"HTTP/1.1 200 OK\r\n\r\n",
+                            )))
+                        }
+                    }
+                    let policy = HostPolicy::with_private_hosts(
+                        allow.into_iter().map(str::to_string),
+                        private.into_iter().map(str::to_string),
+                    )
+                    .unwrap();
+                    let resolver = CountResolver(address, 0.into());
+                    let connector = PinnedConnector(address, 0.into());
+                    let client = ScriptedConn::with_script(request);
+                    handle_conn(
+                        Box::new(client.clone()),
+                        &policy,
+                        &connector,
+                        &resolver,
+                        &NullSink,
+                        &Mutex::new(HashSet::new()),
+                    )
+                    .unwrap();
+                    assert!(
+                        client
+                            .written_str()
+                            .starts_with(&format!("HTTP/1.1 {expected}")),
+                        "address {address}, expected {expected}: {}",
+                        client.written_str()
+                    );
+                    assert_eq!(
+                        connector.1.load(Ordering::SeqCst),
+                        usize::from(expected == 200)
+                    );
+                    assert_eq!(
+                        resolver.1.load(Ordering::SeqCst),
+                        usize::from(expected != 403)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_private_hosts_never_approve_forbidden_ranges() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let policy = HostPolicy::with_private_hosts(
+            ["service.test".to_string()],
+            ["service.test".to_string()],
+        )
+        .unwrap();
+        for ip in [
+            "169.254.169.254",
+            "fd00:ec2::254",
+            "0.0.0.0",
+            "0.1.2.3",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.18.0.1",
+            "::",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+            "::ffff:224.0.0.1",
+        ]
+        .into_iter()
+        .map(|ip| ip.parse::<IpAddr>().unwrap())
+        .chain([
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V6(Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped()),
+        ]) {
+            let resolver = FixedResolver(SocketAddr::new(ip, 443));
+            for request in [
+                &b"CONNECT service.test:443 HTTP/1.1\r\n\r\n"[..],
+                &b"GET http://service.test/ HTTP/1.1\r\n\r\n"[..],
+            ] {
+                let client = ScriptedConn::with_script(request);
+                let sink = CapturingSink::default();
+                // A successful fake dial would return 200, so 502 proves it was screened out.
+                handle_conn(
+                    Box::new(client.clone()),
+                    &policy,
+                    &FakeConnector(ScriptedConn::with_script(b"HTTP/1.1 200 OK\r\n\r\n")),
+                    &resolver,
+                    &sink,
+                    &Mutex::new(HashSet::new()),
+                )
+                .unwrap();
+                assert!(
+                    client.written_str().contains("502"),
+                    "forbidden address {ip}"
+                );
+                assert_eq!(sink.events()[0].decision, NetDecision::Error);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_private_hosts_reject_patterns_urls_and_ambiguous_names() {
+        for invalid in [
+            "",
+            "*",
+            "*.test",
+            ".test",
+            "https://service.test",
+            "service.test:443",
+            "user@service.test",
+            "service.test/path",
+            " service.test",
+            "service.test ",
+            "a..test",
+            "-bad.test",
+            "bad-.test",
+            "127.1",
+            "0x7f000001",
+            "service.test?x",
+        ] {
+            assert!(
+                HostPolicy::with_private_hosts(["service.test".to_string()], [invalid.to_string()])
+                    .is_err(),
+                "invalid exact name: {invalid}"
+            );
+        }
+        let policy =
+            HostPolicy::with_private_hosts(["fd00::1".to_string()], ["[FD00::1]".to_string()])
+                .unwrap();
+        assert!(policy.allows_private("fd00::1"));
     }
 
     #[test]
@@ -1448,7 +1723,9 @@ mod tests {
     /// `sandbox-exec`/`curl` are unavailable. This is the one test that genuinely
     /// needs the real socket path (the fence is a kernel property); the forward /
     /// tunnel / allow-list / audit LOGIC is covered deterministically in-memory
-    /// above.
+    /// above. The exact-private-host constructor is used here to ground its
+    /// unchanged fence/allowlist behavior; private address classification and
+    /// pinned dialing are covered by `exact_private_hosts_require_both_grants_and_pin_the_screened_address`.
     #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
     #[test]
     fn fenced_child_reaches_allowed_via_proxy_denied_refused_direct_kernel_blocked() {
@@ -1471,9 +1748,11 @@ mod tests {
         }
 
         let origin = spawn_origin();
-        let proxy = start_null(
+        let proxy = start_with_private_hosts(
+            ["allowed.test".to_string()],
             ["allowed.test".to_string()],
             Arc::new(FixedResolver(origin)),
+            Arc::new(NullSink),
         )
         .unwrap();
 
