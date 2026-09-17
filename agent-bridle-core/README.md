@@ -57,7 +57,7 @@ separate admission work is accepted.
 
 ## Exact private-host approvals for async subprocesses
 
-With `spawn-tokio`, an owning harness may call
+On Unix, with `spawn-tokio`, an owning harness may call
 `ConfinedCommand::with_private_hosts(["service.example".to_string()])?`
 before `spawn_tokio`. This separate, transient approval lets that exact name
 resolve to RFC1918 or IPv6 unique-local space only when the active context's

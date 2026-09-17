@@ -36,28 +36,27 @@ fn unix_socket_grants_are_not_proxy_hosts_and_survive_the_fence() {
 
 #[test]
 fn unix_socket_grants_require_seatbelt_even_at_advisory_floor() {
-    let grant = scoped(&["unix:/private/tmp/service.sock"]);
-    for kind in [
-        SandboxKind::None,
-        SandboxKind::Landlock,
-        SandboxKind::AppContainer,
-        SandboxKind::MinimalRootfs,
-        SandboxKind::MicroVm,
-    ] {
-        assert!(
-            confinement_unenforceable(kind, &grant, AxisEnforcement::Advisory),
-            "{kind:?}"
-        );
-        assert_eq!(
-            enforcement_report(&grant, kind).net,
-            Some(AxisEnforcement::Advisory)
-        );
-    }
     for names in [
         vec!["unix:/private/tmp/service.sock"],
         vec!["unix:/private/tmp/service.sock", "localhost"],
     ] {
         let grant = scoped(&names);
+        for kind in [
+            SandboxKind::None,
+            SandboxKind::Landlock,
+            SandboxKind::AppContainer,
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+        ] {
+            assert!(
+                confinement_unenforceable(kind, &grant, AxisEnforcement::Advisory),
+                "{kind:?}"
+            );
+            assert_eq!(
+                enforcement_report(&grant, kind).net,
+                Some(AxisEnforcement::Advisory)
+            );
+        }
         assert_eq!(
             effective_sandbox_kind(SandboxKind::Seatbelt, &grant),
             SandboxKind::Seatbelt

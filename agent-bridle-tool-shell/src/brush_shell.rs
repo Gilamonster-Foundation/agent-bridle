@@ -21,7 +21,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -313,7 +312,7 @@ fn supervise_worker(
         let stderr_reader =
             std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
 
-        kill_worker_tree(&mut child);
+        crate::kill_child_tree(&mut child);
         let _ = child.wait();
         let stdout = stdout_reader
             .join()
@@ -358,7 +357,7 @@ fn supervise_worker(
         );
     };
     if status.is_none() {
-        kill_worker_tree(&mut child);
+        crate::kill_child_tree(&mut child);
         let _ = child.wait();
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
@@ -417,19 +416,6 @@ fn read_capped(reader: impl Read, cap: usize) -> ToolResult<Vec<u8>> {
         ));
     }
     Ok(bytes)
-}
-
-#[cfg(unix)]
-fn kill_worker_tree(child: &mut Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_worker_tree(child: &mut Child) {
-    let _ = child.kill();
 }
 
 /// What a finished brush run produced.

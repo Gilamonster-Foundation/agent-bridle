@@ -447,7 +447,9 @@ pub use landlock_impl::{landlock_is_supported, landlock_net_is_supported, Landlo
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 
-#[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+// Prefix construction is portable; unit tests exercise its admission decisions
+// on every host. Native Windows enforcement remains in the Windows proof lane.
+#[cfg(any(test, all(target_os = "windows", feature = "windows-appcontainer")))]
 pub(crate) mod appcontainer_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -520,6 +522,11 @@ pub(crate) mod appcontainer_impl {
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            if super::has_unix_socket_grants(effective) {
+                return Err(ToolError::denied(
+                    "windows-appcontainer: exact Unix endpoint grants require Seatbelt",
+                ));
+            }
             // The launcher engages when:
             //  - net is fully denied (deny-by-default network policy)
             //  - net is loopback-only (egress proxy path, #133)
@@ -1788,6 +1795,46 @@ mod seatbelt_impl {
 mod tests {
     use super::*;
     use crate::Scope;
+
+    fn assert_appcontainer_rejects_unix(names: &[&str]) {
+        let caveats = Caveats {
+            net: Scope::only(names.iter().map(|name| (*name).to_owned())),
+            ..Caveats::top()
+        };
+        let result = appcontainer_impl::AppContainerSandbox::new().command_prefix(&caveats);
+        assert!(
+            matches!(&result, Err(crate::ToolError::Denied { reason }) if reason.contains("Unix")),
+            "unsupported Unix authority must refuse before launcher lookup: {result:?}"
+        );
+    }
+
+    #[test]
+    fn appcontainer_command_prefix_rejects_unix_only() {
+        assert_appcontainer_rejects_unix(&["unix:/private/tmp/service.sock"]);
+    }
+
+    #[test]
+    fn appcontainer_command_prefix_rejects_unix_with_loopback() {
+        assert_appcontainer_rejects_unix(&["unix:/private/tmp/service.sock", "localhost"]);
+    }
+
+    #[test]
+    fn appcontainer_command_prefix_keeps_existing_unix_free_behavior() {
+        let sandbox = appcontainer_impl::AppContainerSandbox::new();
+        assert!(sandbox.command_prefix(&Caveats::top()).unwrap().is_empty());
+        let caveats = Caveats {
+            net: Scope::only(["localhost".to_owned()]),
+            ..Caveats::top()
+        };
+        match sandbox.command_prefix(&caveats) {
+            Ok(prefix) => assert!(prefix.iter().any(|arg| arg == "--loopback-exemption")),
+            Err(crate::ToolError::Denied { reason }) => assert!(
+                reason.contains("agent-bridle-aclaunch.exe not found"),
+                "plain loopback must reach normal launcher lookup: {reason}"
+            ),
+            other => panic!("unexpected loopback prefix result: {other:?}"),
+        }
+    }
 
     #[test]
     fn noop_reports_none_and_never_fails() {
