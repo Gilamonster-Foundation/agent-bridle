@@ -1012,6 +1012,51 @@ async fn real_seatbelt_denies_egress_when_net_is_empty() {
     );
 }
 
+/// Grounds the mocked private-host forwarding seam in a real confined child:
+/// an explicit private approval must not add ordinary host authority. The
+/// reserved `.invalid` destination is refused before DNS or any upstream dial.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_private_hosts_do_not_widen_the_fenced_host_scope() {
+    if !agent_bridle_core::seatbelt_is_supported() || !Path::new("/usr/bin/curl").exists() {
+        assert!(
+            std::env::var_os("BRIDLE_REQUIRE_SEATBELT").is_none(),
+            "required Seatbelt/curl fixture unavailable"
+        );
+        return;
+    }
+    let caveats = Caveats {
+        exec: Scope::only(["curl".to_string()]),
+        net: Scope::only(["allowed.invalid".to_string()]),
+        ..Caveats::top()
+    };
+    let out = ShellTool::new()
+        .with_private_hosts(["refused.invalid".to_string()])
+        .expect("exact private approval")
+        .invoke(
+            serde_json::json!({
+                "program": "/usr/bin/curl",
+                "args": ["--silent", "--show-error", "--noproxy", "", "--max-time", "5",
+                    "--output", "/dev/null", "--write-out", "%{http_code}", "http://refused.invalid/"],
+                "timeout_secs": 10
+            }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("confined proxy invocation");
+    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
+    assert_eq!(
+        out["exit_code"], 0,
+        "curl received the proxy response: {out}"
+    );
+    assert_eq!(
+        out["stdout"], "403",
+        "private approval cannot widen scope: {out}"
+    );
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
+    assert_eq!(out["denials"][0]["target"], "refused.invalid", "{out}");
+}
+
 // #1220 regression: a write-confined child must still be able to OPEN the
 // device sinks — git opens `/dev/null` O_RDWR as plumbing and died with
 // "could not open '/dev/null' for reading and writing: Permission denied"
