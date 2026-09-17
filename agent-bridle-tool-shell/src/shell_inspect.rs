@@ -12,7 +12,7 @@ use brush_parser::{Parser, ParserOptions};
 use serde::Serialize;
 
 const INSPECTION_SCHEMA_VERSION: u8 = 1;
-const MAX_SOURCE_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_SOURCE_BYTES: usize = 32 * 1024;
 const MAX_INSPECTION_DEPTH: usize = 32;
 
 /// A stable, serializable, flattened inventory of a shell command's source.
@@ -136,7 +136,7 @@ pub struct ShellInspectionError {
 }
 
 impl ShellInspectionError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -870,7 +870,10 @@ fn substitution_value_warning(source: &str, quoted: bool) -> String {
     }
 }
 
-fn static_shell_word(word: &Word, options: &ParserOptions) -> Result<String, ShellInspectionError> {
+pub(crate) fn static_shell_word(
+    word: &Word,
+    options: &ParserOptions,
+) -> Result<String, ShellInspectionError> {
     if may_contain_brace_expansion(&word.value)
         && word::parse_brace_expansions(&word.value, options)
             .map_err(|error| {
@@ -1658,3 +1661,5 @@ mod tests {
         assert!(value["warnings"].is_array());
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

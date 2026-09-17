@@ -167,6 +167,11 @@ pub enum ChildNetworkPolicy {
 /// Sandbox path lists + ABI floors (`sandbox.rs` constants).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxPolicy {
+    /// Trusted inventory of private roots which runtime closure additions must
+    /// not expose. Required only for NamedRoot; never inferred from model input.
+    /// This is inventory-relative protection, not discovery of all private state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_root_protected_roots: Option<std::collections::BTreeSet<String>>,
     /// Backend enable/require toggles.
     #[serde(default)]
     pub backends: BackendToggles,
@@ -261,6 +266,7 @@ impl Default for SandboxPolicy {
             backends: BackendToggles::default(),
             child_network: ChildNetworkPolicy::default(),
             appcontainer_launcher_path: None,
+            named_root_protected_roots: None,
             base_read_paths: PathList::from_defaults(base_read),
             device_sink_paths: default_device_sink_paths(),
             bin_read_paths: PathList::from_defaults(&[
@@ -890,3 +896,5 @@ mod tests {
         }
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

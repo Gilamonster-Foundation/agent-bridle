@@ -398,7 +398,7 @@ fn exec_scope_allows(scope: &Scope<String>, program: &str) -> bool {
 /// `fs_write` case: creating a new file under an allowed directory). So we
 /// canonicalize the deepest existing ancestor and re-attach the trailing
 /// not-yet-existing components, rejecting any `..` we cannot resolve away.
-fn canonicalize_for_check(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn canonicalize_for_check(path: &Path) -> std::io::Result<PathBuf> {
     // Fast path: the whole thing exists (this also resolves all symlinks).
     if let Ok(c) = path.canonicalize() {
         return Ok(c);
@@ -462,7 +462,7 @@ fn canonicalize_for_check(path: &Path) -> std::io::Result<PathBuf> {
 /// True iff `candidate` is `base` itself or a descendant of `base`. Both are
 /// expected to be canonical, symlink-free paths, so this component-wise check
 /// is sound (it is *not* a string prefix test — `/a/bc` is not within `/a/b`).
-fn path_is_within(candidate: &Path, base: &Path) -> bool {
+pub(crate) fn path_is_within(candidate: &Path, base: &Path) -> bool {
     candidate == base || candidate.starts_with(base)
 }
 
@@ -716,3 +716,5 @@ mod tests {
         assert_eq!(cx.sandbox_kind(), SandboxKind::None);
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

@@ -54,7 +54,9 @@ pub use agent_bridle_tool_shell::HostShellTool;
 // NOT auto-added to `registry()` — it shares the `"shell"` name with ShellTool
 // (ADR 0005 D2), so the embedder selects it.
 #[cfg(feature = "brush")]
-pub use agent_bridle_tool_shell::{brush_private_control_supported, BrushShellTool};
+pub use agent_bridle_tool_shell::{
+    brush_private_control_supported, lower_named_host_root_command, BrushShellTool,
+};
 /// Parse and inspect Brush shell source without expansion or execution.
 ///
 /// The returned source-bound schema lets an embedder present command
@@ -300,3 +302,5 @@ mod tests {
         assert!(error.message().contains("runtime shell state"));
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

@@ -97,6 +97,25 @@ impl LocalExecutionBackend {
         cx: &ToolContext,
         request: ExecutionRequest,
     ) -> ToolResult<ExecutionHandle> {
+        self.start_with_boundary(cx, request, crate::ExecBoundary::ProcessTree)
+    }
+
+    /// Admit one exact absolute root and permit descendant executable identities
+    /// only under its unchanged inherited filesystem/network fence.
+    pub fn start_named_root(
+        &self,
+        cx: &ToolContext,
+        request: ExecutionRequest,
+    ) -> ToolResult<ExecutionHandle> {
+        self.start_with_boundary(cx, request, crate::ExecBoundary::NamedRoot)
+    }
+
+    fn start_with_boundary(
+        &self,
+        cx: &ToolContext,
+        request: ExecutionRequest,
+        boundary: crate::ExecBoundary,
+    ) -> ToolResult<ExecutionHandle> {
         request.validate()?;
         let id = ExecutionId::next();
         let limits = request.limits;
@@ -107,7 +126,7 @@ impl LocalExecutionBackend {
         // tell "refused before we tried" from "never reached the backend".
         sink.accepted()?;
 
-        match self.spawn(cx, &request) {
+        match self.spawn(cx, &request, boundary) {
             Ok(spawned) => {
                 self.attach(spawned, request, sink, &control)?;
                 Ok(handle)
@@ -133,7 +152,12 @@ impl LocalExecutionBackend {
         }
     }
 
-    fn spawn(&self, cx: &ToolContext, request: &ExecutionRequest) -> ToolResult<ManagedSpawn> {
+    fn spawn(
+        &self,
+        cx: &ToolContext,
+        request: &ExecutionRequest,
+        boundary: crate::ExecBoundary,
+    ) -> ToolResult<ManagedSpawn> {
         let mut cmd = ConfinedCommand::new(request.executable.clone())
             .args(request.argv.iter())
             .stdin(Stdio::piped())
@@ -152,7 +176,10 @@ impl LocalExecutionBackend {
         if let Some(dir) = &request.cwd {
             cmd = cmd.current_dir(dir);
         }
-        cmd.spawn_managed(cx)
+        match boundary {
+            crate::ExecBoundary::ProcessTree => cmd.spawn_managed(cx),
+            crate::ExecBoundary::NamedRoot => cmd.spawn_named_root_managed(cx),
+        }
     }
 
     /// Wire a freshly spawned tree to its drainers, stdin writer, and reaper.
@@ -167,6 +194,7 @@ impl LocalExecutionBackend {
             mut child,
             sandbox_kind,
             fence_id,
+            admitted,
             proxy,
         } = spawned;
         let pid = child.id();
@@ -174,6 +202,7 @@ impl LocalExecutionBackend {
             fence_id,
             sandbox_kind,
             egress_proxied: proxy.is_some(),
+            admitted: admitted.map(Box::new),
         };
 
         let stdout = child.stdout.take();
@@ -704,3 +733,5 @@ pub enum LocalTreeContainment {
     /// No tree primitive; only the direct child can be signalled.
     DirectChildOnly,
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

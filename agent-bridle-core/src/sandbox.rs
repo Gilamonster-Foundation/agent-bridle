@@ -85,6 +85,11 @@ pub trait Sandbox: Send + Sync {
     /// The kind of confinement this sandbox provides.
     fn kind(&self) -> SandboxKind;
 
+    /// The executable-identity proof domain actually installed by this backend.
+    fn exec_boundary(&self) -> crate::ExecBoundary {
+        crate::ExecBoundary::ProcessTree
+    }
+
     /// Apply the confinement for the given effective caveats. Called by a tool
     /// *before* it does any privileged work, on the thread/process that will do
     /// it. A `Noop` implementation succeeds without restricting anything.
@@ -568,6 +573,19 @@ pub fn best_available_sandbox(policy: &Arc<SandboxPolicy>) -> Box<dyn Sandbox> {
         let _ = policy; // NoopSandbox is unconfigurable (advisory).
         Box::new(NoopSandbox)
     }
+}
+
+/// Explicitly select the reviewed native root operation. Other backends refuse;
+/// in particular Seatbelt's legacy fs projection is not a ruleset-grain proof.
+pub(crate) fn named_root_sandbox(policy: &Arc<SandboxPolicy>) -> ToolResult<Box<dyn Sandbox>> {
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    if landlock_impl::landlock_is_supported() {
+        return Ok(Box::new(landlock_impl::LandlockSandbox::for_named_root(
+            policy.clone(),
+        )));
+    }
+    let _ = policy;
+    Err(crate::ToolError::denied("named-root execution requires the supported Landlock backend; other backend projections are not established"))
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
@@ -1133,6 +1151,7 @@ pub(crate) mod landlock_impl {
     pub struct LandlockSandbox {
         /// The read/exec allow-lists + ABI floors this backend enforces (I5-B).
         policy: Arc<SandboxPolicy>,
+        exec_boundary: crate::ExecBoundary,
     }
 
     impl LandlockSandbox {
@@ -1143,7 +1162,22 @@ pub(crate) mod landlock_impl {
 
         /// Construct configured with an operator-supplied [`SandboxPolicy`].
         pub fn with_policy(policy: Arc<SandboxPolicy>) -> Self {
-            Self { policy }
+            Self {
+                policy,
+                exec_boundary: crate::ExecBoundary::ProcessTree,
+            }
+        }
+
+        pub(super) fn for_named_root(policy: Arc<SandboxPolicy>) -> Self {
+            Self {
+                policy,
+                exec_boundary: crate::ExecBoundary::NamedRoot,
+            }
+        }
+
+        fn handles_execute(&self, effective: &Caveats) -> bool {
+            self.exec_boundary == crate::ExecBoundary::ProcessTree
+                && matches!(effective.exec, Scope::Only(_))
         }
 
         // ── Shared root computation (ONE routine for both the applied ruleset and
@@ -1211,6 +1245,10 @@ pub(crate) mod landlock_impl {
             SandboxKind::Landlock
         }
 
+        fn exec_boundary(&self) -> crate::ExecBoundary {
+            self.exec_boundary
+        }
+
         fn apply(&self, effective: &Caveats) -> ToolResult<()> {
             let write = AccessFs::from_write(fs_abi_floor(&self.policy));
             // Pure read rights — `from_read` also bundles `Execute`, which we
@@ -1232,7 +1270,7 @@ pub(crate) mod landlock_impl {
             if confine_read {
                 handled |= read;
             }
-            if confine_exec {
+            if self.handles_execute(effective) {
                 handled |= AccessFs::Execute;
             }
 
@@ -1282,7 +1320,7 @@ pub(crate) mod landlock_impl {
                 ruleset
             };
 
-            let ruleset = if confine_exec {
+            let ruleset = if self.handles_execute(effective) {
                 // Execute-allow ONLY the resolved granted program files plus the
                 // dynamic linker(s) — never library directories (recursive +
                 // expose `/usr/lib`'s interpreters). A permitted binary still runs
@@ -1361,7 +1399,7 @@ pub(crate) mod landlock_impl {
             // loader (the direct-execve corpus). The ld.so mmap-exec trampoline is
             // out of scope for the exec axis by definition (arbitrary-code, not a
             // process image; a separate future concern), so it is NOT a widening here.
-            let exec = if confine_exec {
+            let exec = if self.handles_execute(effective) {
                 bounded(self.exec_roots(effective))
             } else {
                 ResolvedScope::Unbounded
@@ -1422,6 +1460,14 @@ pub(crate) mod landlock_impl {
             // binding, PR-5; here we refuse only closure roots that actually
             // resolve INTO harness-private state.)
             let harness_safe_bounded = |s: BTreeSet<String>| -> ResolvedScope {
+                if self.exec_boundary == crate::ExecBoundary::NamedRoot {
+                    // Retain the REAL substrate entries for the NamedRoot
+                    // additions-only inventory check. It checks canonical
+                    // recorded protected-root overlap against explicit delegation;
+                    // poisoning an already read-granted image here would hide
+                    // the evidence that no extra authority was added.
+                    return bounded(s);
+                }
                 let reaches_private = s.iter().any(|entry| {
                     crate::admitted::entry_reaches_harness_private(entry)
                         || std::fs::canonicalize(entry)
@@ -1453,7 +1499,7 @@ pub(crate) mod landlock_impl {
 
             // exec additions: the resolved granted program image (reconciling the
             // grant TOKEN with its canonical path) + the dynamic linker(s).
-            let exec_add = if confine_exec {
+            let exec_add = if self.handles_execute(effective) {
                 let mut e = resolve_exec_paths(&effective.exec);
                 e.extend(self.policy.loader_paths.resolve());
                 existing(e)
@@ -4487,3 +4533,5 @@ print(d.value())
         );
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

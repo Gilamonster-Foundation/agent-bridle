@@ -31,10 +31,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Caveats, ChildNetworkPolicy, SandboxKind, Scope};
 
+/// The domain of the executable-identity admission obligation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecBoundary {
+    /// Existing process-tree scope obligation; native residuals still apply.
+    #[default]
+    ProcessTree,
+    /// Exact root admission; descendant identities are explicitly unrestricted
+    /// inside the inherited filesystem/network fence.
+    NamedRoot,
+}
+
+impl ExecBoundary {
+    fn is_process_tree(&self) -> bool {
+        *self == Self::ProcessTree
+    }
+}
+
 /// The confinement **mechanism** actually governing a spawn: the selected OS
 /// backend PLUS the mechanism configuration that changes what a given backend can
-/// truthfully enforce. Today the only such knob is the child-network policy
-/// ([`ChildNetworkPolicy`]) — the difference between a Landlock TCP-only rule and
+/// truthfully enforce. These include the explicit [`ExecBoundary`] proof domain
+/// and child-network policy ([`ChildNetworkPolicy`]) — the difference between a Landlock TCP-only rule and
 /// the seccomp `DenyDirect` socket-family deny is *material* to the net witness,
 /// so the report must be computed from the mechanism, not the backend kind alone.
 ///
@@ -47,6 +65,9 @@ use crate::{Caveats, ChildNetworkPolicy, SandboxKind, Scope};
 pub struct ConfinementMechanism {
     kind: SandboxKind,
     child_network: ChildNetworkPolicy,
+    // Omission preserves the existing default canonical body and fence CID.
+    #[serde(default, skip_serializing_if = "ExecBoundary::is_process_tree")]
+    exec_boundary: ExecBoundary,
 }
 
 impl ConfinementMechanism {
@@ -56,7 +77,24 @@ impl ConfinementMechanism {
         Self {
             kind,
             child_network,
+            exec_boundary: ExecBoundary::ProcessTree,
         }
+    }
+
+    /// Explicit root admission with a filesystem/network-fenced process tree.
+    #[must_use]
+    pub fn for_named_root(kind: SandboxKind, child_network: ChildNetworkPolicy) -> Self {
+        Self {
+            kind,
+            child_network,
+            exec_boundary: ExecBoundary::NamedRoot,
+        }
+    }
+
+    /// The actual executable-identity proof domain.
+    #[must_use]
+    pub fn exec_boundary(&self) -> ExecBoundary {
+        self.exec_boundary
     }
 
     /// A backend with the **conservative** (weakest) child-network mechanism
@@ -216,6 +254,7 @@ pub fn enforcement_report(
     let ConfinementMechanism {
         kind: active,
         child_network,
+        exec_boundary,
     } = mechanism.into();
     // Filesystem axes: kernel when an OS sandbox actually governs them, else the
     // in-process interceptor. Exhaustive over `SandboxKind` so a new backend
@@ -244,6 +283,7 @@ pub fn enforcement_report(
         fs_read: fs(&effective.fs_read),
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(match active {
+            _ if exec_boundary == ExecBoundary::NamedRoot => AxisEnforcement::Interceptor,
             // `exec → kernel` is reserved for modes that close the axis by
             // *identity*: Seatbelt (macOS) via `process-exec*` — interior-covering,
             // no trampoline bypass on Apple Silicon (ADR 0014) — and the Linux
@@ -1868,3 +1908,5 @@ mod tests {
         );
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

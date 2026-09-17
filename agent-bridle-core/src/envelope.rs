@@ -7,6 +7,8 @@
 
 use crate::{EnforcementReport, HumanGate, SandboxKind};
 
+mod execution;
+
 /// Which kind of capability operation the leash refused.
 ///
 /// Mirrors the brush `CommandInterceptor` hooks: an `exec` denial comes from
@@ -64,7 +66,7 @@ pub struct Disclosure {
     /// The run was explicitly **unbridled** (confinement off — `Caveats::top()` +
     /// advisory floor + `SandboxKind::None`), an acknowledged operator opt-in
     /// (#151/I12). Always emitted when `true`; never reachable by omission.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub unbridled: bool,
     /// Automatic normalizations the operator turned off, by name (e.g.
     /// `ldd_closure`, `nss_closure_fallback`) — so a degraded run is legible.
@@ -74,7 +76,7 @@ pub struct Disclosure {
     /// the loopback egress proxy admits exactly the granted hosts while the report
     /// honestly keeps the axis `advisory` (proxy-, not kernel-, enforced; #124/#128,
     /// ADR 0016). Discloses the over-delivery without raising the claim.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub net_over_delivery: bool,
     /// A sandbox backend was overridden from the default selection (downgrade /
     /// select-available only; #149/I10). Names the backend actually applied.
@@ -125,17 +127,17 @@ pub struct ToolEnvelope {
     /// Whether captured stdout was clipped at the output cap (more was produced
     /// than was kept). Lets a consumer tell a complete result from a truncated
     /// one. Omitted (treated as `false`) when output was not clipped.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub stdout_truncated: bool,
     /// Whether captured stderr was clipped at the output cap. Omitted when not.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub stderr_truncated: bool,
     /// Whether the in-process leash recorded at least one denial during this
     /// invocation. This is a **structured** signal: it is set iff
     /// [`Self::denials`] is non-empty, so a consumer never has to string-match
     /// stderr to detect a security refusal. Omitted (treated as `false`) when
     /// no denial was recorded.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub denied: bool,
     /// The denials the interceptor recorded, in the order they occurred. Empty
     /// (and omitted from JSON) unless [`Self::denied`] is `true`.
@@ -155,6 +157,13 @@ pub struct ToolEnvelope {
     /// worth disclosing); an `unbridled` run always surfaces here.
     #[serde(skip_serializing_if = "Disclosure::is_quiet", default)]
     pub disclosure: Disclosure,
+    /// The actual Started event, when a managed root acquired a process tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_started: Option<crate::ExecutionEvent>,
+    /// The actual managed terminal event, including failure or pre-spawn denial.
+    /// Together with `execution_started` this is a bounded pair, not an output log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::ExecutionEvent>,
 }
 
 /// `skip_serializing_if` helper: omit `denied` from JSON when it is `false`.
@@ -443,3 +452,5 @@ mod tests {
         );
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

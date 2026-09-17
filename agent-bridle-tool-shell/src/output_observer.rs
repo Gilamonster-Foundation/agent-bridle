@@ -163,6 +163,16 @@ pub(crate) type WorkerChannelSink = Arc<dyn Fn(ShellOutputStream, &[u8]) + Send 
 
 #[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
 impl OutputEmitter {
+    /// Stop presentation when the managed owner reaches its timeout. The async
+    /// invocation's guard still owns cancellation when its waiter is dropped.
+    #[cfg(feature = "brush")]
+    pub(crate) fn cancel(&self) {
+        if let Some(session) = &self.session {
+            session.phase.store(CANCELLED, Ordering::Release);
+            let _ = session.sender.send(Dispatch::Cancel);
+        }
+    }
+
     pub(crate) fn emit(&self, stream: ShellOutputStream, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
@@ -561,3 +571,5 @@ mod tests {
         assert!(truncated);
     }
 }
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

@@ -92,7 +92,7 @@ native_test   = ["agent-bridle-tool-shell/tests/child_network_seccomp_real.rs"]
 native_test_fn = ["agent-bridle-tool-shell/tests/child_network_seccomp_real.rs::deny_direct_denies_a_childs_io_uring_setup_with_eacces", "agent-bridle-tool-shell/tests/child_network_seccomp_real.rs::deny_direct_denies_a_forked_descendants_io_uring_setup"]
 liveness      = "capability positive control (io_uring_capable): a host that cannot create a ring SKIPS with an explicit 'SKIP is not PASS' notice instead of reporting the deny as observed."
 evidence_cid  = "held:phase1d"
-premise       = "ASM-SECCOMP-IOURING: RC-CERTIFIED at v0.8.0-rc.1 (d1cb545), 2026-08-13: re-run at the frozen tag on gnuc kernel 6.8.0-134, 3/3 green (both deny probes EACCES-exact + capability positive control)."
+premise       = "ASM-SECCOMP-IOURING: RC-CERTIFIED at v0.8.0-rc.1 (d1cb545), 2026-08-13: re-run at the frozen tag on the Linux test host, kernel 6.8.0-134, 3/3 green (both deny probes EACCES-exact + capability positive control)."
 status        = "partial"
 
 # ── Portable authority-algebra claims (platform-neutral core) ────────────────
