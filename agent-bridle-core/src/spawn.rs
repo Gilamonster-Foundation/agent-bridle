@@ -1084,6 +1084,9 @@ pub fn confinement_unenforceable(
     caveats: &Caveats,
     floor: AxisEnforcement,
 ) -> bool {
+    if crate::sandbox::has_unix_socket_grants(caveats) && kind != SandboxKind::Seatbelt {
+        return true;
+    }
     let report = enforcement_report(caveats, kind);
     let below_kernel = |e: Option<AxisEnforcement>| e.is_some_and(|e| e != AxisEnforcement::Kernel);
     // (1) Filesystem axes: kernel-enforceable, so a restricted-but-not-kernel fs
