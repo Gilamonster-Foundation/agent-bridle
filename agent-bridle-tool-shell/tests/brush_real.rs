@@ -168,6 +168,11 @@ fn run_platform() {
         "env_seam_delivers_home_for_tilde_class_tooling",
         env_seam_delivers_home_for_tilde_class_tooling,
     );
+    run_async_case(
+        &runtime,
+        "env_seam_vars_reach_a_real_spawned_childs_environment",
+        env_seam_vars_reach_a_real_spawned_childs_environment,
+    );
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -766,5 +771,40 @@ async fn env_seam_delivers_home_for_tilde_class_tooling() {
         out["stdout"].as_str().unwrap_or("").trim(),
         "/seam/home",
         "HOME must cross the import surface: {out}"
+    );
+}
+
+/// The vacuous-green gap the two tests above shared: `echo "$VAR"` is a brush
+/// BUILTIN, so it reads brush's own internal variable table directly — it
+/// would pass identically whether or not the seeded variable was ever
+/// `.export()`ed, since export only controls what a *spawned child process*
+/// inherits, never brush's own expansion. `ShellVariable::new` defaults
+/// `exported: false`; `set_global` alone never flips it. Found live: a real
+/// confined `run_command` dispatch showed only `PWD`/`SHLVL`/`_` in `env |
+/// sort`'s output — none of PATH/HOME/USER, despite this file's own tests all
+/// passing. `/usr/bin/env` (never a shell builtin) is this test's ground
+/// truth: it can only print what its OWN process actually inherited.
+async fn env_seam_vars_reach_a_real_spawned_childs_environment() {
+    let out = tool()
+        .invoke(
+            serde_json::json!({
+                "cmd": "env",
+                "env": { "NEWT_SEAM_EXPORT_PROBE": "reached-the-child" },
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+
+    assert_ne!(out["denied"], true, "{out}");
+    let stdout = out["stdout"].as_str().unwrap_or("");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "NEWT_SEAM_EXPORT_PROBE=reached-the-child"),
+        "the caller-provided env var must reach a REAL spawned child's \
+         environment, not just brush's own variable table (a `set_global` \
+         without `.export()` passes `echo \"$VAR\"` yet still fails this): \
+         {out}"
     );
 }
