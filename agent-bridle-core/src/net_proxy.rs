@@ -348,7 +348,10 @@ fn canonical_private_host(host: &str) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
-pub(crate) fn canonical_private_hosts(
+/// Validate and canonicalize exact private-host approvals from an owning
+/// harness. This does not grant ordinary network authority or permit an address;
+/// the proxy still intersects the host scope and screens each resolved address.
+pub fn canonical_private_hosts(
     hosts: impl IntoIterator<Item = String>,
 ) -> io::Result<HashSet<String>> {
     hosts
