@@ -20,8 +20,16 @@ the wheel.
 ```python
 import agent_bridle
 
-# A grant that authorizes executing ONLY `echo` — nothing else.
-grant = {"exec": {"only": ["echo"]}}
+# Restrict executable selection to echo. The other axes are explicitly open:
+# this default-wheel example enables no native filesystem/network sandbox.
+grant = {
+    "exec": {"only": ["echo"]},
+    "fs_read": "all",
+    "fs_write": "all",
+    "net": "all",
+    "max_calls": "unlimited",
+    "valid_for_generation": "all",
+}
 
 # ALLOWED: `echo` is within the granted `exec` scope, so it is spawned as an
 # external program (after the exec leash admits it) and stdout is captured.
@@ -29,11 +37,9 @@ r = agent_bridle.invoke("shell", {"program": "echo", "args": ["hi"]}, grant)
 print(r["exit_code"], repr(r["stdout"]))   # -> 0 'hi\n'
 print(r["sandbox_kind"])                    # -> 'none' (default wheel enables no native L3 backend)
 
-# DENIED: `rm` is NOT in the granted `exec` scope. The leash refuses to mint
-# the tool's context, so the destructive command never runs — no prompt
-# hygiene required. The confused-deputy gap is closed structurally.
+# DENIED: even a harmless `pwd` is outside the exact executable grant.
 try:
-    agent_bridle.invoke("shell", {"program": "rm", "args": ["-rf", "/tmp/x"]}, grant)
+    agent_bridle.invoke("shell", {"program": "pwd", "args": []}, grant)
 except agent_bridle.BridleDenied as e:   # subclass of PermissionError
     print("blocked by the leash:", e)
 
@@ -42,19 +48,23 @@ print(agent_bridle.tool_names())          # -> ['shell']
 print(agent_bridle.tool_definitions())    # MCP tools/list schemas
 ```
 
-### The `shell` tool takes argv form, not a `cmd` string
+### Shell input forms
 
-The shell tool's arguments are **argv form** — `{"program": ..., "args": [...]}`
-— deliberately, not a free-form `{"cmd": "echo hi"}` string. The `exec` caveat
-gates on the *named program token*, so the program has to be a discrete field the
-leash can check. A `cmd` string would let `echo hi; rm -rf /` slip the leash,
-which is exactly the hole the bridle closes (DESIGN §6).
+The shell accepts either `{"program": ..., "args": [...]}` or a safe-subset
+`{"cmd": "echo hi"}` string, one form per call. The safe-subset parser checks
+executable and filesystem operations before spawning; unsupported dynamic
+syntax is refused. See the [shell documentation](../agent-bridle-tool-shell/README.md).
+
+The example explicitly leaves all non-exec axes unrestricted to match the
+default wheel, which compiles no native L3 backend. Restricting a filesystem or
+network axis can therefore require a backend that this build cannot provide;
+omitting that axis does not authorize it.
 
 ## API
 
 | Function | Signature | Notes |
 |---|---|---|
-| `invoke` | `invoke(tool: str, args: dict, caveats: dict \| None = None) -> dict` | Dispatch `tool` with `args` under `caveats`. `None` → unconfined (`Caveats::top()`) with a stderr WARNING. Returns the result dict; raises `BridleDenied` on a leash denial or any tool error. |
+| `invoke` | `invoke(tool: str, args: dict, caveats: dict \| None = None) -> dict` | Dispatch `tool` with `args` under `caveats`. `None` → deny-all; no operation is authorized. Returns the result dict; raises `BridleDenied` on a leash denial or any tool error. |
 | `tool_names` | `tool_names() -> list[str]` | Registered tool names (sorted). |
 | `tool_definitions` | `tool_definitions() -> list[dict]` | One MCP `tools/list` dict (`name` + `inputSchema`) per tool. |
 | `BridleDenied` | exception class | Subclass of `PermissionError`; its message carries the human-readable denial reason. |
@@ -70,22 +80,24 @@ which is exactly the hole the bridle closes (DESIGN §6).
 | `max_calls` | `"unlimited"` or `{"at_most": N}` |
 | `valid_for_generation` | `"all"` or `{"only": [N, …]}` (non-negative integers) |
 
-Any omitted axis defaults to its **top** (unrestricted). This is exactly the
-shape `serde_json::to_value(&Caveats)` produces in Rust.
+Any omitted axis defaults to **deny-all**: scopes become empty and a missing
+`max_calls` becomes zero. A complete `serde_json::to_value(&Caveats)` grant
+names every axis and round-trips unchanged.
 
 > **Interop note.** The `agent_mesh.core.Caveats` *pyclass* (agent-mesh PR #18)
 > exposes a friendlier surface (`fs_read=["/repo"]`, `max_calls=10`, top axes as
 > `None`). Its `.to_json()` is **not** byte-identical to the Rust serde shape
-> above; translate each axis (`["echo"]` → `{"only": ["echo"]}`, `None` → omit,
-> `10` → `{"at_most": 10}`) when passing an agent-mesh pyclass grant here. Both
-> describe the same lattice; only the JSON spelling differs.
+> above. Translate scope values explicitly (`["echo"]` → `{"only": ["echo"]}`,
+> a top-valued `None` → `"all"`) and bounds (`10` → `{"at_most": 10}`,
+> an unlimited bound → `"unlimited"`). Do not omit a top-valued axis: omission
+> means deny-all at this Python boundary.
 
 A malformed grant (unknown axis, wrong value form) raises `ValueError` — it is
 bad input, distinct from a `BridleDenied` authority refusal.
 
 ## Building from source
 
-The shared `~/venv` may carry too old a maturin; build in an isolated venv:
+Build in an isolated virtual environment:
 
 ```bash
 python3 -m venv /tmp/abp-venv
@@ -98,3 +110,5 @@ python3 -m venv /tmp/abp-venv
 
 Apache-2.0. This default wheel carries the safe-subset engine, not the optional
 Brush dependencies; the workspace `NOTICE` covers builds that do carry Brush.
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 00:18 EDT | Date: 2026-09-18

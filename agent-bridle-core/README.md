@@ -57,12 +57,10 @@ preserving absent versus empty values. The runtime interprets the value.
 Windows AppContainer timezone parity is tracked in [#387](https://github.com/Gilamonster-Foundation/agent-bridle/issues/387);
 micro-VM named-zone materialization is tracked in [#388](https://github.com/Gilamonster-Foundation/agent-bridle/issues/388).
 
-## Proposed 0.7 maintenance scope
+## 0.7.16 maintenance scope
 
-This candidate extends the published 0.7.15 API with explicit private-host and
-Unix-endpoint approvals. It retains that line's admission behavior for existing
-scopes; a compatible published release still requires upstream review and
-validation. The workspace version is unchanged.
+Version 0.7.16 extends the 0.7.15 API with explicit private-host and Unix-endpoint
+approvals. It retains that line's admission behavior for existing scopes.
 
 This is not a port of the 0.8 admission protocol and does not relax its macOS
 restricted-network hold or establish that its outstanding confinement proof is
@@ -123,3 +121,9 @@ Apache-2.0
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 11:46 EDT | Date: 2026-09-17
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 16:23 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 00:12 EDT | Date: 2026-09-18
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 00:16 EDT | Date: 2026-09-18
