@@ -165,6 +165,18 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
 }
 
+/// An explicit path-named Unix endpoint is distinct from a DNS host. The exact
+/// token participates in the ordinary net-scope meet; filesystem grants never
+/// imply permission to connect. Only Seatbelt projects this endpoint authority.
+pub(crate) fn has_unix_socket_grants(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s) if s.iter().any(|s| s.starts_with("unix:")))
+}
+
+pub(crate) fn net_unix_only(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s)
+        if !s.is_empty() && s.iter().all(|s| s.starts_with("unix:")))
+}
+
 /// `true` when the `exec` axis is a deny-all empty allow-list (`Scope::Only([])`).
 ///
 /// An empty allow-list means *no program may be spawned* — any `exec` call is
@@ -213,10 +225,14 @@ pub(crate) const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 /// Unlike the fs `(subpath root)` case — where the kernel subtree and the granted
 /// root denote the same set — the loopback interface can exceed a single-address
 /// grant; see ADR 0015 D2.
+/// Explicit `unix:` endpoints may coexist; they are separate exact outbound
+/// exceptions under Seatbelt, never additional IP authority. Other backends
+/// refuse scopes containing those endpoints at admission.
 #[must_use]
 pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s)
-        if !s.is_empty() && s.iter().all(|h| LOOPBACK_HOSTS.contains(&h.as_str())))
+        if s.iter().any(|h| LOOPBACK_HOSTS.contains(&h.as_str()))
+            && s.iter().all(|h| h.starts_with("unix:") || LOOPBACK_HOSTS.contains(&h.as_str())))
 }
 
 /// The granted host set of a **general remote-host** `net` allow-list — the case
@@ -230,15 +246,22 @@ pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
 /// a caller confines a spawned child's egress to the loopback interface
 /// ([`loopback_fenced_caveats`], reusing the ADR 0015 kernel fence) and runs a
 /// loopback forward proxy that enforces this host set. Pure; no IO. The returned
-/// set is the **full** grant (loopback members included — the proxy admits them
-/// too), matching `ToolContext::check_net`'s exact-name membership.
+/// set is the full **IP host** grant (loopback members included), matching
+/// `ToolContext::check_net`'s exact-name membership. Explicit `unix:` endpoints
+/// are not DNS hosts and remain exclusively in the child's kernel profile.
 #[must_use]
 pub fn net_egress_proxy_hosts(caveats: &Caveats) -> Option<Vec<String>> {
     match &caveats.net {
         crate::Scope::Only(s)
-            if !s.is_empty() && s.iter().any(|h| !LOOPBACK_HOSTS.contains(&h.as_str())) =>
+            if s.iter()
+                .any(|h| !h.starts_with("unix:") && !LOOPBACK_HOSTS.contains(&h.as_str())) =>
         {
-            Some(s.iter().cloned().collect())
+            Some(
+                s.iter()
+                    .filter(|h| !h.starts_with("unix:"))
+                    .cloned()
+                    .collect(),
+            )
         }
         _ => None,
     }
@@ -246,7 +269,8 @@ pub fn net_egress_proxy_hosts(caveats: &Caveats) -> Option<Vec<String>> {
 
 /// The confinement caveats for a spawned child paired with a loopback **egress
 /// proxy** (#124, ADR 0016): identical to `caveats` except the `net` axis is
-/// replaced by the loopback set, so its [`seatbelt_profile`] emits the ADR 0015
+/// replaced by the loopback set plus any explicit `unix:` endpoints, so its
+/// [`seatbelt_profile`] emits the ADR 0015
 /// kernel fence — `(deny network*)` + `(allow network* (remote ip
 /// "localhost:*"))` — while the `fs`/`exec` rules are preserved verbatim. The
 /// child can then reach *nothing* off-box directly; its only path off the
@@ -254,8 +278,13 @@ pub fn net_egress_proxy_hosts(caveats: &Caveats) -> Option<Vec<String>> {
 /// IO. Only meaningful for a grant where [`net_egress_proxy_hosts`] is `Some`.
 #[must_use]
 pub fn loopback_fenced_caveats(caveats: &Caveats) -> Caveats {
+    let mut endpoints: std::collections::BTreeSet<String> =
+        LOOPBACK_HOSTS.iter().map(|h| (*h).to_string()).collect();
+    if let crate::Scope::Only(names) = &caveats.net {
+        endpoints.extend(names.iter().filter(|h| h.starts_with("unix:")).cloned());
+    }
     Caveats {
-        net: crate::Scope::Only(LOOPBACK_HOSTS.iter().map(|h| (*h).to_string()).collect()),
+        net: crate::Scope::Only(endpoints),
         ..caveats.clone()
     }
 }
@@ -289,6 +318,9 @@ pub(crate) fn egress_proxy_plan_for(
     available: SandboxKind,
     caveats: &Caveats,
 ) -> Option<(Vec<String>, Caveats)> {
+    if has_unix_socket_grants(caveats) && available != SandboxKind::Seatbelt {
+        return None; // No other backend projects exact Unix endpoint authority.
+    }
     let allow_hosts = net_egress_proxy_hosts(caveats)?;
     // Engage the proxy ONLY where the child's egress can be kernel-fenced to
     // loopback. Checking merely that the sandbox confines *something* (as the
@@ -357,6 +389,7 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
             if restricts_fs(caveats)
                 || net_fully_denied(caveats)
                 || net_loopback_only(caveats)
+                || has_unix_socket_grants(caveats)
                 || restricts_exec(caveats) =>
         {
             SandboxKind::Seatbelt
@@ -414,7 +447,9 @@ pub use landlock_impl::{landlock_is_supported, landlock_net_is_supported, Landlo
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
 
-#[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+// Prefix construction is portable; unit tests exercise its admission decisions
+// on every host. Native Windows enforcement remains in the Windows proof lane.
+#[cfg(any(test, all(target_os = "windows", feature = "windows-appcontainer")))]
 pub(crate) mod appcontainer_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -487,6 +522,11 @@ pub(crate) mod appcontainer_impl {
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            if super::has_unix_socket_grants(effective) {
+                return Err(ToolError::denied(
+                    "windows-appcontainer: exact Unix endpoint grants require Seatbelt",
+                ));
+            }
             // The launcher engages when:
             //  - net is fully denied (deny-by-default network policy)
             //  - net is loopback-only (egress proxy path, #133)
@@ -1090,6 +1130,15 @@ mod seatbelt_impl {
         }
 
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            let unix_sockets = unix_socket_paths(effective)?;
+            if !unix_sockets.is_empty()
+                && !super::net_unix_only(effective)
+                && !super::net_loopback_only(effective)
+            {
+                return Err(ToolError::denied(
+                    "Unix socket grants with remote hosts require the managed egress proxy",
+                ));
+            }
             // Nothing on a governed axis (fs, all-egress-denied or loopback-only
             // net, or a restricted exec allow-list) => nothing to confine; run
             // unwrapped (coarse honesty falls to `None` upstream, and the per-axis
@@ -1097,6 +1146,7 @@ mod seatbelt_impl {
             if !super::restricts_fs(effective)
                 && !super::net_fully_denied(effective)
                 && !super::net_loopback_only(effective)
+                && unix_sockets.is_empty()
                 && !super::restricts_exec(effective)
             {
                 return Ok(Vec::new());
@@ -1115,6 +1165,7 @@ mod seatbelt_impl {
                     effective,
                     &self.policy.base_read_paths.resolve(),
                     &self.policy.device_sink_paths.resolve(),
+                    &unix_sockets,
                 ),
             ])
         }
@@ -1142,6 +1193,7 @@ mod seatbelt_impl {
             effective,
             &policy.base_read_paths.resolve(),
             &policy.device_sink_paths.resolve(),
+            &unix_socket_paths(effective).expect("valid Unix socket grants in profile fixture"),
         )
     }
 
@@ -1152,6 +1204,7 @@ mod seatbelt_impl {
         effective: &Caveats,
         base_read: &[String],
         sinks: &[String],
+        unix_sockets: &[String],
     ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n");
 
@@ -1210,11 +1263,17 @@ mod seatbelt_impl {
         //     interface (`localhost` = 127.0.0.1 + ::1). The process's own off-box
         //     socket egress stays kernel-denied; the exact loopback host is narrowed
         //     by admission. Last-match-wins, so the allow overrides.
-        if super::net_fully_denied(effective) {
+        if super::net_fully_denied(effective) || super::net_unix_only(effective) {
             p.push_str("(deny network*)\n");
         } else if super::net_loopback_only(effective) {
             p.push_str("(deny network*)\n");
             p.push_str("(allow network* (remote ip \"localhost:*\"))\n");
+        }
+        for path in unix_sockets {
+            p.push_str(&format!(
+                "(allow network-outbound (literal {}))\n",
+                sbpl_string(path)
+            ));
         }
 
         // exec: deny *all* further execs, then re-allow exactly the granted
@@ -1239,6 +1298,24 @@ mod seatbelt_impl {
         }
 
         p
+    }
+
+    /// No lexical aliases, symlinks, missing endpoints, or patterns. Matching is
+    /// to this exact existing pathname, not its parent or a socket subtree.
+    fn unix_socket_paths(effective: &Caveats) -> ToolResult<Vec<String>> {
+        use std::os::unix::fs::FileTypeExt;
+        let Scope::Only(names) = &effective.net else {
+            return Ok(Vec::new());
+        };
+        names.iter().filter_map(|name| name.strip_prefix("unix:")).map(|name| {
+            let path = Path::new(name);
+            let valid = path.is_absolute()
+                && !name.chars().any(|c| c.is_control() || matches!(c, '*' | '?' | '[' | ']'))
+                && std::fs::canonicalize(path).ok().and_then(|p| p.to_str().map(str::to_owned)).as_deref() == Some(name)
+                && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
+            if valid { Ok(name.to_owned()) }
+            else { Err(ToolError::denied("Unix endpoint grant must name an existing canonical absolute socket without symlinks or patterns")) }
+        }).collect()
     }
 
     /// The canonicalized, existing roots a restricted [`Scope`] grants. A path
@@ -1718,6 +1795,46 @@ mod seatbelt_impl {
 mod tests {
     use super::*;
     use crate::Scope;
+
+    fn assert_appcontainer_rejects_unix(names: &[&str]) {
+        let caveats = Caveats {
+            net: Scope::only(names.iter().map(|name| (*name).to_owned())),
+            ..Caveats::top()
+        };
+        let result = appcontainer_impl::AppContainerSandbox::new().command_prefix(&caveats);
+        assert!(
+            matches!(&result, Err(crate::ToolError::Denied { reason }) if reason.contains("Unix")),
+            "unsupported Unix authority must refuse before launcher lookup: {result:?}"
+        );
+    }
+
+    #[test]
+    fn appcontainer_command_prefix_rejects_unix_only() {
+        assert_appcontainer_rejects_unix(&["unix:/private/tmp/service.sock"]);
+    }
+
+    #[test]
+    fn appcontainer_command_prefix_rejects_unix_with_loopback() {
+        assert_appcontainer_rejects_unix(&["unix:/private/tmp/service.sock", "localhost"]);
+    }
+
+    #[test]
+    fn appcontainer_command_prefix_keeps_existing_unix_free_behavior() {
+        let sandbox = appcontainer_impl::AppContainerSandbox::new();
+        assert!(sandbox.command_prefix(&Caveats::top()).unwrap().is_empty());
+        let caveats = Caveats {
+            net: Scope::only(["localhost".to_owned()]),
+            ..Caveats::top()
+        };
+        match sandbox.command_prefix(&caveats) {
+            Ok(prefix) => assert!(prefix.iter().any(|arg| arg == "--loopback-exemption")),
+            Err(crate::ToolError::Denied { reason }) => assert!(
+                reason.contains("agent-bridle-aclaunch.exe not found"),
+                "plain loopback must reach normal launcher lookup: {reason}"
+            ),
+            other => panic!("unexpected loopback prefix result: {other:?}"),
+        }
+    }
 
     #[test]
     fn noop_reports_none_and_never_fails() {

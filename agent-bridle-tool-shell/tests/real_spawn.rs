@@ -68,51 +68,80 @@ async fn real_echo_runs_and_captures_stdout() {
 }
 
 /// #269 / AB-006: a timed-out child is KILLED and reaped — it must not run to
-/// completion. `sh -c 'sleep 3; touch MARKER'` with a 1s timeout: the envelope
-/// reports a confirmed timeout, and after the child's would-be sleep elapses the
-/// marker never appears (the sleep was SIGKILLed, not merely un-awaited). Before
-/// the fix the detached blocking worker let the child run on and write it.
+/// completion. The script writes START, then sleeps 3s, then writes DONE. With
+/// a 1s timeout, START proves the child ran and DONE must never appear.
+///
+/// This process-lifecycle fixture uses unrestricted authority, as on main.
+/// A restricted exec grant can refuse a shell or its descendants before the
+/// timeout, which tests admission rather than process cleanup.
 #[tokio::test]
 async fn real_timed_out_child_is_killed_and_never_writes_marker() {
-    let marker = unique_temp("ab006-child");
-    let script = format!("sleep 3; touch {}", shell_path(&marker));
+    let start = unique_temp("ab006-child-start");
+    let done = unique_temp("ab006-child-done");
+    let script = format!(
+        "touch {}; sleep 3; touch {}",
+        shell_path(&start),
+        shell_path(&done)
+    );
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
-            &ctx(exec_only(&["sh"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
-    assert_eq!(out["timed_out"], true, "must report a confirmed timeout");
-    // Wait well past the child's 3s sleep; a killed child never reaches `touch`.
+    assert_eq!(
+        out["timed_out"], true,
+        "must report a confirmed timeout: {out}"
+    );
+    assert!(
+        start.exists(),
+        "the child must actually start before timeout"
+    );
+    // Wait well past the child's 3s sleep; a killed child never reaches DONE.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     assert!(
-        !marker.exists(),
-        "the timed-out child must be killed, not run to completion (its marker was written)"
+        !done.exists(),
+        "the timed-out child must be killed, not run to completion (DONE appeared)"
     );
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&start);
+    let _ = std::fs::remove_file(&done);
 }
 
 /// #269 / AB-006: the kill reaches a GRANDCHILD, not just the direct child —
-/// process-group SIGKILL takes the whole tree. `sh -c 'sh -c "sleep 3; touch M"'`.
+/// process-group SIGKILL takes the whole tree. START proves the tree ran;
+/// the inner shell must not reach DONE after its sleep would have elapsed.
 #[tokio::test]
 async fn real_timed_out_grandchild_is_killed() {
-    let marker = unique_temp("ab006-grandchild");
-    let script = format!("sh -c 'sleep 3; touch {}'", shell_path(&marker));
+    let start = unique_temp("ab006-grandchild-start");
+    let done = unique_temp("ab006-grandchild-done");
+    let script = format!(
+        "sh -c 'touch {}; sleep 3; touch {}'",
+        shell_path(&start),
+        shell_path(&done)
+    );
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({"program": "sh", "args": ["-c", script], "timeout_secs": 1}),
-            &ctx(exec_only(&["sh"])),
+            &ctx(Caveats::top()),
         )
         .await
         .expect("invoke");
-    assert_eq!(out["timed_out"], true);
+    assert_eq!(
+        out["timed_out"], true,
+        "must report a confirmed timeout: {out}"
+    );
+    assert!(
+        start.exists(),
+        "the process tree must actually start before timeout"
+    );
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     assert!(
-        !marker.exists(),
-        "the timed-out grandchild must be killed via the process group"
+        !done.exists(),
+        "the timed-out grandchild must be killed via the process group (DONE appeared)"
     );
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&start);
+    let _ = std::fs::remove_file(&done);
 }
 
 /// #268 / AB-004: loader / interpreter / hook env vars are DROPPED before the

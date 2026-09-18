@@ -182,6 +182,11 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             }
         }),
         net: is_restricted(&effective.net).then_some(match active {
+            _ if crate::sandbox::has_unix_socket_grants(effective)
+                && active != SandboxKind::Seatbelt =>
+            {
+                AxisEnforcement::Advisory
+            }
             // AppContainer (#133, ADR 0016): the capability model kernel-denies all
             // off-box egress when no internet capability SIDs are granted. Two net
             // scopes reach Kernel: deny-all (empty set) and loopback-only — both
@@ -207,7 +212,8 @@ pub fn enforcement_report(effective: &Caveats, active: SandboxKind) -> Enforceme
             // net this increment.
             SandboxKind::Seatbelt
                 if crate::sandbox::net_fully_denied(effective)
-                    || crate::sandbox::net_loopback_only(effective) =>
+                    || crate::sandbox::net_loopback_only(effective)
+                    || crate::sandbox::net_unix_only(effective) =>
             {
                 AxisEnforcement::Kernel
             }

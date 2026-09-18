@@ -57,7 +57,11 @@ dispatch-capable embedding binary as
 private entrypoint before an async runtime is constructed and calls the bundled
 uutils implementation. The carried child repeats a PID/image/peer-credential
 handshake that binds the exact utility name and raw argv; a direct
-`--invoke-bundled` is refused. Any L3 policy engaged for the worker therefore
+`--invoke-bundled` is refused. After acknowledging its argv, the child waits for
+an explicit parent confirmation before dispatch. The parent sends it only after
+the final live-image check; EOF or an invalid confirmation refuses execution.
+This keeps fast utilities alive through authentication without ignoring a failed
+identity check. Any L3 policy engaged for the worker therefore
 covers the carried child too. A host embedding Agent Bridle must call
 `maybe_dispatch()` at the very top of `main`.
 
