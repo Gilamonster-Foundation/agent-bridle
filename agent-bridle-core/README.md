@@ -43,6 +43,20 @@ On Windows, AppContainer is attached at process creation by the wired
 `agent-bridle-aclaunch.exe` wrapper rather than by `Sandbox::apply` on the
 current thread.
 
+## System timezone data
+
+The macOS read baseline includes the OS-owned timezone database, so confined
+programs can follow `/etc/localtime` and `/usr/share/zoneinfo` into the standard
+data files. Linux already includes its localtime file and shared runtime data.
+These are read defaults in `SandboxPolicy::base_read_paths`, not write grants.
+Setting `TZ` to another file never grants access to that file.
+
+`ConfinedCommand` still starts with an empty environment. A host that inherits
+the parent's explicit timezone must pass `TZ` through its existing `env` seam,
+preserving absent versus empty values. The runtime interprets the value.
+Windows AppContainer timezone parity is tracked in [#387](https://github.com/Gilamonster-Foundation/agent-bridle/issues/387);
+micro-VM named-zone materialization is tracked in [#388](https://github.com/Gilamonster-Foundation/agent-bridle/issues/388).
+
 ## Proposed 0.7 maintenance scope
 
 This candidate extends the published 0.7.15 API with explicit private-host and
@@ -107,3 +121,5 @@ registry for the Gilamonster agent line.
 Apache-2.0
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 11:46 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17
