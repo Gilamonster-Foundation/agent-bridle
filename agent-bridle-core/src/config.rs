@@ -235,6 +235,9 @@ impl Default for SandboxPolicy {
             "/opt",
             "/private/etc",
             "/private/var/db/dyld",
+            // /etc/localtime and /usr/share/zoneinfo resolve into this
+            // OS-owned database on macOS. TZ never adds arbitrary read roots.
+            "/private/var/db/timezone",
             "/dev",
         ];
         #[cfg(not(target_os = "macos"))]
@@ -818,6 +821,7 @@ mod tests {
             "/opt",
             "/private/etc",
             "/private/var/db/dyld",
+            "/private/var/db/timezone",
             "/dev",
         ]);
         #[cfg(not(target_os = "macos"))]

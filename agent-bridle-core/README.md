@@ -72,6 +72,20 @@ current executable, or when `SandboxPolicy::appcontainer_launcher_path` names an
 explicit absolute helper path; the AppContainer backend never searches ambient
 `PATH` for its sandbox constructor.
 
+## System timezone data
+
+The macOS read baseline includes the OS-owned timezone database, so confined
+programs can follow `/etc/localtime` and `/usr/share/zoneinfo` into the standard
+data files. Linux already includes its localtime file and shared runtime data.
+These are read defaults in `SandboxPolicy::base_read_paths`, not write grants.
+Setting `TZ` to another file never grants access to that file.
+
+`ConfinedCommand` still starts with an empty environment. A host that inherits
+the parent's explicit timezone must pass `TZ` through its existing `env` seam,
+preserving absent versus empty values. The runtime interprets the value.
+Windows AppContainer timezone parity is tracked in [#387](https://github.com/Gilamonster-Foundation/agent-bridle/issues/387);
+micro-VM named-zone materialization is tracked in [#388](https://github.com/Gilamonster-Foundation/agent-bridle/issues/388).
+
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
 the capability leash for agent tools — a shared, capability-governed tool
 registry for the Gilamonster agent line.
