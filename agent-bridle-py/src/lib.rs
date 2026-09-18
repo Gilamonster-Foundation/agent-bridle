@@ -5,13 +5,21 @@
 //!
 //! ```python
 //! import agent_bridle
-//! # The `shell` tool takes argv form (program + args), NOT a free-form
-//! # `cmd` string — that is the deliberate brush exec-bypass mitigation
-//! # (DESIGN §6): the leash gates on the named program token.
+//! # Restrict executable selection to echo. Other axes are explicitly open:
+//! # the default wheel enables no native filesystem/network sandbox.
+//! grant = {
+//!     "exec": {"only": ["echo"]},
+//!     "fs_read": "all",
+//!     "fs_write": "all",
+//!     "net": "all",
+//!     "max_calls": "unlimited",
+//!     "valid_for_generation": "all",
+//! }
+//! # The shell accepts argv or a safe-subset cmd string, one form per call.
 //! r = agent_bridle.invoke(
 //!     "shell",
 //!     {"program": "echo", "args": ["hi"]},
-//!     {"exec": {"only": ["echo"]}},
+//!     grant,
 //! )
 //! print(r["exit_code"], r["stdout"])  # -> 0 'hi\n'
 //! ```
@@ -43,9 +51,9 @@
 //! exposes a friendlier surface — `fs_read=["/repo"]` / `max_calls=10` /
 //! `top()`'s axes as `None`. Its `.to_json()` is **not** identical to this Rust
 //! serde shape. To pass an agent-mesh pyclass grant here, translate each axis to
-//! the serde form above (e.g. `["echo"]` → `{"only": ["echo"]}`, `None` →
-//! omit-the-axis, `10` → `{"at_most": 10}`). Both describe the *same* lattice;
-//! only the JSON spelling differs.
+//! the serde form above: `["echo"]` → `{"only": ["echo"]}`, top-valued scope
+//! `None` → `"all"`, and `10` → `{"at_most": 10}` (an unlimited bound is
+//! `"unlimited"`). Do not omit top-valued axes: omission means deny-all here.
 //!
 //! `caveats=None` is **deny-all** — nothing is authorized (a missing leash is
 //! not a full leash). To run with full ambient authority you must ask for it
@@ -82,8 +90,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// The process-wide tool registry (the host's compiled feature set: `shell` is
-/// on, so the confined brush-backed shell is present). Built once and reused.
+/// The process-wide tool registry (`shell` enables the safe-subset engine).
+/// Built once and reused.
 fn shared_registry() -> &'static Registry {
     static REG: OnceLock<Registry> = OnceLock::new();
     REG.get_or_init(registry)
@@ -92,8 +100,8 @@ fn shared_registry() -> &'static Registry {
 /// Dispatch `tool` with `args` through the registry's leash.
 ///
 /// `caveats` is the granted authority as a dict in the agent-mesh `Caveats`
-/// serde shape (see the module docs). `None` → unconfined `Caveats::top()` with
-/// a stderr WARNING.
+/// serde shape (see the module docs). `None` authorizes nothing; omitted axes
+/// in a partial dict also default to deny-all.
 ///
 /// Returns the tool's result as a Python `dict`. A leash denial (out-of-scope
 /// `exec`/`fs`/`net`, exhausted `max_calls`, wrong generation) or any tool
@@ -202,13 +210,6 @@ fn tool_definitions(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
         .collect()
 }
 
-/// Parse a Python caveats dict (agent-mesh `Caveats` serde shape) into a Rust
-/// [`Caveats`]. Omitted axes default to their top.
-///
-/// We round-trip through `serde_json::Value` (the dict → JSON), then build the
-/// `Caveats` axis-by-axis so a *partial* dict is accepted (serde's derive would
-/// reject one missing a field). This keeps the wheel self-contained: no
-/// `agent_mesh` import needed, while the shape matches it exactly.
 /// The fail-closed default (#271 / AB-009): authorizes nothing on any axis.
 /// Mirrors the MCP frontend's `caveats_source::deny_all`, so both shipped
 /// facades default to deny-all instead of full ambient authority.
@@ -224,6 +225,8 @@ fn deny_all() -> Caveats {
     }
 }
 
+/// Parse a Python caveats dict into [`Caveats`], defaulting omitted axes to
+/// deny-all. Complete Rust serde grants round-trip without changing authority.
 fn caveats_from_py(dict: &Bound<'_, PyDict>) -> PyResult<Caveats> {
     use agent_mesh_protocol::{CountBound, Scope};
 
@@ -472,3 +475,5 @@ fn agent_bridle_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     )?;
     Ok(())
 }
+
+// Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 00:18 EDT | Date: 2026-09-18

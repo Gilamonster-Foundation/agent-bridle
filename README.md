@@ -39,6 +39,25 @@ backstopped by an available native L3 backend. Every result discloses the
 boundary and per-axis strength actually achieved, so weaker enforcement is
 visible rather than overclaimed.
 
+## 0.7.16 maintenance scope
+
+This update adds exact, operator-approved private-host access through the
+existing async subprocess and safe-subset shell proxies, plus exact outbound
+Unix socket grants on macOS Seatbelt. Ordinary network authority remains
+required, private-host approvals default to empty, and unsupported Unix-socket
+backends refuse the request. See the [core](agent-bridle-core/README.md) and
+[shell](agent-bridle-tool-shell/README.md) documentation for their limits.
+
+The macOS read baseline now includes standard system timezone data. Explicit
+`TZ` inheritance remains the host's choice through the existing environment
+seam. Linux VM materialization and Windows timezone validation remain tracked
+in the core README; no write permission is added.
+
+On Unix, owned process groups are stopped before timeout cleanup. Carried utilities
+wait for the parent's final identity confirmation before dispatch. This
+maintenance line preserves the 0.7 admission behavior; it does not lift the
+separate 0.8 macOS restricted-network admission hold.
+
 ## Usage
 
 ```rust
@@ -359,3 +378,9 @@ Apache-2.0 (see [`LICENSE`](LICENSE)). The carried Brush dependencies are MIT;
 their notices are carried in [`NOTICE`](NOTICE).
 
 [`agent_mesh_protocol::Caveats`]: https://crates.io/crates/agent-mesh-protocol
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 16:28 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 00:12 EDT | Date: 2026-09-18
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 00:16 EDT | Date: 2026-09-18
