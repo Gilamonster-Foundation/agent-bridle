@@ -522,9 +522,21 @@ pub(crate) fn run_in_brush(
             crate::coreutils_dispatch::register_shims(&mut shell);
         }
 
+        // Every var seeded below MUST be `.export()`ed: `ShellVariable::new`
+        // defaults `exported: false` (an ordinary shell variable, visible to
+        // brush's own expansion but NOT propagated to a spawned child's OS
+        // environment). Without this, a real external command sees NONE of
+        // PATH/HOME/USER/the caller's env seam — only brush's own internal
+        // variable table has them, which is indistinguishable from working
+        // until the first external command needs one of these (any command
+        // not in `confined_builtins()`). Found via `env | sort` inside a live
+        // confined `run_command` showing only `PWD`/`SHLVL`/`_` — none of the
+        // vars this function believed it had seeded.
+        let mut path_var = ShellVariable::new(path_value);
+        path_var.export();
         shell
             .env_mut()
-            .set_global("PATH", ShellVariable::new(path_value))
+            .set_global("PATH", path_var)
             .map_err(|e| ToolError::Exec(brush_io("seed PATH", &e)))?;
 
         // Windows: a child spawned under `do_not_inherit_env(true)` needs the
@@ -543,7 +555,9 @@ pub(crate) fn run_in_brush(
             "NUMBER_OF_PROCESSORS",
         ] {
             if let Ok(val) = std::env::var(key) {
-                let _ = shell.env_mut().set_global(key, ShellVariable::new(val));
+                let mut var = ShellVariable::new(val);
+                var.export();
+                let _ = shell.env_mut().set_global(key, var);
             }
         }
 
@@ -554,9 +568,11 @@ pub(crate) fn run_in_brush(
         // caveats regardless of `PATH` (brush_shell.schema.json). Nothing ambient
         // is inherited; only these explicitly-passed vars cross the boundary.
         for (key, val) in &env {
+            let mut var = ShellVariable::new(val.clone());
+            var.export();
             shell
                 .env_mut()
-                .set_global(key, ShellVariable::new(val.clone()))
+                .set_global(key, var)
                 .map_err(|e| ToolError::Exec(brush_io("seed env var", &e)))?;
         }
 
