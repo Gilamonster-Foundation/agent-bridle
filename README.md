@@ -39,6 +39,17 @@ backstopped by an available native L3 backend. Every result discloses the
 boundary and per-axis strength actually achieved, so weaker enforcement is
 visible rather than overclaimed.
 
+## 0.7.17 maintenance scope
+
+This update fixes one bug. A confined Brush child process now receives the
+seeded `PATH` and the embedder's environment-seam variables (for example `HOME`,
+`USER` and a virtual-environment path). They were set as unexported shell
+variables, so no external program saw any of them: builtins worked, but a tool
+such as `rustc` could not find `cc`. Nothing ambient is inherited, so the child
+still sees only what the embedder passed. Embedders should note that seam values
+now reach the external programs a command runs; no authority is added, since
+the seam was already the deliberate import surface across the boundary.
+
 ## 0.7.16 maintenance scope
 
 This update adds exact, operator-approved private-host access through the
