@@ -52,7 +52,9 @@ Brush's full `cmd` grammar to the safe-subset `program`/`args` schema.
 When the effective caveats engage an available native L3 backend, the worker,
 carried utilities, and all other descendants inherit it; otherwise the result
 honestly reports `SandboxKind::None`. It receives only explicit environment
-values. Timeout supervision terminates the worker's whole process group.
+values: the seeded `PATH` and the embedder's `env`-seam variables, which are
+exported to the external programs a command runs (nothing ambient is
+inherited). Timeout supervision terminates the worker's whole process group.
 Restricted filesystem authority fails closed when no kernel backend is
 available; `unbridled` is the explicit policy opt-out, not a private-control
 bypass.
