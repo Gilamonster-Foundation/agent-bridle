@@ -173,6 +173,11 @@ fn run_platform() {
         "env_seam_vars_reach_a_real_spawned_childs_environment",
         env_seam_vars_reach_a_real_spawned_childs_environment,
     );
+    run_async_case(
+        &runtime,
+        "a_child_gets_the_seeded_path_and_the_seam_but_no_ambient_variable",
+        a_child_gets_the_seeded_path_and_the_seam_but_no_ambient_variable,
+    );
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -806,5 +811,45 @@ async fn env_seam_vars_reach_a_real_spawned_childs_environment() {
          environment, not just brush's own variable table (a `set_global` \
          without `.export()` passes `echo \"$VAR\"` yet still fails this): \
          {out}"
+    );
+}
+
+/// The two halves of the child-environment contract, checked against a REAL
+/// spawned child (`env` is never a shell builtin), so a `set_global` without
+/// `.export()` cannot pass:
+///
+/// * the seeded PATH and the caller's `env` seam ARE in the child's
+///   environment — without PATH a toolchain cannot find its own helpers
+///   (`rustc` reports "linker `cc` not found" from an otherwise fine host);
+/// * a variable that exists only in the AMBIENT process environment and was
+///   NOT passed through the seam is ABSENT: `do_not_inherit_env` still holds,
+///   so exporting the seeded set widened nothing.
+async fn a_child_gets_the_seeded_path_and_the_seam_but_no_ambient_variable() {
+    const AMBIENT: &str = "BRIDLE_AMBIENT_MUST_NOT_LEAK";
+    // SAFETY: this runner executes its cases sequentially on one thread.
+    unsafe { std::env::set_var(AMBIENT, "ambient-secret") };
+    let out = tool()
+        .invoke(
+            serde_json::json!({
+                "cmd": "env",
+                "env": { "BRIDLE_SEAM_PROBE": "passed" },
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+    unsafe { std::env::remove_var(AMBIENT) };
+
+    assert_ne!(out["denied"], true, "{out}");
+    let stdout = out["stdout"].as_str().unwrap_or("");
+    let has = |name: &str| stdout.lines().any(|l| l.starts_with(&format!("{name}=")));
+    assert!(has("PATH"), "the seeded PATH must reach the child: {out}");
+    assert!(
+        stdout.lines().any(|l| l == "BRIDLE_SEAM_PROBE=passed"),
+        "a seam variable must reach the child: {out}"
+    );
+    assert!(
+        !stdout.contains("ambient-secret") && !has(AMBIENT),
+        "an ambient variable that was not passed must NOT reach the child: {out}"
     );
 }
