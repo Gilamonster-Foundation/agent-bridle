@@ -41,8 +41,8 @@ across two crates: `agent-mesh-protocol` (the canonical `Caveats` lattice
 type) and `agent-bridle` (a non-bypassable enforcement registry binding a
 carried shell to the lattice), validated against a reference agent host. We
 report on adversarial audits that found, and closed, two enforcement bypasses,
-and we position the work against ocap, SPKI/SDSI, macaroons, Biscuit, Landlock,
-and DeepMind's CaMeL. The thesis in one line: **the industry builds "agents," is
+and we position the work against ocap, SPKI/SDSI, macaroons, Biscuit, zcap, UCAN,
+Landlock, and DeepMind's CaMeL. The thesis in one line: **the industry builds "agents," is
 surprised they behave like confused deputies, and the cure is hidden in the
 canonical name of the disease — deputize, do not empower.**
 
@@ -625,6 +625,18 @@ enforced at a non-bypassable gate and, distinctively, address the
 content-addressed, causal-clock re-attribution — the part we believe is least
 anticipated by prior work.
 
+**Convergent work.** agent-mesh's interop survey
+(`docs/research/a2a_interop.md` §16.1) noted on 2026-08-18 that its `Grant` is
+UCAN-shaped [11], a design arrived at independently. On 2026-09-19 we took up
+UCAN and the W3C CCG zcap draft [10] in depth. Both share our core: authority
+travels with a capability rather than an identity, delegation can narrow it but
+never widen it, and it is checked where it is used. The main differences are
+scope and clock. They authorize requests between parties, while we confine one
+host's tools, backed by a kernel sandbox where the platform has one. They bound
+a grant's validity by wall clock, while we bind ours to a causal generation
+counter. We intend to learn from both, and to contribute what enforcing
+capabilities inside agent harnesses has taught us to the state of practice.
+
 ---
 
 ## 9. Discussion
@@ -693,6 +705,13 @@ Datalog-based caveats*. `biscuit-auth`, 2021–.
 
 [9] E. Debenedetti et al. *Defeating Prompt Injections by Design (CaMeL)*.
 Google DeepMind, 2025.
+
+[10] C. Lemmer-Webber et al. *Authorization Capabilities (ZCAP)*, v0.4.0-rc.6.
+W3C Credentials Community Group draft, 2026.
+<https://w3c-ccg.github.io/zcap-spec/v0.4.0-rc.6/>
+
+[11] B. Zelenka et al. *User Controlled Authorization Network (UCAN)
+Specification*, v1.0.0, 2026. <https://github.com/ucan-wg/spec>
 
 ---
 
