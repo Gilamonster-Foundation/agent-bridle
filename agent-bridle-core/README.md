@@ -72,6 +72,27 @@ current executable, or when `SandboxPolicy::appcontainer_launcher_path` names an
 explicit absolute helper path; the AppContainer backend never searches ambient
 `PATH` for its sandbox constructor.
 
+## Exact private-host approvals for async subprocesses
+
+With `spawn-tokio`, an owning harness may call
+`ConfinedCommand::with_private_hosts(["service.example".to_string()])?`
+before `spawn_tokio`. This separate, transient approval lets that exact name
+resolve to RFC1918 or IPv6 unique-local space only when the active context's
+ordinary network allowlist also permits it. Supply names approved by the
+operator, never names taken from tool output or server metadata.
+
+The default is empty. Wildcards, URLs, ports and malformed names are rejected;
+DNS names use ASCII/ACE labels with case and final-dot normalization. Metadata,
+link-local, unspecified, multicast and CGNAT destinations remain blocked.
+The existing proxy resolves each connection once and dials that screened
+address. Its kernel loopback fence and the command's filesystem/exec caveats
+are unchanged. Platforms without that fence retain their documented advisory
+posture; this option does not enable a proxy or alter synchronous `spawn`.
+
+`net_proxy::start_with_private_hosts` exposes the same policy for embedders
+already using the proxy's resolver/audit seams. Existing constructors retain
+the default private-address denial.
+
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
 the capability leash for agent tools — a shared, capability-governed tool
 registry for the Gilamonster agent line.

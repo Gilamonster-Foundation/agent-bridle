@@ -1382,3 +1382,55 @@ async fn real_landlock_write_confined_child_can_open_dev_null() {
 
     let _ = std::fs::remove_dir_all(&allowed);
 }
+
+/// #385/#386: forward-port of `66960bb`'s real acceptance test, onto main's
+/// seatbelt-fixture style (`agent_bridle_core::seatbelt_is_supported`, asserted
+/// rather than env-gated, matching the other macOS fixtures in this file).
+/// Grounds the mocked private-host forwarding seam in a real confined child: an
+/// explicit private approval must not add ordinary host authority. The reserved
+/// `.invalid` destination is refused before DNS or any upstream dial.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_private_hosts_do_not_widen_the_fenced_host_scope() {
+    use agent_bridle_core::seatbelt_is_supported;
+
+    assert!(
+        seatbelt_is_supported(),
+        "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
+    );
+    assert!(
+        std::path::Path::new("/usr/bin/curl").exists(),
+        "fixture requires /usr/bin/curl"
+    );
+
+    let caveats = Caveats {
+        exec: Scope::only(["curl".to_string()]),
+        net: Scope::only(["allowed.invalid".to_string()]),
+        ..Caveats::top()
+    };
+    let out = ShellTool::new()
+        .with_private_hosts(["refused.invalid".to_string()])
+        .expect("exact private approval")
+        .invoke(
+            serde_json::json!({
+                "program": "/usr/bin/curl",
+                "args": ["--silent", "--show-error", "--noproxy", "", "--max-time", "5",
+                    "--output", "/dev/null", "--write-out", "%{http_code}", "http://refused.invalid/"],
+                "timeout_secs": 10
+            }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("confined proxy invocation");
+    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
+    assert_eq!(
+        out["exit_code"], 0,
+        "curl received the proxy response: {out}"
+    );
+    assert_eq!(
+        out["stdout"], "403",
+        "private approval cannot widen scope: {out}"
+    );
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
+    assert_eq!(out["denials"][0]["target"], "refused.invalid", "{out}");
+}
