@@ -247,6 +247,14 @@ pub(crate) fn authorize_carried_child(
     if ack != CARRIED_ACK {
         return Err("carried child returned an invalid authentication ACK".to_string());
     }
+    // Keep the child alive through the final image check. EOF alone cannot
+    // release dispatch: a refused parent also closes its socket on error.
+    stream
+        .write_all(&CARRIED_ACK)
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("confirm carried authentication: {error}"))?;
+    // A confirmed fast utility may already have exited; the helper tolerates
+    // only that on the courtesy half-close.
     close_authorization_direction(&stream)?;
     Ok(BufReader::new(stream))
 }
@@ -330,6 +338,13 @@ pub(crate) fn authenticate_carried_dispatch(name: &OsStr, args: &[OsString]) -> 
             .write_all(&CARRIED_ACK)
             .and_then(|()| stream.flush())
             .map_err(|error| format!("write carried authentication ACK: {error}"))?;
+        let mut confirmation = [0_u8; CARRIED_ACK.len()];
+        stream
+            .read_exact(&mut confirmation)
+            .map_err(|error| format!("read carried authentication confirmation: {error}"))?;
+        if confirmation != CARRIED_ACK {
+            return Err("carried parent returned an invalid authentication confirmation".into());
+        }
         set_cloexec(&stderr)?;
         Ok(())
     }
@@ -688,10 +703,12 @@ fn set_cloexec(fd: &impl AsFd) -> Result<(), String> {
     .map_err(|error| format!("mark private control descriptor close-on-exec: {error}"))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    #[cfg(any(target_os = "linux", feature = "carried-coreutils"))]
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn queued_bootstrap_precedes_credentialed_authority_frame_without_racing() {
         let (mut sender, mut receiver) = UnixStream::pair().expect("private socketpair");
@@ -716,6 +733,130 @@ mod tests {
         assert_eq!(received, authority);
         assert_eq!(credentials.pid, std::process::id() as i32);
         assert_eq!(credentials.uid, nix::unistd::getuid().as_raw());
+    }
+
+    #[cfg(feature = "carried-coreutils")]
+    mod carried_confirmation {
+        use super::*;
+        use std::os::fd::OwnedFd;
+        use std::process::{Child, Command, ExitStatus, Stdio};
+        use std::time::{Duration, Instant};
+
+        const MARKER_ENV: &str = "AB_TEST_CARRIED_CONFIRMATION_MARKER";
+        const BOUND: Duration = Duration::from_secs(5);
+
+        struct ReapChild(Child);
+
+        impl Drop for ReapChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        impl ReapChild {
+            fn wait(&mut self) -> ExitStatus {
+                let deadline = Instant::now() + BOUND;
+                loop {
+                    if let Some(status) = self.0.try_wait().expect("poll owned child") {
+                        return status;
+                    }
+                    assert!(Instant::now() < deadline, "carried child exceeded deadline");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        /// Same-image real child grounds the carried handshake's requirement
+        /// that dispatch follow the parent's final identity verification.
+        #[test]
+        #[ignore = "private child fixture, launched by the confirmation tests"]
+        fn child() {
+            let marker = std::env::var_os(MARKER_ENV).expect("private marker path");
+            let code = match authenticate_carried_dispatch(OsStr::new("echo"), &[]) {
+                Ok(()) => {
+                    std::fs::write(marker, b"DISPATCHED").expect("write dispatch marker");
+                    0
+                }
+                Err(_) => 64,
+            };
+            std::process::exit(code);
+        }
+
+        fn check_confirmation(label: &str, confirmation: Option<&[u8]>, succeeds: bool) {
+            let dir = std::env::temp_dir().join(format!(
+                "ab-carried-confirmation-{}-{label}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&dir).expect("create unique fixture directory");
+            let marker = dir.join("dispatched");
+            let (mut parent, child) = UnixStream::pair().expect("private socketpair");
+            parent.set_read_timeout(Some(BOUND)).unwrap();
+            parent.set_write_timeout(Some(BOUND)).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "private_control::tests::carried_confirmation::child",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(MARKER_ENV, &marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(OwnedFd::from(child)));
+            let mut child = ReapChild(command.spawn().expect("spawn same-image child"));
+            drop(command);
+
+            parent.write_all(&TRUSTED_WORKER_BOOTSTRAP).unwrap();
+            let mut hello = [0; TRUSTED_WORKER_HELLO_LEN];
+            parent.read_exact(&mut hello).expect("read child hello");
+            let (pid, challenge) = agent_bridle_core::decode_trusted_worker_hello(&hello).unwrap();
+            assert_eq!(pid, child.0.id());
+            let identity = carried_identity(OsStr::new("echo"), &[]);
+            let header = encode_trusted_worker_frame_header(
+                challenge,
+                trusted_worker_frame_digest(&challenge, &identity),
+                identity.len(),
+            )
+            .unwrap();
+            parent.write_all(&header).unwrap();
+            parent.write_all(&identity).unwrap();
+            let mut ack = [0; CARRIED_ACK.len()];
+            parent.read_exact(&mut ack).expect("read authenticated ACK");
+            assert_eq!(ack, CARRIED_ACK);
+            if let Some(confirmation) = confirmation {
+                parent
+                    .write_all(confirmation)
+                    .expect("send final confirmation");
+            } else {
+                parent.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+
+            let status = child.wait();
+            assert_eq!(status.code(), Some(if succeeds { 0 } else { 64 }));
+            assert_eq!(marker.exists(), succeeds, "dispatch requires confirmation");
+            if succeeds {
+                assert_eq!(std::fs::read(&marker).unwrap(), b"DISPATCHED");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn eof_after_ack_does_not_release_carried_dispatch() {
+            check_confirmation("eof", None, false);
+        }
+
+        #[test]
+        fn invalid_confirmation_does_not_release_carried_dispatch() {
+            check_confirmation("invalid", Some(b"INVALID!"), false);
+        }
+
+        #[test]
+        fn verified_confirmation_releases_carried_dispatch() {
+            check_confirmation("valid", Some(&CARRIED_ACK), true);
+        }
     }
 }
 
