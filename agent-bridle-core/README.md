@@ -44,7 +44,7 @@ construction.
 | Feature | Default | Pulls | Enables |
 |---|---|---|---|
 | `linux-landlock` | off | `landlock` (Linux only) | filesystem confinement, direct-exec narrowing, and deny-all TCP on ABI-v4 kernels |
-| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement; expressible restricted-net profiles add direct-network rules and `net:none` also adds a Mach floor, but all remain `Unknown` and are refused |
+| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement; expressible restricted-net profiles (deny-all, loopback, and exact `unix:` socket endpoints) add direct-network rules and `net:none`/`unix:`-only also add a Mach floor, but all remain `Unknown` and are refused |
 | `windows-appcontainer` | off | companion `agent-bridle-aclaunch.exe` | AppContainer filesystem DACLs, deny-all or loopback-only network policy, and exec deny-all |
 | `os-sandbox` | off | target-specific backend deps | convenience feature for every native OS sandbox backend |
 | `verifier-ed25519` | off | `ed25519-dalek` | production `Ed25519Verifier` for step-up discharges |
@@ -64,6 +64,18 @@ no-egress: allow-listed and other ambient IPC services have not been
 comprehensively certified. Consequently every restricted Seatbelt `net` scope,
 including `net:none`, loopback, and the former loopback-proxy shape, resolves
 `Unknown` and is refused by admission.
+
+An explicit `net` scope entry `unix:/absolute/canonical/service.sock` names a
+single existing Unix-domain socket; the path must already be canonical and
+name a socket — relative paths, symlinks, missing paths, and patterns fail
+closed. The profile emits an exact outbound exception for that path and
+nothing wider; filesystem authority stays independent, and a mixed
+remote-host/socket scope requires the managed async egress proxy (Unix
+entries never enter its DNS host list). Every other backend refuses a `unix:`
+grant outright, including at the advisory strength floor. Like every other
+restricted Seatbelt `net` shape above, admission currently resolves this one
+`Unknown` too and refuses it — the profile machinery is real, but the same
+hold applies until the outstanding confinement proof is accepted.
 
 On Windows, AppContainer is attached at process creation by the wired
 `agent-bridle-aclaunch.exe` wrapper rather than by `Sandbox::apply` on the
