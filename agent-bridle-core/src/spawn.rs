@@ -412,6 +412,11 @@ pub struct ConfinedCommand {
     /// NOT the `ToolContext`, which carries only authority (I5-B, #144, ADR 0017
     /// D2). Defaults to today's built-in allow-lists.
     sandbox_policy: Arc<SandboxPolicy>,
+    /// Explicit private-host approvals for [`spawn_tokio`](ConfinedCommand::spawn_tokio)'s
+    /// egress proxy (#385/#386, forward-ported from the 0.7 line's `ac3d34a`).
+    /// Empty by default; consulted only on the `spawn_tokio` path.
+    #[cfg(all(unix, feature = "spawn-tokio"))]
+    private_hosts: std::collections::HashSet<String>,
 }
 
 impl ConfinedCommand {
@@ -422,6 +427,8 @@ impl ConfinedCommand {
             args: Vec::new(),
             envs: Vec::new(),
             cwd: None,
+            #[cfg(all(unix, feature = "spawn-tokio"))]
+            private_hosts: std::collections::HashSet::new(),
             stdin: None,
             stdout: None,
             stderr: None,
@@ -696,6 +703,9 @@ impl ConfinedCommand {
             new_process_group,
             // Already consumed above into `sandbox` via `best_available_sandbox`.
             sandbox_policy: _,
+            // Consulted only on the `spawn_tokio` path, not this sync `spawn`.
+            #[cfg(all(unix, feature = "spawn-tokio"))]
+                private_hosts: _,
         } = self;
 
         let apply_admitted = admitted.clone();
@@ -1197,6 +1207,23 @@ mod tokio_spawn {
     }
 
     impl ConfinedCommand {
+        /// Approve exact names for RFC1918/ULA resolution by this command's
+        /// `spawn_tokio` egress proxy (#385/#386, forward-ported from the 0.7
+        /// line). The owning harness supplies these names after an explicit
+        /// operator decision; server metadata is not authority. The context's
+        /// ordinary net allow-list must independently permit them.
+        ///
+        /// Empty by default. This neither starts a proxy where no loopback fence
+        /// exists nor changes synchronous `spawn` or any filesystem/exec caveat.
+        /// No wildcard or global private-space approval is accepted.
+        pub fn with_private_hosts(
+            mut self,
+            hosts: impl IntoIterator<Item = String>,
+        ) -> std::io::Result<Self> {
+            self.private_hosts = crate::net_proxy::canonical_private_hosts(hosts)?;
+            Ok(self)
+        }
+
         /// Admission-check, confine, and spawn the child — like
         /// [`spawn`](ConfinedCommand::spawn), but the stdio pipes are returned as
         /// **tokio-native** handles wrapped in a kill-on-drop
@@ -1225,7 +1252,13 @@ mod tokio_spawn {
             if let Some((hosts, fenced)) = egress_proxy_plan(&effective, &self.sandbox_policy) {
                 // Fail-closed: the grant calls for a fence + proxy; a proxy
                 // that cannot bind must refuse the spawn, never run unfenced.
-                let handle = crate::net_proxy::start_for_hosts(hosts).map_err(|e| {
+                let handle = crate::net_proxy::start_with_private_hosts(
+                    hosts,
+                    self.private_hosts.iter().cloned(),
+                    std::sync::Arc::new(crate::net_proxy::StdResolver),
+                    std::sync::Arc::new(crate::net_proxy::NullSink),
+                )
+                .map_err(|e| {
                     ToolError::Exec(std::io::Error::other(format!(
                         "refusing to spawn {:?}: the egress proxy could not bind \
                          loopback ({e})",
@@ -1368,6 +1401,22 @@ mod tokio_spawn_tests {
         ["/usr/bin/cat", "/bin/cat"]
             .into_iter()
             .find(|p| Path::new(p).exists())
+    }
+
+    /// #385/#386: forward-port of `ac3d34a`'s `ConfinedCommand::with_private_hosts`
+    /// acceptance test — empty by default, canonicalizes an exact approval, and
+    /// rejects a wildcard.
+    #[test]
+    fn exact_private_hosts_builder_defaults_closed_and_validates_names() {
+        let command = ConfinedCommand::new("cat");
+        assert!(command.private_hosts.is_empty());
+        let command = command
+            .with_private_hosts(["SERVICE.TEST.".to_string()])
+            .unwrap();
+        assert_eq!(command.private_hosts, ["service.test".to_string()].into());
+        assert!(ConfinedCommand::new("cat")
+            .with_private_hosts(["*".to_string()])
+            .is_err());
     }
 
     /// The MCP-transport use case: a newline-delimited JSON-RPC line written to

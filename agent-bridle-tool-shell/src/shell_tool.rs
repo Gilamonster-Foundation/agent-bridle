@@ -25,7 +25,7 @@
 //! is behind a [`Spawner`] seam (mocked in unit tests; real path in
 //! `tests/real_spawn.rs`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{PipeReader, PipeWriter, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
@@ -96,6 +96,10 @@ pub(crate) struct SpawnCfg {
     pub audit_sink: Option<String>,
     /// Sandbox read/exec allow-lists + ABI floors ([`SandboxPolicy`]).
     pub sandbox: Arc<SandboxPolicy>,
+    /// Explicit private-host approvals (#385/#386, forward-ported from the 0.7
+    /// line), independently intersected with the invocation's ordinary network
+    /// scope by the shared egress proxy.
+    pub private_hosts: HashSet<String>,
     /// Process is **unbridled** (ADR 0018): drop the L3 OS sandbox and run the
     /// pipeline natively. The L2 grant checks in `invoke` still gate (advisory);
     /// only the kernel mechanism is skipped. Read once from the process marker.
@@ -233,8 +237,9 @@ fn run_with_egress_proxy(
     // (2) Start the proxy — fail-closed if it cannot bind loopback (never spawn
     //     an unfenced child that would then egress freely). Audit is opt-in via the
     //     configured audit sink (observability only; off = zero overhead).
-    let proxy = net_proxy::start(
+    let proxy = net_proxy::start_with_private_hosts(
         allow_hosts,
+        cfg.private_hosts.iter().cloned(),
         Arc::new(net_proxy::StdResolver),
         net_audit_sink(cfg.audit_sink.as_deref()),
     )
@@ -404,6 +409,7 @@ pub struct ShellTool {
     /// Sandbox mechanism policy (read/exec allow-lists, ABI floors) the L3 backend
     /// enforces (I5-B, #144). Rides the tool, not the `ToolContext`.
     sandbox: Arc<SandboxPolicy>,
+    private_hosts: HashSet<String>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
 }
 
@@ -431,6 +437,7 @@ impl ShellTool {
             lister: Arc::new(RealDirLister),
             limits,
             sandbox: Arc::new(SandboxPolicy::default()),
+            private_hosts: HashSet::new(),
             output_observer: None,
         }
     }
@@ -455,6 +462,22 @@ impl ShellTool {
         self
     }
 
+    /// Approve exact names for RFC1918/ULA resolution by the existing fenced
+    /// egress proxy (#385/#386, forward-ported from the 0.7 line). The owning
+    /// harness supplies explicit operator approvals; command text and remote
+    /// metadata are not authority. The invocation's ordinary network scope must
+    /// independently allow every requested host.
+    ///
+    /// Empty by default. This does not start a proxy where no kernel fence
+    /// exists, permit forbidden address ranges, or change filesystem/exec scope.
+    pub fn with_private_hosts(
+        mut self,
+        hosts: impl IntoIterator<Item = String>,
+    ) -> std::io::Result<Self> {
+        self.private_hosts = net_proxy::canonical_private_hosts(hosts)?;
+        Ok(self)
+    }
+
     /// Construct with an injected spawner; real environment + dir lister (tests).
     #[cfg(test)]
     fn with_spawner(spawner: Arc<dyn Spawner>) -> Self {
@@ -464,6 +487,7 @@ impl ShellTool {
             lister: Arc::new(RealDirLister),
             limits: LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
+            private_hosts: HashSet::new(),
             output_observer: None,
         }
     }
@@ -479,6 +503,7 @@ impl ShellTool {
             lister: Arc::new(RealDirLister),
             limits: LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
+            private_hosts: HashSet::new(),
             output_observer: None,
         }
     }
@@ -498,6 +523,7 @@ impl ShellTool {
             lister,
             limits: LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
+            private_hosts: HashSet::new(),
             output_observer: None,
         }
     }
@@ -893,6 +919,7 @@ impl Tool for ShellTool {
             max_output: self.limits.max_output_bytes,
             audit_sink: self.limits.audit_sink.clone(),
             sandbox: Arc::clone(&self.sandbox),
+            private_hosts: self.private_hosts.clone(),
             unbridled,
             output,
             timeout,
@@ -2075,6 +2102,11 @@ mod tests {
         /// The env map handed to each `run` call (parallel to `calls`), so the env
         /// seam (newt #783) is verified without a real process.
         envs: Mutex<Vec<BTreeMap<String, String>>>,
+        /// #385/#386: private-host approvals forwarded to each `run` call, and the
+        /// granted `net` scope alongside them — so a test can assert the two travel
+        /// independently rather than one being inferred from the other.
+        private_hosts: Mutex<Vec<Vec<String>>>,
+        net_scopes: Mutex<Vec<Scope<String>>>,
         exit_by_program: HashMap<String, i32>,
         block_ms: u64,
         /// #196: net denials the spawner reports back — the shape
@@ -2118,12 +2150,16 @@ mod tests {
             &self,
             stages: &[Command],
             _cwd: Option<&str>,
-            _caveats: &Caveats,
+            caveats: &Caveats,
             env: &BTreeMap<String, String>,
-            _cfg: &SpawnCfg,
+            cfg: &SpawnCfg,
         ) -> ToolResult<Captured> {
             self.calls.lock().unwrap().push(stages.to_vec());
             self.envs.lock().unwrap().push(env.clone());
+            let mut hosts: Vec<_> = cfg.private_hosts.iter().cloned().collect();
+            hosts.sort();
+            self.private_hosts.lock().unwrap().push(hosts);
+            self.net_scopes.lock().unwrap().push(caveats.net.clone());
             if self.block_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.block_ms));
             }
@@ -2506,6 +2542,70 @@ mod tests {
     /// The env map handed to each `run` call, in order (the env seam, newt #783).
     fn envs(mock: &Arc<MockSpawner>) -> Vec<BTreeMap<String, String>> {
         mock.envs.lock().unwrap().clone()
+    }
+
+    /// #385/#386: forward-port of `66960bb`'s `ShellTool` builder tests — the
+    /// approval set is empty by default and rejects anything that is not an
+    /// exact host (wildcard, URL, port, path/socket form).
+    #[test]
+    fn private_hosts_are_empty_by_default_and_reject_nonexact_names() {
+        assert!(ShellTool::new().private_hosts.is_empty());
+        assert!(ShellTool::default().private_hosts.is_empty());
+        for invalid in [
+            "*",
+            "*.example.test",
+            "https://service.test",
+            "service.test:443",
+            "unix:/tmp/service.sock",
+        ] {
+            let error = ShellTool::new()
+                .with_private_hosts([invalid.to_string()])
+                .expect_err("private-host approval must be an exact host");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    /// The approved set is canonicalized (lowercased, trailing-dot stripped,
+    /// deduped) and reaches the spawner via `SpawnCfg::private_hosts`, without
+    /// widening or narrowing the invocation's own `net` scope.
+    #[tokio::test]
+    async fn private_hosts_reach_spawner_without_changing_net_authority() {
+        let mock = Arc::new(MockSpawner::default());
+        let granted = Caveats {
+            net: Scope::only(["other.test".to_string()]),
+            ..Caveats::top()
+        };
+        let out = ShellTool::with_spawner(mock.clone())
+            .with_private_hosts(["Service.Test.".to_string(), "service.test".to_string()])
+            .expect("canonical exact approval")
+            .invoke(serde_json::json!({"cmd": "echo hi"}), &ctx(granted.clone()))
+            .await
+            .expect("invoke");
+        assert_eq!(out["exit_code"], 0);
+        assert_eq!(
+            *mock.private_hosts.lock().unwrap(),
+            vec![vec!["service.test".to_string()]]
+        );
+        assert_eq!(*mock.net_scopes.lock().unwrap(), vec![granted.net]);
+    }
+
+    /// Granting ordinary `net` scope for a host does NOT itself approve it as a
+    /// private-host target — the two grants are independent (#385/#386).
+    #[tokio::test]
+    async fn private_hosts_are_not_inferred_from_net_authority() {
+        let mock = Arc::new(MockSpawner::default());
+        let granted = Caveats {
+            net: Scope::only(["service.test".to_string()]),
+            ..Caveats::top()
+        };
+        ShellTool::with_spawner(mock.clone())
+            .invoke(serde_json::json!({"cmd": "echo hi"}), &ctx(granted))
+            .await
+            .expect("invoke");
+        assert_eq!(
+            *mock.private_hosts.lock().unwrap(),
+            vec![Vec::<String>::new()]
+        );
     }
 
     /// ADR 0012 D4/D8 + ADR 0014: a STRONG principal (floor = `Kernel`) refuses to

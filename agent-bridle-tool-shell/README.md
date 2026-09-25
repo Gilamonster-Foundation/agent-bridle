@@ -25,6 +25,14 @@ Because agent-bridle performs each redirect's open and each glob's directory
 listing itself, those filesystem touches are leash-checked (`fs_read`/`fs_write`)
 **before any stage spawns**; out-of-scope `exec` is denied at the funnel.
 
+An owning harness may call `ShellTool::with_private_hosts` with exact,
+operator-approved hostnames for RFC1918/ULA destinations. The safe-subset
+engine's existing managed proxy requires both that approval and the invocation's
+ordinary network scope. Approvals are empty by default; the shared core validator
+rejects patterns, URLs and endpoint paths. Address screening, pinned dialing,
+kernel confinement and proxy lifetime follow the existing core implementation.
+This option applies to the safe-subset engine's managed proxy only.
+
 The Brush engine creates its worker through the shared confined-spawn funnel.
 Linux and macOS authenticate that private transition over a fresh kernel socket:
 the child verifies that the frame sender is its real parent and the exact same

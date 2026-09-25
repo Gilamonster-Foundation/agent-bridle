@@ -1382,3 +1382,60 @@ async fn real_landlock_write_confined_child_can_open_dev_null() {
 
     let _ = std::fs::remove_dir_all(&allowed);
 }
+
+/// #385/#386: forward-port of `66960bb`'s real acceptance test, onto main's
+/// seatbelt-fixture style (`agent_bridle_core::seatbelt_is_supported`, asserted
+/// rather than env-gated, matching the other macOS fixtures in this file).
+/// Grounds the mocked private-host forwarding seam in a real confined child: an
+/// explicit private approval must not add ordinary host authority. The reserved
+/// `.invalid` destination is refused before DNS or any upstream dial.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+async fn real_private_hosts_do_not_widen_the_fenced_host_scope() {
+    use agent_bridle_core::seatbelt_is_supported;
+
+    assert!(
+        seatbelt_is_supported(),
+        "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
+    );
+    assert!(
+        std::path::Path::new("/usr/bin/curl").exists(),
+        "fixture requires /usr/bin/curl"
+    );
+
+    let caveats = Caveats {
+        exec: Scope::only(["curl".to_string()]),
+        net: Scope::only(["allowed.invalid".to_string()]),
+        ..Caveats::top()
+    };
+    let out = ShellTool::new()
+        .with_private_hosts(["refused.invalid".to_string()])
+        .expect("exact private approval")
+        .invoke(
+            serde_json::json!({
+                "program": "/usr/bin/curl",
+                "args": ["--silent", "--show-error", "--noproxy", "", "--max-time", "5",
+                    "--output", "/dev/null", "--write-out", "%{http_code}", "http://refused.invalid/"],
+                "timeout_secs": 10
+            }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("confined proxy invocation");
+    // 0.8 posture: every restricted Seatbelt `net` scope resolves Advisory and
+    // admission refuses it before spawn (L3 BOUND; see the core README), so the
+    // 0.7 test's proxied 403 never happens here. The property still holds, more
+    // strongly: an exact private approval adds no authority, and nothing runs.
+    assert_eq!(out["denied"], true, "{out}");
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
+    assert!(
+        out["denials"][0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("L3 BOUND")),
+        "private approval cannot widen a refused Seatbelt net scope: {out}"
+    );
+    assert!(
+        out["stdout"].as_str().unwrap_or("").is_empty(),
+        "curl never ran: {out}"
+    );
+}
