@@ -2000,9 +2000,116 @@ mod tests {
                         "address {address}, expected {expected}: {}",
                         client.written_str()
                     );
+                    assert_eq!(
+                        connector.1.load(Ordering::SeqCst),
+                        usize::from(expected == 200)
+                    );
+                    assert_eq!(
+                        resolver.1.load(Ordering::SeqCst),
+                        usize::from(expected != 403)
+                    );
                 }
             }
         }
+    }
+
+    /// #385: forward-port of `ac3d34a`'s forbidden-ranges test. An approved exact
+    /// host still cannot reach anything but RFC1918/ULA.
+    #[test]
+    fn exact_private_hosts_never_approve_forbidden_ranges() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let policy = HostPolicy::with_private_hosts(
+            ["service.test".to_string()],
+            ["service.test".to_string()],
+        )
+        .unwrap();
+        for ip in [
+            "169.254.169.254",
+            "fd00:ec2::254",
+            "0.0.0.0",
+            "0.1.2.3",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.18.0.1",
+            "::",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+            "::ffff:224.0.0.1",
+        ]
+        .into_iter()
+        .map(|ip| ip.parse::<IpAddr>().unwrap())
+        .chain([
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V6(Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped()),
+        ]) {
+            let resolver = FixedResolver(SocketAddr::new(ip, 443));
+            for request in [
+                &b"CONNECT service.test:443 HTTP/1.1\r\n\r\n"[..],
+                &b"GET http://service.test/ HTTP/1.1\r\n\r\n"[..],
+            ] {
+                let client = ScriptedConn::with_script(request);
+                let sink = CapturingSink::default();
+                let evidence = Mutex::new(Evidence::default());
+                let closer = ConnCloser::new(Box::new(client.clone()));
+                let connector =
+                    FakeConnector(ScriptedConn::with_script(b"HTTP/1.1 200 OK\r\n\r\n"));
+                let env = ConnEnv {
+                    policy: &policy,
+                    connector: &connector,
+                    resolver: &resolver,
+                    sink: &sink,
+                };
+                // A successful fake dial would return 200, so 502 proves it was screened out.
+                handle_conn(
+                    Box::new(client.clone()),
+                    &env,
+                    &evidence,
+                    &closer,
+                    &ConnHooks::default(),
+                )
+                .unwrap();
+                assert!(
+                    client.written_str().contains("502"),
+                    "forbidden address {ip}"
+                );
+                assert_eq!(sink.events()[0].decision, NetDecision::Error);
+            }
+        }
+    }
+
+    /// #385: forward-port of `ac3d34a`'s name-validation test.
+    #[test]
+    fn exact_private_hosts_reject_patterns_urls_and_ambiguous_names() {
+        for invalid in [
+            "",
+            "*",
+            "*.test",
+            ".test",
+            "https://service.test",
+            "service.test:443",
+            "user@service.test",
+            "service.test/path",
+            " service.test",
+            "service.test ",
+            "a..test",
+            "-bad.test",
+            "bad-.test",
+            "127.1",
+            "0x7f000001",
+            "service.test?x",
+        ] {
+            assert!(
+                HostPolicy::with_private_hosts(["service.test".to_string()], [invalid.to_string()])
+                    .is_err(),
+                "invalid exact name: {invalid}"
+            );
+        }
+        let policy =
+            HostPolicy::with_private_hosts(["fd00::1".to_string()], ["[FD00::1]".to_string()])
+                .unwrap();
+        assert!(policy.allows_private("fd00::1"));
     }
 
     #[test]

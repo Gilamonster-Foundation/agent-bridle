@@ -93,6 +93,9 @@ posture; this option does not enable a proxy or alter synchronous `spawn`.
 already using the proxy's resolver/audit seams. Existing constructors retain
 the default private-address denial.
 
+Private-host approvals are honoured by `spawn_tokio` and `ShellTool`, not yet
+by `spawn_managed_authorized`.
+
 Part of [agent-bridle](https://github.com/Gilamonster-Foundation/agent-bridle),
 the capability leash for agent tools — a shared, capability-governed tool
 registry for the Gilamonster agent line.
