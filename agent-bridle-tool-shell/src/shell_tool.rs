@@ -1614,21 +1614,6 @@ fn expand_stage_argv(stage: &Command, _cwd: Option<&str>) -> Vec<String> {
 /// `wrap` is the OS-sandbox command prefix (macOS Seatbelt's `sandbox-exec -p
 /// <profile>`), prepended to **every** stage so each spawned program is confined;
 /// it is empty for thread-confining (Landlock) and unconfined runs.
-/// Kill a pipeline stage and everything it spawned. Each stage is its own
-/// process-group leader (`process_group(0)` at spawn), so SIGKILL to the group
-/// takes the stage plus any descendants — the child cannot outlive the deadline
-/// by forking. Mirrors `brush_shell::kill_worker_tree`.
-fn kill_pipeline_stage(child: &mut Child) {
-    // The stage was spawned with `process_group(0)`, so it leads a group; killing
-    // the GROUP takes the stage plus every descendant it forked — not just the
-    // direct child. Safe wrapper (the crate is `#![forbid(unsafe_code)]`).
-    #[cfg(unix)]
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-    let _ = child.kill();
-}
-
 #[allow(clippy::too_many_arguments)] // house precedent (shell_inspect/gate): flat args over a one-off bag
 fn run_pipeline(
     stages: &[Command],
@@ -1864,7 +1849,7 @@ fn run_pipeline(
         if std::time::Instant::now() >= deadline {
             timed_out = true;
             for child in children.iter_mut() {
-                kill_pipeline_stage(child);
+                crate::kill_child_tree(child);
             }
             // Reap every stage so no zombie/child survives the call.
             for child in children.iter_mut() {
