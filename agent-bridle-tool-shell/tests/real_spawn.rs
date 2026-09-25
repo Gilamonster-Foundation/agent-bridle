@@ -1422,15 +1422,20 @@ async fn real_private_hosts_do_not_widen_the_fenced_host_scope() {
         )
         .await
         .expect("confined proxy invocation");
-    assert_eq!(out["sandbox_kind"], "seatbelt", "{out}");
-    assert_eq!(
-        out["exit_code"], 0,
-        "curl received the proxy response: {out}"
-    );
-    assert_eq!(
-        out["stdout"], "403",
-        "private approval cannot widen scope: {out}"
-    );
+    // 0.8 posture: every restricted Seatbelt `net` scope resolves Advisory and
+    // admission refuses it before spawn (L3 BOUND; see the core README), so the
+    // 0.7 test's proxied 403 never happens here. The property still holds, more
+    // strongly: an exact private approval adds no authority, and nothing runs.
+    assert_eq!(out["denied"], true, "{out}");
     assert_eq!(out["denials"][0]["kind"], "net", "{out}");
-    assert_eq!(out["denials"][0]["target"], "refused.invalid", "{out}");
+    assert!(
+        out["denials"][0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("L3 BOUND")),
+        "private approval cannot widen a refused Seatbelt net scope: {out}"
+    );
+    assert!(
+        out["stdout"].as_str().unwrap_or("").is_empty(),
+        "curl never ran: {out}"
+    );
 }
