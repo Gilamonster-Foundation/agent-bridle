@@ -166,10 +166,16 @@ pub fn deny_inherited_fds(cmd: &mut std::process::Command) {
         cmd.pre_exec(|| {
             // close_range(first=3, last=U32::MAX, CLOSE_RANGE_CLOEXEC): mark every
             // fd >= 3 close-on-exec; the kernel closes them atomically at `exec`.
-            let rc = libc::close_range(
-                3,
+            // Raw syscall, not `libc::close_range`: the libc crate has no wrapper
+            // on musl, and `syscall(2)` is identical everywhere else. On a kernel
+            // < 5.11 it returns -1/ENOSYS (or EINVAL for the flag) and the spawn
+            // is refused — fail-closed, unchanged.
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+            let rc = libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
                 libc::c_uint::MAX,
-                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+                CLOSE_RANGE_CLOEXEC,
             );
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());

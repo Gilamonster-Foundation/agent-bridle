@@ -201,6 +201,22 @@ check-windows-cross:
     RUSTFLAGS="-D warnings" cargo check --workspace --exclude agent-bridle-py \
         --all-features --target "$target"
 
+# musl compile check: newt builds its binary for x86_64-unknown-linux-musl, and the
+# libc crate lacks `close_range` there, so fdguard once failed to compile on it.
+# HOOK PARITY: run by .githooks/pre-push; mirrored by the `check-musl` job in
+# .github/workflows/ci.yml.
+[unix]
+check-musl:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    target=x86_64-unknown-linux-musl
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+        echo "!! $target NOT INSTALLED — musl check SKIPPED locally."
+        echo "!! Install once with: rustup target add $target"
+        exit 0
+    fi
+    RUSTFLAGS="-D warnings" cargo check -p agent-bridle-fdguard --target "$target"
+
 # Coverage gate. Uses cargo-llvm-cov if installed; skips gracefully otherwise
 # so the recipe never blocks a machine that lacks the tool. Also skips when
 # there are no tests yet (e.g. a fresh scaffold) — llvm-cov reports "no
