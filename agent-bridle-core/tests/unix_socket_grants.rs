@@ -93,7 +93,7 @@ fn unix_socket_grants_stay_advisory_on_every_backend_including_seatbelt() {
 mod seatbelt {
     use super::*;
     use agent_bridle_core::{
-        ConfinedCommand, Gate, Sandbox, SeatbeltSandbox, Tool, ToolContext, ToolResult,
+        ConfinedCommand, Gate, Sandbox, SeatbeltSandbox, Tool, ToolContext, ToolError, ToolResult,
     };
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -294,6 +294,7 @@ mod seatbelt {
     /// Grounds the probe deadline and kill/reap cleanup in a real stalled child;
     /// the other real-child case independently grounds the mocked socket policy.
     #[test]
+    #[ignore = "re-enable when Seatbelt net is promoted from Advisory (1ac8995 hold)"]
     fn unix_socket_probe_timeout_kills_and_reaps_the_child() {
         let ep = Endpoints::new();
         let cx = Gate::new(0)
@@ -316,9 +317,31 @@ mod seatbelt {
         );
     }
 
+    /// Pins the 0.8 posture positively: a `unix:` grant is refused at
+    /// admission, not silently downgraded. Every restricted Seatbelt `net`
+    /// scope resolves Advisory and is refused before spawn (L3 BOUND) — see
+    /// `agent-bridle-core/README.md` and the ignored real-child proofs above,
+    /// which re-enable the day this hold lifts.
+    #[test]
+    fn unix_socket_grant_is_refused_at_admission_under_seatbelt() {
+        let ep = Endpoints::new();
+        let cx = Gate::new(0)
+            .authorize(&Fixture, &scoped(&[&ep.grant()]))
+            .unwrap();
+        let err = probe_command("connect", &ep.first, "allowed")
+            .spawn(&cx)
+            .unwrap_err();
+        let ToolError::Denied { reason } = err else {
+            panic!("expected a Denied refusal, got {err:?}");
+        };
+        assert!(reason.contains("Net"), "{reason}");
+        assert!(reason.contains("L3 BOUND"), "{reason}");
+    }
+
     /// Real inherited kernel proof for the profile and proxy-partition tests:
     /// one granted live socket works; its live sibling and TCP stay denied.
     #[test]
+    #[ignore = "re-enable when Seatbelt net is promoted from Advisory (1ac8995 hold)"]
     fn unix_socket_real_child_obeys_exact_connect_scope_and_cannot_listen() {
         let ep = Endpoints::new();
         // Reachability controls avoid confusing a missing service with denial.
