@@ -97,6 +97,9 @@ pub struct BrushShellTool {
     timeout: Duration,
     sandbox_policy: Arc<SandboxPolicy>,
     named_host_roots: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// The build-tool delegation hook (`(names, delegate)`), off by default.
+    build_delegate: Option<(Vec<String>, Arc<dyn crate::BuildDelegate>)>,
 }
 
 impl std::fmt::Debug for BrushShellTool {
@@ -122,7 +125,35 @@ impl BrushShellTool {
             timeout: default_timeout(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
             named_host_roots: false,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            build_delegate: None,
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Let the worker **ask** this supervisor to run the named build tools.
+    ///
+    /// Each name becomes a builtin inside the worker's shell (brush's own name
+    /// resolution — nothing parses shell text), and invoking it sends
+    /// `{argv, cwd}` over an already-connected socket the worker inherits. The
+    /// supervisor answers by calling `delegate`, whose implementation owns the
+    /// whole fence: it must treat `argv` and `cwd` as untrusted worker input,
+    /// pin the run inside its own root, and supply its own environment.
+    ///
+    /// **The worker gains no new authority.** It gets one pre-connected
+    /// descriptor and no filesystem root, `exec` entry, or network right; a
+    /// path-spelled `/usr/bin/cargo`, or `cargo` behind `env`, is still an
+    /// ordinary external and still meets `before_exec`'s fail-closed denial.
+    /// Omit this and the worker holds nothing to ask with — the socket it
+    /// authenticated on is closed the moment the grant arrives.
+    #[must_use]
+    pub fn with_build_delegate(
+        mut self,
+        names: Vec<String>,
+        delegate: Arc<dyn crate::BuildDelegate>,
+    ) -> Self {
+        self.build_delegate = Some((names, delegate));
+        self
     }
 
     /// Override the wall-clock ceiling (three-Cs: Configuration). A run that
@@ -276,15 +307,36 @@ impl Tool for BrushShellTool {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let delegate_names = self
+            .build_delegate
+            .as_ref()
+            .map(|(names, _)| names.clone())
+            .unwrap_or_default();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let delegate_names: Vec<String> = Vec::new();
         let payload = WorkerPayload::new(
             cmd,
             Some(cwd.to_string_lossy().into_owned()),
             path_value,
             env,
             max_output,
+            delegate_names.clone(),
         );
+        // The capability is minted here or not at all: with no delegate (or no
+        // names) the private channel is half-closed after the grant exactly as
+        // before, and the worker holds nothing to ask on.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let delegate = (!delegate_names.is_empty())
+            .then(|| self.build_delegate.as_ref().map(|(_, d)| Arc::clone(d)))
+            .flatten();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let has_delegate = delegate.is_some();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let has_delegate = false;
         let confined = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))
+            .with_delegate_channel(has_delegate)
             .spawn(cx, &nonce, &cwd)?;
         let sandbox_kind = confined.sandbox_kind;
         let caveats = cx.caveats().clone();
@@ -295,6 +347,20 @@ impl Tool for BrushShellTool {
         let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network);
         let timeout = self.timeout;
         let worker_output = output.clone();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let supervised = tokio::task::spawn_blocking(move || {
+            supervise_worker(
+                confined,
+                &payload,
+                timeout,
+                max_output,
+                worker_output,
+                delegate,
+            )
+        })
+        .await
+        .map_err(|error| ToolError::Exec(std::io::Error::other(format!("join: {error}"))))??;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let supervised = tokio::task::spawn_blocking(move || {
             supervise_worker(confined, &payload, timeout, max_output, worker_output)
         })
@@ -348,12 +414,18 @@ enum Supervised {
     TimedOut,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one supervision call owns the worker's whole lifecycle"
+)]
 fn supervise_worker(
     mut confined: SandboxedWorkerChild,
     payload: &WorkerPayload,
     timeout: Duration,
     max_output: usize,
     output: OutputEmitter,
+    delegate: Option<Arc<dyn crate::BuildDelegate>>,
 ) -> ToolResult<Supervised> {
     let auth_started = std::time::Instant::now();
     if let Err(error) = confined.send_payload(payload, timeout) {
@@ -384,6 +456,16 @@ fn supervise_worker(
             "brush worker authentication handshake failed: {reason}"
         )));
     }
+
+    // The worker authenticated, so the surviving socket is the channel it may
+    // ASK on. Serving it is the supervisor's choice: with no delegate there is
+    // no channel to take and nothing ever reads a request.
+    let delegate_serving = match (delegate, confined.take_delegate_channel()) {
+        (Some(delegate), Some(channel)) => Some(std::thread::spawn(move || {
+            crate::build_delegate::serve(channel, delegate.as_ref());
+        })),
+        _ => None,
+    };
 
     let mut child = confined.child;
     let stdout = child
@@ -424,6 +506,11 @@ fn supervise_worker(
         let _ = child.wait();
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
+        // The dead worker's end is closed, so the serving thread reads EOF and
+        // ends; joining here keeps a build delegate from outliving its worker.
+        if let Some(serving) = delegate_serving {
+            let _ = serving.join();
+        }
         return Ok(Supervised::TimedOut);
     }
     let outcome = stdout_reader
@@ -436,6 +523,100 @@ fn supervise_worker(
     if response.error.is_some() && !stderr.is_empty() {
         // Keep the authenticated terminal error authoritative. Worker stderr is
         // diagnostic-only and must never become a second result channel.
+        eprintln!(
+            "brush worker diagnostic stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    if let Some(serving) = delegate_serving {
+        let _ = serving.join();
+    }
+    Ok(Supervised::Complete(outcome))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn supervise_worker(
+    mut confined: SandboxedWorkerChild,
+    payload: &WorkerPayload,
+    timeout: Duration,
+    max_output: usize,
+    output: OutputEmitter,
+) -> ToolResult<Supervised> {
+    let auth_started = std::time::Instant::now();
+    if let Err(error) = confined.send_payload(payload, timeout) {
+        let mut child = confined.child;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
+        let protocol_cap = max_output.saturating_mul(4).saturating_add(1024 * 1024);
+        let stdout_reader = std::thread::spawn(move || read_capped(stdout, protocol_cap));
+        let stderr_reader =
+            std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
+        kill_worker_tree(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| ToolError::denied("brush worker stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| ToolError::denied("brush worker stderr reader panicked"))??;
+        let reason = brush_worker_handshake_error_message(&error.to_string(), &stdout, &stderr);
+        return Err(ToolError::denied(format!(
+            "brush worker authentication handshake failed: {reason}"
+        )));
+    }
+    let mut child = confined.child;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
+    let limits = stream_limits(max_output)?;
+    let stdout_reader = std::thread::spawn(move || {
+        read_stream(stdout, limits, |stream, chunk| {
+            output.emit(stream, chunk);
+        })
+    });
+    let stderr_reader =
+        std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
+    let deadline = auth_started + timeout;
+    let status = loop {
+        if let Some(status) = reap_worker_tree_if_exited(&mut child)? {
+            break Some(status);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break None;
+        }
+        std::thread::park_timeout(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10)),
+        );
+    };
+    if status.is_none() {
+        kill_worker_tree(&mut child);
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Ok(Supervised::TimedOut);
+    }
+    let outcome = stdout_reader
+        .join()
+        .map_err(|_| ToolError::denied("brush worker stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| ToolError::denied("brush worker stderr reader panicked"))??;
+    let response = &outcome.response;
+    if response.error.is_some() && !stderr.is_empty() {
         eprintln!(
             "brush worker diagnostic stderr: {}",
             String::from_utf8_lossy(&stderr)
@@ -569,6 +750,10 @@ pub(crate) struct Captured {
 /// IO must be enabled on the runtime (not just time): `$(...)` sets up real
 /// pipes via tokio's IO driver, and with IO enabled the inner program hits the
 /// `before_exec` funnel (a legible recorded denial) rather than panicking.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "worker request fields, threaded one-for-one from the authenticated grant"
+)]
 pub(crate) fn run_in_brush(
     cmd: String,
     cwd: Option<String>,
@@ -577,6 +762,11 @@ pub(crate) fn run_in_brush(
     interceptor: CaveatInterceptor,
     max_output: usize,
     output: OutputEmitter,
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        allow(unused_variables)
+    )]
+    build_delegate: &[String],
 ) -> ToolResult<Captured> {
     let (out_reader, out_writer) =
         std::io::pipe().map_err(|e| ToolError::Exec(brush_io("create stdout pipe", &e)))?;
@@ -657,6 +847,13 @@ pub(crate) fn run_in_brush(
             crate::coreutils_dispatch::install_default_providers();
             crate::coreutils_dispatch::register_shims(&mut shell);
         }
+
+        // The supervisor-named build tools (empty unless the grant carried a
+        // build capability). Registered AFTER the coreutils shims and with
+        // `register_builtin`, so a delegated name is never shadowed. This is
+        // brush's own name resolution — no shell text is inspected anywhere.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::build_delegate::register_build_builtins(&mut shell, build_delegate);
 
         // Every var seeded below MUST be `.export()`ed: `ShellVariable::new`
         // defaults `exported: false` (an ordinary shell variable, visible to
@@ -907,6 +1104,7 @@ mod cancel_tests {
             interceptor,
             DEFAULT_MAX_OUTPUT,
             OutputEmitter::default(),
+            &[],
         );
 
         assert!(
@@ -948,6 +1146,7 @@ mod cancel_tests {
                 interceptor,
                 DEFAULT_MAX_OUTPUT,
                 OutputEmitter::default(),
+                &[],
             )
         });
 

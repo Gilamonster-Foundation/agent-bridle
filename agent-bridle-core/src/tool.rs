@@ -65,6 +65,9 @@ impl From<serde_json::Value> for Invocation {
 /// tool a [`ToolContext`] minted from that meet. The tool can only act through
 /// the context's `check_*` methods, so it can never exceed what it declared or
 /// what the session was granted.
+// async_trait desugars async fns to #[must_use] Pin<Box<dyn Future>>, which is
+// itself #[must_use] — clippy::double_must_use fires on the macro output.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// The dispatch name (the key in `tools/list` and in

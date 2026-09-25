@@ -35,6 +35,8 @@ mod brush_protocol;
 mod brush_shell;
 #[cfg(feature = "brush")]
 mod brush_worker;
+#[cfg(all(feature = "brush", any(target_os = "linux", target_os = "macos")))]
+mod build_delegate;
 #[cfg(feature = "brush")]
 mod caveat_interceptor;
 #[cfg(feature = "brush")]
@@ -50,7 +52,7 @@ mod private_control {
     use serde::de::DeserializeOwned;
 
     pub(crate) fn receive_worker_request<P: DeserializeOwned>(
-    ) -> Result<agent_bridle_core::TrustedWorkerRequest<P>, String> {
+    ) -> Result<(agent_bridle_core::TrustedWorkerRequest<P>, ()), String> {
         Err("authenticated private worker control is unavailable on this platform".to_string())
     }
 
@@ -116,6 +118,12 @@ pub use shell_inspect::{
     inspect_shell, DescendantExec, InspectedCommand, InspectedConstruct, InspectedRedirect,
     RedirectOperation, ShellConstructKind, ShellInspection, ShellInspectionError,
 };
+
+/// Build-tool **delegation**: the narrowing-only confused-deputy hook. A
+/// sandboxed worker holds no authority to run `cargo`, so it asks the supervisor
+/// instead. See [`BrushShellTool::with_build_delegate`].
+#[cfg(all(feature = "brush", any(target_os = "linux", target_os = "macos")))]
+pub use build_delegate::BuildDelegate;
 
 /// Private Brush-worker dispatch. An embedder's binary calls
 /// [`maybe_dispatch`] at the top of `main` so the sandboxed worker re-exec

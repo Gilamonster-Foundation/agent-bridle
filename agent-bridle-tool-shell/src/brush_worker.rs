@@ -30,6 +30,16 @@ pub(crate) struct WorkerPayload {
     path: String,
     env: BTreeMap<String, String>,
     max_output: usize,
+    /// The build-tool names the supervisor is willing to run on this worker's
+    /// behalf. Empty for every worker without a build grant, and then the
+    /// surviving control socket is dropped rather than kept — so the capability
+    /// is genuinely absent, not merely unused.
+    ///
+    /// This list is not authority the worker can widen: it arrives inside the
+    /// same digest-bound, credential-checked frame as the caveats, and naming a
+    /// command here only routes it to the supervisor, which computes the fence.
+    #[serde(default)]
+    build_delegate: Vec<String>,
 }
 
 impl WorkerPayload {
@@ -39,6 +49,7 @@ impl WorkerPayload {
         path: String,
         env: BTreeMap<String, String>,
         max_output: usize,
+        build_delegate: Vec<String>,
     ) -> Self {
         Self {
             cmd,
@@ -46,6 +57,7 @@ impl WorkerPayload {
             path,
             env,
             max_output,
+            build_delegate,
         }
     }
 }
@@ -68,7 +80,7 @@ pub(crate) fn main() -> i32 {
 }
 
 fn receive_request() -> Result<(WorkerPayload, ToolContext), String> {
-    let request: TrustedWorkerRequest<WorkerPayload> =
+    let (request, control): (TrustedWorkerRequest<WorkerPayload>, _) =
         crate::private_control::receive_worker_request()
             .map_err(|error| format!("trusted worker authentication failed: {error}"))?;
     if !request.has_supported_version() {
@@ -89,6 +101,17 @@ fn receive_request() -> Result<(WorkerPayload, ToolContext), String> {
             .next()
             .ok_or_else(|| "worker grant has no valid generation".to_string())?,
     };
+    // The one capability this worker gains: an already-connected socket to ask
+    // on. Kept ONLY when the authenticated grant named build tools; otherwise
+    // dropped here, closing the worker's end for good.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if payload.build_delegate.is_empty() {
+        drop(control);
+    } else {
+        crate::build_delegate::install_channel(control);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = control;
     let tool = WorkerTool;
     let cx = Gate::new(generation)
         // The delegated floor is per-axis (`EnforcementFloor`), re-applied
@@ -142,6 +165,7 @@ fn run(request: WorkerPayload, cx: ToolContext) -> i32 {
         interceptor,
         request.max_output,
         output,
+        &request.build_delegate,
     );
 
     let denials = sink

@@ -111,6 +111,12 @@ pub struct SandboxedWorkerChild {
     /// The OS-level sandbox actually applied to the worker.
     pub sandbox_kind: SandboxKind,
     control: Option<TrustedWorkerControl>,
+    /// Keep the authenticated channel open after the one authority frame, so
+    /// the supervisor can serve worker→supervisor *requests* on it. Set by
+    /// [`SandboxedWorker::with_delegate_channel`].
+    keep_channel: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    delegate_channel: Option<std::os::unix::net::UnixStream>,
 }
 
 impl SandboxedWorkerChild {
@@ -121,12 +127,40 @@ impl SandboxedWorkerChild {
     /// contains only tool-specific, non-authority fields. The control endpoint
     /// is consumed and closed after this frame, so a launch can authorize at
     /// most one request.
+    ///
+    /// When the worker was built with
+    /// [`SandboxedWorker::with_delegate_channel`], the *socket* survives the
+    /// frame — but the authority direction does not: no second
+    /// `TrustedWorkerRequest` can ever be sent, because the
+    /// [`TrustedWorkerControl`] (which owns the nonce, caveats and floor) is
+    /// still consumed here. What remains is a bare pipe on which the worker may
+    /// ASK the supervisor for something; see
+    /// [`Self::take_delegate_channel`].
     pub fn send_payload<T: Serialize>(&mut self, payload: &T, timeout: Duration) -> ToolResult<()> {
         let mut control = self
             .control
             .take()
             .ok_or_else(|| ToolError::denied("trusted worker request was already sent"))?;
-        control.send(payload, self.child.id(), timeout)
+        control.send(payload, self.child.id(), timeout, self.keep_channel)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.keep_channel {
+            self.delegate_channel = Some(control.stream);
+        }
+        Ok(())
+    }
+
+    /// Take the post-authority socket, if this worker was built with
+    /// [`SandboxedWorker::with_delegate_channel`] and the authority frame has
+    /// been sent.
+    ///
+    /// The returned endpoint carries **no authority to the worker**: it is the
+    /// already-authenticated socketpair the worker holds the other end of, on
+    /// which the worker can send requests the supervisor may choose to serve.
+    /// Every decision — whether to read it at all, and what any request is
+    /// allowed to do — stays with the supervisor.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn take_delegate_channel(&mut self) -> Option<std::os::unix::net::UnixStream> {
+        self.delegate_channel.take()
     }
 }
 
@@ -152,6 +186,7 @@ impl TrustedWorkerControl {
         payload: &T,
         child_pid: u32,
         timeout: Duration,
+        keep_channel: bool,
     ) -> ToolResult<()> {
         self.stream
             .set_read_timeout(Some(timeout))
@@ -212,7 +247,18 @@ impl TrustedWorkerControl {
         // The control object is consumed immediately after this method. The
         // worker may close its endpoint as soon as it writes the ACK, so a
         // racing ENOTCONN here is not an authentication failure.
-        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        //
+        // `keep_channel` skips the half-close ONLY. The authority envelope is
+        // still gone with the consumed `TrustedWorkerControl`, so the socket
+        // that survives can carry worker REQUESTS, never a second grant.
+        if keep_channel {
+            // A delegated request/response exchange outlives the handshake
+            // timeout; the supervisor sets its own deadlines from here on.
+            let _ = self.stream.set_read_timeout(None);
+            let _ = self.stream.set_write_timeout(None);
+        } else {
+            let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        }
         Ok(())
     }
 
@@ -222,6 +268,7 @@ impl TrustedWorkerControl {
         payload: &T,
         child_pid: u32,
         timeout: Duration,
+        keep_channel: bool,
     ) -> ToolResult<()> {
         let _ = (
             &self.unavailable,
@@ -231,6 +278,7 @@ impl TrustedWorkerControl {
             payload,
             child_pid,
             timeout,
+            keep_channel,
         );
         Err(ToolError::denied(
             "trusted worker control channels are unavailable on this platform",
@@ -890,6 +938,7 @@ pub struct SandboxedWorker {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     kind: TrustedWorkerKind,
     sandbox_policy: Arc<SandboxPolicy>,
+    delegate_channel: bool,
 }
 
 impl SandboxedWorker {
@@ -904,6 +953,7 @@ impl SandboxedWorker {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             kind: TrustedWorkerKind::Brush,
             sandbox_policy: Arc::new(SandboxPolicy::default()),
+            delegate_channel: false,
         }
     }
 
@@ -911,6 +961,22 @@ impl SandboxedWorker {
     #[must_use]
     pub fn sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
         self.sandbox_policy = policy;
+        self
+    }
+
+    /// Keep the authenticated private channel open past the one authority
+    /// frame, so the worker can send the supervisor REQUESTS on it
+    /// ([`SandboxedWorkerChild::take_delegate_channel`]).
+    ///
+    /// This is a **narrowing-only** capability: the surviving socket is already
+    /// connected, so the worker needs no filesystem, exec, or network right to
+    /// use it; and the authority envelope is still consumed by the one frame, so
+    /// no second grant can travel down it. The supervisor decides whether to
+    /// read the channel at all and what any request may do. Default `false` — a
+    /// worker that was not given this holds nothing to ask with.
+    #[must_use]
+    pub fn with_delegate_channel(mut self, delegate_channel: bool) -> Self {
+        self.delegate_channel = delegate_channel;
         self
     }
 
@@ -1003,6 +1069,8 @@ impl SandboxedWorker {
                 caveats: request_caveats,
                 strength_floor: request_strength_floor,
             }),
+            keep_channel: self.delegate_channel,
+            delegate_channel: None,
         })
     }
 }
@@ -1620,6 +1688,8 @@ mod tests {
             child: process,
             sandbox_kind: SandboxKind::None,
             control: Some(control),
+            keep_channel: false,
+            delegate_channel: None,
         };
         let forged_payload = serde_json::json!({
             "cmd": "echo ok",

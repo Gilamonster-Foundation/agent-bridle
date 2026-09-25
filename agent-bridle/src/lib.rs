@@ -57,6 +57,10 @@ pub use agent_bridle_tool_shell::HostShellTool;
 pub use agent_bridle_tool_shell::{
     brush_private_control_supported, lower_named_host_root_command, BrushShellTool,
 };
+// The build-delegation hook (narrowing only): the worker asks the supervisor to
+// run a build instead of being granted the authority to run one itself.
+#[cfg(all(feature = "brush", any(target_os = "linux", target_os = "macos")))]
+pub use agent_bridle_tool_shell::BuildDelegate;
 /// Parse and inspect Brush shell source without expansion or execution.
 ///
 /// The returned source-bound schema lets an embedder present command

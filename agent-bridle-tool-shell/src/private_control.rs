@@ -85,8 +85,15 @@ fn inspect_image_with_fallback(pid: i32) -> Result<ImageIdentityState, String> {
 }
 
 /// Receive and authenticate the one core-framed Brush worker request on fd 0.
+///
+/// Returns the authenticated request together with the **close-on-exec
+/// duplicate** of the control socket. fd 0 itself is retired to `/dev/null`
+/// before returning, exactly as before, so no model-visible shell code inherits
+/// or reopens the channel; the duplicate is the worker's own in-process handle
+/// and is dropped unless the supervisor's grant asked for delegation. Because it
+/// is `FD_CLOEXEC`, nothing the worker `exec`s can see it either.
 pub(crate) fn receive_worker_request<P: DeserializeOwned>(
-) -> Result<TrustedWorkerRequest<P>, String> {
+) -> Result<(TrustedWorkerRequest<P>, UnixStream), String> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         return Err(
@@ -101,6 +108,10 @@ pub(crate) fn receive_worker_request<P: DeserializeOwned>(
             .try_clone_to_owned()
             .map_err(|error| format!("duplicate worker control socket: {error}"))?;
         let mut stream = UnixStream::from(owned);
+        // Belt and braces: `try_clone_to_owned` already uses `F_DUPFD_CLOEXEC`,
+        // but this channel's whole safety argument rests on the duplicate never
+        // surviving an `exec`, so assert it here rather than inherit it.
+        set_cloexec(&stream)?;
 
         let mut challenge = [0_u8; 32];
         getrandom::getrandom(&mut challenge)
@@ -144,7 +155,7 @@ pub(crate) fn receive_worker_request<P: DeserializeOwned>(
             .and_then(|()| stream.flush())
             .map_err(|error| format!("acknowledge worker authority frame: {error}"))?;
         retire_worker_stdin()?;
-        Ok(request)
+        Ok((request, stream))
     }
 }
 
@@ -678,7 +689,6 @@ fn retire_worker_stdin() -> Result<(), String> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cfg(feature = "carried-coreutils")]
 fn set_cloexec(fd: &impl AsFd) -> Result<(), String> {
     nix::fcntl::fcntl(
         fd,
