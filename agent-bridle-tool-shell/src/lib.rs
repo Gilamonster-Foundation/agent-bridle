@@ -78,6 +78,21 @@ mod parse;
 #[cfg(feature = "shell")]
 mod shell_tool;
 
+/// Stop the existing stage/worker process group before terminating its members.
+/// Killing a waited-on child first can wake a shell long enough to run its next
+/// command before the group's kill reaches it. Callers retain their wait/reap
+/// handling; this does not reach descendants that leave the process group.
+#[cfg(any(feature = "shell", feature = "brush"))]
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::STOP);
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    // Preserve the direct-child fallback even if either group signal fails.
+    let _ = child.kill();
+}
+
 pub use output_observer::{ShellInvocationId, ShellOutputObserver, ShellOutputStream};
 #[cfg(feature = "shell")]
 pub use shell_tool::ShellTool;
