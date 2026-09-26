@@ -2273,6 +2273,11 @@ mod seatbelt_impl {
         } else if super::net_loopback_only(effective) {
             p.push_str("(deny network*)\n");
             p.push_str("(allow network* (remote ip \"localhost:*\"))\n");
+            // The server side of the same interface: bind, listen and accept
+            // on a loopback address (a test suite's mock server). `remote ip`
+            // governs only the peer, so without this `bind` is EPERM. Off-box
+            // stays denied: both rules name only `localhost`.
+            p.push_str("(allow network-bind network-inbound (local ip \"localhost:*\"))\n");
         }
         // Exact Unix endpoints (#385 upstream, forward-ported): each granted
         // socket path is an exact outbound exception, never an `(allow
@@ -2669,6 +2674,16 @@ mod seatbelt_impl {
                 assert!(
                     prof.contains("(allow network* (remote ip \"localhost:*\"))"),
                     "{host}: loopback re-allow missing: {prof}"
+                );
+                assert!(
+                    prof.contains(
+                        "(allow network-bind network-inbound (local ip \"localhost:*\"))"
+                    ),
+                    "{host}: loopback listener rule missing: {prof}"
+                );
+                assert!(
+                    !prof.contains("(local ip \"*:*\")") && !prof.contains("(remote ip \"*:*\")"),
+                    "{host}: no rule may name a non-loopback address: {prof}"
                 );
                 assert!(
                     !SeatbeltSandbox::new()
@@ -4482,6 +4497,40 @@ print(d.value())
             }
         });
         Some(addr)
+    }
+
+    /// A loopback-only child can also SERVE on loopback: bind, listen and
+    /// accept (a test suite's mock HTTP server). The connect-side rule alone
+    /// (`remote ip "localhost:*"`) refused `bind` with EPERM, so newt's build
+    /// lane could not run any wiremock-based test under this fence.
+    #[test]
+    fn net_loopback_only_permits_a_loopback_listener() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let perl = "/usr/bin/perl";
+        if !std::path::Path::new(perl).exists() {
+            eprintln!("skipping: no perl(1) on this host");
+            return;
+        }
+        let cav = Caveats {
+            net: Scope::only(["localhost".to_string()]),
+            ..Caveats::top()
+        };
+        // Bind an ephemeral loopback port, connect to it, accept: a full
+        // local round trip, all inside the fence.
+        let script = "use IO::Socket::INET; \
+            my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0, Listen => 1) \
+                or die \"bind: $!\"; \
+            my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $s->sockport) \
+                or die \"connect: $!\"; \
+            $s->accept or die \"accept: $!\"; print \"served\\n\";";
+        let out = run_wrapped_output(&cav, perl, &["-e", script]);
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("served"),
+            "net:Only([localhost]) must permit a loopback listener; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A loopback-only `net` grant kernel-confines egress to the loopback
