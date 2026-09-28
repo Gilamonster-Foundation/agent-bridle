@@ -157,12 +157,16 @@ Native L3 coverage is deliberately scope-shaped and reported per axis:
   kernel-deny all TCP on ABI-v4 kernels.
 - macOS Seatbelt confines both filesystem axes and restricted exec. For a
   restricted network scope it emits direct-network restrictions and, for the
-  E4 `net:none` profile, a Mach-lookup floor that closes the demonstrated
-  NSURLSession/`nsurlsessiond` deputy. That is defense in depth, not a faithful
-  network-authority projection: allow-listed and other ambient IPC deputies are
-  not comprehensively certified, so every restricted macOS `net` shape remains
+  network-denied shapes (`net:none`, `unix:`/`mach:` entries only), a **zero**
+  Mach-lookup floor: every named Mach service is denied unless the operator
+  granted it by name (`mach:<service>`, agent-bridle#405) — nothing ambient, so
+  the demonstrated NSURLSession/`nsurlsessiond` deputy and every other
+  named-lookup deputy is closed. That is defense in depth, not a faithful
+  network-authority projection: other ambient IPC routes are not
+  comprehensively certified, so every restricted macOS `net` shape remains
   `Unknown` and admission refuses it. There is no current `net:none`, loopback,
-  or loopback-proxy support promotion.
+  or loopback-proxy support promotion; a grant is projected as the named class
+  `seatbelt-mach-service:<name>` once the audit completes.
 - Windows AppContainer confines filesystem paths, empty or loopback-only
   network scopes, and exec deny-all; non-empty exec allowlists remain
   `Interceptor`.

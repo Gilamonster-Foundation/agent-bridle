@@ -109,10 +109,10 @@ class         = "exact"      # for net:none/DenyDirect; else unknown
 
 [net.macos]
 projection    = "All=>Unbounded; every restricted Seatbelt net shape=>Unknown=>refuse. No net:none, loopback, or loopback-proxy authority promotion"
-primitive     = "SBPL direct-network deny; loopback may re-allow localhost; E4 net:none also default-denies Mach lookup and excludes the demonstrated nsurlsessiond service"
+primitive     = "SBPL direct-network deny; loopback may re-allow localhost; the network-denied shapes also default-deny Mach lookup with a ZERO floor and re-allow only named mach:<service> operator grants (#405)"
 formal_claim  = "Unknown fails closed (L6/T4). The nsurlsessiond close is defense in depth, not a faithful restricted-net projection"
-native_test   = "E4 A/B/A deputy differential: agent-bridle-core/src/sandbox.rs::net_none_mach_floor_has_strict_ambient_closed_ambient_differential; direct-socket inheritance: agent-bridle-core/src/sandbox.rs::net_none_direct_floor_is_inherited_by_a_grandchild; loopback mechanism: agent-bridle-core/src/sandbox.rs::net_loopback_only_permits_loopback_interface_denies_offbox; end-to-end restricted shapes: agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs (refused before spawn)"
-residual      = "ASM-MACOS-DEPUTY UNDISCHARGED: allow-listed and other ambient IPC deputies are not comprehensively certified; ADR 0016 proxy path held"
+native_test   = "E4 A/B/A deputy differential: agent-bridle-core/src/sandbox.rs::net_none_mach_floor_has_strict_ambient_closed_ambient_differential; zero floor + named grant differential: agent-bridle-core/src/sandbox.rs::net_none_mach_floor_is_zero_and_a_named_grant_reopens_that_service; direct-socket inheritance: agent-bridle-core/src/sandbox.rs::net_none_direct_floor_is_inherited_by_a_grandchild; loopback mechanism: agent-bridle-core/src/sandbox.rs::net_loopback_only_permits_loopback_interface_denies_offbox; end-to-end restricted shapes: agent-bridle-tool-shell/tests/seatbelt_net_evidence.rs (refused before spawn)"
+residual      = "ASM-MACOS-DEPUTY UNDISCHARGED: named Mach lookup is closed (zero floor) but other ambient IPC routes are not comprehensively certified; ADR 0016 proxy path held"
 class         = "unknown"
 
 [net.windows]

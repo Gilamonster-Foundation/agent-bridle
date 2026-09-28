@@ -34,10 +34,11 @@ linux-landlock = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 # the `sandbox-exec(1)` wrapper — no extra dependency and no FFI (core forbids
 # `unsafe`), so the feature is empty here. It confines both filesystem axes and
 # restricted exec. Expressible restricted-net profiles add direct-network rules;
-# `net:none` additionally adds the E4 Mach-lookup floor. Every restricted macOS
-# net scope still resolves Unknown and admission refuses it until ambient and
-# allow-listed IPC deputies have a deputy-complete native proof. The demonstrated
-# nsurlsessiond close is defense in depth, not a net:none/loopback/proxy support
+# the network-denied shapes additionally install a ZERO Mach-lookup floor with
+# named `mach:<service>` operator grants (#405). Every restricted macOS net scope
+# still resolves Unknown and admission refuses it until every ambient IPC route
+# has a deputy-complete native proof. The zero floor and the demonstrated
+# nsurlsessiond close are defense in depth, not a net:none/loopback/proxy support
 # promotion. Without this feature/off-macOS, another native backend may apply or
 # the honest NoopSandbox reports SandboxKind::None. ADR 0006/0009/0014/0015/0016.
 macos-seatbelt = []
