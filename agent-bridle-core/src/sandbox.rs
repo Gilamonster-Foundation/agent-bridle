@@ -2106,14 +2106,21 @@ mod seatbelt_impl {
         /// Deliberately partial Seatbelt projection. The filesystem and exec axes
         /// retain the legacy caveats-grain/verbatim projection so this change does
         /// not claim ruleset-grain fidelity that has not been established. Network
-        /// is stricter: unrestricted authority is honestly ambient, while every
-        /// restricted network scope remains `Unknown` and is refused before spawn.
-        /// The Mach floor in the generated profile is defense-in-depth only and is
-        /// not used to promote restricted network authority to a bounded claim.
+        /// is stricter: unrestricted authority is honestly ambient; `net: none`
+        /// resolves `Bounded` (to nothing), because the emitted profile is a bare
+        /// `(deny network*)` with no re-allow of any kind (no loopback exception,
+        /// no Unix-socket exception — those require a non-empty `net` grant, a
+        /// different scope shape, and `net_unix_only`/`net_loopback_only` gate the
+        /// re-allow branches below in `seatbelt_profile_with`); every OTHER
+        /// restricted network scope (a host allowlist) stays `Unknown` and is
+        /// refused before spawn, since SBPL cannot name an arbitrary host (ADR
+        /// 0015) and the grant stays advisory. The Mach floor is defense-in-depth
+        /// only and plays no part in this resolution (2026-09-28, Shawn).
         fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
             let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
             resolved.net = match &effective.net {
                 Scope::All => crate::ResolvedScope::Unbounded,
+                Scope::Only(s) if s.is_empty() => crate::ResolvedScope::empty(),
                 Scope::Only(_) => crate::ResolvedScope::Unknown,
             };
             resolved
@@ -2527,19 +2534,31 @@ mod seatbelt_impl {
             assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
         }
 
-        /// Support remains held: every restricted network scope is Unknown even
-        /// when the profile installs direct-network and Mach defense-in-depth.
+        /// Lifted 2026-09-28 (Shawn): the emitted profile for `net:none` is a
+        /// bare `(deny network*)` with no re-allow of any kind — no loopback
+        /// exception, no Unix-socket exception (those require an explicit
+        /// non-empty grant, a different `Caveats.net` shape). The kernel denies
+        /// every direct socket operation, matching `ResolvedScope::empty()`
+        /// (bounded to nothing) exactly, so admission may honestly resolve it.
         #[test]
-        fn every_restricted_network_scope_resolves_unknown() {
+        fn net_none_resolves_bounded_to_nothing() {
             let cav = Caveats {
                 net: Scope::none(),
                 ..Caveats::top()
             };
             assert_eq!(
                 SeatbeltSandbox::new().resolved_authority(&cav).net,
-                ResolvedScope::Unknown,
-                "net:none support must remain held at admission"
+                ResolvedScope::empty(),
+                "net:none's emitted profile denies all direct network with no \
+                 re-allow, so it may resolve Bounded (to nothing) rather than Unknown"
             );
+        }
+
+        /// Support remains held for every OTHER restricted network scope: a
+        /// host allowlist is inexpressible in SBPL (ADR 0015) and stays
+        /// advisory, so admission must still refuse it as Unknown.
+        #[test]
+        fn host_list_network_scope_resolves_unknown() {
             let cav = Caveats {
                 net: Scope::only(["127.0.0.1".to_string()]),
                 ..Caveats::top()

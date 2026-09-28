@@ -39,12 +39,21 @@ comprehensively certified against child-controlled egress.
 Therefore the operative authority ruling is fail-closed:
 
 - `SeatbeltSandbox::resolved_authority().net` is `Unknown` for **every**
-  restricted net scope, including `net:none` and every loopback shape.
-- Admission refuses those scopes. The emitted SBPL direct-network and Mach rules
-  are defense in depth only; they are not a support or `Kernel`-witness
-  promotion.
+  restricted net scope, including every loopback shape and every host
+  allow-list. Admission refuses those scopes.
 - The loopback egress-proxy design from ADR 0016 is held/unavailable on macOS
   until a deputy-complete native proof supports a faithful projection.
+
+**2026-09-28 (Shawn): the `net:none` hold is lifted, host-list stays held.**
+The E4 finding above is about a Mach/XPC *deputy* reaching the network on the
+child's behalf despite `(deny network*)` — it is not evidence against the
+direct-socket deny itself, and `net:none`'s emitted profile installs no re-allow
+of any kind (no loopback exception, no Unix-socket exception — those require a
+non-empty `net` grant). `resolved_authority().net` therefore resolves `Bounded`
+(to nothing, `ResolvedScope::empty()`) for `net:none` only; every other
+restricted net scope (a host allow-list, loopback) remains `Unknown` per the
+ruling above, since SBPL cannot enforce those and the E4 deputy gap still
+applies to whatever ambient service they'd otherwise reach.
 
 The remainder of this ADR records the 2026-06 direct-socket findings and the
 superseded decision for history. Where it says a restricted net shape is

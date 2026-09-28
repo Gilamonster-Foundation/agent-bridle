@@ -2370,10 +2370,45 @@ mod seatbelt_child_tests {
         );
     }
 
-    /// Restricted Seatbelt network authority remains held: admission must refuse
-    /// before the program is spawned, regardless of the defense-in-depth profile.
+    /// Lifted 2026-09-28 (Shawn): `net:none`'s emitted SBPL profile is a bare
+    /// `(deny network*)` with no re-allow, so admission now resolves it Bounded
+    /// (to nothing) rather than Unknown — the spawn is admitted, and the kernel
+    /// still blocks the child's outbound connect.
     #[test]
-    fn restricted_net_authority_is_denied_before_spawn() {
+    fn net_none_is_admitted_and_kernel_blocks_egress() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let curl = "/usr/bin/curl";
+        if !std::path::Path::new(curl).exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        });
+        let mut spawned = ConfinedCommand::new(curl)
+            .args(["-sS", "--max-time", "5", "http://1.1.1.1/"])
+            .spawn(&cx)
+            .expect("net:none must now be admitted, not refused before spawn");
+        assert_eq!(spawned.sandbox_kind, SandboxKind::Seatbelt);
+        let status = spawned.child.wait().expect("wait");
+        // curl exit 7 = "couldn't connect": the socket is kernel-denied
+        // immediately, not merely slow (28) or the profile failing to parse (65).
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "egress under net:none must be kernel-denied at the socket (curl exit 7)"
+        );
+    }
+
+    /// A host allowlist stays `Unknown`: SBPL cannot name an arbitrary IP host
+    /// (ADR 0015), so the profile leaves it advisory and admission must refuse
+    /// before the program is spawned.
+    #[test]
+    fn restricted_host_list_net_authority_is_denied_before_spawn() {
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
@@ -2381,7 +2416,7 @@ mod seatbelt_child_tests {
         let dir = unique_dir("net-held");
         let marker = dir.join("must-not-spawn");
         let cx = ctx(Caveats {
-            net: Scope::none(),
+            net: Scope::only(["127.0.0.1".to_string()]),
             ..Caveats::top()
         });
         match ConfinedCommand::new("/usr/bin/touch")
@@ -2392,7 +2427,7 @@ mod seatbelt_child_tests {
             Err(other) => panic!("expected a restricted-network authority denial, got {other}"),
             Ok(mut spawned) => {
                 let _ = spawned.child.kill();
-                panic!("restricted network authority must be denied before spawn");
+                panic!("a restricted host-list network authority must be denied before spawn");
             }
         }
         assert!(
