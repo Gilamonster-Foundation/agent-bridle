@@ -50,7 +50,7 @@ mod windows {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
-        INVALID_HANDLE_VALUE,
+        INVALID_HANDLE_VALUE, LUID,
     };
     use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
         NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
@@ -64,10 +64,13 @@ mod windows {
         CreateAppContainerProfile, DeleteAppContainerProfile,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, FreeSid, WinCapabilityInternetClientServerSid,
+        AdjustTokenPrivileges, CopySid, CreateWellKnownSid, FreeSid, GetLengthSid,
+        LookupPrivilegeValueW, WinCapabilityInternetClientServerSid,
         WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid, ACL,
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_ATTRIBUTES,
-        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+        SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -75,9 +78,9 @@ mod windows {
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
-        EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, OpenProcessToken, UpdateProcThreadAttribute,
+        WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
         PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
         STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
     };
@@ -186,6 +189,115 @@ mod windows {
 
         LocalFree(p_sd);
         err == ERROR_SUCCESS
+    }
+
+    /// Enable `privilege_name` (e.g. `SeRestorePrivilege`) on the current
+    /// process token. Privileges an admin token holds are disabled by
+    /// default; `SetNamedSecurityInfoW(OWNER_SECURITY_INFORMATION, <sid not
+    /// held by this token>)` fails with `ERROR_INVALID_OWNER` without this.
+    /// Best-effort: returns `false` on any failure, never panics.
+    unsafe fn enable_privilege(privilege_name: &str) -> bool {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
+            return false;
+        }
+
+        let name_w = to_wide(OsStr::new(privilege_name));
+        let mut luid: LUID = std::mem::zeroed();
+        if LookupPrivilegeValueW(std::ptr::null(), name_w.as_ptr(), &mut luid) == 0 {
+            CloseHandle(token);
+            return false;
+        }
+
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let ok =
+            AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut());
+        CloseHandle(token);
+        // AdjustTokenPrivileges can report success while silently not
+        // assigning every requested privilege; GetLastError distinguishes
+        // that partial-success case from a real failure.
+        ok != 0 && windows_sys::Win32::Foundation::GetLastError() == ERROR_SUCCESS
+    }
+
+    /// Copy `path`'s current owner SID into an owned buffer (for later
+    /// restore) via `GetNamedSecurityInfoW`. `None` on any failure.
+    unsafe fn get_path_owner(path: &str) -> Option<Vec<u8>> {
+        let path_w = to_wide(OsStr::new(path));
+        let mut p_owner: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_sd: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut p_owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut p_sd,
+        );
+        if err != ERROR_SUCCESS || p_owner.is_null() {
+            if !p_sd.is_null() {
+                LocalFree(p_sd);
+            }
+            return None;
+        }
+        let len = GetLengthSid(p_owner) as usize;
+        let mut buf = vec![0u8; len];
+        let copied = CopySid(len as u32, buf.as_mut_ptr().cast(), p_owner) != 0;
+        LocalFree(p_sd);
+        copied.then_some(buf)
+    }
+
+    /// Set `path`'s owner to `sid`. `ADR-0009 follow-up (fatal: detected
+    /// dubious ownership)`: `grant_path_access` alone leaves a granted
+    /// directory's OWNER unchanged (still whoever created it — CI's
+    /// elevated runner, a build tool, ...); Git's post-CVE-2022-24765
+    /// ownership check compares the OWNER, not the DACL, so an AppContainer
+    /// child with full read/write ACL access can still get `fatal: detected
+    /// dubious ownership`. Scoped to exactly the same `--fs-write` paths the
+    /// ACL grant already covers — no broader authority than that grant.
+    /// Requires `SeRestorePrivilege` (see [`enable_privilege`]); best-effort
+    /// like the ACL grant's siblings, never refuses the whole launch.
+    unsafe fn set_path_owner(path: &str, sid: *mut std::ffi::c_void) -> bool {
+        let path_w = to_wide(OsStr::new(path));
+        let err = SetNamedSecurityInfoW(
+            path_w.as_ptr() as *mut _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        err == ERROR_SUCCESS
+    }
+
+    /// Restore `path`'s owner from a buffer saved by [`get_path_owner`].
+    /// Best-effort cleanup: a failure here leaves the path owned by the
+    /// AppContainer SID rather than corrupting anything, and the path is
+    /// normally a short-lived temp directory the caller deletes next.
+    unsafe fn restore_path_owner(path: &str, owner_sid: &[u8]) {
+        if owner_sid.is_empty() {
+            return;
+        }
+        let sid_ptr = owner_sid.as_ptr() as *mut std::ffi::c_void;
+        if !set_path_owner(path, sid_ptr) {
+            eprintln!(
+                "agent-bridle-aclaunch: cleanup could not restore original owner of {path:?}: {:?}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 
     /// Revoke only the explicit ACE for this launcher's AppContainer SID.
@@ -716,6 +828,22 @@ mod windows {
         //     is unsafe under overlapping launches on the same resource.
         let mut fs_grants: Vec<String> = Vec::new();
 
+        // #51 follow-up (`fatal: detected dubious ownership`): a granted
+        // write path's DACL now admits the AppContainer SID, but its OWNER
+        // is still whoever created it (an elevated CI runner, a build tool,
+        // ...). Git's post-CVE-2022-24765 ownership check reads the OWNER,
+        // not the DACL, so the confined child can still be refused even
+        // with full read/write access. Transfer ownership too, scoped to
+        // exactly the same `--fs-write` paths the DACL grant already
+        // covers — no broader authority than that grant. Best-effort: a
+        // failure here does not block the launch (see `set_path_owner`'s
+        // doc comment), since most confined commands never touch git
+        // ownership at all. `owner_backups` is only populated on success,
+        // so restore-on-exit only ever touches paths this run actually
+        // changed.
+        let have_restore_privilege = enable_privilege("SeRestorePrivilege");
+        let mut owner_backups: Vec<(String, Vec<u8>)> = Vec::new();
+
         // Grant read+write for write paths first (superset of read).
         for path in fs_write {
             let granted = grant_path_access(path, ac_sid, FILE_GENERIC_READ_WRITE_EXECUTE);
@@ -729,6 +857,20 @@ mod windows {
                 std::process::exit(1);
             }
             fs_grants.push(path.clone());
+            if have_restore_privilege {
+                if let Some(old_owner) = get_path_owner(path) {
+                    if set_path_owner(path, ac_sid) {
+                        owner_backups.push((path.clone(), old_owner));
+                    } else {
+                        eprintln!(
+                            "agent-bridle-aclaunch: could not take ownership of {path:?} \
+                             for the AppContainer SID; a native Git command against this \
+                             path may still refuse with \"detected dubious ownership\": {:?}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                }
+            }
         }
         // Grant read-only for remaining read paths not already granted.
         for path in fs_read {
@@ -960,7 +1102,11 @@ mod windows {
         GetExitCodeProcess(proc_info.hProcess as HANDLE, &mut exit_code);
         CloseHandle(proc_info.hProcess as HANDLE);
 
-        // 7a. Revoke this profile SID's explicit fs ACEs.
+        // 7a. Restore original ownership on any path we took ownership of,
+        //     then revoke this profile SID's explicit fs ACEs.
+        for (path, old_owner) in &owner_backups {
+            restore_path_owner(path, old_owner);
+        }
         revoke_path_grants(fs_grants, ac_sid);
 
         // 7b. Restore loopback exemption list if we modified it.
