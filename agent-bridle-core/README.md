@@ -67,15 +67,19 @@ compatibility allow-list is now the documented candidate set
 (`MACH_SERVICE_CANDIDATES`) a host may offer for a grant. The result envelope's
 `disclosure.mach_services` names what was granted and which candidates were
 withheld — the structured "service X denied" signal, derived from the installed
-policy because the kernel denies a Mach lookup silently. This closes every
-named-lookup deputy (the demonstrated NSURLSession / `nsurlsessiond` path
-included) but is not yet a deputy-complete proof: other ambient IPC has not been
+policy because the kernel denies a Mach lookup silently. With no grant the
+floor closes every named Mach lookup (the demonstrated NSURLSession /
+`nsurlsessiond` path included); a grant re-opens the named service, deputy or
+not. Neither is a deputy-complete proof: other ambient IPC has not been
 comprehensively certified. Consequently every restricted Seatbelt `net` scope,
 including `net:none`, a `mach:` grant, loopback, and the former loopback-proxy
-shape, still resolves `Unknown` and is refused by admission. Once the audit is
-complete, a grant resolves as the named class `seatbelt-mach-service:<name>`
-(never `∅`), which the Seatbelt runtime closure declares so admission compares
-it honestly.
+shape, still resolves `Unknown` and is refused by admission. The post-audit
+projection resolves a grant as the named class `seatbelt-mach-service:<name>`
+(never `∅`), which the Seatbelt runtime closure declares so the scope bound
+compares it honestly; the strength report and floor are unchanged by that
+projection and are integrated by the promotion PR, not by flipping the audit
+constant. A `mach:` grant mixed with a remote-host allow-list has no
+egress-proxy semantics and the proxy planner refuses it.
 
 An explicit `net` scope entry `unix:/absolute/canonical/service.sock` names a
 single existing Unix-domain socket; the path must already be canonical and

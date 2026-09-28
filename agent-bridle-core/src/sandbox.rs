@@ -648,12 +648,18 @@ pub(crate) fn egress_proxy_plan_for(
     available: SandboxKind,
     caveats: &Caveats,
 ) -> Option<(Vec<String>, Caveats)> {
-    if (has_unix_socket_grants(caveats) || has_mach_service_grants(caveats))
-        && available != SandboxKind::Seatbelt
-    {
-        // No other backend projects exact Unix endpoint or Mach service
-        // authority; the proxy would silently drop the grant instead of
-        // confining it.
+    if has_unix_socket_grants(caveats) && available != SandboxKind::Seatbelt {
+        // No other backend projects exact Unix endpoint authority; the proxy
+        // would silently drop the Unix grant instead of confining it.
+        return None;
+    }
+    if has_mach_service_grants(caveats) {
+        // A `mach:` grant has meaning only under a Mach floor, and the proxy's
+        // loopback fence installs none (Mach stays ambient there). The fenced
+        // caveats would erase the grant rather than confine it, so a
+        // mach-bearing remote-host scope has no defined proxy semantics on ANY
+        // backend: refuse the plan outright instead of dropping the token
+        // (review of #406). Define and prove those semantics before enabling.
         return None;
     }
     let allow_hosts = net_egress_proxy_hosts(caveats)?;
@@ -2118,9 +2124,13 @@ mod seatbelt_impl {
     /// shape projects `Unknown` and admission refuses it — the fail-closed
     /// posture of ADR 0015's E4 ruling. Only a deputy-complete native proof
     /// (every reachable ambient IPC route shown closed, positive controls
-    /// included) may flip [`MACH_DEPUTY_AUDIT`] to `Complete`; the projection
-    /// for that state is implemented and pinned by unit test now so the
-    /// promotion is a one-constant, reviewable change, never a rewrite.
+    /// included) may flip [`MACH_DEPUTY_AUDIT`] to `Complete`. The constant
+    /// controls ONLY the resolved-authority projection (the L3 scope bound).
+    /// It does not touch the per-axis strength report (`report.rs`, which
+    /// keeps every restricted Seatbelt net shape Advisory) or the L4 strength
+    /// floor, so flipping it alone does not admit `net:none` under a CONFINED
+    /// (Kernel-net) contract. Report/floor integration and end-to-end
+    /// admission tests belong to the evidence-backed promotion PR.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum MachDeputyAudit {
         Incomplete,
@@ -2207,9 +2217,10 @@ mod seatbelt_impl {
     /// entries only) it kernel-denies the child's direct socket operations and
     /// installs the **zero** Mach-lookup floor (agent-bridle#405): every named
     /// Mach service is denied unless the operator granted it by name with a
-    /// `mach:<service>` token — nothing ambient. That closes every named-lookup
-    /// deputy but is not yet a deputy-complete proof (other ambient IPC is not
-    /// certified), so restricted network authority remains held at admission
+    /// `mach:<service>` token — nothing ambient. With no grant the floor
+    /// closes every named Mach lookup; a grant re-opens the named service,
+    /// deputy or not. Neither is a deputy-complete proof (other ambient IPC is
+    /// not certified), so restricted network authority remains held at admission
     /// (`MACH_DEPUTY_AUDIT`). A non-empty `net` host allowlist is not
     /// expressible in SBPL (it filters by socket, not hostname) and stays
     /// advisory.
@@ -2497,9 +2508,10 @@ mod seatbelt_impl {
         //     `(deny network*)`: the child's direct socket operations are
         //     kernel-denied. Production also installs the ZERO Mach-lookup floor
         //     below (agent-bridle#405): every named Mach service is denied unless
-        //     the operator granted it by name. Nothing is ambient. This closes
-        //     every named-lookup deputy but is not yet a deputy-complete proof, so
-        //     restricted network admission remains held (`MACH_DEPUTY_AUDIT`).
+        //     the operator granted it by name. Nothing is ambient. With no grant
+        //     this closes every named Mach lookup; it is not a deputy-complete
+        //     proof, so restricted network admission remains held
+        //     (`MACH_DEPUTY_AUDIT`).
         //   • loopback-only allowlist → deny all, then re-allow the loopback
         //     interface (`localhost` = 127.0.0.1 + ::1). The process's own off-box
         //     socket egress stays kernel-denied; the exact loopback host is narrowed
@@ -2758,8 +2770,8 @@ mod seatbelt_impl {
             assert!(!profile.contains("nsurlsessiond"), "{profile}");
         }
 
-        /// A `mach:` grant re-opens exactly that service and nothing else, as an
-        /// exact SBPL `global-name` literal after the deny (last-match-wins).
+        /// A `mach:` grant emits exactly one `global-name` literal per granted
+        /// service after the deny (last-match-wins) and no other re-allow.
         #[test]
         fn mach_grant_reopens_exactly_the_named_service() {
             let cav = Caveats {
@@ -2872,12 +2884,16 @@ mod seatbelt_impl {
             );
         }
 
-        /// The resolution a grant takes once the deputy audit is complete: a
+        /// The PROJECTION a grant takes once the deputy audit is complete: a
         /// named class per granted service (never `∅` while a grant exists),
-        /// `unix:` endpoints concrete, and admission honest — the class admits
-        /// only because the Seatbelt closure declares exactly that class for
-        /// the grant; without the declaration it is Incomparable and refuses.
-        /// Pinned now so the promotion is a one-constant change.
+        /// `unix:` endpoints concrete, and the lattice-level scope comparison
+        /// honest — the class compares as `Subset` only because the Seatbelt
+        /// closure declares exactly that class for the grant; without the
+        /// declaration it is Incomparable and refuses. This exercises the pure
+        /// `admit` lattice law only: it is set bookkeeping for the L3 bound, not
+        /// `AdmittedFence::admit` (which also applies the L4 strength floor and
+        /// the Advisory net report) and not native deputy safety. Operational
+        /// admission under `Complete` is deferred to the promotion PR.
         #[test]
         fn complete_audit_projects_grants_as_named_classes() {
             use crate::{admit, empty_closure, AdmissionDecision};
@@ -3436,7 +3452,18 @@ mod tests {
             !net_loopback_full_interface(&with_net([m, "localhost"])),
             "a mach grant is authority beyond the loopback interface"
         );
-        // Off Seatbelt the proxy would drop the grant, so it does not engage.
+        // A mach-bearing remote-host scope has no proxy semantics: the loopback
+        // fence would erase the grant, so the planner refuses on EVERY backend,
+        // Seatbelt included (never a plan with the token silently dropped).
+        let mixed = with_net([m, "example.com"]);
+        assert!(
+            egress_proxy_plan_for(SandboxKind::Seatbelt, &mixed).is_none(),
+            "Seatbelt must not plan a proxy that drops the mach grant"
+        );
+        assert!(
+            !matches!(&loopback_fenced_caveats(&mixed).net, Scope::Only(set) if set.contains(m)),
+            "the fence does not carry the grant, which is why the plan is refused"
+        );
         assert!(
             egress_proxy_plan_for(SandboxKind::Landlock, &with_net([m, "example.com"])).is_none()
         );
@@ -5050,16 +5077,60 @@ print(d.value())
         Some(addr)
     }
 
-    /// The Mach floor is ZERO and a `mach:` grant re-opens exactly the named
-    /// service, kernel-enforced (agent-bridle#405). Differential with positive
-    /// controls: uid→name resolution (`id -un`) goes through
-    /// `com.apple.system.opendirectoryd.libinfo`; unconfined it prints the
-    /// user name (the control proves the host resolves it); under `net:none` the
-    /// zero floor denies the lookup and `id` falls back to the numeric uid; under
-    /// `net: {mach:…libinfo}` the name resolves again. Under BOTH confined
-    /// profiles a benign command (`/bin/echo`) still runs, proving each profile
-    /// parsed and only the lookup changed. Deterministic and offline: no network,
-    /// no compiler, no timing.
+    /// The numeric-uid control for the zero-floor differential, validated so it
+    /// can never be satisfied by a failed or empty child: `id -u` must exit
+    /// successfully and print exactly one non-empty ASCII-decimal token. The
+    /// denied legs of the proof compare against THIS value, so an `id` that
+    /// died with empty stdout cannot match an empty control (review of #406,
+    /// finding 1). Pure over the captured output; pinned by
+    /// `validated_uid_rejects_failed_or_non_numeric_controls`.
+    fn validated_uid(output: &std::process::Output) -> Result<String, String> {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() {
+            return Err(format!(
+                "`id -u` control did not exit successfully: status={:?} stdout={text:?}",
+                output.status.code()
+            ));
+        }
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "`id -u` control did not print a non-empty ASCII-decimal uid: {text:?}"
+            ));
+        }
+        Ok(text)
+    }
+
+    /// A failed, empty, or non-numeric uid control is refused — so the denied
+    /// legs of the differential below cannot pass against an empty string.
+    #[test]
+    fn validated_uid_rejects_failed_or_non_numeric_controls() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(validated_uid(&out(0, "501\n")).unwrap(), "501");
+        assert!(validated_uid(&out(1, "501\n")).is_err(), "failed status");
+        assert!(validated_uid(&out(0, "")).is_err(), "empty stdout");
+        assert!(validated_uid(&out(0, "\n")).is_err(), "whitespace only");
+        assert!(validated_uid(&out(0, "runner")).is_err(), "not numeric");
+        assert!(validated_uid(&out(0, "501 502")).is_err(), "not one token");
+    }
+
+    /// The Mach floor is ZERO and a `mach:` grant re-opens the ONE service it
+    /// names, kernel-enforced (agent-bridle#405). Measured differential with
+    /// positive controls, for `com.apple.system.opendirectoryd.libinfo`:
+    /// uid→name resolution (`id -un`) goes through that service; unconfined it
+    /// prints the user name (control: the host resolves it, and the name is
+    /// distinct from the validated numeric uid); under `net:none` the zero
+    /// floor denies the lookup and `id` falls back to the numeric uid; under
+    /// `net: {mach:…libinfo}` the name resolves again; under an UNRELATED grant
+    /// (`SecurityServer`) it does not. Under every confined profile a benign
+    /// command (`/bin/echo`) still runs, proving each profile parsed. This
+    /// characterizes the libinfo grant and the literal rule it emits; it does
+    /// not characterize any other service's transitive authority. Deterministic
+    /// and offline: no network, no compiler, no timing.
     #[test]
     fn net_none_mach_floor_is_zero_and_a_named_grant_reopens_that_service() {
         if skip_proof_unless_seatbelt() {
@@ -5072,26 +5143,36 @@ print(d.value())
         }
         let stdout =
             |o: &std::process::Output| String::from_utf8_lossy(&o.stdout).trim().to_string();
+        // Control 1: a validated numeric uid (success + non-empty ASCII decimal).
+        let uid = match validated_uid(
+            &std::process::Command::new(id)
+                .arg("-u")
+                .output()
+                .expect("run id -u"),
+        ) {
+            Ok(uid) => uid,
+            Err(reason) => {
+                fail_required_or_skip(&format!("positive control: {reason}"));
+                return;
+            }
+        };
+        // Control 2: the host resolves a NAME distinct from that uid, or the
+        // differential is meaningless — refuse to pass vacuously.
         let unconfined = std::process::Command::new(id)
             .arg("-un")
             .output()
             .expect("run id unconfined");
         let name = stdout(&unconfined);
-        let uid = stdout(
-            &std::process::Command::new(id)
-                .arg("-u")
-                .output()
-                .expect("run id -u"),
-        );
         if !unconfined.status.success() || name.is_empty() || name == uid {
-            // The control must resolve a NAME distinct from the uid, or the
-            // differential is meaningless — refuse to pass vacuously.
             fail_required_or_skip(&format!(
                 "positive control: unconfined `id -un` did not resolve a user name (got {name:?}, uid {uid:?})"
             ));
             return;
         }
 
+        // Denied leg: the documented `id` fallback is the exact validated uid on
+        // stdout. Exit status is NOT assumed (a denied lookup may or may not
+        // fail the tool); the non-empty exact-uid match is the evidence.
         let none = Caveats {
             net: Scope::none(),
             ..Caveats::top()
@@ -5109,6 +5190,7 @@ print(d.value())
             String::from_utf8_lossy(&denied.stderr)
         );
 
+        // Reopened leg: success status AND the expected name.
         let granted = Caveats {
             net: Scope::only(["mach:com.apple.system.opendirectoryd.libinfo".to_string()]),
             ..Caveats::top()
@@ -5118,22 +5200,34 @@ print(d.value())
             "mach-grant profile must still run non-network commands (must parse)"
         );
         let reopened = run_wrapped_output(&granted, id, &["-un"]);
+        assert!(
+            reopened.status.success(),
+            "under the libinfo grant `id -un` must exit successfully (stderr: {})",
+            String::from_utf8_lossy(&reopened.stderr)
+        );
         assert_eq!(
             stdout(&reopened),
             name,
-            "a named grant must re-open exactly that service (stderr: {})",
+            "the libinfo grant must re-open uid→name resolution (stderr: {})",
             String::from_utf8_lossy(&reopened.stderr)
         );
-        // The grant re-opens ONLY libinfo: a different service stays denied. An
-        // unrelated grant must not resolve the name either.
+
+        // Unrelated-grant leg: its own launch control, then the same exact-uid
+        // fallback — a grant of SecurityServer does not re-open libinfo.
         let other = Caveats {
             net: Scope::only(["mach:com.apple.SecurityServer".to_string()]),
             ..Caveats::top()
         };
+        assert!(
+            run_wrapped(&other, "/bin/echo", &["ok"]).success(),
+            "unrelated-grant profile must still run non-network commands (must parse)"
+        );
+        let unrelated = run_wrapped_output(&other, id, &["-un"]);
         assert_eq!(
-            stdout(&run_wrapped_output(&other, id, &["-un"])),
+            stdout(&unrelated),
             uid,
-            "an unrelated grant must not re-open libinfo"
+            "an unrelated grant must not re-open libinfo (stderr: {})",
+            String::from_utf8_lossy(&unrelated.stderr)
         );
     }
 

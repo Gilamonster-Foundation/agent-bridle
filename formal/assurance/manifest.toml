@@ -55,13 +55,13 @@ status        = "partial"   # native env test landed on main (#338 merged); RC-S
 [[claim]]
 id             = "MACOS-E4-NSURLSESSIOND-DEFENSE"
 platform       = "macos"
-statement      = "The Seatbelt Mach-lookup floor closes the demonstrated background-URLSession to com.apple.nsurlsessiond deputy path. Since #405 the floor is ZERO (every named Mach lookup denied unless granted by a mach:<service> token) and a grant is natively shown to re-open exactly the named service. This is defense in depth only: it does not establish that net:none, loopback, or the loopback-proxy shape has no other child-drivable ambient IPC deputy."
+statement      = "The Seatbelt Mach-lookup floor closes the demonstrated background-URLSession to com.apple.nsurlsessiond deputy path. Since #405 the zero-grant floor denies every named Mach lookup; a mach:<service> grant re-opens the named service (measured for opendirectoryd.libinfo against an unrelated SecurityServer grant, plus literal-rule inspection — not a characterization of every service's transitive authority). This is defense in depth only: it does not establish that net:none, loopback, or the loopback-proxy shape has no other child-drivable ambient IPC deputy."
 lean_theorem   = []
 tla_invariant  = []
 rust_test      = []
 native_test    = ["agent-bridle-core/src/sandbox.rs"]
 native_test_fn = ["agent-bridle-core/src/sandbox.rs::net_none_mach_floor_has_strict_ambient_closed_ambient_differential", "agent-bridle-core/src/sandbox.rs::net_none_mach_floor_is_zero_and_a_named_grant_reopens_that_service"]
-liveness      = "WEAK. The differential does verify the before-leg actually succeeded (callback_success), but the test carries ~6 silent early returns, each converting an environment that cannot run the probe into a PASSING test. Strengthening tracked by #361; needs Apple hardware to change safely."
+liveness      = "Gated, not executable-verified. Every early return in both differentials goes through fail_required_or_skip, which PANICS under BRIDLE_REQUIRE_SEATBELT=1 (set by the check-macos job), so an environment that cannot run a probe fails CI rather than passing; a local run without the flag skips loudly. The E4 before-leg asserts callback_success; the #405 differential validates its uid control (success + non-empty ASCII decimal) and name control before any denied leg is compared. The executable liveness artifact (probe emits the SHA it observed) remains #361."
 evidence_cid   = "held:phase1d"
 impl_sha       = "pending:PR-341-head"
 premise        = "ASM-MACOS-DEPUTY: UNDISCHARGED. The named nsurlsessiond path is natively characterized at the PR head SHA and the named-lookup floor is zero, but other ambient IPC routes are not comprehensively certified; every restricted Seatbelt net projection remains Unknown and admission refuses it."

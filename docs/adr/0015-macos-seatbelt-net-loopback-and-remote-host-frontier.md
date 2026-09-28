@@ -76,8 +76,19 @@ exactly that class per grant, so admission compares it as a `Subset` rather
 than an undeclared widening. The projection is implemented and pinned by unit
 test for the post-audit state, but **this build ships
 `MACH_DEPUTY_AUDIT = Incomplete`**, under which every restricted net shape
-still resolves `Unknown` and is refused (fail closed first, #405 D4). Flipping
-the constant is the one-line promotion a deputy-complete proof would justify.
+still resolves `Unknown` and is refused (fail closed first, #405 D4). The
+constant switches **only the authority projection** (the L3 scope bound). It
+does not change the per-axis strength report (every restricted Seatbelt net
+shape stays Advisory) or the L4 strength floor, so flipping it alone does not
+admit `net:none` under a CONFINED contract. Report/floor integration, the
+end-to-end admission tests, and the native deputy evidence that would justify
+the flip all belong to a later, evidence-backed promotion PR. Loopback and
+remote-host shapes stay `Unknown` in either state.
+
+A `mach:` grant alongside a remote-host allow-list has no egress-proxy
+semantics (the proxy's loopback fence installs no Mach floor, so the grant
+would be erased rather than confined); the proxy planner refuses such a scope
+on every backend.
 
 **Denial report.** The kernel denies a Mach lookup silently, so bridle derives
 the structured result from the installed policy: the envelope's
@@ -105,9 +116,13 @@ grant (evidence table in `docs/security/platform/macos-evidence.md`):
 | `security find-certificate` (keychain) | fails | `com.apple.SecurityServer` |
 
 The `id -un` differential is encoded as the CI proof
-`net_none_mach_floor_is_zero_and_a_named_grant_reopens_that_service`: the
-unconfined control resolves a name, the zero floor yields the uid, a grant of
-exactly `libinfo` resolves the name again, and an unrelated grant does not.
+`net_none_mach_floor_is_zero_and_a_named_grant_reopens_that_service`: a
+validated numeric-uid control (success, non-empty ASCII decimal) and a name
+control distinct from it; the zero floor yields the exact uid; a grant of
+`libinfo` exits successfully with the name; an unrelated `SecurityServer`
+grant yields the uid again; each confined profile has its own launch control.
+This measures the `libinfo` grant and the literal rule it emits; it does not
+characterize any other service's transitive authority.
 The E4 A/B/A differential still passes under the zero floor (the production
 leg exits via `callback_error`).
 
