@@ -280,6 +280,15 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: cargo test -p agent-bridle-aclaunch --test handle_inheritance -- --test-threads=1
 
+      # Git-for-Windows opens NUL during startup even when its standard fds are
+      # occupied. Keep the two facts separately proven: every caller stdio
+      # handle reaches the child, while the probe records this runner's NUL
+      # device result without changing its device ACL.
+      - name: AppContainer standard-handle delivery proof (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test stdio_inheritance -- --test-threads=1 --nocapture
+
       - name: AppContainer fail-closed setup proofs (require the boundary)
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"

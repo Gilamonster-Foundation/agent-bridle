@@ -59,6 +59,13 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: cargo test -p agent-bridle-aclaunch --test handle_inheritance -- --test-threads=1
 
+      # Keep Git's NUL-device startup requirement separate from the launcher's
+      # caller-stdio delivery guarantee; print the current runner observation.
+      - name: AppContainer standard-handle delivery proof (require the boundary)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: cargo test -p agent-bridle-aclaunch --test stdio_inheritance -- --test-threads=1 --nocapture
+
       - name: AppContainer fail-closed setup proofs (require the boundary)
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"

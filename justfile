@@ -156,6 +156,9 @@ check-windows:
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test kernel_proofs -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test net_proofs -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test handle_inheritance -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    # #404 round 2: prove standard-handle delivery independently from Git's
+    # host-controlled NUL-device startup requirement; print that observation.
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test stdio_inheritance -- --test-threads=1 --nocapture; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fail_closed -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     # #404: mirror the CI native-Git regression target. CI also sets

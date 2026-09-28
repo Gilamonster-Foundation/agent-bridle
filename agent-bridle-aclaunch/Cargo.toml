@@ -30,6 +30,12 @@ path = "src/bin/ab-netprobe.rs"
 name = "ab-handleprobe"
 path = "src/bin/ab-handleprobe.rs"
 
+# A console-only standard-handle and NUL-device probe used to distinguish
+# AppContainer handle delivery from device access during Git startup.
+[[bin]]
+name = "ab-stdio-probe"
+path = "src/bin/ab-stdio-probe.rs"
+
 # A token-identity probe used by descendant containment proofs.
 [[bin]]
 name = "ab-tokenprobe"
