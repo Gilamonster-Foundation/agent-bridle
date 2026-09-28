@@ -69,6 +69,17 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1
 
+      # Native Git ownership regression (#404): require the actual Git-for-
+      # Windows/AppContainer path, including the caller-controlled exact
+      # `safe.directory` recovery shape. Do not permit an unavailable Git
+      # runtime to turn this proof into a passing skip.
+      - name: AppContainer native Git ownership regression (require real Git)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+          BRIDLE_REQUIRE_NATIVE_GIT: "1"
+          BRIDLE_REQUIRE_OWNER_TRANSFER_REGRESSION: "1"
+        run: cargo test -p agent-bridle-aclaunch --test git_ownership -- --test-threads=1
+
       - name: AppContainer descendant containment proofs (require the boundary)
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"

@@ -290,6 +290,20 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1
 
+      # Native Git ownership regression (#404): a `--fs-write` grant may add
+      # only the AppContainer SID's scoped DACL ACE; it must never replace a
+      # caller path's owner. The test also proves that only caller-supplied,
+      # exact-path `safe.directory` configuration admits a forced-untrusted
+      # fixture. Require real Git startup so CI cannot silently skip this leg.
+      # The old implementation gated its transfer on SeRestorePrivilege, so
+      # require that old code path to be reachable as part of this regression.
+      - name: AppContainer native Git ownership regression (require real Git)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+          BRIDLE_REQUIRE_NATIVE_GIT: "1"
+          BRIDLE_REQUIRE_OWNER_TRANSFER_REGRESSION: "1"
+        run: cargo test -p agent-bridle-aclaunch --test git_ownership -- --test-threads=1
+
       - name: AppContainer descendant containment proofs (require the boundary)
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"

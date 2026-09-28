@@ -158,6 +158,11 @@ check-windows:
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test handle_inheritance -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fail_closed -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    # #404: mirror the CI native-Git regression target. CI also sets
+    # BRIDLE_REQUIRE_NATIVE_GIT=1 because its Windows runner must exercise
+    # Git-for-Windows; a noninteractive local service session may be unable to
+    # initialize user32-dependent Git, and the test reports that explicit skip.
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test git_ownership -- --test-threads=1 --nocapture; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test descendants -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test local_deputy -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test windows_appcontainer_contract -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
