@@ -243,3 +243,28 @@ this ADR; it is accepted here, not eliminated. **Mitigation:**
 `xcode-select -s /Library/Developer/CommandLineTools` — CommandLineTools is
 fully root-owned end to end, so once it is the active toolchain, no exception
 ever applies and the class never appears. See `SECURITY.md`.
+
+**Round 3 (operator decision 2026-09-29) — the widening is now OPT-IN,
+default OFF (agent-bridle#409).** Round 2 shipped the `/Applications`
+exception unconditionally. Round 3 gates it behind a new
+`SandboxPolicy` field, `seatbelt_trust_admin_writable_xcode` (mirroring how
+`appcontainer_nul_device_ace`-style mechanism flags already ride
+`SandboxPolicy`), plumbed through `resolve_exec_targets`,
+`git_toolchain_redirect_targets`, `resolved_authority`, and `runtime_closure`.
+**Unset (the default): behaviour is round 1's** — the strict, fully-root-owned
+ancestry bar applies everywhere, including to the Xcode.app candidate, so a
+stock Xcode install's admin-group-writable `/Applications` fails closed and
+`git worktree add` is denied. **Set: round 2's exception applies**, plus the
+named `seatbelt-admin-writable-xcode-toolchain` class on the resolved-authority
+exec axis exactly as before.
+
+**Admission needs the closure to agree with the resolved authority.** A prior
+draft of this round left `runtime_closure` untouched, so `resolved_authority`
+could name the exception class on the exec axis while `runtime_closure` never
+declared it — failing the `resolved ⊆ delegated ∪ runtime_closure` admission
+bound (`admitted.rs`) for the exact widening this ADR documents as accepted.
+`SeatbeltSandbox::runtime_closure` now unions the same class onto its exec
+axis whenever `resolve_exec_targets_uses_xcode_applications_exception` says
+the opt-in grant used it — the exec-axis mirror of the net-axis Mach-grant
+closure already there. See `SECURITY.md` for the opt-in framing of the known
+issue.

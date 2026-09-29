@@ -2846,6 +2846,7 @@ mod seatbelt_impl {
                     &unix_socket_paths(effective)?,
                     &super::mach_service_grants(effective)?,
                     mach_floor,
+                    self.policy.seatbelt_trust_admin_writable_xcode,
                 ),
             ])
         }
@@ -2894,7 +2895,10 @@ mod seatbelt_impl {
             // git grant's kernel redirect was admitted only through the named
             // /Applications widening, say so on the exec axis as a class —
             // never silently folded into the ordinary concrete grant.
-            if resolve_exec_targets_uses_xcode_applications_exception(&effective.exec) {
+            if resolve_exec_targets_uses_xcode_applications_exception(
+                &effective.exec,
+                self.policy.seatbelt_trust_admin_writable_xcode,
+            ) {
                 resolved.exec = resolved.exec.union(&crate::ResolvedScope::class(
                     XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS,
                 ));
@@ -2917,6 +2921,19 @@ mod seatbelt_impl {
                         super::seatbelt_mach_service_class(g),
                     ))
                 });
+            }
+            // The exec-axis mirror of the net-axis Mach grants above: when
+            // `resolved_authority` names `XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS`
+            // on a grant, admission's `resolved ⊆ delegated ∪ runtime_closure`
+            // bound needs THIS closure to declare that class too, or the named
+            // widening it reports refuses at admission (reviewer-flagged gap).
+            if resolve_exec_targets_uses_xcode_applications_exception(
+                &effective.exec,
+                self.policy.seatbelt_trust_admin_writable_xcode,
+            ) {
+                closure.exec = closure.exec.union(&crate::ResolvedScope::class(
+                    XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS,
+                ));
             }
             closure
         }
@@ -2993,6 +3010,7 @@ mod seatbelt_impl {
             &unix_socket_paths(effective).expect("valid Unix socket grants in profile fixture"),
             &super::mach_service_grants(effective).expect("valid mach: grants in profile fixture"),
             NetNoneMachFloor::Closed,
+            policy.seatbelt_trust_admin_writable_xcode,
         )
     }
 
@@ -3009,6 +3027,7 @@ mod seatbelt_impl {
         unix_sockets: &[String],
         mach_grants: &[String],
         mach_floor: NetNoneMachFloor,
+        trust_admin_writable_xcode: bool,
     ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n");
 
@@ -3125,7 +3144,7 @@ mod seatbelt_impl {
         // ambient. SBPL is last-match-wins, so the trailing allow overrides.
         if let Scope::Only(_) = &effective.exec {
             p.push_str("(deny process-exec*)\n");
-            let targets = resolve_exec_targets(&effective.exec);
+            let targets = resolve_exec_targets(&effective.exec, trust_admin_writable_xcode);
             if !targets.is_empty() {
                 p.push_str("(allow process-exec*");
                 for t in &targets {
@@ -3225,14 +3244,20 @@ mod seatbelt_impl {
     /// a narrower fix than Linux's #2630 (no static convention lets it be
     /// *derived* from the grant; it is matched against a fixed, checked list
     /// instead).
-    fn resolve_exec_targets(scope: &Scope<String>) -> Vec<String> {
+    fn resolve_exec_targets(
+        scope: &Scope<String>,
+        trust_admin_writable_xcode: bool,
+    ) -> Vec<String> {
         let Scope::Only(set) = scope else {
             return Vec::new();
         };
         let canon_file = |path: &Path, out: &mut Vec<String>| {
             if let Ok(c) = std::fs::canonicalize(path) {
                 if c.is_file() {
-                    out.extend(git_toolchain_redirect_targets(&c));
+                    out.extend(git_toolchain_redirect_targets(
+                        &c,
+                        trust_admin_writable_xcode,
+                    ));
                     out.push(c.to_string_lossy().into_owned());
                 }
             }
@@ -3284,7 +3309,11 @@ mod seatbelt_impl {
     /// admits, without touching its return shape or its callers.
     pub(super) fn resolve_exec_targets_uses_xcode_applications_exception(
         scope: &Scope<String>,
+        trust_admin_writable_xcode: bool,
     ) -> bool {
+        if !trust_admin_writable_xcode {
+            return false; // opt-in off: the exception is never consulted, let alone used.
+        }
         let Scope::Only(set) = scope else {
             return false;
         };
@@ -3423,7 +3452,10 @@ mod seatbelt_impl {
     /// one canonical binary already covers them (verified live: `git
     /// worktree add` succeeds with exactly the stub plus this one extra
     /// literal, no `git-core` entries admitted at all).
-    pub(super) fn git_toolchain_redirect_targets(canon_git_bin: &Path) -> Vec<String> {
+    pub(super) fn git_toolchain_redirect_targets(
+        canon_git_bin: &Path,
+        trust_admin_writable_xcode: bool,
+    ) -> Vec<String> {
         if canon_git_bin.file_name().and_then(|n| n.to_str()) != Some("git") {
             return Vec::new();
         }
@@ -3445,7 +3477,8 @@ mod seatbelt_impl {
             }
             let trusted = if *root == XCODE_TOOLCHAIN_ROOT {
                 ancestry_is_root_owned_and_unwritable(&candidate)
-                    || xcode_toolchain_ancestry_is_trusted(&candidate)
+                    || (trust_admin_writable_xcode
+                        && xcode_toolchain_ancestry_is_trusted(&candidate))
             } else {
                 ancestry_is_root_owned_and_unwritable(&candidate)
             };
@@ -3468,7 +3501,11 @@ mod seatbelt_impl {
     pub(super) fn git_toolchain_redirect_uses_xcode_applications_exception(
         canon_git_bin: &Path,
     ) -> bool {
-        if git_toolchain_redirect_targets(canon_git_bin).is_empty() {
+        // Only ever called once the opt-in flag has already gated the caller
+        // (see `resolve_exec_targets_uses_xcode_applications_exception`), so
+        // this recomputes the exception-only admission unconditionally —
+        // `true` here means "the exception, if enabled, is what would carry it".
+        if git_toolchain_redirect_targets(canon_git_bin, true).is_empty() {
             return false;
         }
         let Ok(candidate) = Path::new(XCODE_TOOLCHAIN_ROOT)
@@ -4255,7 +4292,7 @@ mod seatbelt_impl {
                 eprintln!("skipping: no git in a TRUSTED_EXEC_DIRS location on this host");
                 return;
             };
-            let resolved = resolve_exec_targets(&Scope::only([git.to_string()]));
+            let resolved = resolve_exec_targets(&Scope::only([git.to_string()]), true);
             assert!(
                 resolved.iter().any(|p| p == git),
                 "the git stub itself must still be admitted: {resolved:?}"
@@ -4289,8 +4326,10 @@ mod seatbelt_impl {
             let fake_git = dir.join("git");
             write_executable_marker_script(&fake_git, &marker);
 
-            let resolved =
-                resolve_exec_targets(&Scope::only([fake_git.to_string_lossy().into_owned()]));
+            let resolved = resolve_exec_targets(
+                &Scope::only([fake_git.to_string_lossy().into_owned()]),
+                true,
+            );
 
             assert!(
                 !marker.exists(),
@@ -4382,7 +4421,7 @@ mod seatbelt_impl {
             let dir = unique_dir("same-path");
             let git = dir.join("git");
             std::fs::write(&git, b"not real git\n").unwrap();
-            let out = git_toolchain_redirect_targets(&git);
+            let out = git_toolchain_redirect_targets(&git, true);
             assert!(
                 out.is_empty(),
                 "a non-trusted-dir git must never yield a redirect target: {out:?}"
@@ -7023,21 +7062,25 @@ print(d.value())
     /// host can have both Xcode.app AND CommandLineTools installed with only
     /// one active) — so this check is against the ACTIVE one specifically,
     /// via [`active_toolchain_git`].
-    fn active_toolchain_is_trusted(git: &str) -> bool {
+    fn active_toolchain_is_trusted(git: &str, trust_admin_writable_xcode: bool) -> bool {
         let Ok(canon_git) = Path::new(git).canonicalize() else {
             return false;
         };
         let Some(active) = active_toolchain_git() else {
             return false;
         };
-        super::seatbelt_impl::git_toolchain_redirect_targets(&canon_git)
+        super::seatbelt_impl::git_toolchain_redirect_targets(&canon_git, trust_admin_writable_xcode)
             .iter()
             .any(|p| Path::new(p) == active)
     }
 
     /// agent-bridle#408 — the macOS/Seatbelt twin of bridle PR #407: a REAL
-    /// kernel-confined `git worktree add` under `exec: Only(["git"])`.
-    /// Confirmed red first (pre-fix `resolve_exec_targets`, no toolchain
+    /// kernel-confined `git worktree add` under `exec: Only(["git"])`. Shared
+    /// by the default-off and opt-in ROUND 3 tests below (agent-bridle#409):
+    /// `trust_admin_writable_xcode` is the exact opt-in flag
+    /// (`SandboxPolicy::seatbelt_trust_admin_writable_xcode`), threaded
+    /// through the SAME `SeatbeltSandbox` construction production uses.
+    /// Confirmed red first (pre-#408 `resolve_exec_targets`, no toolchain
     /// redirect fold-in): `fatal: cannot exec
     /// '/Applications/Xcode.app/Contents/Developer/usr/bin/git': Operation
     /// not permitted` (git's own re-exec of the active toolchain binary,
@@ -7045,18 +7088,12 @@ print(d.value())
     /// runs — even `git --version` fails the same way under the pre-fix
     /// resolver).
     ///
-    /// This asserts SUCCESS only when the active toolchain is one our fix
-    /// actually trusts ([`active_toolchain_is_trusted`]). ROUND 2 (operator
-    /// decision 2026-09-29, `XCODE_APPLICATIONS_EXCEPTION`): on THIS Mac
-    /// that now includes the stock Xcode.app toolchain reached through a
-    /// group-writable `/Applications` (confirmed live, macOS 15 / Xcode
-    /// 26.3: `drwxrwxr-x root:wheel`) — the one named widening this
-    /// resolver applies, and nowhere else. A host whose active toolchain
-    /// fails even the relaxed bar still fails closed — asserted in the
-    /// `else` branch, so this test exercises a real kernel-enforced outcome
-    /// either way and never silently skips.
-    #[test]
-    fn git_worktree_add_succeeds_under_a_git_only_exec_grant_when_the_toolchain_is_trusted() {
+    /// Asserts SUCCESS only when the active toolchain is one this flag
+    /// setting actually trusts ([`active_toolchain_is_trusted`]); a host
+    /// whose active toolchain fails even the relaxed bar still fails closed
+    /// — asserted in the `else` branch, so this exercises a real
+    /// kernel-enforced outcome either way and never silently skips.
+    fn assert_git_worktree_add_matches_trust_setting(trust_admin_writable_xcode: bool) {
         if skip_proof_unless_seatbelt() {
             return;
         }
@@ -7093,7 +7130,11 @@ print(d.value())
             exec: Scope::only([git.to_string()]),
             ..Caveats::top()
         };
-        let prefix = SeatbeltSandbox::new()
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: trust_admin_writable_xcode,
+            ..SandboxPolicy::default()
+        };
+        let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
             .command_prefix(&cav)
             .expect("a restricted exec axis must yield a wrapper prefix");
         let status = hermetic_git_command(&prefix, git, &main, &home, &[])
@@ -7108,11 +7149,11 @@ print(d.value())
             .status()
             .expect("spawn confined worktree add");
 
-        if active_toolchain_is_trusted(git) {
+        if active_toolchain_is_trusted(git, trust_admin_writable_xcode) {
             assert!(
                 status.success(),
                 "git worktree add must succeed under a git-only exec grant once the active \
-                 toolchain passes the ancestry bar (agent-bridle#408)"
+                 toolchain passes the ancestry bar (trust_admin_writable_xcode={trust_admin_writable_xcode})"
             );
             assert!(
                 wt.join(".git").exists(),
@@ -7120,12 +7161,12 @@ print(d.value())
             );
         } else {
             eprintln!(
-                "NOTE: this host's active git toolchain does not pass the root-owned/ \
-                 unwritable ancestry bar agent-bridle#408 requires (e.g. Xcode.app under a \
-                 group-writable /Applications) — the fix correctly declines to trust it, so \
-                 worktree add must still fail exactly as before this fix. The positive case \
-                 is exercised on a host whose active toolchain is fully root-owned end to \
-                 end (e.g. CommandLineTools-only)."
+                "NOTE: this host's active git toolchain does not pass the ancestry bar for \
+                 trust_admin_writable_xcode={trust_admin_writable_xcode} (e.g. Xcode.app under \
+                 a group-writable /Applications, with the opt-in off) — the fix correctly \
+                 declines to trust it, so worktree add must still fail exactly as before this \
+                 fix. The positive case is exercised on a host/setting combination whose active \
+                 toolchain passes (e.g. CommandLineTools-only, or the opt-in enabled)."
             );
             assert!(
                 !status.success(),
@@ -7136,6 +7177,23 @@ print(d.value())
         let _ = fs::remove_dir_all(&main);
         let _ = fs::remove_dir_all(&wt);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// ROUND 3 (agent-bridle#409, operator decision 2026-09-29): DEFAULT OFF.
+    /// On this Mac (active toolchain = Xcode.app under a group-writable
+    /// `/Applications`), `git worktree add` must still fail closed — round
+    /// 2's exception no longer fires unless the operator opts in.
+    #[test]
+    fn git_worktree_add_fails_closed_by_default_without_the_xcode_opt_in() {
+        assert_git_worktree_add_matches_trust_setting(false);
+    }
+
+    /// ROUND 3: opt-in ON reproduces round 2's behavior — on THIS Mac, `git
+    /// worktree add` succeeds once the operator explicitly sets
+    /// `seatbelt_trust_admin_writable_xcode`.
+    #[test]
+    fn git_worktree_add_succeeds_under_a_git_only_exec_grant_when_the_toolchain_is_trusted() {
+        assert_git_worktree_add_matches_trust_setting(true);
     }
 
     /// agent-bridle#408, P2: a hostile `DEVELOPER_DIR`/`GIT_EXEC_PATH` set ONLY
@@ -7189,7 +7247,14 @@ print(d.value())
             exec: Scope::only([git.to_string()]),
             ..Caveats::top()
         };
-        let prefix = SeatbeltSandbox::new()
+        // Opt-in ON: exercises this Mac's actual trusted-toolchain path (round
+        // 3's default-off case already has its own dedicated test above, where
+        // the base grant alone denies everything and this proof would be moot).
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
             .command_prefix(&cav)
             .expect("a restricted exec axis must yield a wrapper prefix");
         let fake_exec_path = fake_dev.join("usr/libexec/git-core");
@@ -7266,12 +7331,19 @@ print(d.value())
         };
         let scope = Scope::only([git.to_string()]);
         let uses_exception =
-            super::seatbelt_impl::resolve_exec_targets_uses_xcode_applications_exception(&scope);
+            super::seatbelt_impl::resolve_exec_targets_uses_xcode_applications_exception(
+                &scope, true,
+            );
         let cav = Caveats {
             exec: scope,
             ..Caveats::top()
         };
-        let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let resolved =
+            SeatbeltSandbox::with_policy(std::sync::Arc::new(policy)).resolved_authority(&cav);
         let carries_class = matches!(
             &resolved.exec,
             crate::ResolvedScope::Bounded { classes, .. }
@@ -7304,7 +7376,12 @@ print(d.value())
             exec: scope,
             ..Caveats::top()
         };
-        let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let resolved =
+            SeatbeltSandbox::with_policy(std::sync::Arc::new(policy)).resolved_authority(&cav);
         let carries_class = matches!(
             &resolved.exec,
             crate::ResolvedScope::Bounded { classes, .. }
@@ -7314,6 +7391,88 @@ print(d.value())
             !carries_class,
             "a CommandLineTools-anchored grant must never carry the Xcode admin-writable \
              exception class — CommandLineTools needs no widening"
+        );
+    }
+
+    /// ROUND 3 (agent-bridle#409): DEFAULT OFF — `resolved_authority` must
+    /// never name the exception class when
+    /// `seatbelt_trust_admin_writable_xcode` is unset, regardless of what
+    /// this host's live filesystem state would otherwise qualify for.
+    #[test]
+    fn resolved_authority_never_carries_the_exception_class_when_the_opt_in_is_off() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
+        let carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert!(
+            !carries_class,
+            "the Xcode admin-writable exception class must never appear with the opt-in off, \
+             even on a host whose active toolchain would qualify once enabled"
+        );
+    }
+
+    /// ROUND 3 (agent-bridle#409), the reviewer-flagged gap: admission needs
+    /// `resolved ⊆ delegated ∪ runtime_closure`, so when `resolved_authority`
+    /// names `XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS` on the exec axis (opt-in
+    /// ON, and this host's grant actually used the exception), the SAME
+    /// sandbox's `runtime_closure` must declare that class too — otherwise
+    /// the named widening it reports would refuse at admission rather than
+    /// being honestly bounded.
+    #[test]
+    fn runtime_closure_declares_the_exception_class_whenever_resolved_authority_names_it() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let sandbox = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy));
+        let resolved = sandbox.resolved_authority(&cav);
+        let resolved_carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        let closure = sandbox.runtime_closure(&cav);
+        let closure_carries_class = matches!(
+            &closure.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert_eq!(
+            resolved_carries_class, closure_carries_class,
+            "runtime_closure must declare the exception class iff resolved_authority named it, \
+             or admission's resolved ⊆ delegated ∪ runtime_closure bound refuses a widening \
+             this sandbox itself reports: resolved_carries_class={resolved_carries_class} \
+             closure_carries_class={closure_carries_class}"
         );
     }
 }
