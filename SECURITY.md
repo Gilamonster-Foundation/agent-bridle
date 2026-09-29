@@ -52,6 +52,44 @@ mitigations an operator should apply:
 > Landlock+seccomp host; tracked under #57/#35. The host-sysctl mitigation above
 > closes the same gap today, and a strong principal already fails closed regardless.
 
+## Known security issue: opt-in AppContainer `NUL` device ACE
+
+On affected Windows Server AppContainer policies, Git for Windows opens `NUL` during
+startup even when all three standard handles are valid. The normal AppContainer
+filesystem grant cannot authorize that host device. For the narrow native-Git
+compatibility case tracked in [#408](https://github.com/Gilamonster-Foundation/agent-bridle/issues/408),
+the launcher offers the explicit, default-off `--nul-device-ace` opt-in.
+Without that option, it neither opens nor modifies `\\.\NUL`, and its
+AppContainer-profile handling remains the existing baseline.
+
+This is a documented security widening, not ordinary `fs_read`, `fs_write`, or
+`exec` authority. When an operator explicitly enables it, the launcher modifies
+the host `\\.\NUL` device DACL by adding one ACE for that launch's freshly created
+AppContainer SID. The ACE grants only `FILE_GENERIC_READ | FILE_GENERIC_WRITE`;
+it grants neither execute nor access to another AppContainer SID. The resolved
+authority and enforcement disclosure name this closure
+`appcontainer-nul-device-ace` so it cannot disappear into an empty report.
+
+The caller must have `WRITE_DAC` on `\\.\NUL` (normally an elevated Windows token).
+If that right is absent, the launcher refuses before spawning the child; it does
+not retry without the requested grant. On every ordinary launcher exit it removes
+exactly its own SID's ACE, never restores a saved whole DACL, because overlapping
+launches must not delete or resurrect one another's grants. If the launcher
+crashes before cleanup, or a revocation fails, its profile remains and a later
+launcher invocation reaches the existing baseline failure:
+`CreateAppContainerProfile` does not return a fresh SID for an existing profile,
+so the child cannot start or reactivate that deterministic SID. External deletion
+of the retained profile is outside this launcher lifecycle and can make a later
+same-name creation possible while an unresolved ACE remains. The possible ACE is
+therefore documented residual host state; it is not silently normalized into the
+baseline.
+
+This escape hatch must be retired when Git for Windows ships an upstream change
+that avoids its unconditional `/dev/null` startup open when stdio is already
+valid (the current call path is visible in
+[Git for Windows `setup.c`](https://github.com/git-for-windows/git/blob/49d759b698127791a5f3f2759c69b983846711dd/setup.c#L2249-L2257)).
+ADR 0009 records the boundary and retirement criterion.
+
 ## Public-repository privacy rules (enforced)
 
 This repo is public. It must never contain the operational specifics of any real

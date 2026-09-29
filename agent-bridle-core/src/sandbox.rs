@@ -717,9 +717,27 @@ const fn loopback_net_enforceable(available: SandboxKind) -> bool {
 /// AppContainer (Windows, #51 / #123 / #133) engages when: `net` is fully denied
 /// (deny-all capability model), `net` is loopback-only (egress-proxy fence, ADR 0016),
 /// `exec` is fully denied (`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, ADR 0013 D7),
-/// or `fs` is restricted (per-path DACL grants, ADR 0009).
+/// `fs` is restricted (per-path DACL grants, ADR 0009), or the operator explicitly
+/// enabled its named host-device NUL ACE mechanism (#408).
 #[must_use]
 pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
+    effective_sandbox_kind_with_policy(available, caveats, &SandboxPolicy::default())
+}
+
+/// Policy-aware form of [`effective_sandbox_kind`].  The default-only helper
+/// above remains the backwards-compatible caveat-only honesty rule for callers
+/// that do not construct a sandbox from operator configuration.
+///
+/// The explicit AppContainer NUL-device ACE is itself a real host-side
+/// mechanism, so it must engage the wrapper even when every delegated Caveat is
+/// ambient. Otherwise the launcher would mutate the host DACL while the result
+/// dishonestly reported `SandboxKind::None` and omitted the widening.
+#[must_use]
+pub fn effective_sandbox_kind_with_policy(
+    available: SandboxKind,
+    caveats: &Caveats,
+    policy: &SandboxPolicy,
+) -> SandboxKind {
     match available {
         SandboxKind::Landlock
             if restricts_fs(caveats) || (net_fully_denied(caveats) && landlock_net_capable()) =>
@@ -740,7 +758,8 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
             if net_fully_denied(caveats)
                 || net_loopback_only(caveats)
                 || exec_fully_denied(caveats)
-                || restricts_fs(caveats) =>
+                || restricts_fs(caveats)
+                || policy.appcontainer_nul_device_ace =>
         {
             SandboxKind::AppContainer
         }
@@ -762,6 +781,7 @@ pub fn best_available_sandbox(policy: &Arc<SandboxPolicy>) -> Box<dyn Sandbox> {
     {
         Box::new(appcontainer_impl::AppContainerSandbox::new(
             policy.appcontainer_launcher_path.clone(),
+            policy.appcontainer_nul_device_ace,
         ))
     }
 
@@ -832,13 +852,17 @@ pub(crate) mod appcontainer_impl {
     #[derive(Debug, Default, Clone)]
     pub struct AppContainerSandbox {
         launcher_path: Option<String>,
+        nul_device_ace: bool,
     }
 
     impl AppContainerSandbox {
         /// Construct the sandbox. Confinement is per-process; the optional path
         /// pins the trusted launcher when it is not shipped beside the binary.
-        pub fn new(launcher_path: Option<String>) -> Self {
-            Self { launcher_path }
+        pub fn new(launcher_path: Option<String>, nul_device_ace: bool) -> Self {
+            Self {
+                launcher_path,
+                nul_device_ace,
+            }
         }
     }
 
@@ -941,9 +965,14 @@ pub(crate) mod appcontainer_impl {
             use crate::ResolvedScope as Rs;
             // fs: mirror the aclaunch DACL — a write ACE (FILE_GENERIC_READ_WRITE)
             // confers read, so the resolved read scope unions the write scope.
-            let fs_read =
+            let mut fs_read =
                 Rs::from_scope(&effective.fs_read).union(&Rs::from_scope(&effective.fs_write));
-            let fs_write = Rs::from_scope(&effective.fs_write);
+            let mut fs_write = Rs::from_scope(&effective.fs_write);
+            if self.nul_device_ace {
+                let class = Rs::class("appcontainer-nul-device-ace");
+                fs_read = fs_read.union(&class);
+                fs_write = fs_write.union(&class);
+            }
             // exec: bounded ONLY by the deny-all child-process block; any non-empty
             // allowlist is Unknown (Interceptor, not a kernel bound).
             let exec = if exec_fully_denied(effective) {
@@ -971,6 +1000,18 @@ pub(crate) mod appcontainer_impl {
                 fs_write,
                 exec,
                 net,
+            }
+        }
+
+        fn runtime_closure(&self, _effective: &Caveats) -> crate::ResolvedAuthority {
+            if !self.nul_device_ace {
+                return crate::empty_closure();
+            }
+            let class = crate::ResolvedScope::class("appcontainer-nul-device-ace");
+            crate::ResolvedAuthority {
+                fs_read: class.clone(),
+                fs_write: class,
+                ..crate::empty_closure()
             }
         }
 
@@ -1005,10 +1046,12 @@ pub(crate) mod appcontainer_impl {
             //  - net is loopback-only (egress proxy path, #133)
             //  - exec is fully denied (kernel child-process-creation block)
             //  - fs is restricted (ACL grants let the container reach its workspace)
+            //  - the operator explicitly enabled the host NUL-device ACE (#408)
             if !net_fully_denied(effective)
                 && !net_loopback_only(effective)
                 && !exec_fully_denied(effective)
                 && !restricts_fs(effective)
+                && !self.nul_device_ace
             {
                 return Ok(Vec::new());
             }
@@ -1021,6 +1064,10 @@ pub(crate) mod appcontainer_impl {
             let container_name = format!("ab{}{}", std::process::id(), n);
 
             let mut prefix = vec![launcher, "--name".to_string(), container_name];
+
+            if self.nul_device_ace {
+                prefix.push("--nul-device-ace".to_string());
+            }
 
             // Grant network capabilities only when net is fully unrestricted
             // (Scope::All). Any non-All net scope denies egress by default via
@@ -1080,6 +1127,61 @@ pub(crate) mod appcontainer_impl {
         use super::*;
 
         #[test]
+        fn nul_device_ace_is_emitted_only_for_the_explicit_opt_in() {
+            let mut launcher_dir = std::env::temp_dir();
+            launcher_dir.push(format!(
+                "ab-nul-device-ace-{}-{}",
+                std::process::id(),
+                SPAWN_N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&launcher_dir).expect("create test launcher directory");
+            let launcher = launcher_dir.join("agent-bridle-aclaunch.exe");
+            std::fs::write(&launcher, b"test launcher").expect("create test launcher");
+            let caveats = Caveats {
+                fs_read: Scope::only(["C:/workspace".to_string()]),
+                ..Caveats::top()
+            };
+
+            let opted_in =
+                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), true)
+                    .command_prefix(&caveats)
+                    .expect("opted-in prefix");
+            assert!(
+                opted_in.iter().any(|arg| arg == "--nul-device-ace"),
+                "the explicit opt-in must reach the launcher: {opted_in:?}"
+            );
+
+            let default_off =
+                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), false)
+                    .command_prefix(&caveats)
+                    .expect("default-off prefix");
+            assert!(
+                !default_off.iter().any(|arg| arg == "--nul-device-ace"),
+                "the default must not widen the host NUL device DACL: {default_off:?}"
+            );
+
+            let ambient_opted_in =
+                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), true)
+                    .command_prefix(&Caveats::top())
+                    .expect("ambient opted-in prefix");
+            assert!(
+                ambient_opted_in.iter().any(|arg| arg == "--nul-device-ace"),
+                "the policy-only opt-in must still invoke the launcher: {ambient_opted_in:?}"
+            );
+
+            let ambient_default_off =
+                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), false)
+                    .command_prefix(&Caveats::top())
+                    .expect("ambient default-off prefix");
+            assert!(
+                ambient_default_off.is_empty(),
+                "ambient Caveats without the opt-in must remain unwrapped: {ambient_default_off:?}"
+            );
+            std::fs::remove_file(launcher).expect("remove test launcher");
+            std::fs::remove_dir(launcher_dir).expect("remove test launcher directory");
+        }
+
+        #[test]
         fn missing_launcher_is_a_denial() {
             let err = find_launcher(Some("")).expect_err("empty launcher must deny");
             assert!(
@@ -1103,7 +1205,7 @@ pub(crate) mod appcontainer_impl {
                 net: Scope::only(names.iter().map(|name| (*name).to_owned())),
                 ..Caveats::top()
             };
-            let result = AppContainerSandbox::new(None).command_prefix(&caveats);
+            let result = AppContainerSandbox::new(None, false).command_prefix(&caveats);
             assert!(
                 matches!(&result, Err(ToolError::Denied { reason }) if reason.contains("Unix")),
                 "unsupported Unix authority must refuse before launcher lookup: {result:?}"
@@ -1148,7 +1250,7 @@ mod appcontainer_resolved_authority_tests {
     }
 
     fn decide(caveats: &Caveats) -> AdmissionDecision {
-        let resolved = AppContainerSandbox::new(None).resolved_authority(caveats);
+        let resolved = AppContainerSandbox::new(None, false).resolved_authority(caveats);
         admit(&resolved, caveats, &empty_closure())
     }
 
@@ -1172,7 +1274,7 @@ mod appcontainer_resolved_authority_tests {
             ),
         }
         // The projection itself must reveal the widening (never == the delegated read).
-        let resolved = AppContainerSandbox::new(None).resolved_authority(&c);
+        let resolved = AppContainerSandbox::new(None, false).resolved_authority(&c);
         assert_ne!(
             resolved.fs_read,
             ResolvedScope::from_scope(&c.fs_read),
@@ -1188,6 +1290,49 @@ mod appcontainer_resolved_authority_tests {
             decide(&c),
             AdmissionDecision::Admit,
             "a write scope inside the read scope adds no new read authority"
+        );
+    }
+
+    #[test]
+    fn nul_device_ace_is_a_visible_fs_runtime_closure_only_when_opted_in() {
+        let c = fs_probe(&["C:/repo"], &["C:/repo"]);
+        let class = ResolvedScope::class("appcontainer-nul-device-ace");
+
+        let default_off = AppContainerSandbox::new(None, false);
+        assert_eq!(default_off.runtime_closure(&c), empty_closure());
+        assert_ne!(default_off.resolved_authority(&c).fs_read, class);
+        assert_ne!(default_off.resolved_authority(&c).fs_write, class);
+
+        let opted_in = AppContainerSandbox::new(None, true);
+        let resolved = opted_in.resolved_authority(&c);
+        let closure = opted_in.runtime_closure(&c);
+        assert_eq!(
+            resolved.fs_read,
+            ResolvedScope::from_scope(&c.fs_read)
+                .union(&ResolvedScope::from_scope(&c.fs_write))
+                .union(&class)
+        );
+        assert_eq!(
+            resolved.fs_write,
+            ResolvedScope::from_scope(&c.fs_write).union(&class)
+        );
+        assert_eq!(closure.fs_read, class);
+        assert_eq!(closure.fs_write, class);
+        assert_eq!(
+            admit(&resolved, &c, &closure),
+            AdmissionDecision::Admit,
+            "the visible runtime closure declares the opt-in widening for admission"
+        );
+
+        let ambient = Caveats::top();
+        assert_eq!(
+            admit(
+                &opted_in.resolved_authority(&ambient),
+                &ambient,
+                &opted_in.runtime_closure(&ambient),
+            ),
+            AdmissionDecision::Admit,
+            "the explicit mechanism remains admissible when ordinary Caveats are ambient"
         );
     }
 
@@ -4301,6 +4446,33 @@ mod tests {
             effective_sandbox_kind(SandboxKind::Landlock, &net_denied),
             expected_landlock_net,
             "Landlock engages for net:none only when V4 TCP-deny support is present"
+        );
+    }
+
+    #[test]
+    fn appcontainer_nul_device_ace_engages_and_reports_the_wrapper_with_ambient_caveats() {
+        let enabled = SandboxPolicy {
+            appcontainer_nul_device_ace: true,
+            ..SandboxPolicy::default()
+        };
+        assert_eq!(
+            effective_sandbox_kind_with_policy(
+                SandboxKind::AppContainer,
+                &Caveats::top(),
+                &enabled,
+            ),
+            SandboxKind::AppContainer,
+            "the named host-device widening is itself an active confinement mechanism"
+        );
+        assert_eq!(
+            effective_sandbox_kind_with_policy(SandboxKind::None, &Caveats::top(), &enabled,),
+            SandboxKind::None,
+            "an unavailable backend must never be reported as active"
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &Caveats::top()),
+            SandboxKind::None,
+            "the legacy caveat-only helper preserves the default-off behavior"
         );
     }
 

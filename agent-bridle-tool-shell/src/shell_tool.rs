@@ -35,11 +35,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    admit, best_available_sandbox, effective_sandbox_kind, enforcement_report, human_gate,
-    is_unbridled, unenforceable_axis, AdmissionDecision, AdmittedFence, BackendProjection, Caveats,
-    ConfinedAxis, ConfinementMechanism, Denial, DenialKind, Disclosure, EnforcementReport,
-    Invocation, LimitsPolicy, ResolvedScope, RuntimeClosure, SandboxKind, SandboxPolicy, Scope,
-    Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    admit, best_available_sandbox, effective_sandbox_kind_with_policy, enforcement_report,
+    human_gate, is_unbridled, unenforceable_axis, AdmissionDecision, AdmittedFence,
+    BackendProjection, Caveats, ConfinedAxis, ConfinementMechanism, Denial, DenialKind, Disclosure,
+    EnforcementReport, Invocation, LimitsPolicy, ResolvedScope, RuntimeClosure, SandboxKind,
+    SandboxPolicy, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -154,6 +154,11 @@ impl Spawner for OsSpawner {
         env: &BTreeMap<String, String>,
         cfg: &SpawnCfg,
     ) -> ToolResult<Captured> {
+        require_appcontainer_for_nul_device_ace(
+            &cfg.sandbox,
+            cfg.unbridled,
+            best_available_sandbox(&cfg.sandbox).kind(),
+        )?;
         // Unbridled (ADR 0018): the operator explicitly dropped the L3 mechanism —
         // run natively, no OS sandbox and no egress proxy. The L2 grant checks in
         // `invoke` already gated this run (advisory); confinement is off by consent.
@@ -332,7 +337,26 @@ fn net_audit_sink(configured: Option<&str>) -> Arc<dyn net_proxy::AuditSink> {
 /// available backend's kind when these caveats engage one of its governed axis
 /// shapes, else `None`. The same rule backs the subprocess primitive in core.
 fn intended_sandbox_kind(caveats: &Caveats, sandbox: &Arc<SandboxPolicy>) -> SandboxKind {
-    effective_sandbox_kind(best_available_sandbox(sandbox).kind(), caveats)
+    effective_sandbox_kind_with_policy(best_available_sandbox(sandbox).kind(), caveats, sandbox)
+}
+
+/// An explicitly requested host `NUL` ACE cannot degrade to an ordinary shell
+/// run. This protects both the direct pipeline route and the egress-proxy route;
+/// [`OsSpawner::run`] repeats the guard so no internal caller can bypass it.
+fn require_appcontainer_for_nul_device_ace(
+    policy: &SandboxPolicy,
+    unbridled: bool,
+    available: SandboxKind,
+) -> ToolResult<()> {
+    if policy.appcontainer_nul_device_ace && (unbridled || available != SandboxKind::AppContainer) {
+        let reason = if unbridled {
+            "appcontainer_nul_device_ace cannot run while unbridled; refusing without the requested --nul-device-ace grant"
+        } else {
+            "appcontainer_nul_device_ace requires the Windows AppContainer backend; refusing without the requested --nul-device-ace grant"
+        };
+        return Err(ToolError::denied(reason));
+    }
+    Ok(())
 }
 
 /// Run the pipeline on a dedicated thread that first applies the OS sandbox.
@@ -612,8 +636,28 @@ impl Tool for ShellTool {
         // confines with). The per-axis report and the fail-closed guard below both
         // read THIS, so neither over-claims the net axis (a Landlock `net:none` is
         // Kernel only under `DenyDirect`).
-        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox.child_network);
+        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox.child_network)
+            .with_appcontainer_nul_device_ace(self.sandbox.appcontainer_nul_device_ace);
         let enforcement = enforcement_report(cx.caveats(), mechanism);
+
+        // An explicit host-device grant is not advisory: reject before parsing,
+        // egress-proxy setup, or spawning if this route cannot reach the
+        // AppContainer launcher. Mock spawners execute no process and remain
+        // available to exercise ordinary parser/admission tests.
+        if self.spawner.requires_backend_admission() {
+            let available = best_available_sandbox(&self.sandbox).kind();
+            if let Err(error) =
+                require_appcontainer_for_nul_device_ace(&self.sandbox, unbridled, available)
+            {
+                return Ok(deny(
+                    sandbox_kind,
+                    enforcement,
+                    DenialKind::Exec,
+                    "appcontainer-nul-device-ace",
+                    &error,
+                ));
+            }
+        }
 
         // Resolve to a script (sequence of pipelines), or surface a refusal.
         let mut script = match parsed.script() {
@@ -1996,6 +2040,41 @@ mod tests {
     use agent_bridle_core::{Caveats, Gate, Scope};
     use std::collections::HashMap;
     use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn nul_device_ace_policy_has_no_shell_or_unbridled_fallback() {
+        let enabled = SandboxPolicy {
+            appcontainer_nul_device_ace: true,
+            ..SandboxPolicy::default()
+        };
+        assert!(
+            require_appcontainer_for_nul_device_ace(&enabled, false, SandboxKind::AppContainer)
+                .is_ok(),
+            "the explicit widening may use only the AppContainer route"
+        );
+        for (unbridled, available) in [
+            (false, SandboxKind::None),
+            (true, SandboxKind::AppContainer),
+        ] {
+            let error = require_appcontainer_for_nul_device_ace(&enabled, unbridled, available)
+                .expect_err("the requested NUL-device ACE must never degrade to a shell fallback");
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing without the requested --nul-device-ace"),
+                "the refusal must name the skipped mechanism: {error}"
+            );
+        }
+        assert!(
+            require_appcontainer_for_nul_device_ace(
+                &SandboxPolicy::default(),
+                false,
+                SandboxKind::None
+            )
+            .is_ok(),
+            "default-off preserves ordinary no-backend behavior"
+        );
+    }
 
     /// The schema loads from the embedded `shell_tool.schema.json` data file (not
     /// an inline literal) with the expected shape. Guards the data file against

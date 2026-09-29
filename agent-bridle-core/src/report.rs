@@ -65,6 +65,11 @@ impl ExecBoundary {
 pub struct ConfinementMechanism {
     kind: SandboxKind,
     child_network: ChildNetworkPolicy,
+    /// An explicitly enabled per-AppContainer-SID ACE on the host `NUL` device.
+    /// This is a host mechanism widening rather than a Caveat axis, and remains
+    /// off unless the operator chose it in [`crate::SandboxPolicy`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    appcontainer_nul_device_ace: bool,
     // Omission preserves the existing default canonical body and fence CID.
     #[serde(default, skip_serializing_if = "ExecBoundary::is_process_tree")]
     exec_boundary: ExecBoundary,
@@ -77,6 +82,7 @@ impl ConfinementMechanism {
         Self {
             kind,
             child_network,
+            appcontainer_nul_device_ace: false,
             exec_boundary: ExecBoundary::ProcessTree,
         }
     }
@@ -87,8 +93,17 @@ impl ConfinementMechanism {
         Self {
             kind,
             child_network,
+            appcontainer_nul_device_ace: false,
             exec_boundary: ExecBoundary::NamedRoot,
         }
+    }
+
+    /// Carry the explicit Windows AppContainer `NUL` device-ACE mechanism choice
+    /// into reporting. It does not alter any Caveat or enforcement strength.
+    #[must_use]
+    pub fn with_appcontainer_nul_device_ace(mut self, enabled: bool) -> Self {
+        self.appcontainer_nul_device_ace = enabled;
+        self
     }
 
     /// The actual executable-identity proof domain.
@@ -115,6 +130,10 @@ impl ConfinementMechanism {
     pub fn child_network(&self) -> ChildNetworkPolicy {
         self.child_network
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl From<SandboxKind> for ConfinementMechanism {
@@ -148,6 +167,16 @@ pub enum AxisEnforcement {
     /// Validated at admission, then **ambient** — nothing backstops the spawned
     /// interior. Honest "we checked the request, we cannot confine the effect."
     Advisory,
+}
+
+/// A named, operator-approved host mechanism widening disclosed alongside the
+/// axis-strength report. These are not Caveats and never change `meet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnforcementWidening {
+    /// The launcher installed `FILE_GENERIC_READ | FILE_GENERIC_WRITE` for this
+    /// launch's AppContainer SID on the host `\\.\NUL` device.
+    #[serde(rename = "appcontainer-nul-device-ace")]
+    AppContainerNulDeviceAce,
 }
 
 impl AxisEnforcement {
@@ -191,6 +220,9 @@ impl PartialOrd for AxisEnforcement {
 /// not OS-confinement axes, so they are not part of this report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EnforcementReport {
+    /// Explicit host mechanism widening, when one was used for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widening: Option<EnforcementWidening>,
     /// Enforcement of the `fs_read` axis, when restricted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_read: Option<AxisEnforcement>,
@@ -210,7 +242,8 @@ impl EnforcementReport {
     /// carries no information and may be omitted from a result envelope.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.fs_read.is_none()
+        self.widening.is_none()
+            && self.fs_read.is_none()
             && self.fs_write.is_none()
             && self.exec.is_none()
             && self.net.is_none()
@@ -254,6 +287,7 @@ pub fn enforcement_report(
     let ConfinementMechanism {
         kind: active,
         child_network,
+        appcontainer_nul_device_ace,
         exec_boundary,
     } = mechanism.into();
     // Filesystem axes: kernel when an OS sandbox actually governs them, else the
@@ -280,6 +314,8 @@ pub fn enforcement_report(
         })
     };
     EnforcementReport {
+        widening: (active == SandboxKind::AppContainer && appcontainer_nul_device_ace)
+            .then_some(EnforcementWidening::AppContainerNulDeviceAce),
         fs_read: fs(&effective.fs_read),
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(match active {
@@ -755,6 +791,26 @@ mod tests {
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    #[test]
+    fn appcontainer_nul_device_ace_widening_is_explicit_in_the_report() {
+        let off = enforcement_report(&Caveats::top(), SandboxKind::AppContainer);
+        assert_eq!(off.widening, None, "the default report must remain quiet");
+
+        let on = enforcement_report(
+            &Caveats::top(),
+            ConfinementMechanism::new(SandboxKind::AppContainer, ChildNetworkPolicy::LandlockOnly)
+                .with_appcontainer_nul_device_ace(true),
+        );
+        assert_eq!(
+            on.widening,
+            Some(EnforcementWidening::AppContainerNulDeviceAce)
+        );
+        assert_eq!(
+            serde_json::to_value(on).unwrap()["widening"],
+            "appcontainer-nul-device-ace"
+        );
     }
 
     /// Blocker 2 (mechanism-aware net witness): a Landlock `net:none` child reaches

@@ -292,7 +292,8 @@ impl Tool for BrushShellTool {
         // policy the worker was spawned under (same `self.sandbox_policy`). Keeps
         // the reported net witness honest (Landlock `net:none` is Kernel only under
         // `DenyDirect`), never over-claiming from the kind alone.
-        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network);
+        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network)
+            .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace);
         let timeout = self.timeout;
         let worker_output = output.clone();
         let supervised = tokio::task::spawn_blocking(move || {

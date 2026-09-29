@@ -1,6 +1,6 @@
 # ADR 0009 — Cross-platform confinement strategy (the L3 boundary across Windows, Linux, macOS)
 
-- Status: Accepted (2026-06-29)
+- Status: Accepted (2026-06-29); amended D6.1 (2026-09-29)
 - Date: 2026-06-29
 - Context: ADR 0006 established per-OS L3 backends behind `best_available_sandbox()` /
   `SandboxKind`, with the Landlock backend as the template. agent-bridle ships as a unified
@@ -11,7 +11,8 @@
 - **Extends ADR 0006** (the per-OS seam) by deciding the full cross-platform strategy and
   recording the options weighed and rejected.
 - Related issues: **#78** (Tier 1 — the portable baseline), #50 (Seatbelt), #51 (Windows —
-  re-scoped by D4), #57 (exec held), #35 (Linux netns/seccomp variant), #58 (command packs).
+  re-scoped by D4), #57 (exec held), #35 (Linux netns/seccomp variant), #58 (command packs),
+  #408 (temporary native-Git `NUL` device compatibility widening).
 
 ## Question
 
@@ -116,6 +117,58 @@ so a green build must have exercised the real boundary.
   (D4); may layer on later as an optional resource backstop, but orthogonal to the OCAP axes.
 - **LPAC / named-object (Desktop, WindowStation) isolation** — optional hardening beyond the
   four axes; the DACL + capability-SID boundary already enforces the core contract.
+
+### Amendment D6.1 — opt-in `NUL` device ACE for native Git compatibility (#408, 2026-09-29)
+
+This amendment records a deliberately visible exception to the normal AppContainer
+projection. On affected Windows Server policies, Git for Windows unconditionally
+opens `NUL` while starting, even when inherited stdin/stdout/stderr are all valid.
+The device DACL denies the fresh AppContainer SID, so an otherwise confined native
+Git child cannot start. Passing an inherited `NUL` handle does not authorize Git's
+later pathname open; transferring ownership of a caller path was rejected because
+it creates global-state, crash, and overlap hazards.
+
+The launcher therefore accepts a **default-off, operator-approved**
+`--nul-device-ace` option. It adds exactly one `FILE_GENERIC_READ |
+FILE_GENERIC_WRITE` ACE to the host `\\.\NUL` device DACL for the freshly created,
+per-launch AppContainer SID. This is neither a normal filesystem grant nor a
+capability-axis widening: it is a named runtime closure,
+`appcontainer-nul-device-ace`, which must appear in resolved authority and the
+enforcement disclosure. This follows ADR 0015's named-closure rule for
+`appcontainer-loopback-exemption`: a host-side mechanism widening must be named
+instead of being silently collapsed away.
+Without `--nul-device-ace`, the launcher neither opens nor modifies `\\.\NUL`,
+and its AppContainer-profile handling remains the existing baseline.
+
+The option fails closed. The launcher must obtain `WRITE_DAC` on `\\.\NUL`; an
+unelevated or otherwise unauthorized caller receives a clear refusal naming that
+missing right, and the child is never started without the requested ACE. Cleanup
+enumerates and removes exactly this launch's matching SID, mask, and
+non-inheriting ACE on every exit path, never snapshot/restores the whole DACL or
+uses trustee-wide `REVOKE_ACCESS`. The latter would clobber live overlapping
+launches, resurrect expired ACEs, or remove a different ACE for the same SID. If
+the launcher crashes before cleanup, or exact-ACE removal fails, it retains the
+profile. A later invocation reaches the existing baseline failure:
+`CreateAppContainerProfile` supplies no fresh SID for an existing profile, so it
+cannot start a child or reactivate that deterministic SID. External deletion of
+the retained profile is outside this launcher lifecycle and can permit a later
+same-name creation while an unresolved ACE remains. The possible ACE remains a
+known residual host-state risk recorded in `SECURITY.md`.
+
+The real Windows proof is `agent-bridle-aclaunch/tests/nul_device_ace.rs`. CI and
+the nightly Windows job require both a real AppContainer and native Git via
+`BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_NATIVE_GIT=1`, and require the
+elevated DACL path. It proves default denial, the explicit opt-in success path,
+post-launch removal, overlap-safe SID cleanup, and clean `WRITE_DAC` refusal.
+The local hook runs the same target through `just check-windows`, but permits a
+non-elevated developer box or unavailable native Git to report its explicit skip.
+
+This is a temporary compatibility escape hatch, not a new authority model. Its
+exit criterion is an upstream Git for Windows release that avoids the unconditional
+`/dev/null` open when all standard descriptors are already valid; the current
+trigger is documented in [Git for Windows `setup.c`](https://github.com/git-for-windows/git/blob/49d759b698127791a5f3f2759c69b983846711dd/setup.c#L2249-L2257).
+At that point, remove the option and its host-DACL mutation rather than retaining
+the widening for convenience.
 
 ## Consequences
 
