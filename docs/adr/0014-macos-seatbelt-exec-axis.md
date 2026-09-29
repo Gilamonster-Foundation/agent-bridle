@@ -200,3 +200,46 @@ and macOS has no unprivileged user-namespace / bind-mount to re-point a read tre
   held Landlock case.
 - Bare-name resolution beyond the system dirs (Homebrew/`/usr/local`) if a future
   consumer needs it — currently absolute-path grants cover it.
+
+## Amendment (2026-09-29): git's toolchain re-exec, and the named `/Applications` exception (agent-bridle#408, #2630 macOS leg)
+
+`/usr/bin/git` — a `TRUSTED_EXEC_DIRS` member — is not git itself: it is a
+small root-owned locator stub that re-execs the active developer toolchain's
+real `git` binary (`.../Xcode.app/Contents/Developer/usr/bin/git` or
+`.../CommandLineTools/usr/bin/git`). That re-exec is itself a kernel-checked
+`process-exec*`, so `exec: Only(["git"])` denied **every** git invocation, not
+just `worktree add`'s internal helpers — the same class of gap ADR 0011/D2's
+Linux `GIT_EXEC_PATH_CANDIDATES` closes for Landlock, applied here as
+`git_toolchain_redirect_targets` (`sandbox.rs`): fold in each fixed
+`GIT_TOOLCHAIN_ROOTS` entry whose `usr/bin/git` independently passes the same
+live root-owned/fully-unwritable ancestry bar (`ancestry_is_root_owned_and_unwritable`)
+this ADR's `TRUSTED_EXEC_DIRS` resolution already uses — never executed, never
+read from `DEVELOPER_DIR`/`GIT_EXEC_PATH` env (a hostile value in the confined
+child's own environment cannot steer what gets admitted; proven live in
+`hostile_developer_dir_env_does_not_extend_the_git_grant`).
+
+**Round 2 (operator decision 2026-09-29) — one narrow, named widening.** On a
+stock Xcode install the active toolchain is reached through `/Applications`,
+which ships `root:admin 0775` (admin-group-writable) — failing the ordinary
+ancestry bar, so the round-1 fix correctly declined to trust it and left
+`git worktree add` failing closed on such a host. The operator judged that
+acceptable to relax, **for exactly one path**: `/Applications` itself may be
+root-owned and admin-group-writable (no other-write) without failing the
+walk; Xcode.app and everything below it, and every ancestor of any other
+toolchain candidate (CommandLineTools), still need the unchanged
+fully-root-owned/fully-unwritable bar
+(`ancestry_passes_with_xcode_applications_exception`, `XCODE_APPLICATIONS_EXCEPTION`).
+When a grant's redirect is admitted only through this exception, the
+resolved-authority exec axis names it as a class,
+`seatbelt-admin-writable-xcode-toolchain` — never silently folded into the
+concrete grant (`resolved_authority_names_the_xcode_admin_writable_exception_class`).
+
+**Known security issue.** An admin-group process — anything running as a
+member of `admin`, which on a single-user Mac is normally the logged-in user
+— can replace `/Applications/Xcode.app` wholesale, and this resolver then
+tells the kernel to trust the replacement's `git`. This is a real widening of
+the trust boundary below what "root-owned toolchain" implies elsewhere in
+this ADR; it is accepted here, not eliminated. **Mitigation:**
+`xcode-select -s /Library/Developer/CommandLineTools` — CommandLineTools is
+fully root-owned end to end, so once it is the active toolchain, no exception
+ever applies and the class never appears. See `SECURITY.md`.

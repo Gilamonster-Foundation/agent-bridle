@@ -7218,22 +7218,23 @@ print(d.value())
             !marker.exists(),
             "a hostile DEVELOPER_DIR/GIT_EXEC_PATH must never be executed"
         );
-        if active_toolchain_is_trusted(git) {
-            assert!(
-                status.success(),
-                "the grant must resolve against the REAL toolchain regardless of a hostile \
-                 DEVELOPER_DIR/GIT_EXEC_PATH set only in the child's own environment"
-            );
-        } else {
-            // Same documented limitation as the sibling test above: an
-            // untrusted active toolchain still fails closed — the hostile
-            // env changed nothing either way, which is the actual claim.
-            assert!(
-                !status.success(),
-                "an untrusted toolchain redirect must still fail closed regardless of a \
-                 hostile DEVELOPER_DIR/GIT_EXEC_PATH"
-            );
-        }
+        // Discovered live (ROUND 2, once the active toolchain became
+        // trusted on this Mac and this test's positive branch could
+        // actually fire): when `DEVELOPER_DIR` names a bogus directory,
+        // Apple's `/usr/bin/git` locator stub itself — not our resolver —
+        // tries an internal `xcrun` to resolve it, and THAT exec is
+        // correctly kernel-denied (`xcrun` is not in the grant). So the
+        // command fails regardless of `active_toolchain_is_trusted`, but for
+        // the right reason: the hostile env is never followed to a widened
+        // or fallback toolchain — it fails closed one exec earlier than
+        // `git worktree`'s own logic would even start. The load-bearing
+        // assertion remains that the marker (the fake toolchain) never runs.
+        assert!(
+            !status.success(),
+            "a hostile DEVELOPER_DIR must fail closed (git's own stub tries an unauthorized \
+             xcrun to resolve it, which the exec grant correctly denies) — never fall back to \
+             a hostile toolchain, and never silently succeed via env-driven redirection"
+        );
 
         let _ = fs::remove_dir_all(&main);
         let _ = fs::remove_dir_all(&wt);
