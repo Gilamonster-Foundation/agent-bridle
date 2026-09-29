@@ -32,6 +32,21 @@ children (no `Sandbox: deny(1) mach-lookup …` line reached the unified log for
 | uid control cannot be vacuous | PINNED | `validated_uid_rejects_failed_or_non_numeric_controls`: a failed status, empty or whitespace stdout, a non-numeric or multi-token value each refuse, so the denied legs never compare against an empty control. |
 | mach grant + remote hosts has no proxy plan | REFUSED | `egress_proxy_plan_for` returns `None` for a mach-bearing scope on every backend, Seatbelt included (`mach_grants_are_structural_not_hosts`); the loopback fence would otherwise erase the grant. |
 
+## E6 — non-Mach-lookup ambient IPC audit (2026-09-29, agent-bridle#405)
+
+Evidence collected on: macOS 15.7.3 (24G419), Darwin, arm64, `/usr/bin/sandbox-exec`.
+Full evidence table, promotion condition, and disposition of each channel:
+ADR 0015's "Amendment E6" section. Summary: AF_UNIX, `open(1)`/LaunchServices,
+Darwin notifications, and pasteboard are CLOSED by the same zero Mach-lookup
+floor E5 shipped. `system-socket`/`AF_ROUTE`/POSIX shm+sem are reachable but
+carry no found egress path (the one real escalation, `utun` tunnel creation
+via `PF_SYSTEM`, is OS-privilege-gated independent of Seatbelt). AppleEvents
+could not be measured over ssh (TCC automation consent needs an interactive
+approval); a checked-in script (`~/workspaces/.handoff/helper-jobs/mac-netnone/probe-appleevents.sh`)
+is left for an operator to run once. File-drop into daemon-watched
+directories is declared open, out of the `net` axis's scope (it's `fs_write`'s
+own default).
+
 ## Notes
 
 - The E4 twelve-service list is retained verbatim as `MACH_SERVICE_CANDIDATES`
