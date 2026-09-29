@@ -3303,7 +3303,7 @@ mod seatbelt_impl {
     /// one canonical binary already covers them (verified live: `git
     /// worktree add` succeeds with exactly the stub plus this one extra
     /// literal, no `git-core` entries admitted at all).
-    fn git_toolchain_redirect_targets(canon_git_bin: &Path) -> Vec<String> {
+    pub(super) fn git_toolchain_redirect_targets(canon_git_bin: &Path) -> Vec<String> {
         if canon_git_bin.file_name().and_then(|n| n.to_str()) != Some("git") {
             return Vec::new();
         }
@@ -6717,17 +6717,68 @@ print(d.value())
         cmd
     }
 
+    /// The active developer toolchain's `git`, per `xcode-select -p` — used
+    /// ONLY here, as test-harness ground truth for what a git worktree op
+    /// SHOULD resolve to, never by the shipped resolver itself (which reads
+    /// neither `xcode-select`/`xcrun` output nor `DEVELOPER_DIR`; see
+    /// `git_toolchain_redirect_targets`'s doc comment for why).
+    fn active_toolchain_git() -> Option<PathBuf> {
+        let out = std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if dir.is_empty() {
+            return None;
+        }
+        Path::new(&dir).join("usr/bin/git").canonicalize().ok()
+    }
+
+    /// `true` iff [`git_toolchain_redirect_targets`] — the SAME production
+    /// routine `resolve_exec_targets` calls — actually admits this host's
+    /// ACTIVE toolchain git. `git_toolchain_redirect_targets` folds in every
+    /// [`GIT_TOOLCHAIN_ROOTS`] entry whose ancestry passes, which is not
+    /// necessarily the one `/usr/bin/git`'s stub actually redirects to (a
+    /// host can have both Xcode.app AND CommandLineTools installed with only
+    /// one active) — so this check is against the ACTIVE one specifically,
+    /// via [`active_toolchain_git`].
+    fn active_toolchain_is_trusted(git: &str) -> bool {
+        let Ok(canon_git) = Path::new(git).canonicalize() else {
+            return false;
+        };
+        let Some(active) = active_toolchain_git() else {
+            return false;
+        };
+        super::seatbelt_impl::git_toolchain_redirect_targets(&canon_git)
+            .iter()
+            .any(|p| Path::new(p) == active)
+    }
+
     /// agent-bridle#408 — the macOS/Seatbelt twin of bridle PR #407: a REAL
-    /// kernel-confined `git worktree add` under `exec: Only(["git"])` now
-    /// succeeds. Confirmed red first (pre-fix `resolve_exec_targets`, no
-    /// toolchain redirect fold-in): `fatal: cannot exec
+    /// kernel-confined `git worktree add` under `exec: Only(["git"])`.
+    /// Confirmed red first (pre-fix `resolve_exec_targets`, no toolchain
+    /// redirect fold-in): `fatal: cannot exec
     /// '/Applications/Xcode.app/Contents/Developer/usr/bin/git': Operation
     /// not permitted` (git's own re-exec of the active toolchain binary,
     /// denied at the kernel `process-exec*` check before worktree logic ever
     /// runs — even `git --version` fails the same way under the pre-fix
     /// resolver).
+    ///
+    /// This asserts SUCCESS only when the active toolchain is one our fix
+    /// actually trusts ([`active_toolchain_is_trusted`]) — e.g. a
+    /// CommandLineTools-only host, fully root-owned end to end. On a host
+    /// whose active toolchain is Xcode.app under a group-writable
+    /// `/Applications` (confirmed live, macOS 15 / Xcode 26.3:
+    /// `/Applications` is `drwxrwxr-x root:wheel`, admin-writable), the fix
+    /// correctly DECLINES to trust it, so worktree add must still fail
+    /// exactly as before this fix — asserted in the `else` branch, so this
+    /// test exercises a real kernel-enforced outcome either way and never
+    /// silently skips.
     #[test]
-    fn git_worktree_add_succeeds_under_a_git_only_exec_grant() {
+    fn git_worktree_add_succeeds_under_a_git_only_exec_grant_when_the_toolchain_is_trusted() {
         if skip_proof_unless_seatbelt() {
             return;
         }
@@ -6778,14 +6829,31 @@ print(d.value())
             ])
             .status()
             .expect("spawn confined worktree add");
-        assert!(
-            status.success(),
-            "git worktree add must succeed under a git-only exec grant (agent-bridle#408)"
-        );
-        assert!(
-            wt.join(".git").exists(),
-            "the new worktree must actually have been created"
-        );
+
+        if active_toolchain_is_trusted(git) {
+            assert!(
+                status.success(),
+                "git worktree add must succeed under a git-only exec grant once the active \
+                 toolchain passes the ancestry bar (agent-bridle#408)"
+            );
+            assert!(
+                wt.join(".git").exists(),
+                "the new worktree must actually have been created"
+            );
+        } else {
+            eprintln!(
+                "NOTE: this host's active git toolchain does not pass the root-owned/ \
+                 unwritable ancestry bar agent-bridle#408 requires (e.g. Xcode.app under a \
+                 group-writable /Applications) — the fix correctly declines to trust it, so \
+                 worktree add must still fail exactly as before this fix. The positive case \
+                 is exercised on a host whose active toolchain is fully root-owned end to \
+                 end (e.g. CommandLineTools-only)."
+            );
+            assert!(
+                !status.success(),
+                "an untrusted toolchain redirect must still fail closed, never wrongly permissive"
+            );
+        }
 
         let _ = fs::remove_dir_all(&main);
         let _ = fs::remove_dir_all(&wt);
@@ -6872,11 +6940,22 @@ print(d.value())
             !marker.exists(),
             "a hostile DEVELOPER_DIR/GIT_EXEC_PATH must never be executed"
         );
-        assert!(
-            status.success(),
-            "the grant must resolve against the REAL toolchain regardless of a hostile \
-             DEVELOPER_DIR/GIT_EXEC_PATH set only in the child's own environment"
-        );
+        if active_toolchain_is_trusted(git) {
+            assert!(
+                status.success(),
+                "the grant must resolve against the REAL toolchain regardless of a hostile \
+                 DEVELOPER_DIR/GIT_EXEC_PATH set only in the child's own environment"
+            );
+        } else {
+            // Same documented limitation as the sibling test above: an
+            // untrusted active toolchain still fails closed — the hostile
+            // env changed nothing either way, which is the actual claim.
+            assert!(
+                !status.success(),
+                "an untrusted toolchain redirect must still fail closed regardless of a \
+                 hostile DEVELOPER_DIR/GIT_EXEC_PATH"
+            );
+        }
 
         let _ = fs::remove_dir_all(&main);
         let _ = fs::remove_dir_all(&wt);
