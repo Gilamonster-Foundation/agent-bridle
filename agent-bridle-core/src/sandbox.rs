@@ -7093,10 +7093,30 @@ print(d.value())
     /// whose active toolchain fails even the relaxed bar still fails closed
     /// — asserted in the `else` branch, so this exercises a real
     /// kernel-enforced outcome either way and never silently skips.
+    /// Serializes every real confined `git worktree add` proof in this
+    /// module (agent-bridle#409, round 3). Discovered under the full
+    /// parallel `--lib` suite (never under this module alone, and never
+    /// under round 2's smaller set of the same proofs): Apple's `git`
+    /// occasionally shells out to `xcodebuild` for a toolchain
+    /// license/registration check keyed off MACHINE-GLOBAL state (not this
+    /// process's own `HOME`), and two of these tests racing that check
+    /// concurrently can make a THIRD, unrelated confined `git` decide it
+    /// needs the same check — an exec this resolver correctly does not
+    /// admit (it is not part of git's own binary chain), so the confined
+    /// child fails for a reason outside this fix's scope. Serializing only
+    /// these real-git-spawn tests (never the pure/fast ones) removes the
+    /// race without weakening what any single test proves.
+    fn lock_out_concurrent_git_worktree_proofs() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn assert_git_worktree_add_matches_trust_setting(trust_admin_writable_xcode: bool) {
         if skip_proof_unless_seatbelt() {
             return;
         }
+        let _guard = lock_out_concurrent_git_worktree_proofs();
         let Some(git) = ["/usr/bin/git", "/bin/git"]
             .into_iter()
             .find(|p| Path::new(p).exists())
@@ -7208,6 +7228,7 @@ print(d.value())
         if skip_proof_unless_seatbelt() {
             return;
         }
+        let _guard = lock_out_concurrent_git_worktree_proofs();
         use std::os::unix::fs::PermissionsExt;
         let Some(git) = ["/usr/bin/git", "/bin/git"]
             .into_iter()
