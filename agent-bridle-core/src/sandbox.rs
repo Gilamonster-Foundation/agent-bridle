@@ -1835,6 +1835,17 @@ pub(crate) mod landlock_impl {
     /// for the `Execute` allow-list: a path-bearing entry is taken as-is (if it
     /// exists); a bare name is resolved against the exec search dirs. Canonicalized
     /// so the rule anchors the real inode. `All` => empty (exec stays ambient).
+    ///
+    /// **Git's own exec-path is folded in (#2630).** A grant that resolves to a
+    /// trusted `git` binary lets git run `git worktree add` / `git commit` / …
+    /// only because those porcelain commands themselves `execve` git's
+    /// *internal* helpers (`git-branch`, `git-update-ref`, …) from `git
+    /// --exec-path` — binaries the caller never named. A grant of `["git"]`
+    /// alone therefore kernel-denies the helper exec and git fails with
+    /// "cannot exec 'branch'". [`git_exec_path_binaries`] resolves that
+    /// directory WITHOUT EVER EXECUTING the granted binary (round 2, #2630) —
+    /// see its doc comment for why running `<git> --exec-path` in the
+    /// resolving process was refused.
     fn resolve_exec_paths(scope: &Scope<String>) -> Vec<String> {
         let set = match scope {
             Scope::All => return Vec::new(),
@@ -1853,11 +1864,111 @@ pub(crate) mod landlock_impl {
             };
             if let Some(p) = candidate {
                 if let Ok(canon) = p.canonicalize() {
+                    out.extend(git_exec_path_binaries(&canon));
                     out.push(canon.to_string_lossy().into_owned());
                 }
             }
         }
         out
+    }
+
+    /// Fixed, root-owned system directories a granted `git` binary must
+    /// resolve into before its own exec-path helpers are folded in. A `git`
+    /// living anywhere else — a repo-local `./tools/git`, a user's
+    /// `~/bin/git`, anything found only via `$PATH` shadowing — gets no extra
+    /// helpers, and (see [`git_exec_path_binaries`]) is never even opened,
+    /// let alone executed, to make that determination.
+    const GIT_TRUSTED_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+    /// Where a git installed under one of [`GIT_TRUSTED_DIRS`] keeps its own
+    /// helper binaries, relative to that directory's parent prefix
+    /// (`/usr/bin/git` → prefix `/usr`). Covers the two conventional
+    /// packaging layouts; a git installed anywhere else yields no candidates
+    /// (fail closed — no helpers, `git worktree add` fails exactly as before
+    /// this fix, never wrongly permissive).
+    const GIT_EXEC_PATH_CANDIDATES: &[&str] = &["lib/git-core", "libexec/git-core"];
+
+    /// If `canon_git_bin` is a `git` binary that lives directly inside one of
+    /// [`GIT_TRUSTED_DIRS`], return the absolute, canonical paths of every
+    /// regular file directly inside its exec-path directory (git's internal
+    /// helper binaries). Empty otherwise.
+    ///
+    /// **Never executes `canon_git_bin` or anything else (#2630 round 2).**
+    /// Round 1 ran `<granted git> --exec-path` in the resolving process,
+    /// gated only on the file's NAME being `git` — so an exec grant naming a
+    /// repo-local `./tools/git` would have run arbitrary repo-controlled code
+    /// with the resolver's full (unconfined) authority just to compute an
+    /// allow-list. This version derives the exec-path directory purely from
+    /// the fixed packaging convention above and never spawns anything; the
+    /// only filesystem operations are `canonicalize`, `metadata`, and
+    /// `read_dir`.
+    ///
+    /// Narrowing, on purpose:
+    /// - `canon_git_bin`'s parent must canonicalize to EXACTLY one of
+    ///   [`GIT_TRUSTED_DIRS`] — those directories are root-owned, not
+    ///   user-writable, so a grant naming a binary there is a grant for
+    ///   system git, not attacker-plantable content. Verified, not assumed:
+    ///   [`is_root_owned_and_unwritable`] checks the live directory.
+    /// - Each candidate exec-path directory is independently checked
+    ///   root-owned and not group/other-writable before its contents are
+    ///   trusted — an attacker without root cannot plant a helper there.
+    /// - Only the directory's direct children are admitted (no recursion),
+    ///   and only as `Execute` grants.
+    fn git_exec_path_binaries(canon_git_bin: &std::path::Path) -> Vec<String> {
+        if canon_git_bin.file_name().and_then(|n| n.to_str()) != Some("git") {
+            return Vec::new();
+        }
+        let Some(bin_dir) = canon_git_bin.parent() else {
+            return Vec::new();
+        };
+        let is_trusted_dir = GIT_TRUSTED_DIRS.iter().any(|trusted| {
+            std::fs::canonicalize(trusted).is_ok_and(|canon_trusted| canon_trusted == bin_dir)
+        });
+        if !is_trusted_dir || !is_root_owned_and_unwritable(bin_dir) {
+            return Vec::new();
+        }
+        let Some(prefix) = bin_dir.parent() else {
+            return Vec::new();
+        };
+
+        let mut helpers = Vec::new();
+        for candidate in GIT_EXEC_PATH_CANDIDATES {
+            let Ok(exec_dir) = prefix.join(candidate).canonicalize() else {
+                continue;
+            };
+            if !is_root_owned_and_unwritable(&exec_dir) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&exec_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(canon) = path.canonicalize() {
+                    if canon.is_file() {
+                        helpers.push(canon.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        helpers
+    }
+
+    /// `true` iff `dir` exists, is a directory, is owned by root (uid 0), and
+    /// carries no group- or other-write bit — the live-permission check
+    /// [`git_exec_path_binaries`] runs before trusting a directory's contents,
+    /// rather than assuming a path string under a conventional system prefix
+    /// is actually protected.
+    #[cfg(unix)]
+    fn is_root_owned_and_unwritable(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir)
+            .is_ok_and(|meta| meta.is_dir() && meta.uid() == 0 && (meta.mode() & 0o022) == 0)
+    }
+
+    #[cfg(not(unix))]
+    fn is_root_owned_and_unwritable(_dir: &std::path::Path) -> bool {
+        false
     }
 
     /// The directories a bare program name is resolved against: `$PATH` if set,
@@ -1904,6 +2015,161 @@ pub(crate) mod landlock_impl {
 
     fn landlock_denied(e: impl std::fmt::Display) -> ToolError {
         ToolError::denied(format!("landlock: {e}"))
+    }
+
+    /// #2630 round 2 — `resolve_exec_paths`/`git_exec_path_binaries` never
+    /// executes a grant-selected binary while computing the exec-path
+    /// allow-list, and only trusts a directory whose live permissions it has
+    /// checked.
+    #[cfg(test)]
+    mod git_exec_path_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn unique_dir(tag: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let mut d = std::env::temp_dir();
+            d.push(format!(
+                "ab-2630-{}-{}-{}",
+                tag,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn write_executable_marker_script(path: &std::path::Path, marker: &std::path::Path) {
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch \"{}\"\necho /nonexistent/hostile-exec-path\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// The real system `git` (if present) resolves into its own
+        /// `--exec-path`-equivalent directory purely from the fixed
+        /// trusted-dir/candidate-suffix convention, with every admitted path
+        /// actually living inside that one resolved directory.
+        #[test]
+        fn a_real_trusted_git_grant_admits_its_own_exec_path_helpers() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                resolved.iter().any(|p| p == git),
+                "the git binary itself must still be admitted: {resolved:?}"
+            );
+            assert!(
+                resolved.len() > 1,
+                "git's own exec-path helpers must be folded in, not just the binary: {resolved:?}"
+            );
+        }
+
+        /// A `git`-named binary OUTSIDE [`GIT_TRUSTED_DIRS`] — a repo-local
+        /// `./tools/git`-style plant — gets NO extra helpers, and (the load-
+        /// bearing assertion) is never executed while resolution decides
+        /// that: a marker-writing stand-in script proves it was never run.
+        #[test]
+        fn a_git_outside_trusted_dirs_gets_no_helpers_and_is_never_executed() {
+            let dir = unique_dir("outside-trusted");
+            let marker = dir.join("was-executed");
+            let fake_git = dir.join("git");
+            write_executable_marker_script(&fake_git, &marker);
+
+            let resolved =
+                resolve_exec_paths(&Scope::only([fake_git.to_string_lossy().into_owned()]));
+
+            assert!(
+                !marker.exists(),
+                "a git outside the trusted dirs must NEVER be executed during resolution"
+            );
+            let canon_fake_git = fake_git.canonicalize().unwrap();
+            assert_eq!(
+                resolved,
+                vec![canon_fake_git.to_string_lossy().into_owned()],
+                "an untrusted git must admit only itself, no helpers: {resolved:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An ambient, attacker-controlled `GIT_EXEC_PATH` is irrelevant by
+        /// construction: resolution never reads process environment at all,
+        /// so a hostile directory named there is never consulted, and the
+        /// admitted set (for the real system git) still comes only from its
+        /// actual, fixed exec-path directory.
+        #[test]
+        fn hostile_git_exec_path_env_does_not_extend_the_grant() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let hostile_dir = unique_dir("hostile-env");
+            std::fs::write(hostile_dir.join("malicious"), b"evil\n").unwrap();
+
+            // Serialized only by this test's own scope: resolution reads no
+            // env var, so this is a belt-and-suspenders check, not load-bearing.
+            std::env::set_var("GIT_EXEC_PATH", &hostile_dir);
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            std::env::remove_var("GIT_EXEC_PATH");
+
+            assert!(
+                !resolved.iter().any(|p| p.contains("hostile-env")),
+                "an attacker-controlled GIT_EXEC_PATH must never extend the grant: {resolved:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&hostile_dir);
+        }
+
+        /// A binary sitting in a sibling directory to git's real exec-path
+        /// directory — never one of the fixed candidate suffixes — is not
+        /// admitted just because a `git` grant is present.
+        #[test]
+        fn a_non_git_binary_elsewhere_is_not_admitted() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                !resolved
+                    .iter()
+                    .any(|p| p.contains("/elsewhere/") || p.contains("not-git-at-all")),
+                "only the fixed exec-path candidate directories may be admitted: {resolved:?}"
+            );
+        }
+
+        /// A directory that LOOKS like a git exec-path (matches a candidate
+        /// suffix under a trusted git's prefix) but is writable by non-root
+        /// must not be trusted — an attacker who can write there could plant
+        /// a helper the kernel would then be told to allow.
+        #[test]
+        fn a_group_writable_candidate_directory_is_not_trusted() {
+            let dir = unique_dir("writable-exec-dir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                !is_root_owned_and_unwritable(&dir),
+                "a world-writable directory must never be trusted, regardless of owner"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[cfg(test)]
@@ -4458,6 +4724,114 @@ mod landlock_kernel_tests {
             udp_created,
             "DenyDirect must be inert when net is granted (caller asked for egress)"
         );
+    }
+
+    /// #2630 — a `git`-only exec grant, naming the SYSTEM `/usr/bin/git`, must
+    /// admit its own internal helpers so `git worktree add` (which `execve`s
+    /// `git-branch`/`git-update-ref`) succeeds under a REAL kernel-enforced
+    /// Landlock fence, not merely the in-process admission check. Confirmed
+    /// red on the pre-fix code (`resolve_exec_paths` admitted only the
+    /// resolved `git` binary itself): `fatal: cannot exec 'branch':
+    /// Permission denied`, git exit 128.
+    #[test]
+    fn git_only_exec_grant_admits_worktree_add_under_real_landlock() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let git = "/usr/bin/git";
+        if !std::path::Path::new(git).exists() {
+            eprintln!("skipping: no /usr/bin/git on this host");
+            return;
+        }
+        let root = unique_dir("git-exec-2630");
+        let main = root.join("main");
+        std::fs::create_dir(&main).unwrap();
+        // Scrub git's own repository-discovery env vars on every child below:
+        // when this whole suite runs from `git push`'s pre-push hook, GIT_DIR
+        // (and friends) are set by git itself in the HOOK's environment to the
+        // OUTER repository's own admin dir, which every plain `Command::new`
+        // inherits — overriding `current_dir()`-based discovery entirely. Left
+        // unscrubbed, `git init`/`worktree add` below silently operate on this
+        // very repository instead of the synthetic fixture (confirmed: it once
+        // left a stray commit on this branch before this scrub was added).
+        const GIT_DISCOVERY_ENV_VARS: &[&str] =
+            &["GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES"];
+        let real_git = |dir: &std::path::Path, args: &[&str]| {
+            let mut cmd = std::process::Command::new(git);
+            cmd.args(args).current_dir(dir);
+            for var in GIT_DISCOVERY_ENV_VARS {
+                cmd.env_remove(var);
+            }
+            let ok = cmd
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        real_git(&main, &["init", "-q"]);
+        std::fs::write(main.join("seed"), "x").unwrap();
+        real_git(&main, &["add", "seed"]);
+        real_git(&main, &["commit", "-q", "-m", "init"]);
+
+        let root_t = root.clone();
+        let main_t = main.clone();
+        // Absolute, not `../wt`: the destination must not depend on the
+        // child's resolved cwd matching this exact relative hop — keeps the
+        // test deterministic under heavy parallel-test-suite load.
+        let wt_t = root.join("wt");
+        let output = std::thread::spawn(move || {
+            let cav = Caveats {
+                // `/etc/gitconfig` is granted defensively (harmless if absent,
+                // as here): a Landlock-confined `git` always tries to read
+                // system config regardless of repo/branch, and the base
+                // read-allowlist does not include it on every distro.
+                fs_read: Scope::only([
+                    root_t.to_string_lossy().into_owned(),
+                    "/etc/gitconfig".to_string(),
+                ]),
+                fs_write: Scope::only([root_t.to_string_lossy().into_owned()]),
+                exec: Scope::only([git.to_string()]),
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            let mut cmd = std::process::Command::new(git);
+            cmd.arg("worktree")
+                .arg("add")
+                .arg("-q")
+                .arg(&wt_t)
+                .arg("-b")
+                .arg("task")
+                .current_dir(&main_t);
+            for var in GIT_DISCOVERY_ENV_VARS {
+                cmd.env_remove(var);
+            }
+            cmd
+                // Point HOME inside the granted root: without this, git tries
+                // to read the real operator's `~/.gitconfig`, which is outside
+                // `fs_read` and fails for a reason unrelated to #2630's exec
+                // fence (masking the very failure this test exists to prove).
+                .env("HOME", &root_t)
+                .output()
+        })
+        .join()
+        .unwrap()
+        .expect("spawn confined git worktree add");
+
+        assert!(
+            output.status.success(),
+            "git worktree add must succeed under a git-only exec grant: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            root.join("wt").join("seed").exists(),
+            "the new worktree must actually be checked out"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
