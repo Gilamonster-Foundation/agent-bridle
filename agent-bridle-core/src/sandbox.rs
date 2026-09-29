@@ -2890,6 +2890,15 @@ mod seatbelt_impl {
         fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
             let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
             resolved.net = seatbelt_net_projection(effective, MACH_DEPUTY_AUDIT);
+            // ROUND 2 (#2630 macOS leg, operator decision 2026-09-29): when a
+            // git grant's kernel redirect was admitted only through the named
+            // /Applications widening, say so on the exec axis as a class —
+            // never silently folded into the ordinary concrete grant.
+            if resolve_exec_targets_uses_xcode_applications_exception(&effective.exec) {
+                resolved.exec = resolved.exec.union(&crate::ResolvedScope::class(
+                    XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS,
+                ));
+            }
             resolved
         }
 
@@ -3258,6 +3267,45 @@ mod seatbelt_impl {
         out
     }
 
+    /// The class [`resolve_exec_targets`] reports on the resolved-authority
+    /// exec axis when any grant's redirect went through
+    /// [`XCODE_APPLICATIONS_EXCEPTION`] — the VISIBLE half of the round-2
+    /// widening (see that constant's doc comment for what it is and why).
+    pub(super) const XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS: &str =
+        "seatbelt-admin-writable-xcode-toolchain";
+
+    /// `true` iff resolving `scope`'s grants the way [`resolve_exec_targets`]
+    /// does would admit at least one binary ONLY via
+    /// [`XCODE_APPLICATIONS_EXCEPTION`] — i.e. the resolved-authority exec
+    /// axis for this grant should carry [`XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS`].
+    /// Mirrors [`resolve_exec_targets`]'s own token-resolution walk (absolute
+    /// grant canonicalized verbatim, bare name resolved against
+    /// [`TRUSTED_EXEC_DIRS`]) so it agrees with what that function actually
+    /// admits, without touching its return shape or its callers.
+    pub(super) fn resolve_exec_targets_uses_xcode_applications_exception(
+        scope: &Scope<String>,
+    ) -> bool {
+        let Scope::Only(set) = scope else {
+            return false;
+        };
+        let flagged = |path: &Path| -> bool {
+            std::fs::canonicalize(path).is_ok_and(|c| {
+                c.is_file() && git_toolchain_redirect_uses_xcode_applications_exception(&c)
+            })
+        };
+        set.iter().any(|token| {
+            if token.starts_with('/') {
+                flagged(Path::new(token))
+            } else if !token.contains('/') {
+                TRUSTED_EXEC_DIRS
+                    .iter()
+                    .any(|dir| flagged(&Path::new(dir).join(token)))
+            } else {
+                false
+            }
+        })
+    }
+
     /// Fixed, well-known Apple toolchain roots that ship their own `git`
     /// binary, reached indirectly through `/usr/bin/git`'s locator-stub
     /// redirect (agent-bridle#408, #2630's macOS leg). Unlike Linux's
@@ -3282,6 +3330,78 @@ mod seatbelt_impl {
         "/Applications/Xcode.app/Contents/Developer",
         "/Library/Developer/CommandLineTools",
     ];
+
+    /// The one [`GIT_TOOLCHAIN_ROOTS`] entry [`XCODE_APPLICATIONS_EXCEPTION`]
+    /// applies to. CommandLineTools gets no exception — it is fully
+    /// root-owned end to end and needs none.
+    const XCODE_TOOLCHAIN_ROOT: &str = "/Applications/Xcode.app/Contents/Developer";
+
+    /// ROUND 2 (operator decision 2026-09-29): the one named widening this
+    /// resolver ever applies. `/Applications` — and only `/Applications` —
+    /// may be admin-group-writable (root:admin, mode `0o775`: group-write
+    /// set, other-write clear) without failing the ancestry bar, so the
+    /// active toolchain on a stock Xcode install (reached through it) can be
+    /// trusted. Every OTHER ancestor — Xcode.app itself, everything below
+    /// it, and every ancestor of any other candidate (including
+    /// CommandLineTools) — still needs the ordinary fully-root-owned,
+    /// fully-unwritable bar.
+    ///
+    /// **KNOWN SECURITY ISSUE** (see `SECURITY.md`, ADR 0015 amendment): an
+    /// admin-group process can replace `/Applications/Xcode.app`, and this
+    /// resolver then tells the kernel to trust the replacement's `git`.
+    /// Mitigation: `xcode-select -s /Library/Developer/CommandLineTools`
+    /// (fully root-owned, no exception needed, no relaxed check ever
+    /// applies to it).
+    const XCODE_APPLICATIONS_EXCEPTION: &str = "/Applications";
+
+    /// `true` iff `path` is exactly [`XCODE_APPLICATIONS_EXCEPTION`], owned by
+    /// root, not other-writable, and (the whole point) IS group-writable —
+    /// the one path the relaxed ancestry walk below tolerates.
+    fn is_xcode_applications_exception(path: &Path, meta: OwnerMode) -> bool {
+        path == Path::new(XCODE_APPLICATIONS_EXCEPTION)
+            && meta.uid == 0
+            && (meta.mode & 0o002) == 0 // no other-write
+            && (meta.mode & 0o020) != 0 // admin/group-write, the widening itself
+    }
+
+    /// Same ancestor walk as [`ancestry_passes`], with exactly one relaxation:
+    /// at [`XCODE_APPLICATIONS_EXCEPTION`], admin-group-writable passes too
+    /// (see [`is_xcode_applications_exception`]). Every other ancestor — at
+    /// every level, including Xcode.app itself — still needs the ordinary
+    /// root-owned/fully-unwritable bar. Used ONLY for the Xcode.app toolchain
+    /// candidate; every other candidate (CommandLineTools) still goes through
+    /// the strict [`ancestry_passes`].
+    fn ancestry_passes_with_xcode_applications_exception(
+        path: &Path,
+        lookup: &dyn Fn(&Path) -> Option<OwnerMode>,
+    ) -> bool {
+        let Some(meta) = lookup(path) else {
+            return false;
+        };
+        let ordinary_pass = meta.uid == 0 && (meta.mode & 0o022) == 0;
+        if !ordinary_pass && !is_xcode_applications_exception(path, meta) {
+            return false;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                ancestry_passes_with_xcode_applications_exception(parent, lookup)
+            }
+            _ => true,
+        }
+    }
+
+    /// Production entry point for [`ancestry_passes_with_xcode_applications_exception`],
+    /// backed by live `symlink_metadata` — the Xcode.app-only counterpart to
+    /// [`ancestry_is_root_owned_and_unwritable`].
+    fn xcode_toolchain_ancestry_is_trusted(path: &Path) -> bool {
+        ancestry_passes_with_xcode_applications_exception(path, &|p| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).ok().map(|m| OwnerMode {
+                uid: m.uid(),
+                mode: m.mode(),
+            })
+        })
+    }
 
     /// If `canon_git_bin` is a `git` binary living directly inside one of
     /// [`TRUSTED_EXEC_DIRS`], return the [`GIT_TOOLCHAIN_ROOTS`] entries whose
@@ -3323,11 +3443,45 @@ mod seatbelt_impl {
             if candidate == *canon_git_bin {
                 continue; // same path as the granted binary — nothing extra to add.
             }
-            if ancestry_is_root_owned_and_unwritable(&candidate) {
+            let trusted = if *root == XCODE_TOOLCHAIN_ROOT {
+                ancestry_is_root_owned_and_unwritable(&candidate)
+                    || xcode_toolchain_ancestry_is_trusted(&candidate)
+            } else {
+                ancestry_is_root_owned_and_unwritable(&candidate)
+            };
+            if trusted {
                 out.push(candidate.to_string_lossy().into_owned());
             }
         }
         out
+    }
+
+    /// `true` iff the Xcode.app candidate in [`GIT_TOOLCHAIN_ROOTS`] would be
+    /// admitted by [`git_toolchain_redirect_targets`] for `canon_git_bin`
+    /// ONLY via [`XCODE_APPLICATIONS_EXCEPTION`] — i.e. the ordinary strict
+    /// ancestry bar fails but the named widening passes. Recomputes the same
+    /// prerequisites `git_toolchain_redirect_targets` checks (trusted stub,
+    /// strict ancestry on the granted binary itself) so it agrees with what
+    /// actually gets admitted, without changing that function's return type.
+    /// Used only to NAME the class on the resolved-authority exec axis —
+    /// never to decide what the kernel allows.
+    pub(super) fn git_toolchain_redirect_uses_xcode_applications_exception(
+        canon_git_bin: &Path,
+    ) -> bool {
+        if git_toolchain_redirect_targets(canon_git_bin).is_empty() {
+            return false;
+        }
+        let Ok(candidate) = Path::new(XCODE_TOOLCHAIN_ROOT)
+            .join("usr/bin/git")
+            .canonicalize()
+        else {
+            return false;
+        };
+        if candidate == *canon_git_bin {
+            return false;
+        }
+        !ancestry_is_root_owned_and_unwritable(&candidate)
+            && xcode_toolchain_ancestry_is_trusted(&candidate)
     }
 
     /// The subset of a filesystem object's identity the ancestry walk needs:
@@ -4234,6 +4388,132 @@ mod seatbelt_impl {
                 "a non-trusted-dir git must never yield a redirect target: {out:?}"
             );
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ----- ROUND 2 (operator decision 2026-09-29): the named
+        // /Applications widening, and its limits -----
+
+        fn synthetic_lookup(
+            fixture: &std::collections::HashMap<std::path::PathBuf, OwnerMode>,
+        ) -> impl Fn(&Path) -> Option<OwnerMode> + '_ {
+            move |p: &Path| fixture.get(p).copied()
+        }
+
+        /// The positive case: `/Applications` itself is root-owned,
+        /// admin-group-writable, not other-writable — every ancestor above
+        /// and below it (Xcode.app, its own leaf) is fully root-owned and
+        /// unwritable. The relaxed walk passes; the ordinary strict walk does
+        /// not — proving the exception is what carries it.
+        #[test]
+        fn xcode_applications_exception_admits_a_group_writable_applications_root() {
+            use std::collections::HashMap;
+            let root_owned_leaf = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let applications = OwnerMode {
+                uid: 0,
+                mode: 0o775, // root:admin, group-writable, no other-write
+            };
+            let leaf =
+                Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned_leaf);
+            let mut anc = leaf.parent();
+            while let Some(p) = anc {
+                if p == Path::new("/Applications") {
+                    fixture.insert(p.to_path_buf(), applications);
+                } else if !p.as_os_str().is_empty() {
+                    fixture.insert(p.to_path_buf(), root_owned_leaf);
+                }
+                anc = p.parent();
+            }
+            fixture.insert(Path::new("/").to_path_buf(), root_owned_leaf);
+            let lookup = synthetic_lookup(&fixture);
+
+            assert!(
+                ancestry_passes_with_xcode_applications_exception(leaf, &lookup),
+                "a group-writable /Applications, and only /Applications, must be tolerated"
+            );
+            assert!(
+                !ancestry_passes(leaf, &lookup),
+                "the ordinary strict walk must still refuse a group-writable ancestor — the \
+                 exception is a separate, narrower relaxation, not a change to the default bar"
+            );
+        }
+
+        /// The exception is keyed to the exact path `/Applications`, not to
+        /// "any admin-group-writable directory named like it". A different
+        /// admin-writable directory sitting in the same ancestor position
+        /// must still be refused.
+        #[test]
+        fn xcode_applications_exception_does_not_apply_to_a_lookalike_elsewhere() {
+            use std::collections::HashMap;
+            let root_owned_leaf = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let admin_writable = OwnerMode {
+                uid: 0,
+                mode: 0o775,
+            };
+            let leaf = Path::new("/opt/not-applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned_leaf);
+            let mut anc = leaf.parent();
+            while let Some(p) = anc {
+                if p == Path::new("/opt/not-applications") {
+                    fixture.insert(p.to_path_buf(), admin_writable);
+                } else if !p.as_os_str().is_empty() {
+                    fixture.insert(p.to_path_buf(), root_owned_leaf);
+                }
+                anc = p.parent();
+            }
+            fixture.insert(Path::new("/").to_path_buf(), root_owned_leaf);
+            let lookup = synthetic_lookup(&fixture);
+
+            assert!(
+                !ancestry_passes_with_xcode_applications_exception(leaf, &lookup),
+                "an admin-writable directory anywhere other than exactly /Applications must \
+                 still be refused, even with the exception-aware walk"
+            );
+        }
+
+        /// A world/other-writable `/Applications` (not just admin-group)
+        /// must still be refused — the exception tolerates the group-write
+        /// bit only, never other-write.
+        #[test]
+        fn other_writable_applications_is_refused_even_with_the_exception() {
+            use std::collections::HashMap;
+            let root_owned_leaf = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let other_writable_applications = OwnerMode {
+                uid: 0,
+                mode: 0o777, // group AND other writable
+            };
+            let leaf =
+                Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned_leaf);
+            let mut anc = leaf.parent();
+            while let Some(p) = anc {
+                if p == Path::new("/Applications") {
+                    fixture.insert(p.to_path_buf(), other_writable_applications);
+                } else if !p.as_os_str().is_empty() {
+                    fixture.insert(p.to_path_buf(), root_owned_leaf);
+                }
+                anc = p.parent();
+            }
+            fixture.insert(Path::new("/").to_path_buf(), root_owned_leaf);
+            let lookup = synthetic_lookup(&fixture);
+
+            assert!(
+                !ancestry_passes_with_xcode_applications_exception(leaf, &lookup),
+                "other-write on /Applications must still be refused; the exception is \
+                 group-write only"
+            );
         }
     }
 }
@@ -6768,15 +7048,15 @@ print(d.value())
     /// resolver).
     ///
     /// This asserts SUCCESS only when the active toolchain is one our fix
-    /// actually trusts ([`active_toolchain_is_trusted`]) — e.g. a
-    /// CommandLineTools-only host, fully root-owned end to end. On a host
-    /// whose active toolchain is Xcode.app under a group-writable
-    /// `/Applications` (confirmed live, macOS 15 / Xcode 26.3:
-    /// `/Applications` is `drwxrwxr-x root:wheel`, admin-writable), the fix
-    /// correctly DECLINES to trust it, so worktree add must still fail
-    /// exactly as before this fix — asserted in the `else` branch, so this
-    /// test exercises a real kernel-enforced outcome either way and never
-    /// silently skips.
+    /// actually trusts ([`active_toolchain_is_trusted`]). ROUND 2 (operator
+    /// decision 2026-09-29, `XCODE_APPLICATIONS_EXCEPTION`): on THIS Mac
+    /// that now includes the stock Xcode.app toolchain reached through a
+    /// group-writable `/Applications` (confirmed live, macOS 15 / Xcode
+    /// 26.3: `drwxrwxr-x root:wheel`) — the one named widening this
+    /// resolver applies, and nowhere else. A host whose active toolchain
+    /// fails even the relaxed bar still fails closed — asserted in the
+    /// `else` branch, so this test exercises a real kernel-enforced outcome
+    /// either way and never silently skips.
     #[test]
     fn git_worktree_add_succeeds_under_a_git_only_exec_grant_when_the_toolchain_is_trusted() {
         if skip_proof_unless_seatbelt() {
@@ -6961,6 +7241,81 @@ print(d.value())
         let _ = fs::remove_dir_all(&wt);
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&fake_dev);
+    }
+
+    /// ROUND 2 (operator decision 2026-09-29): when a git grant's redirect
+    /// is admitted only via `XCODE_APPLICATIONS_EXCEPTION`, the
+    /// resolved-authority exec axis must carry
+    /// `XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS` — the VISIBLE half of the
+    /// widening. Checked against the real production predicate
+    /// (`resolve_exec_targets_uses_xcode_applications_exception`), which is
+    /// what actually decides this on this host — never a fixed expectation,
+    /// since whether the exception is *needed* here depends on live
+    /// filesystem state (which toolchain is installed, `/Applications`'
+    /// mode).
+    #[test]
+    fn resolved_authority_names_the_xcode_admin_writable_exception_class() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let scope = Scope::only([git.to_string()]);
+        let uses_exception =
+            super::seatbelt_impl::resolve_exec_targets_uses_xcode_applications_exception(&scope);
+        let cav = Caveats {
+            exec: scope,
+            ..Caveats::top()
+        };
+        let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
+        let carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert_eq!(
+            uses_exception, carries_class,
+            "resolved_authority's exec axis must name the exception class iff the exception \
+             was actually needed to admit this host's git redirect: uses_exception={uses_exception} \
+             carries_class={carries_class}"
+        );
+    }
+
+    /// ROUND 2: a CommandLineTools-anchored `git` grant carries NO exception
+    /// class — CommandLineTools is fully root-owned end to end and needs no
+    /// widening. Skips (not fails) when CommandLineTools is not installed on
+    /// this host, since the assertion is about that specific toolchain root.
+    #[test]
+    fn commandlinetools_git_carries_no_exception_class() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let clt_git = Path::new("/Library/Developer/CommandLineTools/usr/bin/git");
+        if !clt_git.exists() {
+            eprintln!("skipping: CommandLineTools not installed on this host");
+            return;
+        }
+        let scope = Scope::only([clt_git.to_string_lossy().into_owned()]);
+        let cav = Caveats {
+            exec: scope,
+            ..Caveats::top()
+        };
+        let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
+        let carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert!(
+            !carries_class,
+            "a CommandLineTools-anchored grant must never carry the Xcode admin-writable \
+             exception class — CommandLineTools needs no widening"
+        );
     }
 }
 
