@@ -44,7 +44,7 @@ construction.
 | Feature | Default | Pulls | Enables |
 |---|---|---|---|
 | `linux-landlock` | off | `landlock` (Linux only) | filesystem confinement, direct-exec narrowing, and deny-all TCP on ABI-v4 kernels |
-| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement; expressible restricted-net profiles (deny-all, loopback, and exact `unix:` socket endpoints) add direct-network rules and `net:none`/`unix:`-only also add a Mach floor, but all remain `Unknown` and are refused |
+| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement; expressible restricted-net profiles (deny-all, loopback, exact `unix:` socket endpoints, and named `mach:` service grants) add direct-network rules and the network-denied shapes also install a zero Mach-lookup floor, but all remain `Unknown` and are refused |
 | `windows-appcontainer` | off | companion `agent-bridle-aclaunch.exe` | AppContainer filesystem DACLs, deny-all or loopback-only network policy, and exec deny-all |
 | `os-sandbox` | off | target-specific backend deps | convenience feature for every native OS sandbox backend |
 | `verifier-ed25519` | off | `ed25519-dalek` | production `Ed25519Verifier` for step-up discharges |
@@ -58,12 +58,28 @@ network allowlists are not directly expressible by the native kernels. Their
 support is backend-specific, and the macOS proxy path is currently held. A
 restricted filesystem scope fails closed when no native backend can enforce it.
 
-On macOS, the E4 `net:none` Mach floor closes the demonstrated NSURLSession /
-`nsurlsessiond` deputy as defense in depth. It does not establish deputy-complete
-no-egress: allow-listed and other ambient IPC services have not been
+On macOS, a network-denied profile (`net:none`, or `unix:`/`mach:` entries
+only) installs a **zero** Mach-lookup floor (agent-bridle#405): every named Mach
+service is kernel-denied unless the operator grants it by name with a
+`mach:<global-name>` scope entry, for example
+`mach:com.apple.system.opendirectoryd.libinfo`. Nothing is ambient; the former
+compatibility allow-list is now the documented candidate set
+(`MACH_SERVICE_CANDIDATES`) a host may offer for a grant. The result envelope's
+`disclosure.mach_services` names what was granted and which candidates were
+withheld — the structured "service X denied" signal, derived from the installed
+policy because the kernel denies a Mach lookup silently. With no grant the
+floor closes every named Mach lookup (the demonstrated NSURLSession /
+`nsurlsessiond` path included); a grant re-opens the named service, deputy or
+not. Neither is a deputy-complete proof: other ambient IPC has not been
 comprehensively certified. Consequently every restricted Seatbelt `net` scope,
-including `net:none`, loopback, and the former loopback-proxy shape, resolves
-`Unknown` and is refused by admission.
+including `net:none`, a `mach:` grant, loopback, and the former loopback-proxy
+shape, still resolves `Unknown` and is refused by admission. The post-audit
+projection resolves a grant as the named class `seatbelt-mach-service:<name>`
+(never `∅`), which the Seatbelt runtime closure declares so the scope bound
+compares it honestly; the strength report and floor are unchanged by that
+projection and are integrated by the promotion PR, not by flipping the audit
+constant. A `mach:` grant mixed with a remote-host allow-list has no
+egress-proxy semantics and the proxy planner refuses it.
 
 An explicit `net` scope entry `unix:/absolute/canonical/service.sock` names a
 single existing Unix-domain socket; the path must already be canonical and

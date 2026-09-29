@@ -26,7 +26,9 @@ proven *denied*).
   narrowing (still honestly reported `Interceptor` because of the loader
   trampoline), and deny-all TCP on ABI-v4 kernels.
 - **macOS** — Seatbelt kernel-confines both filesystem axes, restricted
-  exec, and deny-all or loopback-only network scopes.
+  exec, and deny-all or loopback-only network scopes; a deny-all scope also
+  installs a zero Mach-lookup floor with named `mach:<service>` operator
+  grants (every restricted net shape still admits as `Unknown`).
 - **Windows** — the wired AppContainer launcher confines filesystem paths,
   deny-all or loopback-only network scopes, and exec deny-all; non-empty
   exec allowlists remain `Interceptor`.

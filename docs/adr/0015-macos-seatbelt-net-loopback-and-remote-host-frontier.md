@@ -1,9 +1,11 @@
 # ADR 0015 — macOS Seatbelt net axis: loopback kernel-confinement + the remote-host allow-list frontier
 
-- Status: **Partially superseded (2026-08-11)** — the SBPL direct-socket
-  findings remain valid, but every claim below that a restricted Seatbelt net
-  scope is a complete `Kernel` witness or is admissible is superseded by the E4
-  ruling in this document.
+- Status: **Partially superseded (2026-08-11); amended E5 (2026-09-28)** — the
+  SBPL direct-socket findings remain valid, but every claim below that a
+  restricted Seatbelt net scope is a complete `Kernel` witness or is admissible
+  is superseded by the E4 ruling in this document. The E4 ambient Mach
+  re-allow list is replaced by the zero floor + named operator grants of
+  amendment E5 (agent-bridle#405).
 - Date: 2026-06-30
 - Context: The macOS `SeatbeltSandbox` (`sandbox.rs`, ADR 0006 / 0009) kernel-denies
   **all** egress when `net` is empty (`(deny network*)` → `net → Kernel`; #50
@@ -49,6 +51,84 @@ Therefore the operative authority ruling is fail-closed:
 The remainder of this ADR records the 2026-06 direct-socket findings and the
 superseded decision for history. Where it says a restricted net shape is
 `Kernel`, exact, admitted, or supported, this 2026-08-11 ruling controls.
+
+## Amendment E5 — zero Mach floor, services are operator grants (2026-09-28, agent-bridle#405)
+
+The E4 profile default-denied Mach lookup and then re-allowed twelve services
+ambiently so ordinary tools kept working. None of those services had native
+evidence that it cannot act as a network deputy for the child, so the ambient
+re-allow was an unproven floor. This amendment removes it.
+
+**Decision.** Nothing ambient. Under a network-denied Seatbelt profile
+(`net:none`, or `unix:`/`mach:` entries only) the Mach-lookup floor is
+**zero**: `(deny mach-lookup)` with no default re-allow. A service is reachable
+only when the operator grants it by name with a `net` scope entry
+`mach:<global-name>` (for example `mach:com.apple.system.opendirectoryd.libinfo`),
+which the profile re-allows as an exact `(global-name …)` literal after the
+deny. The grant is an ordinary scope entry: narrowed by `meet`, validated
+(launchd label characters only, fail-closed), Seatbelt-only (AppContainer
+refuses it; the egress proxy never treats it as a host).
+
+**Resolution.** A grant is projected as the named class
+`seatbelt-mach-service:<name>`, following the `appcontainer-loopback-exemption`
+precedent, so it never collapses to `∅`; the Seatbelt runtime closure declares
+exactly that class per grant, so admission compares it as a `Subset` rather
+than an undeclared widening. The projection is implemented and pinned by unit
+test for the post-audit state, but **this build ships
+`MACH_DEPUTY_AUDIT = Incomplete`**, under which every restricted net shape
+still resolves `Unknown` and is refused (fail closed first, #405 D4). The
+constant switches **only the authority projection** (the L3 scope bound). It
+does not change the per-axis strength report (every restricted Seatbelt net
+shape stays Advisory) or the L4 strength floor, so flipping it alone does not
+admit `net:none` under a CONFINED contract. Report/floor integration, the
+end-to-end admission tests, and the native deputy evidence that would justify
+the flip all belong to a later, evidence-backed promotion PR. Loopback and
+remote-host shapes stay `Unknown` in either state.
+
+A `mach:` grant alongside a remote-host allow-list has no egress-proxy
+semantics (the proxy's loopback fence installs no Mach floor, so the grant
+would be erased rather than confined); the proxy planner refuses such a scope
+on every backend.
+
+**Denial report.** The kernel denies a Mach lookup silently, so bridle derives
+the structured result from the installed policy: the envelope's
+`disclosure.mach_services` lists `granted` (by name) and `withheld` (every
+known candidate the profile denies). The host owns the prompt ("allow for this
+session" vs. "allow permanently"); bridle owns the token, the resolution and the
+report.
+
+**Native evidence (macOS 26.6.2 / Darwin 25.6.0 arm64, `sandbox-exec`).**
+Per-service deputy status: **unknown for every candidate** — no candidate has
+been shown incapable of egress on the child's behalf, which is exactly why the
+floor is zero. Breakage measurement under the zero floor, then per single
+grant (evidence table in `docs/security/platform/macos-evidence.md`):
+
+| tool / operation | zero floor | needs |
+|---|---|---|
+| `/bin/sh`, `/bin/echo`, `/usr/bin/xcrun --find` | runs | — |
+| `git add/commit/log/status` with a configured identity | runs | — |
+| `git commit` **without** a configured identity (`getpwuid`) | "Author identity unknown" | `com.apple.system.opendirectoryd.libinfo` |
+| `id -un` (uid → name) | prints the numeric uid | `com.apple.system.opendirectoryd.libinfo` |
+| `cargo --version` | runs | — |
+| `python3` (`ssl.create_default_context()` loads 128 CA certs) | runs | — |
+| `curl https://127.0.0.1:…` (TLS stack loads; socket denied as intended) | connect refused by `(deny network*)` | — |
+| `getaddrinfo("example.com")` via the system resolver | fails (no `mDNSResponder` lookup) | *not a candidate* — DNS exfil via the resolver daemon is now closed under `net:none` |
+| `security find-certificate` (keychain) | fails | `com.apple.SecurityServer` |
+
+The `id -un` differential is encoded as the CI proof
+`net_none_mach_floor_is_zero_and_a_named_grant_reopens_that_service`: a
+validated numeric-uid control (success, non-empty ASCII decimal) and a name
+control distinct from it; the zero floor yields the exact uid; a grant of
+`libinfo` exits successfully with the name; an unrelated `SecurityServer`
+grant yields the uid again; each confined profile has its own launch control.
+This measures the `libinfo` grant and the literal rule it emits; it does not
+characterize any other service's transitive authority.
+The E4 A/B/A differential still passes under the zero floor (the production
+leg exits via `callback_error`).
+
+**Out of scope here.** Windows AppContainer (the brokered-RPC/COM/named-pipe
+audit, #405 A/Windows) is a separate delegate on native Windows; host
+allow-lists (#124 frontier) stay `Unknown`.
 
 ## Question
 
