@@ -1963,6 +1963,49 @@ pub(crate) mod landlock_impl {
         Vec::new()
     }
 
+    /// The subset of a filesystem object's identity the ancestry walk
+    /// needs: owning uid and permission mode. Broken out as plain data so
+    /// the walk itself ([`ancestry_passes`]) can be driven by either live
+    /// `symlink_metadata` (production, via
+    /// [`ancestry_is_root_owned_and_unwritable`]) or a synthetic lookup
+    /// (tests) — bridle PR #407 review, round 3 finding 1: without this
+    /// seam, the round-3 adversarial "writable grandparent" tests could
+    /// pass with the RECURSIVE ancestor walk deleted outright, because they
+    /// never constructed a real root-owned leaf and so never got past the
+    /// leaf's own ownership check to exercise a grandparent at all.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct OwnerMode {
+        uid: u32,
+        mode: u32,
+    }
+
+    /// The actual ancestry walk: `path` and every ancestor up to and
+    /// including `/` must each pass `lookup` as root-owned (`uid == 0`) and
+    /// not group/other-writable (`mode & 0o022 == 0`). `lookup` returning
+    /// `None` (object doesn't exist / can't be inspected) fails closed.
+    /// Both production ([`ancestry_is_root_owned_and_unwritable`], backed
+    /// by live `symlink_metadata`) and the adversarial unit tests (backed
+    /// by a synthetic `HashMap`) call this SAME function, so a test that
+    /// passes is a claim about this exact traversal, not a parallel
+    /// reimplementation of it that could drift from what production runs.
+    #[cfg(unix)]
+    fn ancestry_passes(
+        path: &std::path::Path,
+        lookup: &dyn Fn(&std::path::Path) -> Option<OwnerMode>,
+    ) -> bool {
+        let Some(meta) = lookup(path) else {
+            return false;
+        };
+        if meta.uid != 0 || (meta.mode & 0o022) != 0 {
+            return false;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => ancestry_passes(parent, lookup),
+            _ => true,
+        }
+    }
+
     /// `true` iff `path` itself AND every ancestor directory up to and
     /// including `/` is owned by root (uid 0) and carries no group- or
     /// other-write bit. Unlike a single-directory check, this rejects a
@@ -1973,22 +2016,17 @@ pub(crate) mod landlock_impl {
     /// canonicalizes into the trusted set. `path` must already be
     /// canonicalized by the caller — this checks the object at that path,
     /// not what a symlink there might point to (`symlink_metadata`, not
-    /// `metadata`), so a still-symlinked path fails closed.
+    /// `metadata`, via [`ancestry_passes`]'s `lookup`), so a still-symlinked
+    /// path fails closed.
     #[cfg(unix)]
     fn ancestry_is_root_owned_and_unwritable(path: &std::path::Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            return false;
-        };
-        if meta.uid() != 0 || (meta.mode() & 0o022) != 0 {
-            return false;
-        }
-        match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => {
-                ancestry_is_root_owned_and_unwritable(parent)
-            }
-            _ => true,
-        }
+        ancestry_passes(path, &|p| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).ok().map(|m| OwnerMode {
+                uid: m.uid(),
+                mode: m.mode(),
+            })
+        })
     }
 
     #[cfg(not(unix))]
@@ -2304,6 +2342,115 @@ pub(crate) mod landlock_impl {
                 "identical content (different inode) must be recognized as the same image"
             );
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// #2630 round 4 (bridle PR #407 review, round 3 finding 1): drives
+    /// [`ancestry_passes`] — the SAME traversal `ancestry_is_root_owned_and_
+    /// unwritable` runs in production — through a synthetic ownership map
+    /// instead of the real filesystem. Round 3's adversarial ancestry tests
+    /// built their fixtures from plain, user-owned tmp files/dirs, so the
+    /// leaf itself already failed the uid check before the walk ever
+    /// reached a parent; deleting the recursive call entirely left those
+    /// tests green. These tests hold every level but ONE constant between
+    /// the positive and negative cases, so only the traversal itself can
+    /// account for the difference.
+    #[cfg(test)]
+    mod ancestry_walk_tests {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn root_owned_unwritable() -> OwnerMode {
+            OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            }
+        }
+
+        /// `/`, `/a`, `/a/b`, `/a/b/git` — every level root-owned and
+        /// unwritable. The baseline every negative test below perturbs at
+        /// exactly one level.
+        fn all_protected_chain() -> HashMap<PathBuf, OwnerMode> {
+            [
+                PathBuf::from("/"),
+                PathBuf::from("/a"),
+                PathBuf::from("/a/b"),
+                PathBuf::from("/a/b/git"),
+            ]
+            .into_iter()
+            .map(|p| (p, root_owned_unwritable()))
+            .collect()
+        }
+
+        fn lookup_in(
+            map: &HashMap<PathBuf, OwnerMode>,
+        ) -> impl Fn(&std::path::Path) -> Option<OwnerMode> + '_ {
+            move |p: &std::path::Path| map.get(p).copied()
+        }
+
+        const LEAF: &str = "/a/b/git";
+
+        /// Positive control: an entirely root-owned, unwritable synthetic
+        /// chain from the leaf to `/` passes.
+        #[test]
+        fn an_all_protected_synthetic_chain_passes() {
+            let map = all_protected_chain();
+            assert!(ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// The leaf and its immediate parent (`/a/b`) are UNCHANGED from the
+        /// positive case; only the GRANDPARENT's owner differs. This can
+        /// only fail if the walk actually recurses past the immediate
+        /// parent — deleting the recursive call (round 3's gap) would leave
+        /// this green.
+        #[test]
+        fn a_grandparent_owned_by_a_non_root_uid_fails_the_walk() {
+            let mut map = all_protected_chain();
+            map.insert(
+                PathBuf::from("/a"),
+                OwnerMode {
+                    uid: 1000,
+                    ..root_owned_unwritable()
+                },
+            );
+            assert!(!ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// Same shape, but the grandparent differs ONLY in its write mode
+        /// (still uid 0) — isolates the mode half of the check from the uid
+        /// half, and again only fails if the walk reaches it.
+        #[test]
+        fn a_group_writable_grandparent_fails_the_walk() {
+            let mut map = all_protected_chain();
+            map.insert(
+                PathBuf::from("/a"),
+                OwnerMode {
+                    mode: 0o775,
+                    ..root_owned_unwritable()
+                },
+            );
+            assert!(!ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// A path with no entry in the lookup at all (object doesn't exist)
+        /// fails closed rather than defaulting to trusted.
+        #[test]
+        fn an_unresolvable_path_fails_closed() {
+            let map = all_protected_chain();
+            assert!(!ancestry_passes(
+                std::path::Path::new("/a/b/does-not-exist"),
+                &lookup_in(&map)
+            ));
         }
     }
 
@@ -4305,15 +4452,53 @@ mod landlock_kernel_tests {
         }
     }
 
+    /// `true` iff `BRIDLE_REQUIRE_LANDLOCK` is set (non-empty, not `"0"`) —
+    /// the same flag [`skip_proof_unless_landlock`] gates on, factored out
+    /// so [`require_trusted_git_or_fail`] can apply the identical
+    /// require-not-skip posture to a DIFFERENT missing prerequisite (the
+    /// fixture `git` binary, not the kernel feature).
+    fn landlock_is_required() -> bool {
+        std::env::var("BRIDLE_REQUIRE_LANDLOCK")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    }
+
+    /// `true` iff `git` exists on this host. **Panics** when Landlock is
+    /// *required* (`BRIDLE_REQUIRE_LANDLOCK=1`, as CI sets) but the fixture
+    /// `git` is absent — bridle PR #407 review, round 3 finding 2: a
+    /// required run that silently `eprintln!`+`return`ed on a missing
+    /// `/usr/bin/git` could go green in CI without ever exercising the
+    /// #2630 fence, exactly the failure mode [`skip_proof_unless_landlock`]
+    /// already closes for a missing KERNEL feature. A local, non-required
+    /// run still legitimately skips.
+    fn require_trusted_git_or_fail(git: &str) -> bool {
+        require_git_gated(git, landlock_is_required())
+    }
+
+    /// The pure decision [`require_trusted_git_or_fail`] wraps: separated so
+    /// the require-vs-skip posture is testable directly against an explicit
+    /// `required` flag, with no process-global `BRIDLE_REQUIRE_LANDLOCK`
+    /// mutation needed to exercise the `true` branch.
+    fn require_git_gated(git: &str, required: bool) -> bool {
+        if std::path::Path::new(git).exists() {
+            return true;
+        }
+        if required {
+            panic!(
+                "BRIDLE_REQUIRE_LANDLOCK is set but {git} is absent — the #2630 \
+                 git-exec-path proof cannot be verified"
+            );
+        }
+        eprintln!("skipping: no {git} on this host");
+        false
+    }
+
     /// `true` if the caller should `return` (skip the proof). **Panics** when
     /// Landlock is *required* (`BRIDLE_REQUIRE_LANDLOCK` set, as CI does) but the
     /// kernel lacks it — so a flagged run cannot pass without actually exercising
     /// the boundary. A local run without the flag legitimately skips (#74).
     fn skip_proof_unless_landlock() -> bool {
-        let required = std::env::var("BRIDLE_REQUIRE_LANDLOCK")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
-        match proof_gate(landlock_is_supported(), required) {
+        match proof_gate(landlock_is_supported(), landlock_is_required()) {
             ProofGate::Run => false,
             ProofGate::Skip => {
                 eprintln!(
@@ -4337,6 +4522,26 @@ mod landlock_kernel_tests {
         // The crux (#74): required + unsupported must FAIL, never silently skip,
         // so CI cannot pass without exercising the kernel boundary.
         assert_eq!(proof_gate(false, true), ProofGate::Fail);
+    }
+
+    /// #2630 round 4, finding 2's require-not-skip half: a missing fixture
+    /// `git` with `required = false` legitimately skips (no panic).
+    #[test]
+    fn require_git_gated_skips_a_missing_git_when_not_required() {
+        assert!(!require_git_gated(
+            "/definitely/does/not/exist/git-2630",
+            false
+        ));
+    }
+
+    /// The crux: the SAME missing `git`, with `required = true`, must FAIL
+    /// rather than silently return `false` — mirroring `proof_gate`'s own
+    /// required-but-unsupported posture (#74), applied to a different
+    /// missing prerequisite.
+    #[test]
+    #[should_panic(expected = "is absent")]
+    fn require_git_gated_panics_on_a_missing_git_when_required() {
+        require_git_gated("/definitely/does/not/exist/git-2630", true);
     }
 
     #[test]
@@ -4914,8 +5119,7 @@ mod landlock_kernel_tests {
             return;
         }
         let git = "/usr/bin/git";
-        if !std::path::Path::new(git).exists() {
-            eprintln!("skipping: no /usr/bin/git on this host");
+        if !require_trusted_git_or_fail(git) {
             return;
         }
         let root = unique_dir("git-exec-2630");
@@ -4923,17 +5127,6 @@ mod landlock_kernel_tests {
         std::fs::create_dir(&main).unwrap();
         let home = root.join("home");
         std::fs::create_dir(&home).unwrap();
-
-        // Sentinels: external paths a *leaky* fixture could redirect into
-        // via inherited GIT_INDEX_FILE / GIT_COMMON_DIR / GIT_OBJECT_DIRECTORY
-        // (review finding 3) if `hermetic_git_command` didn't `env_clear()`.
-        // None of these three env vars is ever set below, so nothing should
-        // touch these files; asserted unchanged at the end.
-        let sentinel_index = unique_dir("sentinel-index").join("index");
-        let sentinel_common = unique_dir("sentinel-common");
-        let sentinel_objects = unique_dir("sentinel-objects");
-        std::fs::write(&sentinel_index, b"untouched\n").unwrap();
-        let sentinel_index_before = std::fs::read(&sentinel_index).unwrap();
 
         let real_git = |dir: &std::path::Path, args: &[&str]| {
             let ok = hermetic_git_command(git, dir, &home)
@@ -4989,26 +5182,173 @@ mod landlock_kernel_tests {
             root.join("wt").join("seed").exists(),
             "the new worktree must actually be checked out"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Env var this test binary's own re-exec checks for: its presence
+    /// (any value) means "run as the dedicated hostile-env subprocess for
+    /// [`hostile_inherited_git_env_is_stripped_by_hermetic_env_clear`]"
+    /// instead of the normal top-level test. **Never set via
+    /// `std::env::set_var` on the shared test-binary process** (bridle PR
+    /// #407 review, round 3 finding 4/round 2's own P2: process-global env
+    /// mutation races every other test in this binary) — set ONLY on the
+    /// `Command` that spawns that one dedicated child process, below.
+    const HOSTILE_ENV_SUBPROCESS_MARKER: &str = "BRIDLE_2630_HOSTILE_ENV_SUBPROCESS_ROOT";
+
+    /// Runs (as the dedicated subprocess) the exact fixture the isolation
+    /// claim is about: [`hermetic_git_command`] for BOTH the unconfined
+    /// setup (`init`/`add`/`commit`) AND the Landlock-confined `worktree
+    /// add`. This subprocess's OWN environment carries hostile
+    /// `GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` (set by the
+    /// parent only on the `Command` that launched this process — never
+    /// globally). If `hermetic_git_command`'s `env_clear()` is doing its
+    /// job, none of the three reach the spawned `git` processes, so every
+    /// step below succeeds exactly as the non-hostile case; if it were
+    /// disabled, git would redirect into the sentinel paths this same
+    /// subprocess inherited and either corrupt them or fail confusingly.
+    fn run_hostile_env_subprocess_fixture(git: &str, root: &std::path::Path) {
+        let main = root.join("main");
+        fs::create_dir(&main).unwrap();
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+
+        let real_git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = hermetic_git_command(git, dir, &home)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed under hostile inherited env");
+        };
+        real_git(&main, &["init", "-q"]);
+        fs::write(main.join("seed"), "x").unwrap();
+        real_git(&main, &["add", "seed"]);
+        real_git(&main, &["commit", "-q", "-m", "init"]);
+
+        let git = git.to_string();
+        let wt = root.join("wt");
+        let confined_ok = {
+            let git = git.clone();
+            let main = main.clone();
+            let home = home.clone();
+            let root = root.to_path_buf();
+            let wt = wt.clone();
+            std::thread::spawn(move || {
+                let cav = Caveats {
+                    fs_read: Scope::only([root.to_string_lossy().into_owned()]),
+                    fs_write: Scope::only([root.to_string_lossy().into_owned()]),
+                    exec: Scope::only([git.clone()]),
+                    net: Scope::none(),
+                    ..Caveats::top()
+                };
+                LandlockSandbox::new().apply(&cav).expect("apply landlock");
+                hermetic_git_command(&git, &main, &home)
+                    .arg("worktree")
+                    .arg("add")
+                    .arg("-q")
+                    .arg(&wt)
+                    .arg("-b")
+                    .arg("task")
+                    .status()
+                    .unwrap()
+                    .success()
+            })
+            .join()
+            .unwrap()
+        };
+        assert!(
+            confined_ok,
+            "confined git worktree add failed under hostile inherited env"
+        );
+        assert!(
+            wt.join("seed").exists(),
+            "confined worktree add must actually check out its seed file"
+        );
+    }
+
+    /// #2630 round 4 (bridle PR #407 review, round 3 finding 2): the
+    /// hostile-`GIT_EXEC_PATH`-style claim needs a real adversary, not
+    /// sentinel files nothing ever pointed at (round 3's version). This
+    /// spawns a DEDICATED subprocess — re-executing this very test binary
+    /// with `--exact` against only this one test — whose `Command`
+    /// environment (not this process's own) carries hostile
+    /// `GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` pointed at
+    /// disposable sentinels. Inside that subprocess,
+    /// [`run_hostile_env_subprocess_fixture`] runs the real fixture (setup
+    /// AND the confined `worktree add`) through [`hermetic_git_command`];
+    /// this parent process then inspects the sentinels afterward. No
+    /// process-global env mutation anywhere in this process.
+    #[test]
+    fn hostile_inherited_git_env_is_stripped_by_hermetic_env_clear() {
+        // Re-entry: this same test, run again as the dedicated subprocess.
+        if let Ok(root) = std::env::var(HOSTILE_ENV_SUBPROCESS_MARKER) {
+            let git = std::env::var("BRIDLE_2630_SUBPROCESS_GIT")
+                .expect("parent must pass the git path to the subprocess");
+            run_hostile_env_subprocess_fixture(&git, std::path::Path::new(&root));
+            return;
+        }
+
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let git = "/usr/bin/git";
+        if !require_trusted_git_or_fail(git) {
+            return;
+        }
+
+        let root = unique_dir("hostile-env-2630");
+        let sentinel_index = unique_dir("hostile-sentinel-index").join("index");
+        let sentinel_common = unique_dir("hostile-sentinel-common");
+        let sentinel_objects = unique_dir("hostile-sentinel-objects");
+        fs::write(&sentinel_index, b"untouched\n").unwrap();
+        let sentinel_index_before = fs::read(&sentinel_index).unwrap();
+
+        let exe = std::env::current_exe().expect("current_exe must resolve for the re-exec proof");
+        let output = Command::new(&exe)
+            .arg("--exact")
+            .arg("sandbox::landlock_kernel_tests::hostile_inherited_git_env_is_stripped_by_hermetic_env_clear")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            // Explicit, minimal env: this Command's env is what the
+            // subprocess inherits, NOT this test's own process env (which
+            // is never mutated). PATH is needed for the re-executed test
+            // binary's own machinery; HOME/TMPDIR are left unset — the
+            // subprocess only ever touches paths this parent hands it.
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("BRIDLE_REQUIRE_LANDLOCK", "1")
+            .env(HOSTILE_ENV_SUBPROCESS_MARKER, root.to_string_lossy().as_ref())
+            .env("BRIDLE_2630_SUBPROCESS_GIT", git)
+            // The hostile ambient redirection targets: if hermetic_git_command
+            // ever inherited these instead of clearing them, git would
+            // redirect its index/object-store operations straight into them.
+            .env("GIT_INDEX_FILE", &sentinel_index)
+            .env("GIT_COMMON_DIR", &sentinel_common)
+            .env("GIT_OBJECT_DIRECTORY", &sentinel_objects)
+            .output()
+            .expect("spawn hostile-env subprocess");
+
+        assert!(
+            output.status.success(),
+            "hostile-env subprocess fixture failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
-            std::fs::read(&sentinel_index).unwrap(),
+            fs::read(&sentinel_index).unwrap(),
             sentinel_index_before,
-            "an external sentinel index must be untouched: hermetic env_clear() must have \
-             prevented any inherited GIT_INDEX_FILE from redirecting into it"
+            "a hostile inherited GIT_INDEX_FILE must never be honored: \
+             hermetic_git_command's env_clear() must have stripped it"
         );
         assert!(
-            std::fs::read_dir(&sentinel_common)
-                .unwrap()
-                .next()
-                .is_none(),
-            "an external sentinel GIT_COMMON_DIR-shaped directory must stay empty"
+            fs::read_dir(&sentinel_common).unwrap().next().is_none(),
+            "a hostile inherited GIT_COMMON_DIR must never be honored"
         );
         assert!(
-            std::fs::read_dir(&sentinel_objects)
-                .unwrap()
-                .next()
-                .is_none(),
-            "an external sentinel GIT_OBJECT_DIRECTORY-shaped directory must stay empty"
+            fs::read_dir(&sentinel_objects).unwrap().next().is_none(),
+            "a hostile inherited GIT_OBJECT_DIRECTORY must never be honored"
         );
+
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(sentinel_index.parent().unwrap());
         let _ = fs::remove_dir_all(&sentinel_common);
