@@ -186,6 +186,12 @@ pub struct SandboxPolicy {
     /// a trusted source for this sandbox constructor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appcontainer_launcher_path: Option<String>,
+    /// Explicit operator opt-in for the Windows AppContainer launcher's
+    /// per-container `\\.\NUL` device DACL ACE. This is a host-side mechanism
+    /// widening, not a Caveat: it is default-off and is disclosed in the resolved
+    /// authority and enforcement report whenever it is active.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub appcontainer_nul_device_ace: bool,
     /// Read base when `fs_read` restricted (`BASE_READ_PATHS`).
     pub base_read_paths: PathList,
     /// Executable dirs read-allowed only when `exec` is ambient (`BIN_READ_PATHS`).
@@ -206,6 +212,10 @@ pub struct SandboxPolicy {
     pub landlock_abi_floor: u32,
     /// Minimum Landlock ABI for TCP net rules (`NET_ABI_FLOOR`).
     pub landlock_net_abi_floor: u32,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The `device_sink_paths` default: the null/zero/full discard devices —
@@ -269,6 +279,7 @@ impl Default for SandboxPolicy {
             backends: BackendToggles::default(),
             child_network: ChildNetworkPolicy::default(),
             appcontainer_launcher_path: None,
+            appcontainer_nul_device_ace: false,
             named_root_protected_roots: None,
             base_read_paths: PathList::from_defaults(base_read),
             device_sink_paths: default_device_sink_paths(),
@@ -769,6 +780,23 @@ mod tests {
             policy.appcontainer_launcher_path.as_deref(),
             Some("C:\\Program Files\\Agent Bridle\\agent-bridle-aclaunch.exe")
         );
+    }
+
+    #[test]
+    fn appcontainer_nul_device_ace_is_explicit_opt_in_mechanism_config() {
+        assert!(
+            !SandboxPolicy::default().appcontainer_nul_device_ace,
+            "the host NUL-device DACL widening must default off"
+        );
+        let policy = SandboxPolicy {
+            appcontainer_nul_device_ace: true,
+            ..SandboxPolicy::default()
+        };
+
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["appcontainer_nul_device_ace"], true);
+        let policy: SandboxPolicy = serde_json::from_value(json).unwrap();
+        assert!(policy.appcontainer_nul_device_ace);
     }
 
     #[test]

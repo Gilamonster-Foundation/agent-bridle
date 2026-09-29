@@ -123,3 +123,26 @@ fn process_attribute_failure_refuses_before_spawn() {
     ]);
     assert_refused_before_spawn(&out, "process-attribute failure");
 }
+
+/// The NUL-device compatibility escape hatch is opt-in and must fail closed
+/// before the child starts if the launcher cannot obtain `WRITE_DAC`.  The
+/// test seam avoids mutating the host device DACL on a non-elevated developer
+/// machine while still proving that there is no unconfined fallback.
+#[test]
+fn nul_device_ace_write_dac_denial_refuses_before_spawn() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+
+    let out = launch(&[
+        "--name",
+        &tag("nul-write-dac-denied"),
+        "--nul-device-ace",
+        "--test-force-nul-write-dac-denied",
+        "cmd.exe",
+        "/c",
+        "echo",
+        STARTED,
+    ]);
+    assert_refused_before_spawn(&out, "WRITE_DAC");
+}

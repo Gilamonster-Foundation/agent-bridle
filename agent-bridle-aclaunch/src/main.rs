@@ -8,7 +8,7 @@
 //! # CLI
 //!
 //! ```text
-//! agent-bridle-aclaunch [--name <container-name>] [--net-allow] <exe> [args...]
+//! agent-bridle-aclaunch [--name <container-name>] [--net-allow] [--nul-device-ace] <exe> [args...]
 //! ```
 //!
 //! * `--name <n>` — AppContainer profile name.  Must be unique per run.  If
@@ -16,13 +16,19 @@
 //! * `--net-allow` — grant `INTERNET_CLIENT` + `INTERNET_CLIENT_SERVER` +
 //!   `PRIVATE_NETWORK_CLIENT_SERVER` capability SIDs.  Without this flag no
 //!   network capability SIDs are granted (deny-by-default egress).
+//! * `--nul-device-ace` — explicit, default-off compatibility widening for
+//!   native Git on affected Windows Server policies. It temporarily grants this
+//!   launch's AppContainer SID read/write access to the host `\\.\NUL` device
+//!   DACL; it requires `WRITE_DAC` and fails closed if unavailable. See
+//!   `SECURITY.md` before using it directly.
 //! * `<exe>` — absolute or `PATH`-resolved executable.
 //! * `[args...]` — arguments forwarded verbatim to the child process.
 //!
 //! The launcher creates a temporary AppContainer profile, spawns the child, and
-//! deletes the profile after the child exits.  Profile deletion is best-effort;
-//! leaked profiles are harmless and can be cleaned up with the userenv APIs or
-//! `icacls`.
+//! deletes the profile after the child exits. If an opted-in NUL-device ACE
+//! cannot be revoked, it deliberately retains that profile so a later launch
+//! cannot recreate the deterministic SID. Profile deletion is otherwise
+//! best-effort.
 //!
 //! # Non-Windows builds
 //!
@@ -50,34 +56,39 @@ mod windows {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
-        INVALID_HANDLE_VALUE,
+        INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
         NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
-        TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+        SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
+        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, FreeSid, WinCapabilityInternetClientServerSid,
-        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid, ACL,
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, SECURITY_ATTRIBUTES,
-        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+        CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
+        WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
+        WinCapabilityPrivateNetworkClientServerSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE,
+        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
     use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
-        EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+        CreateMutexW, CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, ReleaseMutex, UpdateProcThreadAttribute,
+        WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
         PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
         STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
     };
@@ -95,6 +106,14 @@ mod windows {
     const FILE_GENERIC_READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
     const FILE_GENERIC_READ_WRITE_EXECUTE: u32 =
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+
+    /// NUL is a host device object rather than a normal filesystem path.  The
+    /// named security APIs used for filesystem grants do not work for it; the
+    /// device must be opened and updated through its HANDLE.
+    const NUL_DEVICE: &str = r"\\.\NUL";
+    const NUL_DEVICE_ACCESS: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    const NUL_DACL_MUTEX: &str = r"Global\agent-bridle-aclaunch-nul-device-dacl-v1";
+    const HRESULT_ERROR_ALREADY_EXISTS: i32 = -2_147_024_713;
 
     struct TestPipeCanary {
         read: HANDLE,
@@ -264,6 +283,283 @@ mod windows {
         }
     }
 
+    /// A cross-launch lock for a single NUL-device DACL read-modify-write
+    /// operation.  The lock is deliberately held only while adding or removing
+    /// an ACE, never while the child runs: a per-launch AppContainer SID makes
+    /// the two live grants independent once the mutation is serialized.
+    struct NulDeviceDaclLock {
+        handle: HANDLE,
+    }
+
+    impl Drop for NulDeviceDaclLock {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = ReleaseMutex(self.handle);
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+
+    unsafe fn lock_nul_device_dacl() -> Result<NulDeviceDaclLock, String> {
+        let mutex_name = to_wide(OsStr::new(NUL_DACL_MUTEX));
+        let handle = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "could not create the NUL-device DACL mutex: {:?}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        match WaitForSingleObject(handle, INFINITE) {
+            WAIT_OBJECT_0 => Ok(NulDeviceDaclLock { handle }),
+            WAIT_ABANDONED => {
+                // A prior launcher crashed while updating the DACL.  We own the
+                // mutex now, so serialize this mutation; a dead-SID ACE may be
+                // left behind and is documented as the residual crash risk.
+                eprintln!(
+                    "agent-bridle-aclaunch: acquired abandoned NUL-device DACL mutex; \
+                     a prior crashed launch may have left a dead-SID ACE"
+                );
+                Ok(NulDeviceDaclLock { handle })
+            }
+            result => {
+                CloseHandle(handle);
+                Err(format!(
+                    "could not acquire the NUL-device DACL mutex (WaitForSingleObject={result}): {:?}",
+                    std::io::Error::last_os_error()
+                ))
+            }
+        }
+    }
+
+    unsafe fn open_nul_for_dacl() -> Result<HANDLE, String> {
+        let device = to_wide(OsStr::new(NUL_DEVICE));
+        let handle = CreateFileW(
+            device.as_ptr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "could not open {NUL_DEVICE:?} with READ_CONTROL | WRITE_DAC; \
+                 the explicit --nul-device-ace grant requires WRITE_DAC and refuses before spawn: {:?}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(handle)
+    }
+
+    /// Add exactly one non-inheriting `FILE_GENERIC_READ | FILE_GENERIC_WRITE`
+    /// ACE for this launch's AppContainer SID to the host NUL device.
+    ///
+    /// `SET_ACCESS` gives this fresh SID a single exact ACE.  This must not use
+    /// the named file-security APIs: `\\.\NUL` is a device object and only the
+    /// handle-based APIs reliably update its DACL.
+    unsafe fn grant_nul_device_access(
+        ac_sid: *mut std::ffi::c_void,
+        force_write_dac_denied: bool,
+        force_cleanup_failure: bool,
+    ) -> Result<(), String> {
+        if ac_sid.is_null() {
+            return Err("AppContainer SID is null; cannot grant NUL-device access".to_string());
+        }
+        // Test-only: take the same post-setup grant failure path without
+        // touching the host device DACL on a developer workstation.
+        if force_write_dac_denied {
+            return Err(
+                "forced NUL device ACE refusal: missing WRITE_DAC; refusing before spawn"
+                    .to_string(),
+            );
+        }
+        // Test-only: model a completed grant followed by an irrecoverable
+        // cleanup failure without touching the shared host device DACL. The
+        // test asserts that the profile is retained as the SID-reuse guard.
+        if force_cleanup_failure {
+            return Ok(());
+        }
+        let _lock = lock_nul_device_dacl()?;
+        let handle = open_nul_for_dacl()?;
+
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+        let get_result = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old_dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if get_result != ERROR_SUCCESS {
+            if !descriptor.is_null() {
+                LocalFree(descriptor);
+            }
+            CloseHandle(handle);
+            return Err(format!(
+                "could not read {NUL_DEVICE:?} DACL after requesting WRITE_DAC (GetSecurityInfo={get_result}); \
+                 refusing before spawn"
+            ));
+        }
+
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: NUL_DEVICE_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: ac_sid.cast(),
+            },
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let merge_result = SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl);
+        if merge_result != ERROR_SUCCESS {
+            LocalFree(descriptor);
+            CloseHandle(handle);
+            return Err(format!(
+                "could not build the explicit {NUL_DEVICE:?} ACE (SetEntriesInAclW={merge_result}); \
+                 refusing before spawn"
+            ));
+        }
+
+        let set_result = SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        LocalFree(new_dacl.cast());
+        LocalFree(descriptor);
+        CloseHandle(handle);
+        if set_result != ERROR_SUCCESS {
+            return Err(format!(
+                "could not apply the explicit {NUL_DEVICE:?} ACE (SetSecurityInfo={set_result}); \
+                 refusing before spawn"
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_this_launch_nul_ace(ace: &ACCESS_ALLOWED_ACE, ac_sid: *mut std::ffi::c_void) -> bool {
+        if u32::from(ace.Header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+            || ace.Header.AceFlags != NO_INHERITANCE as u8
+            || ace.Mask != NUL_DEVICE_ACCESS
+        {
+            return false;
+        }
+        let ace_sid = std::ptr::addr_of!(ace.SidStart)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+        unsafe { EqualSid(ace_sid, ac_sid) != 0 }
+    }
+
+    /// Remove only the exact ACE created by [`grant_nul_device_access`].
+    ///
+    /// In particular, this does not restore a saved DACL and does not remove a
+    /// broader/narrower ACE for the same SID.  The cross-launch mutex protects
+    /// the device DACL read-modify-write window, so one launch's cleanup cannot
+    /// erase another fresh AppContainer SID's live grant.
+    unsafe fn revoke_nul_device_access(ac_sid: *mut std::ffi::c_void) -> Result<(), String> {
+        if ac_sid.is_null() {
+            return Ok(());
+        }
+        let _lock = lock_nul_device_dacl()?;
+        let handle = open_nul_for_dacl()?;
+
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+        let get_result = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if get_result != ERROR_SUCCESS {
+            if !descriptor.is_null() {
+                LocalFree(descriptor);
+            }
+            CloseHandle(handle);
+            return Err(format!(
+                "could not read {NUL_DEVICE:?} DACL during cleanup (GetSecurityInfo={get_result})"
+            ));
+        }
+
+        let mut matching_ace: Option<u32> = None;
+        if !dacl.is_null() {
+            for index in 0..u32::from((*dacl).AceCount) {
+                let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut raw) == 0 {
+                    LocalFree(descriptor);
+                    CloseHandle(handle);
+                    return Err(format!(
+                        "GetAce({index}) failed while cleaning up {NUL_DEVICE:?}"
+                    ));
+                }
+                let header = &*raw.cast::<ACE_HEADER>();
+                if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
+                    continue;
+                }
+                let ace = &*raw.cast::<ACCESS_ALLOWED_ACE>();
+                if is_this_launch_nul_ace(ace, ac_sid) && matching_ace.replace(index).is_some() {
+                    LocalFree(descriptor);
+                    CloseHandle(handle);
+                    return Err(format!(
+                        "found multiple exact {NUL_DEVICE:?} ACEs for one launch SID; \
+                         refusing ambiguous cleanup"
+                    ));
+                }
+            }
+        }
+
+        let result = if let Some(index) = matching_ace {
+            if DeleteAce(dacl, index) == 0 {
+                Err(format!(
+                    "DeleteAce({index}) failed while cleaning up {NUL_DEVICE:?}: {:?}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                let set_result = SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null_mut(),
+                );
+                if set_result == ERROR_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "could not apply exact {NUL_DEVICE:?} ACE removal (SetSecurityInfo={set_result})"
+                    ))
+                }
+            }
+        } else {
+            // A failed grant may have reached cleanup before `SetSecurityInfo`
+            // completed.  No matching ACE is safe and needs no broader action.
+            Ok(())
+        };
+        LocalFree(descriptor);
+        CloseHandle(handle);
+        result
+    }
+
     /// Grant the AppContainer SID loopback network access (#133, ADR 0016).
     ///
     /// AppContainers cannot connect to the loopback interface (127.0.0.1) by
@@ -430,11 +726,14 @@ mod windows {
         pub container_name: Option<String>,
         pub net_allow: bool,
         pub loopback_exemption: bool,
+        pub nul_device_ace: bool,
         pub no_child_process: bool,
         pub test_inheritable_file_handle: Option<String>,
         pub test_inheritable_pipe_handle: bool,
         pub test_inheritable_socket_handle: bool,
         pub test_force_process_attribute_failure: bool,
+        pub test_force_nul_write_dac_denied: bool,
+        pub test_force_nul_cleanup_failure: bool,
         pub fs_read: Vec<String>,
         pub fs_write: Vec<String>,
         pub exe: String,
@@ -452,11 +751,14 @@ mod windows {
         let mut container_name: Option<String> = None;
         let mut net_allow = false;
         let mut loopback_exemption = false;
+        let mut nul_device_ace = false;
         let mut no_child_process = false;
         let mut test_inheritable_file_handle: Option<String> = None;
         let mut test_inheritable_pipe_handle = false;
         let mut test_inheritable_socket_handle = false;
         let mut test_force_process_attribute_failure = false;
+        let mut test_force_nul_write_dac_denied = false;
+        let mut test_force_nul_cleanup_failure = false;
         let mut fs_read: Vec<String> = Vec::new();
         let mut fs_write: Vec<String> = Vec::new();
         let mut i = 0usize;
@@ -468,6 +770,7 @@ mod windows {
                 }
                 "--net-allow" => net_allow = true,
                 "--loopback-exemption" => loopback_exemption = true,
+                "--nul-device-ace" => nul_device_ace = true,
                 "--no-child-process" => no_child_process = true,
                 "--test-inheritable-file-handle" => {
                     i += 1;
@@ -477,6 +780,12 @@ mod windows {
                 "--test-inheritable-socket-handle" => test_inheritable_socket_handle = true,
                 "--test-force-process-attribute-failure" => {
                     test_force_process_attribute_failure = true;
+                }
+                "--test-force-nul-write-dac-denied" => {
+                    test_force_nul_write_dac_denied = true;
+                }
+                "--test-force-nul-cleanup-failure" => {
+                    test_force_nul_cleanup_failure = true;
                 }
                 "--fs-read" => {
                     i += 1;
@@ -501,11 +810,14 @@ mod windows {
             container_name,
             net_allow,
             loopback_exemption,
+            nul_device_ace,
             no_child_process,
             test_inheritable_file_handle,
             test_inheritable_pipe_handle,
             test_inheritable_socket_handle,
             test_force_process_attribute_failure,
+            test_force_nul_write_dac_denied,
+            test_force_nul_cleanup_failure,
             fs_read,
             fs_write,
             exe: argv[i].clone(),
@@ -521,7 +833,7 @@ mod windows {
                 eprintln!(
                     "usage: agent-bridle-aclaunch [--name <n>] [--net-allow] \
                      [--loopback-exemption] [--no-child-process] [--fs-read <path>]... \
-                     [--fs-write <path>]... <exe> [args...]"
+                     [--fs-write <path>]... [--nul-device-ace] <exe> [args...]"
                 );
                 std::process::exit(code as i32);
             }
@@ -535,11 +847,14 @@ mod windows {
                 &name,
                 parsed.net_allow,
                 parsed.loopback_exemption,
+                parsed.nul_device_ace,
                 parsed.no_child_process,
                 parsed.test_inheritable_file_handle.as_deref(),
                 parsed.test_inheritable_pipe_handle,
                 parsed.test_inheritable_socket_handle,
                 parsed.test_force_process_attribute_failure,
+                parsed.test_force_nul_write_dac_denied,
+                parsed.test_force_nul_cleanup_failure,
                 &parsed.fs_read,
                 &parsed.fs_write,
                 &parsed.exe,
@@ -560,11 +875,14 @@ mod windows {
         name: &str,
         net_allow: bool,
         loopback_exemption: bool,
+        nul_device_ace: bool,
         no_child_process: bool,
         test_inheritable_file_handle: Option<&str>,
         test_inheritable_pipe_handle: bool,
         test_inheritable_socket_handle: bool,
         test_force_process_attribute_failure: bool,
+        test_force_nul_write_dac_denied: bool,
+        test_force_nul_cleanup_failure: bool,
         fs_read: &[String],
         fs_write: &[String],
         exe: &str,
@@ -576,8 +894,10 @@ mod windows {
         let desc_w = to_wide(OsStr::new("agent-bridle AppContainer"));
         let mut ac_sid: *mut std::ffi::c_void = std::ptr::null_mut();
 
-        // 0x800700b7 == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) — if a profile
-        // by this name already exists we can reuse it; the SID is stable.
+        // 0x800700b7 == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS). A profile
+        // name deterministically identifies its SID. Never reuse a still-live
+        // profile: an interrupted or failed NUL-device cleanup may have left an
+        // ACE for that SID, and recreating it would reactivate the host grant.
         let hr = CreateAppContainerProfile(
             name_w.as_ptr(),
             display_w.as_ptr(),
@@ -586,7 +906,8 @@ mod windows {
             0,
             &mut ac_sid,
         );
-        if hr != 0 && hr != -2_147_024_713i32 {
+        let existing_profile = hr == HRESULT_ERROR_ALREADY_EXISTS;
+        if hr != 0 && !existing_profile {
             eprintln!(
                 "agent-bridle-aclaunch: CreateAppContainerProfile({name:?}) failed: \
                  HRESULT={hr:#010x}"
@@ -594,10 +915,30 @@ mod windows {
             std::process::exit(1);
         }
         if ac_sid.is_null() {
+            if nul_device_ace {
+                eprintln!(
+                    "agent-bridle-aclaunch: --nul-device-ace requires a fresh unique --name; \
+                     AppContainer profile {name:?} did not return a fresh SID and cannot \
+                     safely own a per-launch device ACE"
+                );
+                std::process::exit(1);
+            }
             eprintln!("agent-bridle-aclaunch: AppContainer SID is null after profile creation");
             std::process::exit(1);
         }
 
+        if existing_profile && nul_device_ace {
+            // The system does not return a fresh SID for an existing profile.
+            // The opt-in must never attach a per-launch device ACE to an
+            // existing deterministic SID, even if a future Windows release
+            // happens to return one here.
+            FreeSid(ac_sid);
+            eprintln!(
+                "agent-bridle-aclaunch: --nul-device-ace requires a fresh unique --name; \
+                 existing AppContainer profile {name:?} would make per-launch cleanup ambiguous"
+            );
+            std::process::exit(1);
+        }
         // Test-only canary for #319: create a deliberately inheritable launcher
         // HANDLE. The child receives only its numeric value; whether it can use
         // the HANDLE depends solely on process creation inheritance policy.
@@ -918,6 +1259,58 @@ mod windows {
         }
         startup_info_ex.lpAttributeList = attr_list;
 
+        // 4b. Native Git for Windows currently opens `\\.\NUL` independently
+        // of its inherited stdio handles (#408).  This is an explicit,
+        // default-off compatibility escape hatch: grant one exact ACE to this
+        // fresh AppContainer SID immediately before spawning, then remove that
+        // exact ACE on both the CreateProcess failure path and normal exit.
+        // It is intentionally later than every other setup failure so there is
+        // no unbracketed `process::exit` after the host-device DACL mutation.
+        let nul_device_ace_granted = if nul_device_ace {
+            match grant_nul_device_access(
+                ac_sid,
+                test_force_nul_write_dac_denied,
+                test_force_nul_cleanup_failure,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!(
+                        "agent-bridle-aclaunch: {error}; refusing before spawn without a NUL-device fallback"
+                    );
+                    // The forced WRITE_DAC seam returns before any device
+                    // access. For a real SetSecurityInfo failure, defensively
+                    // remove an exact matching ACE in case the OS reports an
+                    // ambiguous partial application.
+                    let nul_cleanup_failed = if test_force_nul_write_dac_denied {
+                        false
+                    } else {
+                        match revoke_nul_device_access(ac_sid) {
+                            Ok(()) => false,
+                            Err(cleanup_error) => {
+                                eprintln!(
+                                    "agent-bridle-aclaunch: cleanup after failed NUL-device ACE grant also failed: {cleanup_error}"
+                                );
+                                true
+                            }
+                        }
+                    };
+                    DeleteProcThreadAttributeList(attr_list);
+                    revoke_path_grants(fs_grants, ac_sid);
+                    if loopback_exemption {
+                        restore_loopback_exemption(loopback_prev, loopback_prev_count);
+                    }
+                    if nul_cleanup_failed {
+                        retain_profile_after_nul_cleanup_failure(name, ac_sid);
+                    } else {
+                        do_cleanup(name, ac_sid);
+                    }
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            false
+        };
+
         let mut cmd_line = build_cmdline(exe, child_args);
         let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
 
@@ -943,11 +1336,33 @@ mod windows {
                 "agent-bridle-aclaunch: CreateProcessW({exe:?}) failed: {:?}",
                 std::io::Error::last_os_error()
             );
+            let nul_cleanup_failed = if nul_device_ace_granted {
+                let cleanup = if test_force_nul_cleanup_failure {
+                    Err("forced NUL-device ACE cleanup failure".to_string())
+                } else {
+                    revoke_nul_device_access(ac_sid)
+                };
+                match cleanup {
+                    Ok(()) => false,
+                    Err(error) => {
+                        eprintln!(
+                            "agent-bridle-aclaunch: cleanup could not revoke this launch's NUL-device ACE: {error}"
+                        );
+                        true
+                    }
+                }
+            } else {
+                false
+            };
             revoke_path_grants(fs_grants, ac_sid);
             if loopback_exemption {
                 restore_loopback_exemption(loopback_prev, loopback_prev_count);
             }
-            do_cleanup(name, ac_sid);
+            if nul_cleanup_failed {
+                retain_profile_after_nul_cleanup_failure(name, ac_sid);
+            } else {
+                do_cleanup(name, ac_sid);
+            }
             std::process::exit(1);
         }
 
@@ -960,18 +1375,63 @@ mod windows {
         GetExitCodeProcess(proc_info.hProcess as HANDLE, &mut exit_code);
         CloseHandle(proc_info.hProcess as HANDLE);
 
-        // 7a. Revoke this profile SID's explicit fs ACEs.
+        // 7a. Revoke only this launch's exact NUL-device ACE. Treat a failure
+        // as a launcher failure even if the child succeeded: otherwise the
+        // caller could mistake a residual host-device grant for a clean exit.
+        let nul_cleanup_failed = if nul_device_ace_granted {
+            let cleanup = if test_force_nul_cleanup_failure {
+                Err("forced NUL-device ACE cleanup failure".to_string())
+            } else {
+                revoke_nul_device_access(ac_sid)
+            };
+            match cleanup {
+                Ok(()) => false,
+                Err(error) => {
+                    eprintln!(
+                        "agent-bridle-aclaunch: cleanup could not revoke this launch's NUL-device ACE: {error}"
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
+
+        // 7b. Revoke this profile SID's explicit fs ACEs.
         revoke_path_grants(fs_grants, ac_sid);
 
-        // 7b. Restore loopback exemption list if we modified it.
+        // 7c. Restore loopback exemption list if we modified it.
         if loopback_exemption {
             restore_loopback_exemption(loopback_prev, loopback_prev_count);
         }
 
-        // 7c. Cleanup: free SIDs and delete the profile.
-        do_cleanup(name, ac_sid);
+        // 7d. Cleanup: a failed NUL revocation retains the profile as the
+        // deterministic-SID reuse guard; all other paths delete it normally.
+        if nul_cleanup_failed {
+            retain_profile_after_nul_cleanup_failure(name, ac_sid);
+        } else {
+            do_cleanup(name, ac_sid);
+        }
 
-        exit_code
+        if nul_cleanup_failed {
+            1
+        } else {
+            exit_code
+        }
+    }
+
+    /// Free the returned SID but deliberately retain the profile after a NUL
+    /// cleanup failure. Its still-existing profile blocks a later launcher
+    /// invocation from recreating the deterministic SID and inheriting a
+    /// residual device ACE.
+    unsafe fn retain_profile_after_nul_cleanup_failure(name: &str, ac_sid: *mut std::ffi::c_void) {
+        if !ac_sid.is_null() {
+            FreeSid(ac_sid);
+        }
+        eprintln!(
+            "agent-bridle-aclaunch: retaining AppContainer profile {name:?} after NUL-device \
+             ACE cleanup failure; a later launch with this name is refused to prevent SID reuse"
+        );
     }
 
     unsafe fn do_cleanup(name: &str, ac_sid: *mut std::ffi::c_void) {
@@ -1019,11 +1479,14 @@ mod windows {
                     container_name: None,
                     net_allow: false,
                     loopback_exemption: false,
+                    nul_device_ace: false,
                     no_child_process: false,
                     test_inheritable_file_handle: None,
                     test_inheritable_pipe_handle: false,
                     test_inheritable_socket_handle: false,
                     test_force_process_attribute_failure: false,
+                    test_force_nul_write_dac_denied: false,
+                    test_force_nul_cleanup_failure: false,
                     fs_read: vec![],
                     fs_write: vec![],
                     exe: "cmd.exe".to_string(),
@@ -1039,8 +1502,10 @@ mod windows {
                 "ab42",
                 "--net-allow",
                 "--loopback-exemption",
+                "--nul-device-ace",
                 "--no-child-process",
                 "--test-inheritable-socket-handle",
+                "--test-force-nul-cleanup-failure",
                 "--fs-write",
                 "C:/ws",
                 "--fs-read",
@@ -1052,11 +1517,13 @@ mod windows {
             ]))
             .expect("parses");
             assert_eq!(a.container_name.as_deref(), Some("ab42"));
-            assert!(a.net_allow && a.loopback_exemption && a.no_child_process);
+            assert!(a.net_allow && a.loopback_exemption && a.nul_device_ace && a.no_child_process);
             assert_eq!(a.test_inheritable_file_handle, None);
             assert!(!a.test_inheritable_pipe_handle);
             assert!(a.test_inheritable_socket_handle);
             assert!(!a.test_force_process_attribute_failure);
+            assert!(!a.test_force_nul_write_dac_denied);
+            assert!(a.test_force_nul_cleanup_failure);
             assert_eq!(a.fs_write, v(&["C:/ws"]));
             assert_eq!(a.fs_read, v(&["C:/etc", "C:/lib"]));
             assert_eq!(a.exe, "child.exe");
