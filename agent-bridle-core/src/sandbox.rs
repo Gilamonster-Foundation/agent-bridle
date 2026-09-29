@@ -3201,6 +3201,21 @@ mod seatbelt_impl {
     /// unresolvable grant is dropped — it cannot anchor a rule, so the program
     /// stays denied (fail-closed). `All` yields nothing (callers pass a restricted
     /// axis). Results are sorted+deduped so the emitted profile is deterministic.
+    ///
+    /// **macOS's system `git` re-execs itself through the active developer
+    /// toolchain (agent-bridle#408).** `/usr/bin/git` is not git — it is a
+    /// small root-owned locator stub that re-execs the real binary under
+    /// `/Applications/Xcode.app/Contents/Developer/…` or
+    /// `/Library/Developer/CommandLineTools/…`. Under a restricted exec axis
+    /// that re-exec is itself a kernel-checked `process-exec`, so a grant of
+    /// `["git"]` alone denies EVERY git invocation, not just worktree's
+    /// internal helpers (confirmed live: `git --version` fails with `can't
+    /// exec '/Applications/.../usr/bin/git' (errno=Operation not
+    /// permitted)`). [`git_toolchain_redirect_targets`] folds in the matching
+    /// toolchain binary, execution-free — see its doc comment for why this is
+    /// a narrower fix than Linux's #2630 (no static convention lets it be
+    /// *derived* from the grant; it is matched against a fixed, checked list
+    /// instead).
     fn resolve_exec_targets(scope: &Scope<String>) -> Vec<String> {
         let Scope::Only(set) = scope else {
             return Vec::new();
@@ -3208,6 +3223,7 @@ mod seatbelt_impl {
         let canon_file = |path: &Path, out: &mut Vec<String>| {
             if let Ok(c) = std::fs::canonicalize(path) {
                 if c.is_file() {
+                    out.extend(git_toolchain_redirect_targets(&c));
                     out.push(c.to_string_lossy().into_owned());
                 }
             }
@@ -3240,6 +3256,129 @@ mod seatbelt_impl {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Fixed, well-known Apple toolchain roots that ship their own `git`
+    /// binary, reached indirectly through `/usr/bin/git`'s locator-stub
+    /// redirect (agent-bridle#408, #2630's macOS leg). Unlike Linux's
+    /// `GIT_EXEC_PATH_CANDIDATES` (a fixed *relative* suffix derivable from
+    /// the granted binary's own directory), there is no such derivation here:
+    /// the stub's actual redirect target is "whichever developer directory
+    /// `xcode-select` currently points at", and learning that is either an
+    /// exec (`xcrun`/`xcode-select -p` — forbidden, same rule as #2630 round
+    /// 2) or an env read (`DEVELOPER_DIR` — forbidden, or a hostile value in
+    /// the CONFINED CHILD's own environment could steer what gets admitted).
+    /// `/var/db/xcode_select_link`, the one symlink that would answer this
+    /// without either, does not exist on a full-Xcode install (confirmed
+    /// live on macOS 15 / Xcode 26.3). So this list is deliberately the
+    /// narrowest HONEST option, not a full solve: admit each fixed root's own
+    /// `usr/bin/git` when it independently passes the same live
+    /// root-owned/unwritable ancestry bar every other trust decision here
+    /// uses — never executed, never read from env, both admitted if both
+    /// happen to be installed. A toolchain living anywhere else still fails
+    /// exactly as it did before this fix (fail closed, never wrongly
+    /// permissive).
+    const GIT_TOOLCHAIN_ROOTS: &[&str] = &[
+        "/Applications/Xcode.app/Contents/Developer",
+        "/Library/Developer/CommandLineTools",
+    ];
+
+    /// If `canon_git_bin` is a `git` binary living directly inside one of
+    /// [`TRUSTED_EXEC_DIRS`], return the [`GIT_TOOLCHAIN_ROOTS`] entries whose
+    /// own `usr/bin/git` passes [`ancestry_is_root_owned_and_unwritable`] —
+    /// the toolchain binary(ies) `/usr/bin/git`'s locator-stub redirect can
+    /// land on. Empty for a grant that isn't a trusted system `git` stub, or
+    /// when no fixed root's git passes the ancestry check.
+    ///
+    /// **Never executes `canon_git_bin` or anything else.** The only
+    /// filesystem operations are `canonicalize` and `symlink_metadata` (via
+    /// [`ancestry_is_root_owned_and_unwritable`]) — no `exec`, no
+    /// `std::env::var`/`var_os` call anywhere in this function.
+    ///
+    /// git's own internal exec-path aliases (`git-branch`, `git-commit`, …)
+    /// need no separate entry once the toolchain binary itself is admitted:
+    /// on macOS they are themselves symlinks to `<root>/usr/bin/git`
+    /// (confirmed live: `.../usr/libexec/git-core/git-branch -> ../../bin/git`),
+    /// and Seatbelt's `process-exec*` matches the *resolved* target — so the
+    /// one canonical binary already covers them (verified live: `git
+    /// worktree add` succeeds with exactly the stub plus this one extra
+    /// literal, no `git-core` entries admitted at all).
+    fn git_toolchain_redirect_targets(canon_git_bin: &Path) -> Vec<String> {
+        if canon_git_bin.file_name().and_then(|n| n.to_str()) != Some("git") {
+            return Vec::new();
+        }
+        let is_trusted_stub = canon_git_bin.parent().is_some_and(|bin_dir| {
+            TRUSTED_EXEC_DIRS
+                .iter()
+                .any(|trusted| std::fs::canonicalize(trusted).is_ok_and(|c| c == bin_dir))
+        });
+        if !is_trusted_stub || !ancestry_is_root_owned_and_unwritable(canon_git_bin) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for root in GIT_TOOLCHAIN_ROOTS {
+            let Ok(candidate) = Path::new(root).join("usr/bin/git").canonicalize() else {
+                continue;
+            };
+            if candidate == *canon_git_bin {
+                continue; // same path as the granted binary — nothing extra to add.
+            }
+            if ancestry_is_root_owned_and_unwritable(&candidate) {
+                out.push(candidate.to_string_lossy().into_owned());
+            }
+        }
+        out
+    }
+
+    /// The subset of a filesystem object's identity the ancestry walk needs:
+    /// owning uid and permission mode. The Seatbelt analog of the same seam
+    /// in the Landlock git-exec-path fix (agent-bridle#407, #2630 round 3),
+    /// duplicated here rather than shared because that module compiles only
+    /// under `target_os = "linux"`. Broken out as plain data so the walk
+    /// itself ([`ancestry_passes`]) can be driven by either live
+    /// `symlink_metadata` (production) or a synthetic lookup (tests).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct OwnerMode {
+        uid: u32,
+        mode: u32,
+    }
+
+    /// The actual ancestry walk: `path` and every ancestor up to and
+    /// including `/` must each pass `lookup` as root-owned (`uid == 0`) and
+    /// not group/other-writable (`mode & 0o022 == 0`). `lookup` returning
+    /// `None` fails closed. Both production
+    /// ([`ancestry_is_root_owned_and_unwritable`], backed by live
+    /// `symlink_metadata`) and the adversarial unit tests (backed by a
+    /// synthetic `HashMap`) call this SAME function.
+    fn ancestry_passes(path: &Path, lookup: &dyn Fn(&Path) -> Option<OwnerMode>) -> bool {
+        let Some(meta) = lookup(path) else {
+            return false;
+        };
+        if meta.uid != 0 || (meta.mode & 0o022) != 0 {
+            return false;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => ancestry_passes(parent, lookup),
+            _ => true,
+        }
+    }
+
+    /// `true` iff `path` itself AND every ancestor directory up to and
+    /// including `/` is owned by root (uid 0) and carries no group- or
+    /// other-write bit. Rejects a trusted-looking leaf sitting under a
+    /// writable grandparent. `path` must already be canonicalized by the
+    /// caller — this checks the object at that path, not what a symlink
+    /// there might point to (`symlink_metadata`, not `metadata`, via
+    /// [`ancestry_passes`]'s `lookup`), so a still-symlinked path fails
+    /// closed.
+    fn ancestry_is_root_owned_and_unwritable(path: &Path) -> bool {
+        ancestry_passes(path, &|p| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).ok().map(|m| OwnerMode {
+                uid: m.uid(),
+                mode: m.mode(),
+            })
+        })
     }
 
     /// Resolve `p` to an absolute, symlink-free path suitable for `(subpath …)`
@@ -3912,6 +4051,189 @@ mod seatbelt_impl {
             // exec:All (the default) is ambient on the exec axis — no rules.
             let prof = seatbelt_profile(&Caveats::top());
             assert!(!prof.contains("process-exec"), "{prof}");
+        }
+    }
+
+    /// agent-bridle#408 (macOS leg of #2630): `resolve_exec_targets` never
+    /// executes a grant-selected binary while computing the toolchain-redirect
+    /// allow-list, and only trusts a directory whose LIVE permissions it has
+    /// checked.
+    #[cfg(test)]
+    mod git_exec_chain_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn unique_dir(tag: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let mut d = std::env::temp_dir();
+            d.push(format!(
+                "ab-408-{}-{}-{}",
+                tag,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn write_executable_marker_script(path: &std::path::Path, marker: &std::path::Path) {
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch \"{}\"\necho /nonexistent/hostile-toolchain\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// The real system `git` (if present at a trusted location) resolves
+        /// into one of the fixed toolchain roots — proving the fold-in fires
+        /// for the actual on-host redirect, not just synthetic fixtures.
+        #[test]
+        fn a_real_trusted_git_grant_admits_its_toolchain_redirect() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a TRUSTED_EXEC_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_targets(&Scope::only([git.to_string()]));
+            assert!(
+                resolved.iter().any(|p| p == git),
+                "the git stub itself must still be admitted: {resolved:?}"
+            );
+            let has_toolchain_hit = GIT_TOOLCHAIN_ROOTS.iter().any(|root| {
+                Path::new(root)
+                    .join("usr/bin/git")
+                    .canonicalize()
+                    .is_ok_and(|c| resolved.iter().any(|p| p == &c.to_string_lossy()))
+            });
+            if !has_toolchain_hit {
+                eprintln!(
+                    "skipping strict assertion: no known toolchain root installed on this host"
+                );
+                return;
+            }
+            assert!(
+                has_toolchain_hit,
+                "git's toolchain redirect target must be folded in: {resolved:?}"
+            );
+        }
+
+        /// A `git`-named binary OUTSIDE `TRUSTED_EXEC_DIRS` — a repo-local
+        /// `./tools/git`-style plant — gets no toolchain redirect, and (the
+        /// load-bearing assertion) is never executed while resolution decides
+        /// that: a marker-writing stand-in script proves it was never run.
+        #[test]
+        fn a_git_outside_trusted_dirs_gets_no_redirect_and_is_never_executed() {
+            let dir = unique_dir("outside-trusted");
+            let marker = dir.join("was-executed");
+            let fake_git = dir.join("git");
+            write_executable_marker_script(&fake_git, &marker);
+
+            let resolved =
+                resolve_exec_targets(&Scope::only([fake_git.to_string_lossy().into_owned()]));
+
+            assert!(
+                !marker.exists(),
+                "a git outside the trusted dirs must NEVER be executed during resolution"
+            );
+            let canon_fake_git = fake_git.canonicalize().unwrap();
+            assert_eq!(
+                resolved,
+                vec![canon_fake_git.to_string_lossy().into_owned()],
+                "an untrusted git must admit only itself, no toolchain redirect: {resolved:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A hostile ambient `DEVELOPER_DIR`/`GIT_EXEC_PATH` is irrelevant by
+        // construction: neither `resolve_exec_targets` nor
+        // `git_toolchain_redirect_targets` calls `std::env::var`/`var_os`
+        // anywhere — there is nothing in either function body that reads
+        // them, so no in-process env mutation is needed to prove it (that
+        // would only race every other test in this binary for no coverage,
+        // per bridle PR #407 review finding 4). The end-to-end, real-kernel
+        // proof that a hostile env in the CONFINED CHILD's own environment
+        // cannot widen the allow-list lives in
+        // `seatbelt_kernel_tests::hostile_developer_dir_env_does_not_extend_the_git_grant`.
+
+        /// A directory that LOOKS like a toolchain root but is writable by
+        /// non-root must not be trusted — an attacker who can write there
+        /// could plant a binary the kernel would then be told to allow.
+        #[test]
+        fn a_group_writable_candidate_directory_is_not_trusted() {
+            let dir = unique_dir("writable-root");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&dir),
+                "a world-writable directory must never be trusted, regardless of owner"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `ancestry_is_root_owned_and_unwritable` walks the FULL ancestor
+        /// chain, not just the immediate parent — a writable grandparent must
+        /// still fail a root-owned leaf. Driven through the same
+        /// `ancestry_passes` traversal via a synthetic lookup so the walk
+        /// itself, not a parallel reimplementation, is what's under test.
+        #[test]
+        fn ancestry_walk_rejects_a_writable_grandparent_even_with_a_root_owned_leaf() {
+            use std::collections::HashMap;
+            let root_owned = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let writable = OwnerMode {
+                uid: 0,
+                mode: 0o777,
+            };
+            let leaf = Path::new("/grandparent-writable/trusted/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned);
+            fixture.insert(leaf.parent().unwrap().to_path_buf(), root_owned);
+            fixture.insert(
+                leaf.parent().unwrap().parent().unwrap().to_path_buf(),
+                writable,
+            );
+            fixture.insert(Path::new("/").to_path_buf(), root_owned);
+            let lookup = |p: &Path| fixture.get(p).copied();
+            assert!(
+                !ancestry_passes(leaf, &lookup),
+                "a writable grandparent must fail the leaf's ancestry, even though the leaf \
+                 and its immediate parent are individually root-owned and unwritable"
+            );
+
+            // A fully root-owned, fully unwritable chain passes.
+            let mut clean = fixture.clone();
+            clean.insert(
+                leaf.parent().unwrap().parent().unwrap().to_path_buf(),
+                root_owned,
+            );
+            let lookup_clean = |p: &Path| clean.get(p).copied();
+            assert!(ancestry_passes(leaf, &lookup_clean));
+        }
+
+        #[test]
+        fn same_image_git_stub_is_never_treated_as_its_own_redirect() {
+            // The stub and a candidate that happens to canonicalize to the
+            // exact same path must not be double-admitted or treated as a
+            // "found" redirect — `git_toolchain_redirect_targets` explicitly
+            // skips a candidate equal to the granted binary itself.
+            let dir = unique_dir("same-path");
+            let git = dir.join("git");
+            std::fs::write(&git, b"not real git\n").unwrap();
+            let out = git_toolchain_redirect_targets(&git);
+            assert!(
+                out.is_empty(),
+                "a non-trusted-dir git must never yield a redirect target: {out:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -6351,6 +6673,215 @@ print(d.value())
             status.success(),
             "an allow-listed dynamic binary must load + run under exec confinement"
         );
+    }
+
+    /// A hermetically-configured, optionally Seatbelt-wrapped `git` `Command`:
+    /// no inherited environment beyond what's explicitly set here. Mirrors
+    /// `landlock_kernel_tests::hermetic_git_command` (bridle PR #407 review,
+    /// P1-3/P2-4) — the pre-push hook sets `GIT_DIR` in ITS OWN environment
+    /// (pointing at this repository), and an unscrubbed test process inherits
+    /// it regardless of `current_dir()`, silently operating on the real
+    /// repository instead of the synthetic fixture; `env_clear()` (not a
+    /// denylist of individually-removed vars) closes the whole class.
+    /// `prefix` is either empty (the plain unconfined fixture setup) or the
+    /// `sandbox-exec -p <profile>` wrapper `SeatbeltSandbox::command_prefix`
+    /// built — always absolute-path invocations, so clearing `PATH` too is
+    /// safe.
+    fn hermetic_git_command(
+        prefix: &[String],
+        git: &str,
+        dir: &Path,
+        home: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Command {
+        let mut cmd = if prefix.is_empty() {
+            std::process::Command::new(git)
+        } else {
+            let mut c = std::process::Command::new(&prefix[0]);
+            c.args(&prefix[1..]).arg(git);
+            c
+        };
+        cmd.current_dir(dir);
+        cmd.env_clear();
+        cmd.env("HOME", home);
+        cmd.env("GIT_AUTHOR_NAME", "t");
+        cmd.env("GIT_AUTHOR_EMAIL", "t@example.invalid");
+        cmd.env("GIT_COMMITTER_NAME", "t");
+        cmd.env("GIT_COMMITTER_EMAIL", "t@example.invalid");
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        cmd.env("GIT_TEMPLATE_DIR", "/dev/null");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// agent-bridle#408 — the macOS/Seatbelt twin of bridle PR #407: a REAL
+    /// kernel-confined `git worktree add` under `exec: Only(["git"])` now
+    /// succeeds. Confirmed red first (pre-fix `resolve_exec_targets`, no
+    /// toolchain redirect fold-in): `fatal: cannot exec
+    /// '/Applications/Xcode.app/Contents/Developer/usr/bin/git': Operation
+    /// not permitted` (git's own re-exec of the active toolchain binary,
+    /// denied at the kernel `process-exec*` check before worktree logic ever
+    /// runs — even `git --version` fails the same way under the pre-fix
+    /// resolver).
+    #[test]
+    fn git_worktree_add_succeeds_under_a_git_only_exec_grant() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let main = unique_dir("git-wt-main");
+        let wt = unique_dir("git-wt-out");
+        let _ = fs::remove_dir_all(&wt); // `worktree add` requires the target not exist yet.
+        let home = unique_dir("git-wt-home");
+
+        assert!(
+            hermetic_git_command(&[], git, &main, &home, &[])
+                .args(["init", "-q"])
+                .status()
+                .expect("spawn git init")
+                .success(),
+            "unconfined git init must succeed"
+        );
+        assert!(
+            hermetic_git_command(&[], git, &main, &home, &[])
+                .args(["commit", "--allow-empty", "-q", "-m", "init"])
+                .status()
+                .expect("spawn git commit")
+                .success(),
+            "unconfined git commit must succeed"
+        );
+
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(&cav)
+            .expect("a restricted exec axis must yield a wrapper prefix");
+        let status = hermetic_git_command(&prefix, git, &main, &home, &[])
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "task-408",
+            ])
+            .status()
+            .expect("spawn confined worktree add");
+        assert!(
+            status.success(),
+            "git worktree add must succeed under a git-only exec grant (agent-bridle#408)"
+        );
+        assert!(
+            wt.join(".git").exists(),
+            "the new worktree must actually have been created"
+        );
+
+        let _ = fs::remove_dir_all(&main);
+        let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// agent-bridle#408, P2: a hostile `DEVELOPER_DIR`/`GIT_EXEC_PATH` set ONLY
+    /// in the CONFINED CHILD's own environment (never a global/process
+    /// mutation — each test spawns its own subprocess) must not extend or
+    /// redirect the grant: `git_toolchain_redirect_targets` never reads
+    /// either variable, so the confined `worktree add` must still resolve
+    /// (and succeed) against the REAL toolchain, and the hostile fake
+    /// toolchain's `git` — a marker-writing stand-in — must never run.
+    #[test]
+    fn hostile_developer_dir_env_does_not_extend_the_git_grant() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let main = unique_dir("git-hostile-main");
+        let wt = unique_dir("git-hostile-out");
+        let _ = fs::remove_dir_all(&wt);
+        let home = unique_dir("git-hostile-home");
+        let fake_dev = unique_dir("git-hostile-fake-dev");
+        let marker = fake_dev.join("was-executed");
+        fs::create_dir_all(fake_dev.join("usr/bin")).unwrap();
+        fs::write(
+            fake_dev.join("usr/bin/git"),
+            format!("#!/bin/sh\ntouch \"{}\"\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(
+            fake_dev.join("usr/bin/git"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        hermetic_git_command(&[], git, &main, &home, &[])
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git init");
+        hermetic_git_command(&[], git, &main, &home, &[])
+            .args(["commit", "--allow-empty", "-q", "-m", "init"])
+            .status()
+            .expect("spawn git commit");
+
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(&cav)
+            .expect("a restricted exec axis must yield a wrapper prefix");
+        let fake_exec_path = fake_dev.join("usr/libexec/git-core");
+        let status = hermetic_git_command(
+            &prefix,
+            git,
+            &main,
+            &home,
+            &[
+                ("DEVELOPER_DIR", fake_dev.to_str().unwrap()),
+                ("GIT_EXEC_PATH", fake_exec_path.to_str().unwrap()),
+            ],
+        )
+        .args([
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "task-408-hostile",
+        ])
+        .status()
+        .expect("spawn confined worktree add");
+
+        assert!(
+            !marker.exists(),
+            "a hostile DEVELOPER_DIR/GIT_EXEC_PATH must never be executed"
+        );
+        assert!(
+            status.success(),
+            "the grant must resolve against the REAL toolchain regardless of a hostile \
+             DEVELOPER_DIR/GIT_EXEC_PATH set only in the child's own environment"
+        );
+
+        let _ = fs::remove_dir_all(&main);
+        let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&fake_dev);
     }
 }
 
