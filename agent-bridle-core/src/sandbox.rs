@@ -4415,8 +4415,7 @@ mod seatbelt_impl {
                 uid: 0,
                 mode: 0o775, // root:admin, group-writable, no other-write
             };
-            let leaf =
-                Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let leaf = Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
             let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
             fixture.insert(leaf.to_path_buf(), root_owned_leaf);
             let mut anc = leaf.parent();
@@ -4493,8 +4492,7 @@ mod seatbelt_impl {
                 uid: 0,
                 mode: 0o777, // group AND other writable
             };
-            let leaf =
-                Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let leaf = Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
             let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
             fixture.insert(leaf.to_path_buf(), root_owned_leaf);
             let mut anc = leaf.parent();
