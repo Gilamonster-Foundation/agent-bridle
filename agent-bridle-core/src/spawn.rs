@@ -1000,7 +1000,7 @@ impl SandboxedWorker {
         } else {
             let effective = cx.caveats().clone();
             let available = best_available_sandbox(&command.sandbox_policy).kind();
-            let reported = effective_sandbox_kind(available, &effective);
+            let reported = crate::effective_sandbox_kind(available, &effective);
             #[cfg(not(target_os = "linux"))]
             let _ = reported;
             #[cfg(target_os = "linux")]
