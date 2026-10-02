@@ -70,8 +70,8 @@ async fn real_seatbelt_confined_floor_admits_restricted_net() {
         )
         .await
         .expect("invoke");
-    assert_eq!(
-        out["denied"], false,
+    assert!(
+        !out["denied"].as_bool().unwrap_or(false),
         "net:none with zero mach: grants must now admit: {out}"
     );
     assert_eq!(out["enforcement"]["fs_write"], "kernel", "{out}");

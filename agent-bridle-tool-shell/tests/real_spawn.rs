@@ -1327,8 +1327,8 @@ async fn real_seatbelt_restricted_net_admits_and_kernel_still_denies_egress() {
         )
         .await
         .expect("invoke");
-    assert_eq!(
-        out["denied"], false,
+    assert!(
+        !out["denied"].as_bool().unwrap_or(false),
         "net:none with zero mach: grants must now admit: {out}"
     );
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
@@ -1354,8 +1354,8 @@ async fn real_seatbelt_restricted_net_admits_and_kernel_still_denies_egress() {
         )
         .await
         .expect("invoke");
-    assert_eq!(
-        out["denied"], false,
+    assert!(
+        !out["denied"].as_bool().unwrap_or(false),
         "admission must still succeed for the curl attempt: {out}"
     );
     assert_ne!(

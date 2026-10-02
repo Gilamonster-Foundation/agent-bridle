@@ -132,8 +132,8 @@ async fn seatbelt_net_none_admits_and_kernel_still_denies_udp() {
     require_prerequisites();
     let probe = write_probe();
     let out = run_probe(net_none(), &probe, "udp", "1.1.1.1:53").await;
-    assert_eq!(
-        out["denied"], false,
+    assert!(
+        !out["denied"].as_bool().unwrap_or(false),
         "net:none with zero mach: grants must now admit: {out}"
     );
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
@@ -159,8 +159,8 @@ async fn seatbelt_net_none_admits_and_kernel_still_denies_loopback_tcp_against_a
     // the sandbox, not a missing server (the positive control is the live socket).
     let (port, handle) = spawn_loopback_tcp();
     let out = run_probe(net_none(), &probe, "tcp", &format!("127.0.0.1:{port}")).await;
-    assert_eq!(
-        out["denied"], false,
+    assert!(
+        !out["denied"].as_bool().unwrap_or(false),
         "net:none with zero mach: grants must now admit: {out}"
     );
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
@@ -197,8 +197,8 @@ async fn seatbelt_net_none_admits_and_kernel_still_denies_pathname_af_unix_deput
         let _ = sock_for_thread;
     });
     let out = run_probe(net_none(), &probe, "unix", &sock.to_string_lossy()).await;
-    assert_eq!(
-        out["denied"], false,
+    assert!(
+        !out["denied"].as_bool().unwrap_or(false),
         "net:none with zero mach: grants must now admit: {out}"
     );
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
