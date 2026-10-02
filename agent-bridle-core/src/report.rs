@@ -2009,16 +2009,27 @@ mod tests {
 
         // macOS (agent-bridle#405 / ADR 0015 amendment E6): the contract's
         // `net: none` with zero `mach:` grants is now a complete witness
-        // wherever the deputy audit is Complete — admits instead of refusing.
-        // Elsewhere (the audit only exists on macOS), unchanged: refuses.
+        // wherever the deputy audit is Complete, the spawn declares audited
+        // stdio, and the caller is unprivileged (agent-bridle#416 round 2)
+        // — admits instead of refusing. Elsewhere, unchanged: refuses. The
+        // bare, Unaudited-by-default conversion must keep refusing even when
+        // the audit is complete (round-2 review item 1).
         let seatbelt = ConfinementMechanism::backend(SandboxKind::Seatbelt);
-        if crate::sandbox::seatbelt_mach_deputy_audit_complete() {
+        let seatbelt_audited = seatbelt.with_stdio_posture(StdioPosture::Audited);
+        assert!(
+            refuses_on(seatbelt, ConfinedAxis::Net),
+            "the bare, Unaudited-by-default mechanism must never satisfy CONFINED net"
+        );
+        if crate::sandbox::seatbelt_mach_deputy_audit_complete()
+            && crate::sandbox::seatbelt_caller_is_unprivileged()
+        {
             assert!(
-                admits(seatbelt),
-                "deny-all, zero-grant net now satisfies CONFINED where the audit is complete"
+                admits(seatbelt_audited),
+                "deny-all, zero-grant net with audited stdio now satisfies CONFINED \
+                 where the audit is complete and the caller is unprivileged"
             );
         } else {
-            assert!(refuses_on(seatbelt, ConfinedAxis::Net));
+            assert!(refuses_on(seatbelt_audited, ConfinedAxis::Net));
         }
 
         // Windows: AppContainer independently kernel-denies egress (no net SIDs)
@@ -2182,19 +2193,32 @@ mod tests {
 
         // Seatbelt: fs/exec meet their floors. net is this contract's deny-all,
         // zero-grant shape — agent-bridle#405/ADR 0015 amendment E6 now proves
-        // it deputy-complete wherever `MACH_DEPUTY_AUDIT` is `Complete` (macOS),
-        // so the contract now ADMITS there; elsewhere (the audit only exists on
-        // macOS) it still refuses on net, unchanged.
-        let seatbelt_unmet_axis =
+        // it deputy-complete wherever `MACH_DEPUTY_AUDIT` is `Complete` (macOS)
+        // AND the spawn declares audited stdio AND the caller is unprivileged
+        // (agent-bridle#416 round 2), so the contract ADMITS only under an
+        // explicitly audited mechanism there; elsewhere, or for the bare
+        // Unaudited-by-default conversion, it still refuses on net, unchanged.
+        let bare_unmet_axis =
             unenforceable_axis(&caveats, SandboxKind::Seatbelt, floor).map(|u| u.axis);
-        if crate::sandbox::seatbelt_mach_deputy_audit_complete() {
+        assert_eq!(
+            bare_unmet_axis,
+            Some(ConfinedAxis::Net),
+            "the bare, Unaudited-by-default mechanism must never satisfy CONFINED net"
+        );
+        let audited = ConfinementMechanism::backend(SandboxKind::Seatbelt)
+            .with_stdio_posture(StdioPosture::Audited);
+        let audited_unmet_axis = unenforceable_axis(&caveats, audited, floor).map(|u| u.axis);
+        if crate::sandbox::seatbelt_mach_deputy_audit_complete()
+            && crate::sandbox::seatbelt_caller_is_unprivileged()
+        {
             assert_eq!(
-                seatbelt_unmet_axis, None,
-                "the newt contract's deny-all net now satisfies CONFINED where the audit is complete"
+                audited_unmet_axis, None,
+                "the newt contract's deny-all net with audited stdio now satisfies CONFINED \
+                 where the audit is complete and the caller is unprivileged"
             );
         } else {
             assert_eq!(
-                seatbelt_unmet_axis,
+                audited_unmet_axis,
                 Some(ConfinedAxis::Net),
                 "Seatbelt restricted net must fail closed before spawn"
             );
