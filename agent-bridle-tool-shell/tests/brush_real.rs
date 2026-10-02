@@ -721,23 +721,28 @@ async fn brush_deny_direct_denies_a_childs_socket() {
 /// to `grep`, no network touched) RUNS under `net: none`, because the
 /// control channel now audits as `ConfinedStdio::WorkerControl`.
 ///
-/// **Correction (measured on the Mac test runner, 2026-10-02):** the
-/// operator's actual field config is a NON-EMPTY host allow-list
-/// (`[tui.permissions] net = ["host:port"]`), not `net: none`. That shape
-/// does NOT exercise this fix: `seatbelt_net_projection` resolves `Unknown`
-/// for any `Scope::Only` that is not `net_direct_denied` (every entry
-/// `unix:`/`mach:`-structural, including the empty set) REGARDLESS of
-/// `stdio_audited` — "Loopback and remote-host shapes stay Unknown under
-/// either state" (`sandbox.rs`, `seatbelt_net_projection`'s own doc
-/// comment). Verified empirically: the same test with
-/// `net: Scope::only(["127.0.0.1:65535"])` still refuses on THIS fix's
-/// branch, identically to main. That is the pre-existing, separate,
-/// documented `#124` remote-host-allowlist frontier (ADR 0015's original
-/// 2026-06-30 scope, predating #416/#405 entirely) — out of scope for this
-/// fix, which only closes the stdio-posture gap for the direct-denied
-/// family. Resolving the operator's literal host-allowlist config on macOS
-/// needs the local-egress-proxy mechanism wired into `TrustedWorker`
-/// admission, a separate, materially larger change.
+/// **Narrowing (measured on the Mac test runner, 2026-10-02):** Bridle's own
+/// `seatbelt_net_projection` resolves `Unknown` for a RAW `Scope::Only` that
+/// is not `net_direct_denied` (every entry `unix:`/`mach:`-structural,
+/// including the empty set) REGARDLESS of `stdio_audited` — "Loopback and
+/// remote-host shapes stay Unknown under either state" (`sandbox.rs`,
+/// `seatbelt_net_projection`'s own doc comment). Verified empirically: the
+/// same test with `net: Scope::only(["127.0.0.1:65535"])` handed DIRECTLY to
+/// Bridle (no caller-side narrowing) still refuses on THIS fix's branch,
+/// identically to main. That is the pre-existing, separate, documented
+/// `#124` remote-host-allowlist frontier (ADR 0015's original 2026-06-30
+/// scope, predating #416/#405 entirely) — out of scope for this fix, which
+/// only closes the stdio-posture gap for the direct-denied family. **This
+/// is a limit on Bridle taking a raw host list directly, not on the
+/// operator's field config:** newt-agent's own `shell.rs`
+/// (`dispatch_caveats_for_command`/`spawn_net_scope`) narrows the operator's
+/// `[tui.permissions] net = ["host:port"]` allow-list to `net: none` before
+/// it ever reaches Bridle, so Bridle only ever sees the `net: none` shape
+/// this fix resolves — confirmed end-to-end on newt-agent #2680's Mac TUI
+/// probe under the operator's real config, no refusal. Resolving a RAW
+/// host-allowlist handed directly to Bridle still needs the
+/// local-egress-proxy mechanism wired into `TrustedWorker` admission, a
+/// separate, materially larger change (`#124`).
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 async fn trusted_worker_net_none_runs_after_worker_control_audit() {
     use agent_bridle_core::seatbelt_is_supported;

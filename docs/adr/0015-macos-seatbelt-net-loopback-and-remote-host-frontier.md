@@ -267,10 +267,14 @@ through the carried Brush worker (`SpawnAuthority::TrustedWorker`,
 `SandboxedWorker::spawn_supported`, `spawn.rs`) under `net: none` refused on
 macOS with "backend authority on the Net axis is not decidable", for commands
 that touch no network at all — because the worker's stdin is, and must
-structurally remain, that channel. (The operator's own config is actually a
-non-empty host allow-list, not `net: none`; see the **Promotion** paragraph
-below for why that shape is a separate, NOT-closed-by-this-amendment
-limitation that happens to fail with the same message.)
+structurally remain, that channel. (The operator's config, as written, is a
+non-empty host allow-list — but newt's own caller-side narrowing
+(`shell.rs`'s `dispatch_caveats_for_command`, `spawn_net_scope`) converts any
+non-empty host-list `net` grant to `net: none` before it ever reaches
+Bridle, so this amendment resolves the operator's field symptom end-to-end
+for that caller. Only a RAW host allow-list handed DIRECTLY to Bridle —
+bypassing that narrowing — stays `Unknown`; see the **Promotion** paragraph
+below.)
 
 **The argument.** The worker's stdin is one half of a fresh
 `UnixStream::pair()` (`spawn.rs:1078`), carrying exactly ONE host-authored,
@@ -281,8 +285,15 @@ value itself** (`SandboxedWorkerChild::send_payload`, `spawn.rs:124-130`: the
 owned `TrustedWorkerControl` is moved out of `self.control` into a
 function-local that goes out of scope at return). This is not a half-close —
 the host retains no descriptor referencing this socket at all once the
-authority handoff completes, before the worker executes a single
-caveat-governed action. The protocol riding it has no worker→host request
+authority handoff completes, so the host itself can never send, or be made
+to relay, a second message. Independently, the **worker** retires its own
+end the moment it acknowledges the frame — `retire_worker_stdin`
+(`agent-bridle-tool-shell/src/private_control.rs:146,688-693`) dup2's
+`/dev/null` over its own stdin right after the ACK write, before the worker
+begins a single caveat-governed action. That is the worker's own control
+flow, not a claim about the relative scheduling of two separate processes:
+nothing here assumes or requires the host's close to happen before or after
+the worker's own retirement. The protocol riding it has no worker→host request
 primitive in either direction beyond that handoff: nothing resembling the
 "a pre-connected port or fd passed into the child, bypassing a fresh bootstrap
 lookup" shape E6's row warns about, because there is no second message for
@@ -299,9 +310,11 @@ about.
 
 **Mechanism.** [`ConfinedStdio::WorkerControl`] (`agent-bridle-core/src/
 spawn.rs`) is a fourth variant alongside `Piped`/`Null`/`Other`, wrapping an
-opaque [`WorkerControlHandle`] whose constructor is `pub(crate)` — so no
-model-selected or external caller can claim this credit for an arbitrary fd,
-only `SandboxedWorker::spawn_supported`'s own `UnixStream::pair()` half.
+opaque [`WorkerControlHandle`] whose constructor is private to its defining
+module (narrower than merely `pub(crate)`, round-2 review item 3) — so no
+model-selected or external caller, anywhere in the crate, can claim this
+credit for an arbitrary fd, only `SandboxedWorker::spawn_supported`'s own
+`UnixStream::pair()` half, in that same module.
 `ConfinedStdio::is_audited` now also admits `WorkerControl`
 (`spawn.rs::is_audited`), which is the single predicate
 `seatbelt_net_kernel_witness` (L4, `sandbox.rs:369-376`) and
@@ -326,12 +339,21 @@ empty set reaches `Kernel`). **It does NOT touch a general host allow-list.**
 applies to any `net: Only([..])` that is not `net_direct_denied` — a plain
 hostname/IP entry — **regardless of `audit`**, checked as the very first
 match arm condition before `stdio_audited` is even consulted for that shape.
-A host allow-list was `Unknown` before this amendment and stays `Unknown`
-after it; this is the pre-existing, separate `#124` remote-host frontier
-(ADR 0015's original 2026-06-30 scope), not something E7 widens or narrows.
-The operator's literal `[tui.permissions] net = [host:port]` config therefore
-still refuses after this fix — confirmed empirically (next paragraph) — and
-needs the local-egress-proxy mechanism wired into `TrustedWorker` admission
+A host allow-list **handed directly to Bridle** was `Unknown` before this
+amendment and stays `Unknown` after it; this is the pre-existing, separate
+`#124` remote-host frontier (ADR 0015's original 2026-06-30 scope), not
+something E7 widens or narrows. This limit is Bridle's own — it says nothing
+about a *caller* that narrows a host allow-list to `net: none` before the
+grant ever reaches Bridle's admission. newt-agent does exactly that:
+`shell.rs`'s `dispatch_caveats_for_command` (`spawn_net_scope`) converts any
+non-empty host-list `net` grant to `net: none` before calling into Bridle
+(`#2596` round 3), so Bridle only ever sees `net: none` for `run_command` —
+precisely the shape this amendment promotes. The operator's literal
+`[tui.permissions] net = [host:port]` config therefore resolves end-to-end
+once this amendment lands in newt's vendored Bridle — confirmed empirically,
+see newt-agent #2680. Only a RAW host allow-list handed directly to Bridle —
+a caller that skips narrowing — stays `Unknown`, needing the
+local-egress-proxy mechanism wired into `TrustedWorker` admission (`#124`)
 to close, which is out of scope here.
 
 **Verified (Mac test runner, macOS 15.x, Apple Silicon, 2026-10-02):**
@@ -341,10 +363,13 @@ spawn.rs`) continues to refuse — proving this amendment did not widen
 `trusted_worker_net_none_runs_after_worker_control_audit`
 (`agent-bridle-tool-shell/tests/brush_real.rs`), measured RED on main
 (`a37e78c`) and GREEN on this branch for `net: none`. The SAME test shape
-with `net: Scope::only(["127.0.0.1:65535"])` in place of `net: none` was
-ALSO measured — red on both main and this branch, confirming the host
-allow-list limitation above is real and unaffected by this fix. See
-newt-agent #2673 for the field trace.
+with `net: Scope::only(["127.0.0.1:65535"])` handed DIRECTLY to Bridle — the
+regression's own caveats, with no caller-side narrowing in front of it — was
+ALSO measured: red on both main and this branch, confirming the raw-host-list
+limitation above is real and unaffected by this fix. (newt's own
+`run_command` path never exercises this raw shape, because `shell.rs` narrows
+first — see the Promotion paragraph above.) See newt-agent #2673/#2680 for
+the field trace and the end-to-end probe under the operator's real config.
 
 ## Question
 
