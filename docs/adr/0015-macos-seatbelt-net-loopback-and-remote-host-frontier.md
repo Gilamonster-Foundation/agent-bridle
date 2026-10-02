@@ -1,6 +1,6 @@
 # ADR 0015 — macOS Seatbelt net axis: loopback kernel-confinement + the remote-host allow-list frontier
 
-- Status: **Partially superseded (2026-08-11); amended E5 (2026-09-28)** — the
+- Status: **Partially superseded (2026-08-11); amended E5 (2026-09-28), E6 (2026-09-29)** — the
   SBPL direct-socket findings remain valid, but every claim below that a
   restricted Seatbelt net scope is a complete `Kernel` witness or is admissible
   is superseded by the E4 ruling in this document. The E4 ambient Mach
@@ -129,6 +129,64 @@ leg exits via `callback_error`).
 **Out of scope here.** Windows AppContainer (the brokered-RPC/COM/named-pipe
 audit, #405 A/Windows) is a separate delegate on native Windows; host
 allow-lists (#124 frontier) stay `Unknown`.
+
+## Amendment E6 — the non-Mach-lookup ambient IPC audit (2026-09-29, agent-bridle#405)
+
+E5 closed *named* Mach lookups. This amendment characterizes the other ambient
+IPC paths ADR 0015/#405 named as candidates — everything a `net: none`,
+zero-`mach:`-grant Seatbelt child might reach that is **not** gated by
+`(deny mach-lookup)` at all — to determine whether the deny-all, zero-grant
+shape can honestly promote to a `net → Kernel` witness.
+
+**Method.** Each row is a differential (ADR 0015 / #361): the same probe
+unconfined (positive control) vs. under exactly
+`(version 1)(allow default)(deny network*)(deny mach-lookup)` with zero
+grants — i.e. `net: none` used alone, independent of the (separately
+governed) `fs`/`exec` axes. Every probe target was a loopback listener or
+local resource this session owned; no external host was contacted.
+Native evidence: macOS 15.7.3 (24G419), Darwin, arm64.
+
+| Channel | Result | Evidence |
+| --- | --- | --- |
+| Unix-domain socket connect (`AF_UNIX`) | **CLOSED** | Unconfined `nc -U` to an owned `nc -lU` listener connects and delivers a byte. Confined (same profile): connect fails (exit 1), listener sees nothing. `(deny network*)` covers `AF_UNIX` connect, the same rule the `unix_sockets` grant mechanism re-allows exactly by path. |
+| `open(1)` / LaunchServices (activate another app) | **CLOSED** | Unconfined `open -g -a Safari http://127.0.0.1:PORT/…` reaches an owned loopback HTTP listener. Confined: `open` fails immediately — `Unable to find application named 'Safari'` — listener sees nothing. Routes through `com.apple.coreservices.launchservicesd`, already denied by the E5 zero floor (`MACH_SERVICE_CANDIDATES`); closes for the same reason, not a new mechanism. |
+| Darwin notifications (`notify_post`, e.g. `notifyutil -p`) | **CLOSED** | Unconfined `notifyutil -p` succeeds (exit 0). Confined: `Failed with code 9`. Requires a mach lookup to `com.apple.system.notification_center` (already in `MACH_SERVICE_CANDIDATES`); closed by the same zero floor. |
+| Pasteboard (`pbcopy`/`pbpaste`) | **CLOSED** | Unconfined round-trips a probe string. Confined: `pbpaste` prints nothing, exit 1. Reached via `mach-lookup` to `com.apple.pasteboard.*` — not itself on `MACH_SERVICE_CANDIDATES`, which demonstrates the deny is a genuine blanket default (unlisted services are exactly as denied as listed ones; the candidate list is documentation of what a host may grant, never a baked-in partial allow). |
+| Bootstrap lookup by any name outside `MACH_SERVICE_CANDIDATES` | **CLOSED (structural)** | `(deny mach-lookup)` has no default re-allow in the emitted profile; the only re-allow is the operator's `mach:` grants. An unlisted service name is denied identically to a listed one — the pasteboard row is itself an example, so this needed no separate probe. |
+| `system-socket` (`PF_SYSTEM`/`AF_SYSTEM` kernel control sockets, e.g. `utun_control`) | **REACHABLE, no viable egress found** | A small C probe: `socket(PF_ROUTE, …)`, `socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)`, `shm_open`, `sem_open` all **succeed identically confined and unconfined** — `system-socket` (and `ipc-posix-shm`/`ipc-posix-sem`) are not gated by this profile at all. Follow-up: actually creating a `utun` tunnel interface (`CTLIOCGINFO` + `connect()` to `com.apple.net.utun_control`) — the one PF_SYSTEM use that could carry raw IP traffic below the BSD socket layer `(deny network*)` governs — fails with `EPERM` **both confined and unconfined**: unprivileged utun creation is refused by the OS itself (entitlement/root-gated), independent of Seatbelt. No SBPL rule is needed for this shape; the residual is OS privilege separation, not something the profile has to add. |
+| `AF_ROUTE` (routing-table socket) | **REACHABLE, read-only relevance** | Same probe: `socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC)` succeeds confined and unconfined. This is a local routing-table read/notify channel (what `netstat -r`/`route get` use); it carries no egress by itself, and writing a route (`RTM_ADD`) is itself root-gated on macOS independent of Seatbelt. Not closed by this profile, but not a network-egress deputy either. |
+| `ipc-posix-shm` / `ipc-posix-sem` (POSIX shared memory / semaphores) | **REACHABLE, no ambient relay found** | Same probe: `shm_open`/`sem_open` succeed confined and unconfined. Local, in-machine IPC only — a relay to egress would require ANOTHER process already reading the confined child's segment, which is a colluding-process scenario (like `mach-register`, below), not an ambient system-service deputy. Out of this audit's threat model; not independently pursued further. |
+| `iokit-open` to a network-related user client | **NOT MEASURED — reasoned, not tested** | Not independently probed. The one concrete escalation this audit found worth checking (`utun` via `PF_SYSTEM`, above) turned out to be OS-privilege-gated regardless of Seatbelt; a network-capable IOKit user client (raw interface access below BSD sockets) would need the same class of entitlement/root gate Apple applies to `utun` and to most other IOKit user-client `IOServiceOpen` calls on a non-rootless-disabled system. This is a **believed**, not measured, claim — flagged here rather than silently assumed, and worth one probe (`IOServiceOpen` on a real network nub) before this row can move to CLOSED. |
+| AppleEvents / `osascript` targeting another app | **BLOCKED — not measured, TCC-gated** | `osascript -e 'tell application "Finder" to get name of startup disk'` hung indefinitely, both unconfined and confined, when run over an interactive ssh session. Root cause, confirmed via the user TCC database: the `sshd` binary itself has an ambiguous/denied `kTCCServiceAppleEvents` entry, and with no one physically present to answer a consent dialog the AppleEvent send blocks rather than failing. A GUI-domain `launchctl bootstrap` LaunchAgent (run as the logged-in user, `gui/$(id -u)`) hit the same block — the window-server session exists (`who` shows an active console login, `Finder` has been running since the last login) but TCC consent still requires a live interactive approval this lane cannot grant over ssh, and no sudo/TCC-database edit is permitted. **A self-contained script is checked in** at `~/workspaces/.handoff/helper-jobs/mac-netnone/probe-appleevents.sh` for an operator to run once, interactively, from Terminal.app on the Mac mini (approving the automation prompt) — its output (`/tmp/appleevents-probe.out`) is the missing measurement. |
+| Mach service *registration* (`mach-register`) by the confined child | **OUT OF THREAT MODEL** | #405's question is whether the confined child itself can cause egress. A child registering a service only matters if ANOTHER process — necessarily itself already unconfined and network-capable — chooses to call into it; the confined child gained no new authority by publishing. This is a colluding-process scenario, not an ambient system-service deputy, and is out of scope for the same reason `ipc-posix-shm`/`sem` relay is. |
+
+**Residual declared, not closed, out of this axis's scope.** File-drop into a
+directory a system daemon watches (a `LaunchAgents` plist, a Mail/CUPS spool)
+is not gated by this profile at all — `net: none` alone leaves `fs_write` at
+its own, independent default (`(allow default)` unless the caller separately
+restricts `fs_write`). This is real but belongs to the `fs_write` axis's own
+honesty, not a hidden `net` leak: a caller combining `net: none` with an
+ambient `fs_write` scope has this residual today regardless of this
+amendment, and will continue to after it, because the two axes are — and
+should stay — independently scoped.
+
+**Promotion condition.** `net: none` (or any `net_direct_denied` shape) with
+**zero `mach:` grants** may resolve `Bounded(∅)` at `Kernel` strength once (a)
+the AppleEvents row above closes (or is shown to need its own SBPL rule) and
+(b) `MACH_DEPUTY_AUDIT` (`agent-bridle-core/src/sandbox.rs`) is flipped to
+`Complete` — the flip is a separate, later commit, reviewable on its own,
+per the design review for this amendment. `seatbelt_net_kernel_witness` and
+the `enforcement_report` Seatbelt arm that consumes it are implemented and
+tested ahead of that flip (this amendment's PR); the flip itself is
+**not** included here. Named `mach:` grants, loopback shapes, and
+remote-host allow-lists are unaffected by this amendment and stay
+`Unknown`/`Advisory` — this audit covers only the deny-all, zero-grant
+shape.
+
+**Out of scope here.** Windows (a separate native delegate, #405 A/Windows);
+per-`mach:`-grant service audits (`trustd.agent`, `opendirectoryd.*`, etc.,
+each independently `Unknown` until characterized); the `fs_write`-mediated
+file-drop residual (declared above, belongs to that axis).
 
 ## Question
 

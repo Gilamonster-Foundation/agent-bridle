@@ -292,6 +292,41 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
 }
 
+/// `true` when the Seatbelt Mach-lookup deputy audit (agent-bridle#405) is
+/// complete on this build — i.e. [`seatbelt_impl::MACH_DEPUTY_AUDIT`] is
+/// `Complete`. A narrow, read-only crossing of the `seatbelt_impl` cfg
+/// boundary so `report.rs`'s cross-platform `enforcement_report` can gate a
+/// `net → Kernel` claim on the same audit state that already gates the L3
+/// `resolved_authority` projection ([`seatbelt_impl::seatbelt_net_projection`]),
+/// without making the enum or the constant itself public. On a non-macOS
+/// build (or without the `macos-seatbelt` feature) the audit cannot exist, so
+/// this is unconditionally `false` — never a claim this platform cannot back.
+#[must_use]
+pub(crate) fn seatbelt_mach_deputy_audit_complete() -> bool {
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    {
+        seatbelt_impl::MACH_DEPUTY_AUDIT == seatbelt_impl::MachDeputyAudit::Complete
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-seatbelt")))]
+    {
+        false
+    }
+}
+
+/// `true` when a Seatbelt `net` scope is a **Kernel** egress-deny witness: the
+/// deny-all shape (`net_fully_denied`, which already implies zero `mach:`/
+/// `unix:` grants — they are entries in the same non-empty scope set) AND a
+/// complete Mach-lookup deputy audit (agent-bridle#405/ADR 0015 E6). Pure —
+/// takes `audit_complete` as a parameter rather than reading
+/// [`seatbelt_mach_deputy_audit_complete`] itself, so `report.rs`'s test suite
+/// can pin the post-audit behavior directly without a production const flip
+/// (the audit is `Incomplete` on every shipping build today; see
+/// [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc comment for why).
+#[must_use]
+pub(crate) fn seatbelt_net_kernel_witness(effective: &Caveats, audit_complete: bool) -> bool {
+    audit_complete && net_fully_denied(effective)
+}
+
 /// An explicit `unix:<path>` token names a path-anchored Unix-domain socket
 /// endpoint, distinct from a DNS host. It participates in the ordinary net
 /// scope like any other grant, but filesystem grants never imply permission

@@ -353,11 +353,34 @@ pub fn enforcement_report(
             {
                 AxisEnforcement::Kernel
             }
+            // Seatbelt deny-all (`net: none`, zero `mach:` grants): agent-bridle#405
+            // closes the direct-socket path AND the zero Mach-lookup floor (#406),
+            // and the amendment-E6 native evidence (AF_UNIX, `open(1)`/
+            // LaunchServices, Darwin notifications, pasteboard, unnamed mach
+            // lookups — ADR 0015 E6) closes every OTHER ambient IPC route this
+            // audit could reach. `net_fully_denied` alone already implies zero
+            // `mach:`/`unix:` grants (they are entries in the same non-empty
+            // scope set), and `seatbelt_mach_deputy_audit_complete` gates this on
+            // the SAME audit state `seatbelt_net_projection` (sandbox.rs) uses for
+            // the L3 scope bound — flipping `MACH_DEPUTY_AUDIT` promotes both
+            // together, never one without the other. A `mach:` grant, a loopback
+            // shape, or a remote-host allowlist all stay Advisory below: this
+            // audit proved only the deny-all, zero-grant shape.
+            SandboxKind::Seatbelt
+                if crate::sandbox::seatbelt_net_kernel_witness(
+                    effective,
+                    crate::sandbox::seatbelt_mach_deputy_audit_complete(),
+                ) =>
+            {
+                AxisEnforcement::Kernel
+            }
             // Seatbelt has useful direct-socket SBPL rules for deny-all and
-            // loopback, but no faithful bound for every ambient Mach/XPC deputy;
-            // every restricted shape therefore stays Advisory and is refused by a
-            // Kernel net floor. The minimal-rootfs jail does not namespace the
-            // network this tier either, so it is advisory too (ADR 0013 D5).
+            // loopback, but no faithful bound for every ambient Mach/XPC deputy
+            // while the audit above is incomplete (or for any shape the audit
+            // didn't cover); every other restricted shape stays Advisory and is
+            // refused by a Kernel net floor. The minimal-rootfs jail does not
+            // namespace the network this tier either, so it is advisory too
+            // (ADR 0013 D5).
             SandboxKind::Landlock
             | SandboxKind::Seatbelt
             | SandboxKind::MinimalRootfs
@@ -878,6 +901,66 @@ mod tests {
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Kernel));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    /// agent-bridle#405 / ADR 0015 E6: a `net: none`, zero-`mach:`-grant Seatbelt
+    /// scope stays `Advisory` on every SHIPPING build — `MACH_DEPUTY_AUDIT` is
+    /// `Incomplete` in production (`seatbelt_mach_deputy_audit_complete()` is
+    /// `false`), so `seatbelt_net_kernel_witness` never fires, no matter how
+    /// completely the `net` axis is denied. This is the negative control that
+    /// must hold BEFORE the audit is ever flipped — pins that the promotion is
+    /// gated on the real audit state, not merely on the shape of the scope.
+    #[test]
+    fn seatbelt_net_none_stays_advisory_while_audit_incomplete() {
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert!(!crate::sandbox::seatbelt_mach_deputy_audit_complete());
+        assert_eq!(
+            enforcement_report(&none, SandboxKind::Seatbelt).net,
+            Some(AxisEnforcement::Advisory),
+        );
+    }
+
+    /// The pure post-audit witness (agent-bridle#405 / ADR 0015 E6), pinned
+    /// directly against `audit_complete` rather than the production const — this
+    /// is the RED-FIRST proof that the Kernel arm's logic is correct, so it can
+    /// be trusted the moment `MACH_DEPUTY_AUDIT` is flipped (a later, separate
+    /// commit) without re-deriving the match arm. A `mach:` grant, a loopback
+    /// shape, and a remote-host allowlist all stay `false` even with a complete
+    /// audit — this lane's evidence covers ONLY the deny-all, zero-grant shape.
+    #[test]
+    fn seatbelt_net_kernel_witness_is_deny_all_zero_grant_and_audit_complete() {
+        use crate::sandbox::seatbelt_net_kernel_witness;
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let mach_grant = Caveats {
+            net: Scope::only(["mach:com.apple.system.opendirectoryd.libinfo".to_string()]),
+            ..Caveats::top()
+        };
+        let loopback = Caveats {
+            net: Scope::only(["localhost".to_string()]),
+            ..Caveats::top()
+        };
+        let remote = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+
+        assert!(seatbelt_net_kernel_witness(&none, true));
+        assert!(
+            !seatbelt_net_kernel_witness(&none, false),
+            "deny-all with an incomplete audit must not witness Kernel",
+        );
+        assert!(
+            !seatbelt_net_kernel_witness(&mach_grant, true),
+            "a named mach: grant is not deny-all and must stay short of Kernel",
+        );
+        assert!(!seatbelt_net_kernel_witness(&loopback, true));
+        assert!(!seatbelt_net_kernel_witness(&remote, true));
     }
 
     /// The macOS exec-axis honesty distinction from Landlock: a restricted `exec`
