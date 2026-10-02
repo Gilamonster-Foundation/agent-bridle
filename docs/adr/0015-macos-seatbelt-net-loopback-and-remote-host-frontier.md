@@ -181,36 +181,53 @@ earlier draft of this paragraph conflated them, describing the broader
 a mixture of only those structural tokens) as reaching the Kernel/`∅` claim
 together. It does not:
 
-- **L3** (`resolved_authority`'s scope bound) resolves the FULL
-  `net_direct_denied` family to a *named* bound once `MACH_DEPUTY_AUDIT` is
-  `Complete`: the exact empty set resolves `Bounded(∅)`; a `unix:` grant
-  resolves its own concrete endpoint; a `mach:` grant resolves its own named
-  class. None of these is ever `Unknown` while the audit is complete — this
-  layer only says "the grant is nameable", not "it is kernel-enforced at full
-  strength".
+- **L3** (`resolved_authority`'s scope bound) is **not** merely a naming
+  layer — it is the actual scope bound `admit` compares against the
+  delegated grant, the operand the ADMIT/REFUSE decision is made from, not a
+  descriptive label layered on top of a decision made elsewhere (round-3
+  review, agent-bridle#416: an earlier draft of this paragraph undersold it as
+  "the grant is nameable", which is why a bare, unaudited `net:none` spawn
+  could resolve a named `Bounded(∅)` and admit under a non-Kernel floor
+  without L4 ever being consulted). It shares the SAME per-spawn
+  preconditions L4's `seatbelt_net_kernel_witness` already required — the
+  spawn's declared [`crate::StdioPosture`] is `Audited` and the spawning
+  process is not root — before resolving the FULL `net_direct_denied` family
+  to a *named* bound at all: the exact empty set resolves `Bounded(∅)`; a
+  `unix:` grant resolves its own concrete endpoint; a `mach:` grant resolves
+  its own named class. Any one of `MACH_DEPUTY_AUDIT` being `Incomplete`, the
+  caller being root, or the spawn's stdio being unaudited resolves `Unknown`
+  instead — admission's fail-closed default — regardless of which net shape
+  was requested.
 - **L4** (`enforcement_report`'s per-axis strength, via
-  `seatbelt_net_kernel_witness`) is strictly narrower: only the EXACT EMPTY
-  `net: none` (`net_fully_denied` — zero grants of ANY kind, including zero
-  `unix:`/`mach:` entries) may resolve `Kernel`. A `unix:`-only or
-  `mach:`-only scope stays `Advisory` at L4 even once `MACH_DEPUTY_AUDIT` is
-  `Complete` — a named grant is not the zero-grant shape this audit measured.
+  `seatbelt_net_kernel_witness`) is strictly narrower on the **shape** it
+  promotes, not on these preconditions: only the EXACT EMPTY `net: none`
+  (`net_fully_denied` — zero grants of ANY kind, including zero `unix:`/
+  `mach:` entries) may resolve `Kernel`. A `unix:`-only or `mach:`-only scope
+  stays `Advisory` at L4 even once `MACH_DEPUTY_AUDIT` is `Complete`, the
+  stdio is audited, and the caller is unprivileged — a named grant is not the
+  zero-grant shape this audit measured.
 
 So: `net: none` may resolve `Bounded(∅)` at `Kernel` strength once (a) the
 AppleEvents row above closes (or is shown to need its own SBPL rule), (b)
 `MACH_DEPUTY_AUDIT` (`agent-bridle-core/src/sandbox.rs`) is flipped to
 `Complete`, (c) the spawn's stdin/stdout/stderr are each a pipe or `/dev/null`
 — checked at spawn via `ConfinedStdio`/`StdioPosture::Audited`, not merely
-claimed (round-2 review item 1) — and (d) the spawning process is not root
-(round-2 review item 2; a root-owned caller narrows `MACH_DEPUTY_AUDIT` back
-to `Incomplete` for this purpose, since the probes below all ran
-unprivileged). `seatbelt_net_kernel_witness` and the `enforcement_report`
-Seatbelt arm that consumes it were implemented and tested ahead of the (b)
-flip, as the design review for this amendment required — the flip is its own
-commit, separate from and following the mechanism commit, so it is
-reviewable on its own. Named `mach:`/`unix:` grants, loopback shapes, and
-remote-host allow-lists never reach L4 `Kernel` — this audit's L4 strength
-claim covers only the deny-all, zero-grant shape, with (c) and (d) as
-additional, per-spawn preconditions the audit's probes relied on.
+claimed (round-2 review item 1), enforced at BOTH L3 and L4 (round-3 review:
+a prior revision enforced it only in the L4 witness, leaving L3 to admit an
+unaudited spawn on a non-Kernel floor regardless) — and (d) the spawning
+process is not root (round-2 review item 2; a root-owned caller narrows
+`MACH_DEPUTY_AUDIT` back to `Incomplete` for this purpose at both L3 and L4,
+since the probes below all ran unprivileged). `seatbelt_net_kernel_witness`
+and the `enforcement_report` Seatbelt arm that consumes it were implemented
+and tested ahead of the (b) flip, as the design review for this amendment
+required — the flip is its own commit, separate from and following the
+mechanism commit, so it is reviewable on its own. Named `mach:`/`unix:`
+grants, loopback shapes, and remote-host allow-lists never reach L4 `Kernel`
+— this audit's L4 strength claim covers only the deny-all, zero-grant shape
+— but (c) and (d) gate L3's *admission* for the whole `net_direct_denied`
+family, not just this narrower L4 shape, since an unaudited or root-owned
+launch is exactly the launch this audit's probes never measured, whatever
+net scope it requested.
 
 **Condition (a) is now met, with its scope corrected.** A second pass
 measured every other candidate channel the brief listed: `iokit-open`,

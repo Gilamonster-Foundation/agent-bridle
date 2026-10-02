@@ -120,56 +120,55 @@ fn net_none() -> Caveats {
 
 // ── net:none — every socket family kernel-denied ─────────────────────────────
 
-/// agent-bridle#405/#416: a `net:none`, zero-`mach:`-grant scope now ADMITS
-/// (the OPPOSITE of what this test pinned before #405 — admission used to
-/// refuse because the L3 scope bound was `Unknown`; it is now `Bounded(∅)`).
-/// `ShellTool`'s own mechanism never declares the audited pipe/null-only
-/// stdio shape (agent-bridle#416 round-2 review, item 1), so its enforcement
-/// report stays Advisory regardless — the REAL kernel still denies the UDP
-/// send, proven by the probe's own "DENIED" stdout, not by admission.
+/// agent-bridle#416 round 3 (fix-first review): round 2's rename to
+/// `..._admits_and_kernel_still_denies_udp` relied on the SAME L3 gap this
+/// round's fix closes — `SeatbeltSandbox::resolved_authority` ignored stdio,
+/// so ANY net:none spawn (audited or not) resolved a named `Bounded(∅)` and
+/// admitted under the DEFAULT floor. `ShellTool` builds each pipeline stage's
+/// stdio from raw `std::process::Stdio`, never `agent_bridle_core::
+/// ConfinedStdio`, so it cannot honestly claim the audited shape
+/// `StdioPosture::Audited` requires — the fix correctly reverts this path to
+/// refusing before the probe ever spawns, matching this file's own header
+/// comment (which was never updated in round 2).
 #[tokio::test]
-async fn seatbelt_net_none_admits_and_kernel_still_denies_udp() {
+async fn seatbelt_net_none_refuses_udp_before_spawn() {
     require_prerequisites();
     let probe = write_probe();
     let out = run_probe(net_none(), &probe, "udp", "1.1.1.1:53").await;
-    assert!(
-        !out["denied"].as_bool().unwrap_or(false),
-        "net:none with zero mach: grants must now admit: {out}"
+    assert_eq!(
+        out["denied"], true,
+        "a net:none spawn through ShellTool's unaudited stdio must fail closed: {out}"
     );
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
     assert!(
-        out["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("DENIED"),
-        "the real kernel must still deny the UDP send despite admission: {out}"
+        out.get("stdout").is_none(),
+        "the probe must never have spawned: {out}"
     );
     let _ = std::fs::remove_file(&probe);
 }
 
-/// agent-bridle#405/#416: see `seatbelt_net_none_admits_and_kernel_still_denies_udp`
-/// — admission now succeeds; the REAL listener stays unreached (the probe
-/// prints "DENIED", not "OK"), proving the kernel, not admission, is the
-/// enforcement boundary for this live-listener positive control.
+/// agent-bridle#416 round 3: see `seatbelt_net_none_refuses_udp_before_spawn`.
+/// The REAL listener proves nothing reached it — not because the kernel
+/// denied a live connect attempt, but because admission refused before the
+/// probe process ever started.
 #[tokio::test]
-async fn seatbelt_net_none_admits_and_kernel_still_denies_loopback_tcp_against_a_live_listener() {
+async fn seatbelt_net_none_refuses_loopback_tcp_before_spawn() {
     require_prerequisites();
     let probe = write_probe();
-    // A REAL listener is accepting on this port: a kernel denial is therefore
-    // the sandbox, not a missing server (the positive control is the live socket).
+    // A REAL listener is accepting on this port: proves non-reachability is
+    // the fence, not a missing server.
     let (port, handle) = spawn_loopback_tcp();
     let out = run_probe(net_none(), &probe, "tcp", &format!("127.0.0.1:{port}")).await;
-    assert!(
-        !out["denied"].as_bool().unwrap_or(false),
-        "net:none with zero mach: grants must now admit: {out}"
+    assert_eq!(
+        out["denied"], true,
+        "a net:none spawn through ShellTool's unaudited stdio must fail closed: {out}"
     );
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
     assert!(
-        out["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("DENIED"),
-        "the real kernel must still deny the loopback connect despite admission: {out}"
+        out.get("stdout").is_none(),
+        "the probe must never have spawned: {out}"
     );
     // Unblock the listener (nothing connected) by connecting from the parent.
     let _ = std::net::TcpStream::connect(("127.0.0.1", port));
@@ -177,15 +176,12 @@ async fn seatbelt_net_none_admits_and_kernel_still_denies_loopback_tcp_against_a
     let _ = std::fs::remove_file(&probe);
 }
 
-/// agent-bridle#405/#416: see `seatbelt_net_none_admits_and_kernel_still_denies_udp`.
+/// agent-bridle#416 round 3: see `seatbelt_net_none_refuses_udp_before_spawn`.
 #[tokio::test]
-async fn seatbelt_net_none_admits_and_kernel_still_denies_pathname_af_unix_deputy() {
+async fn seatbelt_net_none_refuses_pathname_af_unix_deputy_before_spawn() {
     require_prerequisites();
     let probe = write_probe();
     // A host deputy on a PATHNAME AF_UNIX socket — the Linux residual, repeated.
-    // On macOS `(deny network*)` governs AF_UNIX connect itself (stronger than
-    // Linux, where only the fs fence bounds it). The socket path is fs-ambient
-    // here (net-only caveats), so a kernel denial is purely the NET axis.
     let sock = unique_temp("deputy.sock");
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).expect("bind unix");
@@ -197,17 +193,15 @@ async fn seatbelt_net_none_admits_and_kernel_still_denies_pathname_af_unix_deput
         let _ = sock_for_thread;
     });
     let out = run_probe(net_none(), &probe, "unix", &sock.to_string_lossy()).await;
-    assert!(
-        !out["denied"].as_bool().unwrap_or(false),
-        "net:none with zero mach: grants must now admit: {out}"
+    assert_eq!(
+        out["denied"], true,
+        "a net:none spawn through ShellTool's unaudited stdio must fail closed: {out}"
     );
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
+    assert_eq!(out["denials"][0]["kind"], "net", "{out}");
     assert!(
-        out["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("DENIED"),
-        "the real kernel must still deny the AF_UNIX connect despite admission: {out}"
+        out.get("stdout").is_none(),
+        "the probe must never have spawned: {out}"
     );
     // Unblock the deputy thread.
     if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {

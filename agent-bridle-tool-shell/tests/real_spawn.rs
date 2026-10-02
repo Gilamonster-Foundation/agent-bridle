@@ -1292,18 +1292,25 @@ async fn real_seatbelt_confines_a_spawned_childs_own_read() {
     let _ = std::fs::remove_dir_all(&forbidden);
 }
 
-// agent-bridle#405/#416: a `net:none`, zero-`mach:`-grant scope now ADMITS —
-// the OPPOSITE of what this test pinned before #405 (admission used to refuse
-// because the L3 scope bound was `Unknown`; it is now `Bounded(∅)`). Updated
-// per the round-2 review (agent-bridle#416, item 4: this was flagged a stale
-// refusal test after #405 flipped `MACH_DEPUTY_AUDIT` to `Complete` without
-// this file being touched). Checks BOTH admission AND denial controls: the
-// admission decision now lets the in-fence `touch` run, while the real kernel
-// still denies the SAME confined process's own network egress — direct
-// socket-rule mechanism evidence otherwise lives below admission in core.
+// agent-bridle#416 round 3 (fix-first review): round 2's rename to
+// `..._admits_and_kernel_still_denies_egress` leaned on the SAME L3 gap this
+// round's fix closes — `SeatbeltSandbox::resolved_authority` ignored stdio,
+// so ANY net:none spawn (audited or not) resolved a named `Bounded(∅)` and
+// admitted under the DEFAULT floor. `ShellTool`'s per-stage pipeline builder
+// uses raw `std::process::Stdio` (file redirects, OS pipes), never
+// `agent_bridle_core::ConfinedStdio` — it is not, and never claimed to be,
+// the "only production caller with actual per-channel knowledge of what it
+// configured" that `StdioPosture::Audited` requires (see
+// `ConfinementMechanism::with_stdio_posture`'s doc comment;
+// `ConfinedCommand::spawn` is that caller — see
+// `agent_bridle_core::spawn::seatbelt_child_tests::
+// net_none_with_audited_stdio_admits_and_the_kernel_still_blocks_egress` for
+// the positive control through THAT path). So `ShellTool` correctly reverts
+// to refusing restricted net before any spawn — the ORIGINAL, pre-#405
+// behavior this test pinned, restored for the right reason this time.
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 #[tokio::test]
-async fn real_seatbelt_restricted_net_admits_and_kernel_still_denies_egress() {
+async fn real_seatbelt_restricted_net_refuses_before_spawn() {
     use agent_bridle_core::seatbelt_is_supported;
 
     assert!(
@@ -1311,56 +1318,32 @@ async fn real_seatbelt_restricted_net_admits_and_kernel_still_denies_egress() {
         "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
     );
 
-    let marker = unique_temp("sb-net-admits");
+    let marker = unique_temp("sb-net-refuses");
     let _ = std::fs::remove_file(&marker);
     let caveats = Caveats {
-        exec: Scope::only(["touch".to_string(), "curl".to_string()]),
+        exec: Scope::only(["touch".to_string()]),
         net: Scope::none(),
         ..Caveats::top()
     };
 
-    // Admission control: the in-fence `touch` now actually runs.
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({ "cmd": format!("touch {}", marker.display()) }),
-            &ctx(caveats.clone()),
-        )
-        .await
-        .expect("invoke");
-    assert!(
-        !out["denied"].as_bool().unwrap_or(false),
-        "net:none with zero mach: grants must now admit: {out}"
-    );
-    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
-    assert!(
-        marker.exists(),
-        "the admitted command must actually have run: {out}"
-    );
-    let _ = std::fs::remove_file(&marker);
-
-    // Denial control: a REAL listener this process owns is never reached —
-    // the confined child's own network attempt is kernel-denied despite
-    // admission succeeding.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an owned listener");
-    let addr = listener.local_addr().expect("local_addr");
-    std::thread::spawn(move || {
-        let _ = listener.accept();
-    });
-    let url = format!("http://{addr}/");
-    let out = ShellTool::new()
-        .invoke(
-            serde_json::json!({ "cmd": format!("curl -sS --max-time 5 {url}") }),
             &ctx(caveats),
         )
         .await
-        .expect("invoke");
-    assert!(
-        !out["denied"].as_bool().unwrap_or(false),
-        "admission must still succeed for the curl attempt: {out}"
+        .expect("backend admission refusal is a structured envelope");
+    assert_eq!(
+        out["denied"], true,
+        "a net:none spawn through ShellTool's unaudited stdio must fail closed: {out}"
     );
-    assert_ne!(
-        out["exit_code"], 0,
-        "the confined child's own network attempt must be kernel-denied: {out}"
+    assert_eq!(
+        out["denials"][0]["kind"], "net",
+        "unexpected refusal: {out}"
+    );
+    assert!(
+        !marker.exists(),
+        "the marker proves ShellTool must not have spawned: {out}"
     );
 }
 
