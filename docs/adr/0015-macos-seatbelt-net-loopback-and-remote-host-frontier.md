@@ -262,12 +262,15 @@ E6's "XPC beyond mach-lookup" row left every `ConfinedStdio::Other` spawn —
 `Advisory`, deliberately conservative pending an argument about that specific
 channel's shape. Field evidence (newt-agent #2673, the Mac test runner, real
 TUI, operator's own `[tui.permissions] net = [host:port]` config, agent-bridle
-main @ `a37e78c`) showed the cost of leaving it unargued: every `run_command`
+main @ `a37e78c`) surfaced the cost of leaving it unargued: every `run_command`
 through the carried Brush worker (`SpawnAuthority::TrustedWorker`,
-`SandboxedWorker::spawn_supported`, `spawn.rs`) refused on macOS with "backend
-authority on the Net axis is not decidable", for commands that touch no
-network at all — because the worker's stdin is, and must structurally remain,
-that channel.
+`SandboxedWorker::spawn_supported`, `spawn.rs`) under `net: none` refused on
+macOS with "backend authority on the Net axis is not decidable", for commands
+that touch no network at all — because the worker's stdin is, and must
+structurally remain, that channel. (The operator's own config is actually a
+non-empty host allow-list, not `net: none`; see the **Promotion** paragraph
+below for why that shape is a separate, NOT-closed-by-this-amendment
+limitation that happens to fail with the same message.)
 
 **The argument.** The worker's stdin is one half of a fresh
 `UnixStream::pair()` (`spawn.rs:1078`), carrying exactly ONE host-authored,
@@ -310,24 +313,38 @@ migrated from raw `Stdio::piped()` to the named `ConfinedStdio::Piped`
 alongside it, closing the same "doesn't claim the credit it could" gap E6's
 round-2 review found and fixed in `host_shell.rs`.
 
-**Promotion.** With this amendment, a `BrushShellTool`/`run_command` spawn's
-`stdio_audited` is `true` whenever `MACH_DEPUTY_AUDIT` is `Complete` and the
-caller is unprivileged — the same preconditions E6 already established, now
-reachable by the ONE production caller (`SandboxedWorker::spawn_supported`)
-that was structurally unable to reach them before. The L4 `Kernel`-strength
-claim is unchanged (still only the exact empty `net: none` shape); a host
-allow-list still resolves at whatever strength its own mechanism (the
-local-egress-proxy, #124) provides — E7 only removes the spurious `Unknown`
-that an unaudited control channel forced onto EVERY restricted net shape,
-regardless of strength.
+**Promotion — and its limit.** With this amendment, a `BrushShellTool`/
+`run_command` spawn's `stdio_audited` is `true` whenever `MACH_DEPUTY_AUDIT`
+is `Complete` and the caller is unprivileged — the same preconditions E6
+already established, now reachable by the ONE production caller
+(`SandboxedWorker::spawn_supported`) that was structurally unable to reach
+them before. This promotes exactly the `net_direct_denied` family
+(`seatbelt_net_projection`, `sandbox.rs`): `net: none` and `unix:`/`mach:`
+-only scopes, at whatever L4 strength each already had (still only the exact
+empty set reaches `Kernel`). **It does NOT touch a general host allow-list.**
+`seatbelt_net_projection`'s `Scope::Only(_) => Rs::Unknown` fallback arm
+applies to any `net: Only([..])` that is not `net_direct_denied` — a plain
+hostname/IP entry — **regardless of `audit`**, checked as the very first
+match arm condition before `stdio_audited` is even consulted for that shape.
+A host allow-list was `Unknown` before this amendment and stays `Unknown`
+after it; this is the pre-existing, separate `#124` remote-host frontier
+(ADR 0015's original 2026-06-30 scope), not something E7 widens or narrows.
+The operator's literal `[tui.permissions] net = [host:port]` config therefore
+still refuses after this fix — confirmed empirically (next paragraph) — and
+needs the local-egress-proxy mechanism wired into `TrustedWorker` admission
+to close, which is out of scope here.
 
-**Verified:** `net_none_with_other_stdio_refuses_admission`
-(`agent-bridle-core/src/spawn.rs`) continues to refuse — proving this
-amendment did not widen `Other`'s disposition. A new real-spawn regression,
-`trusted_worker_host_allowlist_net_runs_after_worker_control_audit`
-(`agent-bridle-tool-shell/tests/brush_real.rs`), reproduces the operator's
-exact host-allowlist config and measured RED → GREEN on the Mac test runner
-(macOS 15.x, Apple Silicon); see newt-agent #2673 for the field trace.
+**Verified (Mac test runner, macOS 15.x, Apple Silicon, 2026-10-02):**
+`net_none_with_other_stdio_refuses_admission` (`agent-bridle-core/src/
+spawn.rs`) continues to refuse — proving this amendment did not widen
+`Other`'s disposition. A new real-spawn regression,
+`trusted_worker_net_none_runs_after_worker_control_audit`
+(`agent-bridle-tool-shell/tests/brush_real.rs`), measured RED on main
+(`a37e78c`) and GREEN on this branch for `net: none`. The SAME test shape
+with `net: Scope::only(["127.0.0.1:65535"])` in place of `net: none` was
+ALSO measured — red on both main and this branch, confirming the host
+allow-list limitation above is real and unaffected by this fix. See
+newt-agent #2673 for the field trace.
 
 ## Question
 

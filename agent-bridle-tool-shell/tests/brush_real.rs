@@ -149,13 +149,14 @@ fn run_platform() {
     );
     // agent-bridle#416 round-3 / newt#2673 regression: the trusted-worker
     // control channel is now an audited stdio shape (ADR 0015 E7), so a
-    // restricted-net BrushShellTool spawn resolves a real bound instead of
-    // `Unknown` and admits.
+    // `net: none` BrushShellTool spawn resolves a real bound instead of
+    // `Unknown` and admits. (A host-allowlist config stays out of scope —
+    // see the test's own doc comment.)
     #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
     run_async_case(
         &runtime,
-        "trusted_worker_host_allowlist_net_runs_after_worker_control_audit",
-        trusted_worker_host_allowlist_net_runs_after_worker_control_audit,
+        "trusted_worker_net_none_runs_after_worker_control_audit",
+        trusted_worker_net_none_runs_after_worker_control_audit,
     );
     run_async_case(
         &runtime,
@@ -706,34 +707,50 @@ async fn brush_deny_direct_denies_a_childs_socket() {
 }
 
 /// agent-bridle#416 round-3 / newt#2673 — the exact field-reported refusal
-/// this fix closes, reproduced with the operator's real config shape: a
-/// NON-EMPTY host net allow-list (`[tui.permissions] net = ["host:port"]`),
-/// not `net: none`. Before ADR 0015 E7, the trusted-worker stdin control
-/// channel was `ConfinedStdio::Other` (never `Piped`/`Null`), so
-/// `stdio_audited` was false for EVERY `BrushShellTool` spawn regardless of
-/// what net scope was requested; `SeatbeltSandbox::resolved_authority`
-/// (`agent_bridle_core::sandbox`) resolved `Unknown` for any restricted net
-/// axis under an incomplete deputy audit, and admission refused before the
-/// worker ever ran — even for a command that touches no network at all.
-/// Measured RED on agent-bridle main (`a37e78c`, before this fix):
-/// `out["denied"] == true`, `out["denials"][0]["kind"] == "net"`, the exact
-/// "backend authority on the Net axis is not decidable" shape. Green after:
-/// a purely local pipeline (`sed` piped to `grep`, no network touched) RUNS
-/// under the same host-allowlist grant, because the control channel now
-/// audits as `ConfinedStdio::WorkerControl`.
+/// this fix closes, reproduced with `net: none` (the `net_direct_denied`
+/// family this fix actually resolves — see the correction note below).
+/// Before ADR 0015 E7, the trusted-worker stdin control channel was
+/// `ConfinedStdio::Other` (never `Piped`/`Null`), so `stdio_audited` was
+/// false for EVERY `BrushShellTool` spawn; `SeatbeltSandbox::resolved_authority`
+/// (`agent_bridle_core::sandbox`) resolved `Unknown` for `net: none` under an
+/// incomplete deputy audit, and admission refused before the worker ever ran
+/// — even for a command that touches no network at all. Measured RED on
+/// agent-bridle main (`a37e78c`, before this fix): `Denied { reason:
+/// "...backend authority on the Net axis is not decidable..." }`, the exact
+/// field-reported shape. Green after: a purely local pipeline (`sed` piped
+/// to `grep`, no network touched) RUNS under `net: none`, because the
+/// control channel now audits as `ConfinedStdio::WorkerControl`.
+///
+/// **Correction (measured on the Mac test runner, 2026-10-02):** the
+/// operator's actual field config is a NON-EMPTY host allow-list
+/// (`[tui.permissions] net = ["host:port"]`), not `net: none`. That shape
+/// does NOT exercise this fix: `seatbelt_net_projection` resolves `Unknown`
+/// for any `Scope::Only` that is not `net_direct_denied` (every entry
+/// `unix:`/`mach:`-structural, including the empty set) REGARDLESS of
+/// `stdio_audited` — "Loopback and remote-host shapes stay Unknown under
+/// either state" (`sandbox.rs`, `seatbelt_net_projection`'s own doc
+/// comment). Verified empirically: the same test with
+/// `net: Scope::only(["127.0.0.1:65535"])` still refuses on THIS fix's
+/// branch, identically to main. That is the pre-existing, separate,
+/// documented `#124` remote-host-allowlist frontier (ADR 0015's original
+/// 2026-06-30 scope, predating #416/#405 entirely) — out of scope for this
+/// fix, which only closes the stdio-posture gap for the direct-denied
+/// family. Resolving the operator's literal host-allowlist config on macOS
+/// needs the local-egress-proxy mechanism wired into `TrustedWorker`
+/// admission, a separate, materially larger change.
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
-async fn trusted_worker_host_allowlist_net_runs_after_worker_control_audit() {
+async fn trusted_worker_net_none_runs_after_worker_control_audit() {
     use agent_bridle_core::seatbelt_is_supported;
     if !seatbelt_is_supported() {
         eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
         return;
     }
-    let file = unique_temp("worker-control-net-allowlist.txt");
+    let file = unique_temp("worker-control-net-none.txt");
     std::fs::write(&file, "one\ntwo\nthree\n").expect("write fixture");
 
     let caveats = Caveats {
         exec: Scope::only(["sed".to_string(), "grep".to_string()]),
-        net: Scope::only(["127.0.0.1:65535".to_string()]),
+        net: Scope::none(),
         ..Caveats::top()
     };
     let out = tool()
@@ -746,7 +763,7 @@ async fn trusted_worker_host_allowlist_net_runs_after_worker_control_audit() {
 
     assert_ne!(
         out["denied"], true,
-        "a host-net-allowlist spawn must admit once the worker control channel \
+        "a net:none spawn must admit once the worker control channel \
          is audited (ADR 0015 E7): {out}"
     );
     assert_eq!(
