@@ -1292,12 +1292,18 @@ async fn real_seatbelt_confines_a_spawned_childs_own_read() {
     let _ = std::fs::remove_dir_all(&forbidden);
 }
 
-// Restricted Seatbelt net is unsupported until ambient Mach/XPC deputies are
-// faithfully bounded. End to end, CONFINED must refuse before any child starts;
-// direct socket-rule mechanism evidence lives below admission in core.
+// agent-bridle#405/#416: a `net:none`, zero-`mach:`-grant scope now ADMITS —
+// the OPPOSITE of what this test pinned before #405 (admission used to refuse
+// because the L3 scope bound was `Unknown`; it is now `Bounded(∅)`). Updated
+// per the round-2 review (agent-bridle#416, item 4: this was flagged a stale
+// refusal test after #405 flipped `MACH_DEPUTY_AUDIT` to `Complete` without
+// this file being touched). Checks BOTH admission AND denial controls: the
+// admission decision now lets the in-fence `touch` run, while the real kernel
+// still denies the SAME confined process's own network egress — direct
+// socket-rule mechanism evidence otherwise lives below admission in core.
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 #[tokio::test]
-async fn real_seatbelt_restricted_net_refuses_before_spawn() {
+async fn real_seatbelt_restricted_net_admits_and_kernel_still_denies_egress() {
     use agent_bridle_core::seatbelt_is_supported;
 
     assert!(
@@ -1305,34 +1311,56 @@ async fn real_seatbelt_restricted_net_refuses_before_spawn() {
         "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
     );
 
-    let marker = unique_temp("sb-net-refused");
+    let marker = unique_temp("sb-net-admits");
     let _ = std::fs::remove_file(&marker);
-    // `touch` would create the marker if admission accidentally spawned it.
     let caveats = Caveats {
-        exec: Scope::only(["touch".to_string()]),
+        exec: Scope::only(["touch".to_string(), "curl".to_string()]),
         net: Scope::none(),
         ..Caveats::top()
     };
+
+    // Admission control: the in-fence `touch` now actually runs.
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({ "cmd": format!("touch {}", marker.display()) }),
+            &ctx(caveats.clone()),
+        )
+        .await
+        .expect("invoke");
+    assert_eq!(
+        out["denied"], false,
+        "net:none with zero mach: grants must now admit: {out}"
+    );
+    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
+    assert!(
+        marker.exists(),
+        "the admitted command must actually have run: {out}"
+    );
+    let _ = std::fs::remove_file(&marker);
+
+    // Denial control: a REAL listener this process owns is never reached —
+    // the confined child's own network attempt is kernel-denied despite
+    // admission succeeding.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an owned listener");
+    let addr = listener.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = listener.accept();
+    });
+    let url = format!("http://{addr}/");
+    let out = ShellTool::new()
+        .invoke(
+            serde_json::json!({ "cmd": format!("curl -sS --max-time 5 {url}") }),
             &ctx(caveats),
         )
         .await
         .expect("invoke");
-
     assert_eq!(
-        out["denied"], true,
-        "restricted Seatbelt net must fail closed before spawn: {out}"
+        out["denied"], false,
+        "admission must still succeed for the curl attempt: {out}"
     );
-    assert_eq!(
-        out["denials"][0]["kind"], "net",
-        "the refusal must identify the net axis: {out}"
-    );
-    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
-    assert!(
-        !marker.exists(),
-        "the child must not spawn after the net-floor refusal: {out}"
+    assert_ne!(
+        out["exit_code"], 0,
+        "the confined child's own network attempt must be kernel-denied: {out}"
     );
 }
 

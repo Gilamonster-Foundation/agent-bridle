@@ -32,10 +32,17 @@ fn unique_temp(tag: &str) -> PathBuf {
     ))
 }
 
-/// A CONFINED-shaped grant with restricted net refuses before spawn: fs and exec
-/// have strong witnesses, but Seatbelt net is Advisory below the Kernel floor.
+/// agent-bridle#405/#416: a `net:none`, zero-`mach:`-grant scope now ADMITS
+/// (the opposite of what this test pinned before #405). NOTE: despite its
+/// name/doc, `ctx()` here mints under `Gate::new(0)` — `EnforcementFloor::DEFAULT`
+/// (net floor `Advisory`), not the `CONFINED` preset named above; that
+/// pre-existing mismatch is unrelated to #405/#416 and left as-is. fs_write
+/// and exec still get real Kernel witnesses; net is Advisory (ShellTool's
+/// mechanism never declares the audited stdio shape, agent-bridle#416 round-2
+/// review item 1) but the DEFAULT floor only requires Advisory, so admission
+/// no longer refuses.
 #[tokio::test]
-async fn real_seatbelt_confined_floor_refuses_restricted_net_before_spawn() {
+async fn real_seatbelt_confined_floor_admits_restricted_net() {
     assert!(
         seatbelt_is_supported(),
         "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
@@ -55,8 +62,7 @@ async fn real_seatbelt_confined_floor_refuses_restricted_net_before_spawn() {
         ..Caveats::top()
     };
 
-    // The net floor refuses before even an otherwise in-fence touch can spawn.
-    let marker = ws.join("must-not-exist");
+    let marker = ws.join("now-exists");
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({ "cmd": format!("touch {}", marker.display()) }),
@@ -65,17 +71,14 @@ async fn real_seatbelt_confined_floor_refuses_restricted_net_before_spawn() {
         .await
         .expect("invoke");
     assert_eq!(
-        out["denied"], true,
-        "restricted Seatbelt net must fail closed under CONFINED: {out}"
+        out["denied"], false,
+        "net:none with zero mach: grants must now admit: {out}"
     );
-    assert_eq!(
-        out["denials"][0]["kind"], "net",
-        "the refused floor axis must be net: {out}"
-    );
+    assert_eq!(out["enforcement"]["fs_write"], "kernel", "{out}");
     assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
     assert!(
-        !marker.exists(),
-        "the child must not spawn after the net-floor refusal: {out}"
+        marker.exists(),
+        "the admitted command must actually have run: {out}"
     );
 
     let _ = std::fs::remove_dir_all(&ws);
