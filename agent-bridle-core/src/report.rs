@@ -855,6 +855,16 @@ mod tests {
         use ChildNetworkPolicy::{DenyDirect, LandlockOnly};
         let sb = ConfinementMechanism::backend(SandboxKind::Seatbelt);
         let noop = ConfinementMechanism::backend(SandboxKind::None);
+        // agent-bridle#405 / ADR 0015 amendment E6: the deny-all, zero-grant
+        // Seatbelt shape is now a complete witness (Kernel) wherever the
+        // deputy audit is Complete (macOS) — Advisory everywhere else, since
+        // the audit only exists where Seatbelt does. Single source of truth,
+        // not a re-derived `cfg`, so this can never drift from production.
+        let seatbelt_net_none = if crate::sandbox::seatbelt_mach_deputy_audit_complete() {
+            Kernel
+        } else {
+            Advisory
+        };
 
         let cases: &[(&str, Caveats, ConfinementMechanism, AxisEnforcement)] = &[
             (
@@ -864,7 +874,7 @@ mod tests {
                 Advisory,
             ),
             ("deny-direct + net:none", none(), ll(DenyDirect), Kernel),
-            ("seatbelt + net:none", none(), sb, Advisory),
+            ("seatbelt + net:none", none(), sb, seatbelt_net_none),
             (
                 "seatbelt + loopback full interface",
                 loopback_full(),
@@ -903,24 +913,51 @@ mod tests {
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
     }
 
-    /// agent-bridle#405 / ADR 0015 E6: a `net: none`, zero-`mach:`-grant Seatbelt
-    /// scope stays `Advisory` on every SHIPPING build — `MACH_DEPUTY_AUDIT` is
-    /// `Incomplete` in production (`seatbelt_mach_deputy_audit_complete()` is
-    /// `false`), so `seatbelt_net_kernel_witness` never fires, no matter how
-    /// completely the `net` axis is denied. This is the negative control that
-    /// must hold BEFORE the audit is ever flipped — pins that the promotion is
-    /// gated on the real audit state, not merely on the shape of the scope.
+    /// agent-bridle#405 / ADR 0015 amendment E6: a `net: none`, zero-`mach:`-
+    /// grant Seatbelt scope reports `Kernel` on this SHIPPING build —
+    /// `MACH_DEPUTY_AUDIT` is `Complete` (the full channel sweep closed,
+    /// AppleEvents included), so `seatbelt_net_kernel_witness` fires for
+    /// exactly this deny-all, zero-grant shape. This is the end-to-end proof
+    /// the mechanism's pure unit test (below) promised: the real production
+    /// constant, not a parameterized stand-in. macOS-only:
+    /// `seatbelt_mach_deputy_audit_complete` is unconditionally `false` off
+    /// macOS (the audit only exists where Seatbelt does), so this assertion
+    /// is platform-specific by construction, not an oversight.
     #[test]
-    fn seatbelt_net_none_stays_advisory_while_audit_incomplete() {
+    #[cfg(target_os = "macos")]
+    fn seatbelt_net_none_reports_kernel_now_the_audit_is_complete() {
         let none = Caveats {
             net: Scope::none(),
             ..Caveats::top()
         };
-        assert!(!crate::sandbox::seatbelt_mach_deputy_audit_complete());
+        assert!(crate::sandbox::seatbelt_mach_deputy_audit_complete());
         assert_eq!(
             enforcement_report(&none, SandboxKind::Seatbelt).net,
-            Some(AxisEnforcement::Advisory),
+            Some(AxisEnforcement::Kernel),
         );
+    }
+
+    /// A `mach:` grant, a loopback scope, and a general remote-host allowlist
+    /// are unaffected by the flip above — they stay `Advisory`, same as
+    /// before, because `seatbelt_net_kernel_witness` only ever fires for the
+    /// deny-all, zero-grant shape this audit covered.
+    #[test]
+    fn seatbelt_net_grant_loopback_and_remote_host_stay_advisory() {
+        for net in [
+            Scope::only(["mach:com.apple.SecurityServer".to_string()]),
+            Scope::only(["127.0.0.1".to_string()]),
+            Scope::only(["example.com".to_string()]),
+        ] {
+            let cav = Caveats {
+                net: net.clone(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                enforcement_report(&cav, SandboxKind::Seatbelt).net,
+                Some(AxisEnforcement::Advisory),
+                "{net:?} must stay Advisory"
+            );
+        }
     }
 
     /// The pure post-audit witness (agent-bridle#405 / ADR 0015 E6), pinned
@@ -1123,10 +1160,14 @@ mod tests {
     }
 
     /// Seatbelt's direct SBPL socket rules remain scope-shaped, but none is a
-    /// complete authority witness while ambient Mach/XPC deputies are unbounded.
-    /// Every restricted net shape is therefore Advisory.
+    /// complete authority witness while ambient Mach/XPC deputies are
+    /// unbounded — EXCEPT the deny-all, zero-grant shape (`net:none`, no
+    /// `mach:` grants), which agent-bridle#405/ADR 0015 amendment E6 now
+    /// proves deputy-complete and is covered by its own, separate test
+    /// (`seatbelt_deny_all_net_is_a_complete_witness`, below). Every scope
+    /// this audit did NOT cover — loopback, remote, mixed — stays Advisory.
     #[test]
-    fn seatbelt_net_is_advisory_for_every_restricted_scope() {
+    fn seatbelt_net_is_advisory_for_every_restricted_scope_the_audit_does_not_cover() {
         let net_report = |net| {
             enforcement_report(
                 &Caveats {
@@ -1139,7 +1180,6 @@ mod tests {
         };
 
         for (label, scope) in [
-            ("deny-all", Scope::none()),
             ("loopback token", Scope::only(["localhost".to_string()])),
             (
                 "both loopback addresses",
@@ -1163,13 +1203,14 @@ mod tests {
         }
     }
 
-    /// Under CONFINED (`net: Kernel`), every restricted Seatbelt net scope is
-    /// refused before spawn because every such report is Advisory. Direct socket
-    /// denial is not enough to discharge the ambient-deputy authority obligation.
+    /// Under CONFINED (`net: Kernel`), every Seatbelt net scope this audit does
+    /// NOT cover is refused before spawn because every such report is Advisory.
+    /// Direct socket denial alone is not enough to discharge the ambient-deputy
+    /// authority obligation. The one shape the audit DOES cover (deny-all, zero
+    /// grants) now admits instead — see `seatbelt_deny_all_net_is_a_complete_witness`.
     #[test]
     fn restricted_seatbelt_net_cannot_be_admitted_under_confined() {
         for (label, net) in [
-            ("deny-all", Scope::none()),
             ("full loopback", Scope::only(["localhost".to_string()])),
             ("single loopback", Scope::only(["127.0.0.1".to_string()])),
             ("remote", Scope::only(["example.com".to_string()])),
@@ -1556,22 +1597,32 @@ mod tests {
         );
     }
 
-    /// A Seatbelt deny-all socket rule is not a complete network witness while
-    /// ambient deputies remain unbounded: report Advisory and refuse CONFINED.
+    /// agent-bridle#405 / ADR 0015 amendment E6: a Seatbelt deny-all, zero-
+    /// `mach:`-grant socket rule IS now a complete network witness, wherever
+    /// the deputy audit is `Complete` (macOS) — report Kernel and admit
+    /// CONFINED. Elsewhere (the audit doesn't exist off macOS), the old
+    /// behavior is unchanged: Advisory, refused. Checked against the real
+    /// `seatbelt_mach_deputy_audit_complete()`, not a re-derived `cfg`.
     #[test]
-    fn seatbelt_deny_all_net_is_advisory_and_refused() {
+    fn seatbelt_deny_all_net_is_a_complete_witness_where_the_audit_is_complete() {
+        let expected = if crate::sandbox::seatbelt_mach_deputy_audit_complete() {
+            AxisEnforcement::Kernel
+        } else {
+            AxisEnforcement::Advisory
+        };
         assert_eq!(
             enforcement_report(&only_net_deny_all(), SandboxKind::Seatbelt).net,
-            Some(AxisEnforcement::Advisory),
+            Some(expected),
         );
-        assert!(
-            unenforceable_axis(
-                &only_net_deny_all(),
-                SandboxKind::Seatbelt,
-                EnforcementFloor::CONFINED
-            )
-            .is_some(),
-            "Seatbelt restricted net cannot satisfy the CONFINED Kernel floor"
+        let unmet = unenforceable_axis(
+            &only_net_deny_all(),
+            SandboxKind::Seatbelt,
+            EnforcementFloor::CONFINED,
+        );
+        assert_eq!(
+            unmet.is_none(),
+            expected == AxisEnforcement::Kernel,
+            "Seatbelt deny-all must admit under CONFINED iff its witness is Kernel"
         );
     }
 
@@ -1597,6 +1648,14 @@ mod tests {
             AxisEnforcement::Interceptor,
             AxisEnforcement::Kernel,
         ];
+        // agent-bridle#405 / ADR 0015 amendment E6: Seatbelt deny-all, zero
+        // grants is Kernel wherever the deputy audit is Complete (macOS),
+        // Advisory elsewhere — see `seatbelt_mach_deputy_audit_complete`.
+        let seatbelt_net_none_actual = if crate::sandbox::seatbelt_mach_deputy_audit_complete() {
+            AxisEnforcement::Kernel
+        } else {
+            AxisEnforcement::Advisory
+        };
         // (caveats, kind, axis, actual enforcement produced by enforcement_report)
         let cases: &[(Caveats, SandboxKind, ConfinedAxis, AxisEnforcement)] = &[
             (
@@ -1621,7 +1680,7 @@ mod tests {
                 only_net_deny_all(),
                 SandboxKind::Seatbelt,
                 ConfinedAxis::Net,
-                AxisEnforcement::Advisory,
+                seatbelt_net_none_actual,
             ),
             (
                 only_exec(),
@@ -1790,12 +1849,19 @@ mod tests {
             "LandlockOnly net:none is incomplete (UDP/DNS/raw ambient) → refuse on net"
         );
 
-        // macOS: direct Seatbelt socket denial is not a complete ambient-authority
-        // witness, so the contract refuses on net before spawn.
-        assert!(refuses_on(
-            ConfinementMechanism::backend(SandboxKind::Seatbelt),
-            ConfinedAxis::Net
-        ));
+        // macOS (agent-bridle#405 / ADR 0015 amendment E6): the contract's
+        // `net: none` with zero `mach:` grants is now a complete witness
+        // wherever the deputy audit is Complete — admits instead of refusing.
+        // Elsewhere (the audit only exists on macOS), unchanged: refuses.
+        let seatbelt = ConfinementMechanism::backend(SandboxKind::Seatbelt);
+        if crate::sandbox::seatbelt_mach_deputy_audit_complete() {
+            assert!(
+                admits(seatbelt),
+                "deny-all, zero-grant net now satisfies CONFINED where the audit is complete"
+            );
+        } else {
+            assert!(refuses_on(seatbelt, ConfinedAxis::Net));
+        }
 
         // Windows: AppContainer independently kernel-denies egress (no net SIDs)
         // and fences fs → admits (exec allowlist is Interceptor, meets the floor).
@@ -1956,13 +2022,25 @@ mod tests {
         let caveats = newt_confined_caveats();
         let floor = EnforcementFloor::CONFINED;
 
-        // Seatbelt: fs/exec meet their floors, but every restricted net shape is
-        // Advisory until ambient deputies are bounded ⇒ REFUSE on net.
-        assert_eq!(
-            unenforceable_axis(&caveats, SandboxKind::Seatbelt, floor).map(|u| u.axis),
-            Some(ConfinedAxis::Net),
-            "Seatbelt restricted net must fail closed before spawn"
-        );
+        // Seatbelt: fs/exec meet their floors. net is this contract's deny-all,
+        // zero-grant shape — agent-bridle#405/ADR 0015 amendment E6 now proves
+        // it deputy-complete wherever `MACH_DEPUTY_AUDIT` is `Complete` (macOS),
+        // so the contract now ADMITS there; elsewhere (the audit only exists on
+        // macOS) it still refuses on net, unchanged.
+        let seatbelt_unmet_axis =
+            unenforceable_axis(&caveats, SandboxKind::Seatbelt, floor).map(|u| u.axis);
+        if crate::sandbox::seatbelt_mach_deputy_audit_complete() {
+            assert_eq!(
+                seatbelt_unmet_axis, None,
+                "the newt contract's deny-all net now satisfies CONFINED where the audit is complete"
+            );
+        } else {
+            assert_eq!(
+                seatbelt_unmet_axis,
+                Some(ConfinedAxis::Net),
+                "Seatbelt restricted net must fail closed before spawn"
+            );
+        }
 
         // Landlock: fs=Kernel, exec=Interceptor(meets floor). net(deny-all) is
         // Kernel only where the kernel mechanism supplies it; on a Landlock report

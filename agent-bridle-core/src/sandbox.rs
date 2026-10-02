@@ -319,9 +319,10 @@ pub(crate) fn seatbelt_mach_deputy_audit_complete() -> bool {
 /// complete Mach-lookup deputy audit (agent-bridle#405/ADR 0015 E6). Pure —
 /// takes `audit_complete` as a parameter rather than reading
 /// [`seatbelt_mach_deputy_audit_complete`] itself, so `report.rs`'s test suite
-/// can pin the post-audit behavior directly without a production const flip
-/// (the audit is `Incomplete` on every shipping build today; see
-/// [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc comment for why).
+/// can pin this pure predicate directly, independent of whichever state the
+/// production constant ships (`Complete` as of agent-bridle#405/ADR 0015
+/// amendment E6, 2026-10-01; see [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc
+/// comment for the evidence).
 #[must_use]
 pub(crate) fn seatbelt_net_kernel_witness(effective: &Caveats, audit_complete: bool) -> bool {
     audit_complete && net_fully_denied(effective)
@@ -2708,26 +2709,29 @@ mod seatbelt_impl {
     /// posture of ADR 0015's E4 ruling. Only a deputy-complete native proof
     /// (every reachable ambient IPC route shown closed, positive controls
     /// included) may flip [`MACH_DEPUTY_AUDIT`] to `Complete`. The constant
-    /// controls ONLY the resolved-authority projection (the L3 scope bound).
-    /// It does not touch the per-axis strength report (`report.rs`, which
-    /// keeps every restricted Seatbelt net shape Advisory) or the L4 strength
-    /// floor, so flipping it alone does not admit `net:none` under a CONFINED
-    /// (Kernel-net) contract. Report/floor integration and end-to-end
-    /// admission tests belong to the evidence-backed promotion PR.
+    /// controls ONLY the resolved-authority projection (the L3 scope bound);
+    /// `report.rs`'s Seatbelt `net` arm reads it too (via
+    /// `seatbelt_mach_deputy_audit_complete`/`seatbelt_net_kernel_witness`) so
+    /// the L3 projection and the L4 strength report promote together, never
+    /// one without the other.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum MachDeputyAudit {
         Incomplete,
-        /// Not yet constructible in production — reached only by the unit test
-        /// that pins the post-audit projection (see `MACH_DEPUTY_AUDIT`).
-        #[cfg_attr(not(test), allow(dead_code))]
         Complete,
     }
 
-    /// The audit state this build ships. **Incomplete**: the zero floor closes
-    /// every *named* Mach lookup, but other ambient IPC (AppleEvents, XPC via
-    /// inherited endpoints, the `nsurlsessiond` class of deputies reached by
-    /// other means) is not comprehensively certified.
-    pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Incomplete;
+    /// The audit state this build ships. **Complete** (agent-bridle#405, ADR
+    /// 0015 amendment E6, 2026-10-01): the zero floor closes every *named*
+    /// Mach lookup, and the full channel sweep this audit required —
+    /// unix-domain sockets, `open(1)`/LaunchServices, Darwin notifications,
+    /// pasteboard, `iokit-open`, `sysctl-write`, a write-class `file-ioctl`,
+    /// `process-info`/`signal`, XPC beyond `mach-lookup`, and AppleEvents —
+    /// is each shown closed or correctly placed out of the net-egress threat
+    /// model (full evidence table: ADR 0015 amendment E6). This governs ONLY
+    /// the deny-all, zero-`mach:`-grant shape; a named grant, a loopback
+    /// scope, or a remote-host allowlist are unaffected and stay
+    /// `Unknown`/`Advisory`.
+    pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Complete;
 
     /// The conservative network projection for `effective` under `audit`.
     /// Pure. `All` is ambient (`Unbounded`). Every restricted shape is
@@ -3436,16 +3440,53 @@ mod seatbelt_impl {
             assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
         }
 
-        /// Support remains held (agent-bridle#405 D4, fail closed first): every
-        /// restricted network scope — `net:none`, a `mach:` grant, loopback — is
-        /// `Unknown` while `MACH_DEPUTY_AUDIT` is incomplete, even though the
-        /// profile installs the zero floor and the named grants for real.
+        /// agent-bridle#405/ADR 0015 amendment E6: the deputy audit is now
+        /// `Complete` (the full channel sweep closed, AppleEvents included).
+        /// `net:none` zero grants resolves to the bottom element `∅` — the
+        /// promotion this whole audit exists to back.
         #[test]
-        fn every_restricted_network_scope_resolves_unknown() {
-            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Incomplete);
+        fn net_none_resolves_bounded_empty_now_the_audit_is_complete() {
+            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Complete);
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new().resolved_authority(&cav).net,
+                ResolvedScope::empty(),
+                "net:none zero grants must resolve to the bottom element now the audit is complete"
+            );
+        }
+
+        /// A named `mach:` grant resolves to its own class, never to `∅` and
+        /// never to `Unknown` — the "never collapse to ∅" requirement from
+        /// #405's acceptance criteria, now exercised through the real
+        /// `resolved_authority`, not just the pure projection function.
+        #[test]
+        fn mach_grant_resolves_its_named_class_not_unknown_or_empty() {
+            let cav = Caveats {
+                net: Scope::only(["mach:com.apple.SecurityServer".to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new().resolved_authority(&cav).net,
+                ResolvedScope::class(super::super::seatbelt_mach_service_class(
+                    "com.apple.SecurityServer"
+                )),
+                "a named grant must never collapse to ∅ nor remain Unknown"
+            );
+        }
+
+        /// Support remains held for shapes this audit never covered: loopback
+        /// and a general remote-host allowlist carry no Mach floor at all (no
+        /// `(deny mach-lookup)` is ever emitted for them — see
+        /// `seatbelt_profile_with`), so a complete deputy audit for the
+        /// deny-all shape says nothing about them. #405's acceptance criteria
+        /// ("named grants stay Unknown until each is audited" extends to
+        /// shapes with no floor to audit at all).
+        #[test]
+        fn loopback_and_remote_host_stay_unknown_even_with_a_complete_audit() {
             for net in [
-                Scope::none(),
-                Scope::only(["mach:com.apple.SecurityServer".to_string()]),
                 Scope::only(["127.0.0.1".to_string()]),
                 Scope::only(["example.com".to_string()]),
             ] {
@@ -3456,7 +3497,7 @@ mod seatbelt_impl {
                 assert_eq!(
                     SeatbeltSandbox::new().resolved_authority(&cav).net,
                     ResolvedScope::Unknown,
-                    "{net:?} support must remain held at admission"
+                    "{net:?} has no Mach floor at all; the audit doesn't bound it"
                 );
             }
             assert_eq!(

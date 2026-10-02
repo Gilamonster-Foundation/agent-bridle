@@ -46,12 +46,17 @@ fails identically confined and unconfined — the same disposition as the
 sibling process is reachable both ways but is not an egress channel on its
 own (same colluding-process reasoning as `mach-register`). XPC beyond
 `mach-lookup` is closed by construction: this spawn mechanism hands the
-child only plain stdio pipes, never a pre-connected port or fd. AppleEvents
-could not be measured over ssh (TCC automation consent needs an interactive
-approval) and is the one channel left genuinely open; a checked-in script,
-held outside this repo, is left for an operator to run once from a GUI
-session. File-drop into daemon-watched directories is declared open, out of
-the `net` axis's scope (it's `fs_write`'s own default).
+child only plain stdio pipes, never a pre-connected port or fd. AppleEvents,
+measured from the operator's desktop GUI session once Automation consent was
+granted, is CLOSED: the AppleEvent send itself fails via
+`com.apple.hiservices-xpcservice` (an unlisted, mach-lookup-mediated
+service) before ever reaching the target app — the same blanket deny as
+every other unlisted service. Every channel this audit identified is now
+CLOSED or correctly placed out of the net-egress threat model, satisfying
+the promotion condition's evidence requirement; `MACH_DEPUTY_AUDIT` flips to
+`Complete` in this amendment's PR. File-drop into daemon-watched directories
+is declared open, out of the `net` axis's scope (it's `fs_write`'s own
+default).
 
 ## Notes
 
