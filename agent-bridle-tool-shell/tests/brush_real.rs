@@ -147,6 +147,16 @@ fn run_platform() {
         "brush_deny_direct_denies_a_childs_socket",
         brush_deny_direct_denies_a_childs_socket,
     );
+    // agent-bridle#416 round-3 / newt#2673 regression: the trusted-worker
+    // control channel is now an audited stdio shape (ADR 0015 E7), so a
+    // restricted-net BrushShellTool spawn resolves a real bound instead of
+    // `Unknown` and admits.
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    run_async_case(
+        &runtime,
+        "trusted_worker_host_allowlist_net_runs_after_worker_control_audit",
+        trusted_worker_host_allowlist_net_runs_after_worker_control_audit,
+    );
     run_async_case(
         &runtime,
         "command_substitution_keeps_inner_exec_independently_gated",
@@ -693,6 +703,63 @@ async fn brush_deny_direct_denies_a_childs_socket() {
         out["exit_code"], 0,
         "DenyDirect must deny the brush child's AF_INET socket creation: {out}"
     );
+}
+
+/// agent-bridle#416 round-3 / newt#2673 — the exact field-reported refusal
+/// this fix closes, reproduced with the operator's real config shape: a
+/// NON-EMPTY host net allow-list (`[tui.permissions] net = ["host:port"]`),
+/// not `net: none`. Before ADR 0015 E7, the trusted-worker stdin control
+/// channel was `ConfinedStdio::Other` (never `Piped`/`Null`), so
+/// `stdio_audited` was false for EVERY `BrushShellTool` spawn regardless of
+/// what net scope was requested; `SeatbeltSandbox::resolved_authority`
+/// (`agent_bridle_core::sandbox`) resolved `Unknown` for any restricted net
+/// axis under an incomplete deputy audit, and admission refused before the
+/// worker ever ran — even for a command that touches no network at all.
+/// Measured RED on agent-bridle main (`a37e78c`, before this fix):
+/// `out["denied"] == true`, `out["denials"][0]["kind"] == "net"`, the exact
+/// "backend authority on the Net axis is not decidable" shape. Green after:
+/// a purely local pipeline (`sed` piped to `grep`, no network touched) RUNS
+/// under the same host-allowlist grant, because the control channel now
+/// audits as `ConfinedStdio::WorkerControl`.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+async fn trusted_worker_host_allowlist_net_runs_after_worker_control_audit() {
+    use agent_bridle_core::seatbelt_is_supported;
+    if !seatbelt_is_supported() {
+        eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+        return;
+    }
+    let file = unique_temp("worker-control-net-allowlist.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write fixture");
+
+    let caveats = Caveats {
+        exec: Scope::only(["sed".to_string(), "grep".to_string()]),
+        net: Scope::only(["127.0.0.1:65535".to_string()]),
+        ..Caveats::top()
+    };
+    let out = tool()
+        .invoke(
+            serde_json::json!({ "cmd": format!("sed -n '1,3p' {} | grep two", file.display()) }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+
+    assert_ne!(
+        out["denied"], true,
+        "a host-net-allowlist spawn must admit once the worker control channel \
+         is audited (ADR 0015 E7): {out}"
+    );
+    assert_eq!(
+        out["exit_code"], 0,
+        "the local pipeline must actually run and succeed: {out}"
+    );
+    assert_eq!(
+        out["stdout"].as_str().unwrap_or_default().trim(),
+        "two",
+        "the piped command must have actually executed, not merely been admitted: {out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
 }
 
 /// Syntax consent is not exec consent: even when Brush interprets `$()`, the

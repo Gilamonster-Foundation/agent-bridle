@@ -1,6 +1,6 @@
 # ADR 0015 — macOS Seatbelt net axis: loopback kernel-confinement + the remote-host allow-list frontier
 
-- Status: **Partially superseded (2026-08-11); amended E5 (2026-09-28), E6 (2026-09-29)** — the
+- Status: **Partially superseded (2026-08-11); amended E5 (2026-09-28), E6 (2026-09-29), E7 (2026-10-02)** — the
   SBPL direct-socket findings remain valid, but every claim below that a
   restricted Seatbelt net scope is a complete `Kernel` witness or is admissible
   is superseded by the E4 ruling in this document. The E4 ambient Mach
@@ -160,7 +160,7 @@ Native evidence: macOS 15.7.3 (24G419), Darwin, arm64.
 | `sysctl-write` (a network-relevant OID) | **CLOSED (OS-privilege-gated, not a Seatbelt rule)** | `sysctl -w net.inet.tcp.msl=30000` fails `EPERM` ("Operation not permitted") **both unconfined and confined** — the OID is `CTLFLAG_PRIVILEGED` (root-only), independent of Seatbelt. Not a working positive control for the same reason as `iokit-open` and `utun`: the floor here is root privilege, not confinement, so there is nothing for this profile to add. |
 | `file-ioctl` (a write-class interface ioctl, e.g. `SIOCSIFFLAGS`) | **CLOSED (OS-privilege-gated, not a Seatbelt rule)** | After confirming the read-class `SIOCGIFFLAGS(lo0)` ioctl path works, the write-class `SIOCSIFFLAGS(lo0)` (re-asserting the interface's own current flags, a no-op mutation) fails `EPERM` **both unconfined and confined** — interface configuration ioctls are root-gated on macOS regardless of the calling process's sandbox state. Same disposition as `sysctl-write`. |
 | `process-info` / `signal` to an unconfined sibling process | **REACHABLE both ways — an explicit accepted limit of this DIRECT-egress claim, not evidence of deputy completeness (round-2 review, agent-bridle#416)** | Against an owned, already-running unconfined `sleep` process: `kill(pid, 0)` (signal-capable probe) and `sysctl(KERN_PROCARGS2)` (the same call `ps`/`lsof` use to read another process's argv) **both succeed, confined and unconfined** — this profile's two rules (`deny network*`, `deny mach-lookup`) don't touch the `signal`/`process-info` SBPL operations at all, so they stay at the base `(allow default)`. Neither is itself a network-egress channel for the confined child: delivering a signal only has effect if the UNCONFINED target process reacts to it by doing something — a colluding/receptive external process, the same threat-model boundary already applied to `mach-register` below; and reading another process's launch arguments is a (real, declared) information-disclosure channel, not an exercise of network authority by the confined child itself. Flagged, not silently assumed closed: a future, stricter profile wanting to narrow this would add `(deny signal)`/`(deny process-info*)` and re-allow only what's needed, but #405's question — can the child cause ITS OWN network egress — is unaffected either way. This row (like the shm/sem row above) is an accepted, declared limit of a DIRECT-egress claim, not proof that the deputy set is exhaustive. |
-| XPC beyond `mach-lookup` (a pre-connected port or fd passed into the child, bypassing a fresh bootstrap lookup) | **CLOSED BY CONSTRUCTION, ENFORCED AT SPAWN (round-2 review, agent-bridle#416, 2026-10-02)** | **Correction:** this row originally claimed "every call site configures only `Stdio::piped()`/`Stdio::null()`" — that was false; `agent-bridle-core/src/spawn.rs` defaulted unset stdio to inherited, and `ConfinedCommand::stdin`/`stdout`/`stderr` accepted an arbitrary `Stdio`, including a wrapped fd (the trusted-worker control channel deliberately does this). The claim is now true by CONSTRUCTION instead of by code-review assertion: [`ConfinedStdio`](../../agent-bridle-core/src/spawn.rs) has exactly three variants (`Piped`, `Null`, `Other`), and the Seatbelt `net:none` Kernel witness ([`seatbelt_net_kernel_witness`](../../agent-bridle-core/src/sandbox.rs)) requires `stdio_audited` — every one of stdin/stdout/stderr is `Piped`/`Null` for THIS spawn — checked at `ConfinedCommand::spawn`, not assumed. A spawn using `Other` (inherited, a redirected file, a wrapped fd — e.g. the trusted-worker control channel) stays outside the audited shape and its net witness stays Advisory, regardless of this row's Mach-lookup argument. For a spawn that IS in the audited shape, the argument above holds: Mach send rights are not inherited across `fork`+`exec` except the standard task/host special ports, none of which hand out a network-capable service without itself going through `bootstrap_look_up` (already covered by the blanket `(deny mach-lookup)` above) or an entitled/root-gated call (the same class as `iokit-open`/`utun`). |
+| XPC beyond `mach-lookup` (a pre-connected port or fd passed into the child, bypassing a fresh bootstrap lookup) | **CLOSED BY CONSTRUCTION, ENFORCED AT SPAWN (round-2 review, agent-bridle#416, 2026-10-02)** | **Correction:** this row originally claimed "every call site configures only `Stdio::piped()`/`Stdio::null()`" — that was false; `agent-bridle-core/src/spawn.rs` defaulted unset stdio to inherited, and `ConfinedCommand::stdin`/`stdout`/`stderr` accepted an arbitrary `Stdio`, including a wrapped fd (the trusted-worker control channel deliberately does this). The claim is now true by CONSTRUCTION instead of by code-review assertion: [`ConfinedStdio`](../../agent-bridle-core/src/spawn.rs) has exactly three variants (`Piped`, `Null`, `Other`), and the Seatbelt `net:none` Kernel witness ([`seatbelt_net_kernel_witness`](../../agent-bridle-core/src/sandbox.rs)) requires `stdio_audited` — every one of stdin/stdout/stderr is `Piped`/`Null` for THIS spawn — checked at `ConfinedCommand::spawn`, not assumed. A spawn using `Other` (inherited, a redirected file, a wrapped fd) stays outside the audited shape and its net witness stays Advisory, regardless of this row's Mach-lookup argument. For a spawn that IS in the audited shape, the argument above holds: Mach send rights are not inherited across `fork`+`exec` except the standard task/host special ports, none of which hand out a network-capable service without itself going through `bootstrap_look_up` (already covered by the blanket `(deny mach-lookup)` above) or an entitled/root-gated call (the same class as `iokit-open`/`utun`). **Superseded for the trusted-worker control channel specifically by amendment E7**, which argues that channel's own one-shot, host-torn-down-on-return shape and gives it a named audited variant (`ConfinedStdio::WorkerControl`) — distinct from, and narrower than, this row's general `Other` disposition, which still stands for every other inherited/redirected/wrapped fd. |
 | AppleEvents / `osascript` targeting another app | **CLOSED (measured, 2026-10-01)** | Earlier attempts over an interactive ssh session hung indefinitely (TCC automation consent has no one present to approve it headlessly). Measured for real from the operator's desktop-owned GUI session (Automation granted): unconfined, `tell application "Finder" to get name of startup disk` succeeds (`Macintosh HD`, exit 0) and `tell application "Safari" to open location` reaches an owned loopback listener (logged `GET /unconfined-probe`). Confined (same zero-floor profile): **both AppleEvent sends fail before ever reaching the target app** — `Connection Invalid error for service com.apple.hiservices-xpcservice` (the XPC service that mediates AppleEvent delivery/target resolution) followed by an AppleScript syntax error from the broken reply, exit 1; the listener log shows no `/confined-probe` request at all. `com.apple.hiservices-xpcservice` is reached via `mach-lookup` and is not on `MACH_SERVICE_CANDIDATES`, so it is denied identically to any other unlisted service — closed by the same blanket `(deny mach-lookup)` floor as the pasteboard row, not a new mechanism. |
 | Mach service *registration* (`mach-register`) by the confined child | **OUT OF THREAT MODEL** | #405's question is whether the confined child itself can cause egress. A child registering a service only matters if ANOTHER process — necessarily itself already unconfined and network-capable — chooses to call into it; the confined child gained no new authority by publishing. This is a colluding-process scenario, not an ambient system-service deputy, and is out of scope for the same reason `ipc-posix-shm`/`sem` relay is. |
 
@@ -254,6 +254,80 @@ promise, both are checked at spawn.
 per-`mach:`-grant service audits (`trustd.agent`, `opendirectoryd.*`, etc.,
 each independently `Unknown` until characterized); the `fs_write`-mediated
 file-drop residual (declared above, belongs to that axis).
+
+## Amendment E7 — the trusted-worker control channel is a named audited shape (2026-10-02, agent-bridle#416 round-3 / newt#2673)
+
+E6's "XPC beyond mach-lookup" row left every `ConfinedStdio::Other` spawn —
+"e.g. the trusted-worker control channel", in that row's own words — at
+`Advisory`, deliberately conservative pending an argument about that specific
+channel's shape. Field evidence (newt-agent #2673, the Mac test runner, real
+TUI, operator's own `[tui.permissions] net = [host:port]` config, agent-bridle
+main @ `a37e78c`) showed the cost of leaving it unargued: every `run_command`
+through the carried Brush worker (`SpawnAuthority::TrustedWorker`,
+`SandboxedWorker::spawn_supported`, `spawn.rs`) refused on macOS with "backend
+authority on the Net axis is not decidable", for commands that touch no
+network at all — because the worker's stdin is, and must structurally remain,
+that channel.
+
+**The argument.** The worker's stdin is one half of a fresh
+`UnixStream::pair()` (`spawn.rs:1078`), carrying exactly ONE host-authored,
+challenge-bound, digest-verified frame — the worker's entire delegated
+authority (`TrustedWorkerRequest { nonce, caveats, strength_floor, payload }`,
+`spawn.rs:182-204`) — then an ACK read, then the host **drops the `UnixStream`
+value itself** (`SandboxedWorkerChild::send_payload`, `spawn.rs:124-130`: the
+owned `TrustedWorkerControl` is moved out of `self.control` into a
+function-local that goes out of scope at return). This is not a half-close —
+the host retains no descriptor referencing this socket at all once the
+authority handoff completes, before the worker executes a single
+caveat-governed action. The protocol riding it has no worker→host request
+primitive in either direction beyond that handoff: nothing resembling the
+"a pre-connected port or fd passed into the child, bypassing a fresh bootstrap
+lookup" shape E6's row warns about, because there is no second message for
+either side to send. It cannot be an ongoing ambient-IPC network deputy for
+the same reason a already-hung-up phone line cannot relay a call.
+
+This is a **different** argument from E6's Mach-lookup reasoning and is
+**not** a blanket re-audit of `ConfinedStdio::Other`: an inherited descriptor,
+a redirected file, or any other raw/dup'd fd stays `Other` and stays
+`Advisory` — only the specific, structurally one-shot, host-torn-down-on-return
+shape described above gets credit, and only because it is impossible by
+construction for it to carry the ambient traffic the Mach-lookup argument is
+about.
+
+**Mechanism.** [`ConfinedStdio::WorkerControl`] (`agent-bridle-core/src/
+spawn.rs`) is a fourth variant alongside `Piped`/`Null`/`Other`, wrapping an
+opaque [`WorkerControlHandle`] whose constructor is `pub(crate)` — so no
+model-selected or external caller can claim this credit for an arbitrary fd,
+only `SandboxedWorker::spawn_supported`'s own `UnixStream::pair()` half.
+`ConfinedStdio::is_audited` now also admits `WorkerControl`
+(`spawn.rs::is_audited`), which is the single predicate
+`seatbelt_net_kernel_witness` (L4, `sandbox.rs:369-376`) and
+`SeatbeltSandbox::resolved_authority`'s `audit` gate (L3,
+`sandbox.rs:3031-3035`) both consume — no duplicate logic, the same
+`StdioPosture::Audited` check E6 already wired through both lattice layers.
+`SandboxedWorker::spawn_supported`'s stdout/stderr (already real pipes) are
+migrated from raw `Stdio::piped()` to the named `ConfinedStdio::Piped`
+alongside it, closing the same "doesn't claim the credit it could" gap E6's
+round-2 review found and fixed in `host_shell.rs`.
+
+**Promotion.** With this amendment, a `BrushShellTool`/`run_command` spawn's
+`stdio_audited` is `true` whenever `MACH_DEPUTY_AUDIT` is `Complete` and the
+caller is unprivileged — the same preconditions E6 already established, now
+reachable by the ONE production caller (`SandboxedWorker::spawn_supported`)
+that was structurally unable to reach them before. The L4 `Kernel`-strength
+claim is unchanged (still only the exact empty `net: none` shape); a host
+allow-list still resolves at whatever strength its own mechanism (the
+local-egress-proxy, #124) provides — E7 only removes the spurious `Unknown`
+that an unaudited control channel forced onto EVERY restricted net shape,
+regardless of strength.
+
+**Verified:** `net_none_with_other_stdio_refuses_admission`
+(`agent-bridle-core/src/spawn.rs`) continues to refuse — proving this
+amendment did not widen `Other`'s disposition. A new real-spawn regression,
+`trusted_worker_host_allowlist_net_runs_after_worker_control_audit`
+(`agent-bridle-tool-shell/tests/brush_real.rs`), reproduces the operator's
+exact host-allowlist config and measured RED → GREEN on the Mac test runner
+(macOS 15.x, Apple Silicon); see newt-agent #2673 for the field trace.
 
 ## Question
 
