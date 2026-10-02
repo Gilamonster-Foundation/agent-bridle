@@ -134,8 +134,22 @@ pub trait Sandbox: Send + Sync {
     /// refuses any restricted grant rather than silently admitting it — the
     /// conservative rule applied to the trait itself. Each concrete backend
     /// overrides this with the authority it can actually be shown to enforce.
-    fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
-        let _ = effective;
+    ///
+    /// `stdio` is the spawn's declared [`crate::StdioPosture`] — whether this
+    /// specific spawn's stdin/stdout/stderr are each a pipe/`/dev/null`
+    /// (`Audited`) or something this builder cannot vouch for (`Unaudited`,
+    /// the default). Only [`SeatbeltSandbox`] consults it today (the Mach
+    /// deputy audit's own precondition, agent-bridle#416 round 3: an L3 scope
+    /// bound is the admission gate under a non-Kernel floor, so it must share
+    /// the same stdio precondition `seatbelt_net_kernel_witness` already
+    /// requires at L4 — an unaudited restricted launch stays `Unknown`, never
+    /// a named bound); every other backend ignores it.
+    fn resolved_authority(
+        &self,
+        effective: &Caveats,
+        stdio: crate::StdioPosture,
+    ) -> crate::ResolvedAuthority {
+        let _ = (effective, stdio);
         crate::ResolvedAuthority {
             fs_read: crate::ResolvedScope::Unknown,
             fs_write: crate::ResolvedScope::Unknown,
@@ -179,7 +193,11 @@ impl Sandbox for NoopSandbox {
         Ok(())
     }
 
-    fn resolved_authority(&self, _effective: &Caveats) -> crate::ResolvedAuthority {
+    fn resolved_authority(
+        &self,
+        _effective: &Caveats,
+        _stdio: crate::StdioPosture,
+    ) -> crate::ResolvedAuthority {
         // Noop confines nothing, so it can deliver EVERYTHING on every axis:
         // the conservative upper bound is `Unbounded`. Any restricted (`Only(_)`)
         // grant is then a `Superset` of what was delegated ⇒ admission refuses —
@@ -225,7 +243,7 @@ mod resolved_authority_foundation_tests {
             }
         }
         let effective = exec_only("git");
-        let resolved = Bare.resolved_authority(&effective);
+        let resolved = Bare.resolved_authority(&effective, crate::StdioPosture::Unaudited);
         assert_eq!(resolved.exec, ResolvedScope::Unknown);
         assert!(matches!(
             admit(&resolved, &effective, &empty_closure()),
@@ -236,7 +254,7 @@ mod resolved_authority_foundation_tests {
     #[test]
     fn noop_backend_is_unbounded_and_refuses_restricted_grants() {
         let effective = exec_only("git");
-        let resolved = NoopSandbox.resolved_authority(&effective);
+        let resolved = NoopSandbox.resolved_authority(&effective, crate::StdioPosture::Unaudited);
         assert_eq!(resolved.exec, ResolvedScope::Unbounded);
         assert!(matches!(
             admit(&resolved, &effective, &empty_closure()),
@@ -250,7 +268,7 @@ mod resolved_authority_foundation_tests {
         // resolved authority is Subset/Equal of the (unbounded) delegated bound
         // ⇒ admit. The conservative rule only bites RESTRICTED axes.
         let effective = Caveats::top();
-        let resolved = NoopSandbox.resolved_authority(&effective);
+        let resolved = NoopSandbox.resolved_authority(&effective, crate::StdioPosture::Unaudited);
         assert!(matches!(
             admit(&resolved, &effective, &empty_closure()),
             AdmissionDecision::Admit
@@ -290,6 +308,71 @@ pub(crate) fn restricts_exec(caveats: &Caveats) -> bool {
 #[must_use]
 pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
+}
+
+/// `true` when the Seatbelt Mach-lookup deputy audit (agent-bridle#405) is
+/// complete on this build — i.e. [`seatbelt_impl::MACH_DEPUTY_AUDIT`] is
+/// `Complete`. A narrow, read-only crossing of the `seatbelt_impl` cfg
+/// boundary so `report.rs`'s cross-platform `enforcement_report` can gate a
+/// `net → Kernel` claim on the same audit state that already gates the L3
+/// `resolved_authority` projection ([`seatbelt_impl::seatbelt_net_projection`]),
+/// without making the enum or the constant itself public. On a non-macOS
+/// build (or without the `macos-seatbelt` feature) the audit cannot exist, so
+/// this is unconditionally `false` — never a claim this platform cannot back.
+#[must_use]
+pub(crate) fn seatbelt_mach_deputy_audit_complete() -> bool {
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    {
+        seatbelt_impl::MACH_DEPUTY_AUDIT == seatbelt_impl::MachDeputyAudit::Complete
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-seatbelt")))]
+    {
+        false
+    }
+}
+
+/// `true` when this process is NOT running as root (effective UID ≠ 0). ADR
+/// 0015 amendment E6's probes all ran unprivileged (agent-bridle#416 round-2
+/// review, item 2): a root-owned bridle process can reach kernel controls
+/// (privileged IOKit classes, sysctl write paths, privileged Mach services)
+/// the probes never exercised, so the Kernel net witness must not extend to
+/// it. Mirrors [`seatbelt_mach_deputy_audit_complete`]'s cfg-crossing shape:
+/// unconditionally `true` off a Seatbelt-capable build, since nothing there
+/// depends on it (`seatbelt_net_kernel_witness`'s `audit_complete` term is
+/// already `false` there).
+#[must_use]
+pub(crate) fn seatbelt_caller_is_unprivileged() -> bool {
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    {
+        !seatbelt_impl::caller_is_root()
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-seatbelt")))]
+    {
+        true
+    }
+}
+
+/// `true` when a Seatbelt `net` scope is a **Kernel** egress-deny witness: the
+/// deny-all shape (`net_fully_denied`, which already implies zero `mach:`/
+/// `unix:` grants — they are entries in the same non-empty scope set), a
+/// complete Mach-lookup deputy audit (agent-bridle#405/ADR 0015 E6), the
+/// spawn's stdio in the shape that audit covered, and an unprivileged
+/// spawning process (agent-bridle#416 round-2 review, items 1/2 — the ADR's
+/// probes assumed pipe/null-only stdio and ran unprivileged; neither was
+/// enforced by construction). Pure — every precondition is a parameter rather
+/// than read from ambient state, so `report.rs`'s test suite can pin this
+/// predicate directly, independent of whichever state the production
+/// constant ships or the actual privilege of whatever process runs the suite
+/// (`Complete` as of agent-bridle#405/ADR 0015 amendment E6, 2026-10-01; see
+/// [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc comment for the evidence).
+#[must_use]
+pub(crate) fn seatbelt_net_kernel_witness(
+    effective: &Caveats,
+    audit_complete: bool,
+    stdio_audited: bool,
+    caller_unprivileged: bool,
+) -> bool {
+    audit_complete && stdio_audited && caller_unprivileged && net_fully_denied(effective)
 }
 
 /// An explicit `unix:<path>` token names a path-anchored Unix-domain socket
@@ -937,7 +1020,11 @@ pub(crate) mod appcontainer_impl {
         /// `127.0.0.0/8` + `::1`, every port — not a requested subset), so union a
         /// `loopback-exemption` class to REVEAL that widening; a specific remote-host
         /// allowlist AppContainer cannot faithfully bound → `Unknown` ⇒ refuse.
-        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        fn resolved_authority(
+            &self,
+            effective: &Caveats,
+            _stdio: crate::StdioPosture,
+        ) -> crate::ResolvedAuthority {
             use crate::ResolvedScope as Rs;
             // fs: mirror the aclaunch DACL — a write ACE (FILE_GENERIC_READ_WRITE)
             // confers read, so the resolved read scope unions the write scope.
@@ -1148,7 +1235,8 @@ mod appcontainer_resolved_authority_tests {
     }
 
     fn decide(caveats: &Caveats) -> AdmissionDecision {
-        let resolved = AppContainerSandbox::new(None).resolved_authority(caveats);
+        let resolved = AppContainerSandbox::new(None)
+            .resolved_authority(caveats, crate::StdioPosture::Unaudited);
         admit(&resolved, caveats, &empty_closure())
     }
 
@@ -1172,7 +1260,8 @@ mod appcontainer_resolved_authority_tests {
             ),
         }
         // The projection itself must reveal the widening (never == the delegated read).
-        let resolved = AppContainerSandbox::new(None).resolved_authority(&c);
+        let resolved =
+            AppContainerSandbox::new(None).resolved_authority(&c, crate::StdioPosture::Unaudited);
         assert_ne!(
             resolved.fs_read,
             ResolvedScope::from_scope(&c.fs_read),
@@ -1599,7 +1688,11 @@ pub(crate) mod landlock_impl {
             Ok(())
         }
 
-        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        fn resolved_authority(
+            &self,
+            effective: &Caveats,
+            _stdio: crate::StdioPosture,
+        ) -> crate::ResolvedAuthority {
             use crate::ResolvedScope;
             use std::collections::BTreeSet;
 
@@ -2541,7 +2634,8 @@ pub(crate) mod landlock_impl {
             std::fs::create_dir_all(&base).unwrap();
             symlink("/", &link).unwrap();
             let delegated = fs_read_only(link.to_str().unwrap());
-            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            let resolved = LandlockSandbox::new()
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_eq!(resolved.fs_read, ResolvedScope::Unknown);
             assert!(matches!(
                 admit(&resolved, &delegated, &empty_closure()),
@@ -2560,7 +2654,8 @@ pub(crate) mod landlock_impl {
                 net: Scope::only(Vec::<String>::new()),
                 ..Caveats::top()
             };
-            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            let resolved = LandlockSandbox::new()
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_eq!(resolved.net, ResolvedScope::Unknown);
             assert!(matches!(
                 admit(&resolved, &delegated, &empty_closure()),
@@ -2584,8 +2679,8 @@ pub(crate) mod landlock_impl {
                 child_network: crate::ChildNetworkPolicy::DenyDirect,
                 ..crate::SandboxPolicy::default()
             };
-            let resolved =
-                LandlockSandbox::with_policy(Arc::new(policy)).resolved_authority(&delegated);
+            let resolved = LandlockSandbox::with_policy(Arc::new(policy))
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_ne!(
                 resolved.net,
                 ResolvedScope::Unknown,
@@ -2605,7 +2700,8 @@ pub(crate) mod landlock_impl {
         #[test]
         fn unrestricted_grant_admits() {
             let delegated = Caveats::top();
-            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            let resolved = LandlockSandbox::new()
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_eq!(resolved.net, ResolvedScope::Unbounded);
             assert_eq!(resolved.fs_read, ResolvedScope::Unbounded);
             assert!(matches!(
@@ -2625,7 +2721,7 @@ pub(crate) mod landlock_impl {
             std::fs::create_dir_all(&dir).unwrap();
             let delegated = fs_read_only(dir.to_str().unwrap());
             let sb = LandlockSandbox::new();
-            let resolved = sb.resolved_authority(&delegated);
+            let resolved = sb.resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             let closure = sb.runtime_closure(&delegated);
             assert!(
                 matches!(
@@ -2673,26 +2769,37 @@ mod seatbelt_impl {
     /// posture of ADR 0015's E4 ruling. Only a deputy-complete native proof
     /// (every reachable ambient IPC route shown closed, positive controls
     /// included) may flip [`MACH_DEPUTY_AUDIT`] to `Complete`. The constant
-    /// controls ONLY the resolved-authority projection (the L3 scope bound).
-    /// It does not touch the per-axis strength report (`report.rs`, which
-    /// keeps every restricted Seatbelt net shape Advisory) or the L4 strength
-    /// floor, so flipping it alone does not admit `net:none` under a CONFINED
-    /// (Kernel-net) contract. Report/floor integration and end-to-end
-    /// admission tests belong to the evidence-backed promotion PR.
+    /// controls ONLY the resolved-authority projection (the L3 scope bound);
+    /// `report.rs`'s Seatbelt `net` arm reads it too (via
+    /// `seatbelt_mach_deputy_audit_complete`/`seatbelt_net_kernel_witness`) so
+    /// the L3 projection and the L4 strength report promote together, never
+    /// one without the other.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum MachDeputyAudit {
         Incomplete,
-        /// Not yet constructible in production — reached only by the unit test
-        /// that pins the post-audit projection (see `MACH_DEPUTY_AUDIT`).
-        #[cfg_attr(not(test), allow(dead_code))]
         Complete,
     }
 
-    /// The audit state this build ships. **Incomplete**: the zero floor closes
-    /// every *named* Mach lookup, but other ambient IPC (AppleEvents, XPC via
-    /// inherited endpoints, the `nsurlsessiond` class of deputies reached by
-    /// other means) is not comprehensively certified.
-    pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Incomplete;
+    /// The audit state this build ships. **Complete** (agent-bridle#405, ADR
+    /// 0015 amendment E6, 2026-10-01; narrowed by the round-2 review,
+    /// agent-bridle#416): the zero floor closes every *named* Mach lookup, and
+    /// the measured legs of the channel sweep — unix-domain sockets,
+    /// `open(1)`/LaunchServices, Darwin notifications, pasteboard,
+    /// `iokit-open`, `sysctl-write`, a write-class `file-ioctl`, XPC beyond
+    /// `mach-lookup`, and AppleEvents — are each shown closed under an
+    /// UNPRIVILEGED probing process (full evidence table: ADR 0015 amendment
+    /// E6). `process-info`/`signal` and the shared-memory/file-drop surface
+    /// are stated as explicit ACCEPTED LIMITS of a direct-egress claim (they
+    /// carry no network authority), not as proof the deputy set is exhaustive;
+    /// "no ambient relay found" on the probed host is an observation about
+    /// that host, not a closure proof. This governs ONLY the deny-all,
+    /// zero-`mach:`-grant shape, and ONLY when the caller is unprivileged and
+    /// the spawn's stdio is pipe/null-only — [`super::seatbelt_net_kernel_witness`]'s
+    /// other parameters, enforced at `caller_is_root`/the spawn's declared
+    /// [`crate::StdioPosture`]. A named grant, a loopback scope, a remote-host
+    /// allowlist, a root-owned caller, or unaudited stdio are all unaffected
+    /// and stay `Unknown`/`Advisory`.
+    pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Complete;
 
     /// The conservative network projection for `effective` under `audit`.
     /// Pure. `All` is ambient (`Unbounded`). Every restricted shape is
@@ -2750,6 +2857,18 @@ mod seatbelt_impl {
     #[must_use]
     pub fn seatbelt_is_supported() -> bool {
         Path::new(SANDBOX_EXEC).exists()
+    }
+
+    /// `true` when this process's effective UID is 0 (root). ADR 0015 E6's
+    /// probes all ran unprivileged (agent-bridle#416 round-2 review, item 2).
+    /// Reads the real ambient UID via `rustix` (a safe wrapper, so core stays
+    /// `forbid(unsafe_code)`) — deliberately NOT a pure/parameterized
+    /// predicate, unlike [`super::seatbelt_net_kernel_witness`], which takes
+    /// the already-read value as a plain bool specifically so its logic stays
+    /// testable without depending on the actual privilege of whatever process
+    /// runs the suite.
+    pub(super) fn caller_is_root() -> bool {
+        rustix::process::geteuid().is_root()
     }
 
     /// A real, kernel-enforced Seatbelt sandbox (macOS).
@@ -2883,13 +3002,38 @@ mod seatbelt_impl {
         /// follows [`seatbelt_net_projection`] under the shipped
         /// [`MACH_DEPUTY_AUDIT`]: unrestricted authority is honestly ambient, and
         /// every restricted network scope remains `Unknown` (refused before spawn)
-        /// until the deputy audit is complete. The zero Mach floor and the named
-        /// `mach:` grants in the generated profile are real kernel rules, but they
-        /// are not used to promote restricted network authority to a bounded claim
-        /// (agent-bridle#405 D4: fail closed first).
-        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        /// until the deputy audit is complete AND this specific spawn's declared
+        /// [`crate::StdioPosture`]/caller privilege back it. The zero Mach floor and
+        /// the named `mach:` grants in the generated profile are real kernel rules,
+        /// but they are not used to promote restricted network authority to a
+        /// bounded claim on their own (agent-bridle#405 D4: fail closed first).
+        fn resolved_authority(
+            &self,
+            effective: &Caveats,
+            stdio: crate::StdioPosture,
+        ) -> crate::ResolvedAuthority {
             let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
-            resolved.net = seatbelt_net_projection(effective, MACH_DEPUTY_AUDIT);
+            // A root-owned process, or a spawn whose stdio is not declared
+            // audited, narrows straight back to `Incomplete` — the SAME
+            // `Unknown`/held-for-admission treatment an actually incomplete audit
+            // already gets (agent-bridle#416 round-2 review, items 1/2: the
+            // probes behind `MACH_DEPUTY_AUDIT` all ran unprivileged with
+            // pipe/null-only stdio, so nothing backs a claim about a root
+            // process's privileged kernel-control surface, or about a launch
+            // whose stdio could already be a connected endpoint Seatbelt's own
+            // socket rules never see). This is the L3 admission gate, not merely
+            // a strength label (round-3 review): it must share the SAME
+            // preconditions `seatbelt_net_kernel_witness` already requires at
+            // L4, or an unprivileged net:none spawn with unaudited stdio resolves
+            // a named `Bounded(∅)` bound here regardless of what L4 reports, and
+            // a non-Kernel floor (e.g. the shipped `EnforcementFloor::DEFAULT`,
+            // which accepts Advisory net) admits it on that bound alone.
+            let audit = if caller_is_root() || stdio != crate::StdioPosture::Audited {
+                MachDeputyAudit::Incomplete
+            } else {
+                MACH_DEPUTY_AUDIT
+            };
+            resolved.net = seatbelt_net_projection(effective, audit);
             resolved
         }
 
@@ -3401,16 +3545,57 @@ mod seatbelt_impl {
             assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
         }
 
-        /// Support remains held (agent-bridle#405 D4, fail closed first): every
-        /// restricted network scope — `net:none`, a `mach:` grant, loopback — is
-        /// `Unknown` while `MACH_DEPUTY_AUDIT` is incomplete, even though the
-        /// profile installs the zero floor and the named grants for real.
+        /// agent-bridle#405/ADR 0015 amendment E6: the deputy audit is now
+        /// `Complete` (the full channel sweep closed, AppleEvents included).
+        /// `net:none` zero grants resolves to the bottom element `∅` — the
+        /// promotion this whole audit exists to back.
         #[test]
-        fn every_restricted_network_scope_resolves_unknown() {
-            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Incomplete);
+        fn net_none_resolves_bounded_empty_now_the_audit_is_complete() {
+            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Complete);
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&cav, crate::StdioPosture::Audited)
+                    .net,
+                ResolvedScope::empty(),
+                "net:none zero grants must resolve to the bottom element now the audit is complete"
+            );
+        }
+
+        /// A named `mach:` grant resolves to its own class, never to `∅` and
+        /// never to `Unknown` — the "never collapse to ∅" requirement from
+        /// #405's acceptance criteria, now exercised through the real
+        /// `resolved_authority`, not just the pure projection function.
+        #[test]
+        fn mach_grant_resolves_its_named_class_not_unknown_or_empty() {
+            let cav = Caveats {
+                net: Scope::only(["mach:com.apple.SecurityServer".to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&cav, crate::StdioPosture::Audited)
+                    .net,
+                ResolvedScope::class(super::super::seatbelt_mach_service_class(
+                    "com.apple.SecurityServer"
+                )),
+                "a named grant must never collapse to ∅ nor remain Unknown"
+            );
+        }
+
+        /// Support remains held for shapes this audit never covered: loopback
+        /// and a general remote-host allowlist carry no Mach floor at all (no
+        /// `(deny mach-lookup)` is ever emitted for them — see
+        /// `seatbelt_profile_with`), so a complete deputy audit for the
+        /// deny-all shape says nothing about them. #405's acceptance criteria
+        /// ("named grants stay Unknown until each is audited" extends to
+        /// shapes with no floor to audit at all).
+        #[test]
+        fn loopback_and_remote_host_stay_unknown_even_with_a_complete_audit() {
             for net in [
-                Scope::none(),
-                Scope::only(["mach:com.apple.SecurityServer".to_string()]),
                 Scope::only(["127.0.0.1".to_string()]),
                 Scope::only(["example.com".to_string()]),
             ] {
@@ -3419,14 +3604,16 @@ mod seatbelt_impl {
                     ..Caveats::top()
                 };
                 assert_eq!(
-                    SeatbeltSandbox::new().resolved_authority(&cav).net,
+                    SeatbeltSandbox::new()
+                        .resolved_authority(&cav, crate::StdioPosture::Audited)
+                        .net,
                     ResolvedScope::Unknown,
-                    "{net:?} support must remain held at admission"
+                    "{net:?} has no Mach floor at all; the audit doesn't bound it"
                 );
             }
             assert_eq!(
                 SeatbeltSandbox::new()
-                    .resolved_authority(&Caveats::top())
+                    .resolved_authority(&Caveats::top(), crate::StdioPosture::Audited)
                     .net,
                 ResolvedScope::Unbounded
             );
