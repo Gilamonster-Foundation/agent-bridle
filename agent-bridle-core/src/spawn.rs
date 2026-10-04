@@ -720,11 +720,15 @@ impl ConfinedCommand {
         // instead preserve exec deny-all so its launcher applies the
         // child-process block — so it declares nothing. Neither changes the
         // reported/effective authority.
-        let worker_image = if authority == SpawnAuthority::TrustedWorker {
-            Some(WorkerImage::bind(kind, &self.program)?)
-        } else {
-            None
-        };
+        // #418/#419 addresses Landlock's separate image read/exec rules.
+        // Other backends keep their own launch protocol; this is backend
+        // dispatch, never a pathname fallback after a failed Landlock bind.
+        let worker_image =
+            if authority == SpawnAuthority::TrustedWorker && kind == SandboxKind::Landlock {
+                Some(WorkerImage::bind(kind, &self.program)?)
+            } else {
+                None
+            };
         let closure_program = worker_image
             .as_ref()
             .map_or(self.program.as_str(), |image| image.program.as_str());
@@ -1206,17 +1210,21 @@ fn trusted_worker_closure(
         return Ok(RuntimeClosure::empty());
     }
     match kind {
-        SandboxKind::Landlock
-        | SandboxKind::Seatbelt
-        | SandboxKind::MinimalRootfs
-        | SandboxKind::MicroVm => {
-            // The declaration names added mechanism authority, not delegated
-            // authority. WorkerImage has already bound and validated this name;
-            // Landlock replaces these entries with rules on that held file,
-            // and exec uses its descriptor. Never re-resolve the name here.
+        SandboxKind::Landlock => {
+            // WorkerImage already bound and validated this label. Landlock
+            // replaces it with rules on the held file and executes that object.
+            // Never re-resolve the name after binding.
             RuntimeClosure::empty()
                 .with_exec(program.to_owned())?
                 .with_fs_read(program.to_owned())
+        }
+        SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
+            // Preserve the existing wrapper/domain closure declaration. These
+            // backends do not consume Linux's descriptor-based image rules.
+            let canonical = crate::admitted::canonical_closure_program(program)?;
+            RuntimeClosure::empty()
+                .with_exec(canonical.clone())?
+                .with_fs_read(canonical)
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
@@ -1774,6 +1782,32 @@ mod tests {
         Gate::new(0)
             .authorize(&AnyTool, &granted)
             .expect("authorize")
+    }
+
+    /// #419 round 2: Linux descriptor execution must not replace another
+    /// backend's worker route. A script exposes the erroneous CLOEXEC/proc-fd
+    /// route on Noop; on macOS the old unconditional bind refuses outright.
+    #[cfg(all(unix, not(all(target_os = "linux", feature = "linux-landlock"))))]
+    #[test]
+    fn non_landlock_trusted_worker_still_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("bridle-non-landlock-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = dir.join("worker");
+        std::fs::write(&worker, "#!/bin/sh\nprintf 'worker-started'\n").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cx = ctx(Caveats::top());
+        let result = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_authorized(&cx, cx.caveats().clone(), SpawnAuthority::TrustedWorker)
+            .and_then(|child| child.child.wait_with_output().map_err(ToolError::from));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let output = result.expect("the non-Landlock worker route must remain available");
+        assert!(output.status.success(), "worker failed: {:?}", output);
+        assert_eq!(output.stdout, b"worker-started");
     }
 
     /// Core freezes authority at worker spawn and exposes only a one-shot

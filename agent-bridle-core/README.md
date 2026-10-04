@@ -6,15 +6,17 @@ plumbing, and the `ToolEnvelope` result type. It re-exports the canonical
 authority types (`Caveats`, `Scope`, `CountBound`) from `agent-mesh-protocol`
 so every host and tool speaks one lattice.
 
-Trusted-worker image binding (PR #419) currently supports Linux only. The
-worker is opened once through the held-root resolver and must be a regular
-file. Landlock read/exec exceptions use that descriptor, and execution uses
-its `/proc/self/fd` operand with close-on-exec retained. Path replacement cannot
-change the launched object or widen the exception to a directory; this is an
-inode binding, not a claim that the file's contents are immutable. Missing
-procfs, unsupported descriptor execution, or a backend/platform without this
-binding refuses the launch. In particular, trusted-worker launches on macOS
-currently fail closed; ordinary model-selected Seatbelt spawns are unchanged.
+Trusted-worker image binding (PR #419) is specific to the Linux Landlock
+backend. The worker is opened once through the held-root resolver and must be
+a regular file. Landlock read/exec exceptions use that descriptor, and execution
+uses its `/proc/self/fd` operand with close-on-exec retained. Path replacement
+cannot change the launched object or widen the exception to a directory; this
+pins an inode, not immutable contents. Missing procfs or unsupported descriptor
+execution refuses the Landlock launch, without falling back to the pathname.
+
+Seatbelt, AppContainer, and Noop retain their existing platform launch routes
+and closure declarations; they do not use Linux's descriptor-execution path.
+The Landlock image-binding guarantee does not extend to those backends.
 
 The non-bypassable invariant: a `Tool` can only act through a `ToolContext`,
 and a `ToolContext` can only be minted inside `Gate::authorize`. The tool

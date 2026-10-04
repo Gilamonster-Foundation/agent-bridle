@@ -206,15 +206,6 @@ impl Sandbox for NoopSandbox {
         Ok(())
     }
 
-    fn apply_with_worker(
-        &self,
-        effective: &Caveats,
-        _program: &str,
-        _image: &std::fs::File,
-    ) -> ToolResult<()> {
-        self.apply(effective)
-    }
-
     fn resolved_authority(
         &self,
         _effective: &Caveats,

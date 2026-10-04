@@ -16,7 +16,7 @@ impl WorkerImage {
     pub(super) fn bind(kind: SandboxKind, program: &str) -> ToolResult<Self> {
         #[cfg(target_os = "linux")]
         {
-            if !matches!(kind, SandboxKind::Landlock | SandboxKind::None) {
+            if kind != SandboxKind::Landlock {
                 return Err(ToolError::denied(
                     "worker backend cannot bind rules and execution to a held image",
                 ));
@@ -101,12 +101,19 @@ mod tests {
         assert!(error.to_string().contains("regular file"), "{error}");
     }
 
-    /// #419: a backend without a same-object route cannot launch by pathname.
+    /// #419 round 2: non-Landlock backends use their own launch route, never
+    /// this Linux binding primitive (including Noop on a Linux host).
     #[test]
-    fn unsupported_worker_binding_fails_closed() {
-        let error = WorkerImage::bind(SandboxKind::Seatbelt, "unused-worker-path")
-            .err()
-            .expect("unsupported backend must refuse");
-        assert!(error.to_string().contains("bind"), "{error}");
+    fn non_landlock_backends_cannot_enter_image_binding() {
+        for kind in [
+            SandboxKind::Seatbelt,
+            SandboxKind::AppContainer,
+            SandboxKind::None,
+        ] {
+            let error = WorkerImage::bind(kind, "unused-worker-path")
+                .err()
+                .expect("only Landlock may enter image binding");
+            assert!(error.to_string().contains("bind"), "{kind:?}: {error}");
+        }
     }
 }
