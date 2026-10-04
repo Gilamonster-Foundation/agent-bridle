@@ -14,9 +14,10 @@ cannot change the launched object or widen the exception to a directory; this
 pins an inode, not immutable contents. Missing procfs or unsupported descriptor
 execution refuses the Landlock launch, without falling back to the pathname.
 
-Seatbelt, AppContainer, and Noop retain their existing platform launch routes
-and closure declarations; they do not use Linux's descriptor-execution path.
-The Landlock image-binding guarantee does not extend to those backends.
+Seatbelt, MinimalRootfs, and MicroVm retain their pre-PR exec-only worker
+closure: no worker image read grant is added. AppContainer and Noop declare
+no worker closure. These backends retain their platform launch routes without
+Linux's descriptor-execution path or its image-binding guarantee.
 
 The non-bypassable invariant: a `Tool` can only act through a `ToolContext`,
 and a `ToolContext` can only be minted inside `Gate::authorize`. The tool

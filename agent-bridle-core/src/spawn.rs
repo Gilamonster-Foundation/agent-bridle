@@ -1180,10 +1180,10 @@ impl SandboxedWorker {
 /// (it then flows through [`AdmittedFence::admit`]'s scope check like any
 /// other closure entry; nothing widens the mechanism caveats silently).
 ///
-/// Landlock, Seatbelt, and the identity-closing stronger tiers need the fixed
-/// worker executable in their kernel execute **and** read allow-lists so the
-/// boundary can launch it — those declare it on both axes. Execute and read
-/// are separate Landlock rights: a caller that restricts `fs_read` while
+/// Seatbelt and the identity-closing stronger tiers declare only the fixed
+/// worker executable on the exec axis. Landlock additionally declares the
+/// worker on the read axis, binding both rules to its held descriptor.
+/// Execute and read are separate Landlock rights: a caller that restricts `fs_read` while
 /// leaving `exec` ambient (`Scope::All`) never merges the worker's path into
 /// the mechanism's exec scope (only a restricted `Only(_)` exec axis gets the
 /// closure's exec entries), so without a matching `fs_read` declaration the
@@ -1219,12 +1219,9 @@ fn trusted_worker_closure(
                 .with_fs_read(program.to_owned())
         }
         SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
-            // Preserve the existing wrapper/domain closure declaration. These
-            // backends do not consume Linux's descriptor-based image rules.
-            let canonical = crate::admitted::canonical_closure_program(program)?;
-            RuntimeClosure::empty()
-                .with_exec(canonical.clone())?
-                .with_fs_read(canonical)
+            // Preserve the pre-#419 exec-only wrapper/domain declaration.
+            // The additional worker read authority belongs only to Landlock.
+            RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
@@ -2127,6 +2124,49 @@ mod tests {
             Some(AxisEnforcement::Kernel),
             "the preserved mechanism matches the reported kernel guarantee"
         );
+    }
+
+    /// #419 round 3: non-Landlock workers must retain the pre-PR exec-only
+    /// closure, without adding their image to a restricted read allowance.
+    #[test]
+    fn non_landlock_worker_closure_preserves_restricted_reads() {
+        let current = std::env::current_exe()
+            .expect("current executable")
+            .canonicalize()
+            .expect("canonical current executable")
+            .to_string_lossy()
+            .into_owned();
+        let delegated = Caveats {
+            exec: Scope::only([] as [String; 0]),
+            fs_read: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+        for kind in [
+            SandboxKind::Seatbelt,
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+        ] {
+            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
+                .expect("non-Landlock worker closure");
+            assert_eq!(
+                closure,
+                RuntimeClosure::empty().with_exec(current.clone()).unwrap(),
+                "{kind:?} must declare exec only, with no worker read grant"
+            );
+            let admitted = AdmittedFence::admit(
+                &delegated,
+                closure,
+                ConfinementMechanism::new(kind, crate::ChildNetworkPolicy::LandlockOnly),
+                EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+                worker_admitting_projection,
+            )
+            .expect("non-Landlock admission");
+            assert_eq!(admitted.mechanism_caveats().fs_read, delegated.fs_read);
+            assert_eq!(
+                admitted.mechanism_caveats().exec,
+                Scope::only([current.clone()])
+            );
+        }
     }
 
     /// Backends whose wrapper/domain must execute the trusted worker still get
