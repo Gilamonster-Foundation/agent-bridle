@@ -40,6 +40,9 @@ use crate::{
     ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy,
     ToolContext, ToolError, ToolResult,
 };
+mod worker_image;
+use worker_image::WorkerImage;
+
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -642,6 +645,19 @@ impl ConfinedCommand {
         effective: Caveats,
         authority: SpawnAuthority,
     ) -> ToolResult<ConfinedChild> {
+        self.spawn_authorized_observed(cx, effective, authority, || {}, || {})
+    }
+
+    // Private continuation seam: deterministic namespace-mutation controls exercise
+    // the real admission/apply/exec sequence without timers or racing threads.
+    fn spawn_authorized_observed(
+        self,
+        cx: &ToolContext,
+        effective: Caveats,
+        authority: SpawnAuthority,
+        after_admission: impl FnOnce(),
+        after_apply: impl FnOnce() + Send + 'static,
+    ) -> ToolResult<ConfinedChild> {
         // (1) Admission: model-selected programs must be in the exec grant.
         // A trusted worker transition is not model-selected; its fixed program
         // is added only to the mechanism policy below.
@@ -704,7 +720,15 @@ impl ConfinedCommand {
         // instead preserve exec deny-all so its launcher applies the
         // child-process block — so it declares nothing. Neither changes the
         // reported/effective authority.
-        let closure = trusted_worker_closure(kind, authority, &self.program)?;
+        let worker_image = if authority == SpawnAuthority::TrustedWorker {
+            Some(WorkerImage::bind(kind, &self.program)?)
+        } else {
+            None
+        };
+        let closure_program = worker_image
+            .as_ref()
+            .map_or(self.program.as_str(), |image| image.program.as_str());
+        let closure = trusted_worker_closure(kind, authority, closure_program)?;
 
         // (3) THE admission (L2+L3+L4, one object). `AdmittedFence::admit`
         // derives the mechanism caveats (delegated ∪ declared closure) exactly
@@ -784,6 +808,7 @@ impl ConfinedCommand {
             }
             other => other,
         })?;
+        after_admission();
         let mechanism_effective = admitted.mechanism_caveats().clone();
 
         // ASM-CID / L2 at runtime: the caveats we are about to compile+apply must
@@ -827,12 +852,21 @@ impl ConfinedCommand {
             // supports only Landlock (no wrapper), so the actual program operand
             // is the root; unsupported wrappers refuse rather than guessing at
             // a second target string. Verification consumes fresh backend state.
-            let (spawn_program, spawn_args) = wrap_argv(&prefix, &program, &args);
+            let exec_operand = match &worker_image {
+                Some(image) => image.exec_operand()?,
+                None => program.clone(),
+            };
+            let (spawn_program, spawn_args) = wrap_argv(&prefix, &exec_operand, &args);
 
             // Wrap the child in the backend's command prefix when it confines via
             // a wrapper (Seatbelt, AppContainer); otherwise spawn the program directly.
             let mut cmd = Command::new(&spawn_program);
             cmd.args(&spawn_args);
+            #[cfg(unix)]
+            if let Some(image) = &worker_image {
+                use std::os::unix::process::CommandExt;
+                cmd.arg0(&image.program);
+            }
             cmd.env_clear(); // no ambient environment crosses the boundary …
             for (k, v) in &envs {
                 cmd.env(k, v); // … only the explicitly-granted vars.
@@ -891,9 +925,14 @@ impl ConfinedCommand {
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
             // non-empty.
             if prefix.is_empty() {
-                sandbox.apply(&mechanism_effective)?;
+                if let Some(image) = &worker_image {
+                    sandbox.apply_with_worker(&mechanism_effective, &image.program, &image.file)?;
+                } else {
+                    sandbox.apply(&mechanism_effective)?;
+                }
             }
 
+            after_apply();
             cmd.spawn().map_err(ToolError::from)
         })
         .join()
@@ -1171,16 +1210,13 @@ fn trusted_worker_closure(
         | SandboxKind::Seatbelt
         | SandboxKind::MinimalRootfs
         | SandboxKind::MicroVm => {
-            // agent-bridle#418: declare the worker image in BOTH `exec` and
-            // `fs_read` — the same canonical object. A kernel exec allow-list
-            // does not imply a read allow-list (they are separate Landlock
-            // rights), so a caller that restricts `fs_read` while leaving
-            // `exec` ambient could load everything else but not the worker's
-            // own ELF. Narrowing-only: exactly this one file, on both axes.
-            let canonical = crate::admitted::canonical_closure_program(program)?;
+            // The declaration names added mechanism authority, not delegated
+            // authority. WorkerImage has already bound and validated this name;
+            // Landlock replaces these entries with rules on that held file,
+            // and exec uses its descriptor. Never re-resolve the name here.
             RuntimeClosure::empty()
-                .with_exec(canonical.clone())?
-                .with_fs_read(canonical)
+                .with_exec(program.to_owned())?
+                .with_fs_read(program.to_owned())
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
@@ -2461,6 +2497,137 @@ mod landlock_child_tests {
 
         let _ = fs::remove_dir_all(worker.parent().unwrap());
         let _ = fs::remove_dir_all(&granted_read);
+    }
+
+    /// #419: replacing the admitted path must not execute the replacement.
+    #[test]
+    fn worker_image_replacement_keeps_the_admitted_object() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        });
+        let swap = worker.clone();
+        let spawned = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    fs::rename(&swap, swap.with_extension("original")).unwrap();
+                    fs::copy("/bin/false", &swap).unwrap();
+                },
+                || {},
+            );
+        let safe = match spawned {
+            Err(_) => true,
+            Ok(mut child) => child.child.wait().unwrap().success(),
+        };
+        fs::remove_dir_all(worker.parent().unwrap()).unwrap();
+        assert!(
+            safe,
+            "replacement image ran instead of the admitted echo image"
+        );
+    }
+
+    // Hold an independent hard link to the original cat image in the delegated
+    // read scope. This keeps exec possible on the old implementation after we
+    // restore the pathname: failure to read the IMAGE cannot mask an overbroad
+    // directory grant. Mutations occur synchronously at both stage boundaries.
+    fn worker_read_substitution(symlink_to_parent: bool) {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let dir = unique_dir("worker-substitution");
+        let worker = dir.join("worker");
+        let original = dir.join("original");
+        fs::copy("/bin/cat", &worker).unwrap();
+        fs::hard_link(&worker, &original).unwrap();
+        let secret = if symlink_to_parent {
+            dir.join("sibling")
+        } else {
+            dir.join("widened/secret")
+        };
+        if symlink_to_parent {
+            fs::write(&secret, "sibling-secret").unwrap();
+        }
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([original.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        // Positive startup + ordinary sibling denial control, before substitution.
+        let control = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(&secret)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, cx.caveats().clone(), SpawnAuthority::TrustedWorker)
+            .expect("control worker starts")
+            .child
+            .wait_with_output()
+            .unwrap();
+        assert!(!control.status.success());
+        assert!(control.stdout.is_empty());
+
+        let before = worker.clone();
+        let after = worker.clone();
+        let restore = original.clone();
+        let spawned = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(&secret)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    fs::remove_file(&before).unwrap();
+                    if symlink_to_parent {
+                        std::os::unix::fs::symlink(before.parent().unwrap(), &before).unwrap();
+                    } else {
+                        fs::create_dir(&before).unwrap();
+                        fs::write(before.join("secret"), "directory-secret").unwrap();
+                    }
+                },
+                move || {
+                    if symlink_to_parent {
+                        fs::remove_file(&after).unwrap();
+                    } else {
+                        fs::rename(&after, after.parent().unwrap().join("widened")).unwrap();
+                    }
+                    fs::hard_link(&restore, &after).unwrap();
+                },
+            );
+        let safe = match spawned {
+            Err(_) => true,
+            Ok(child) => {
+                let out = child.child.wait_with_output().unwrap();
+                !out.status.success() && out.stdout.is_empty()
+            }
+        };
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            safe,
+            "worker closure widened to a directory and disclosed an ungranted file"
+        );
+    }
+
+    /// #419: substituting a directory during rule construction never grants it.
+    #[test]
+    fn worker_image_directory_substitution_never_grants_directory_read() {
+        worker_read_substitution(false);
+    }
+
+    /// #419: a symlink to the worker's parent must not make its sibling readable.
+    #[test]
+    fn worker_image_symlink_substitution_never_grants_sibling_read() {
+        worker_read_substitution(true);
     }
 }
 

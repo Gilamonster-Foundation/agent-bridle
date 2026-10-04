@@ -6,6 +6,16 @@ plumbing, and the `ToolEnvelope` result type. It re-exports the canonical
 authority types (`Caveats`, `Scope`, `CountBound`) from `agent-mesh-protocol`
 so every host and tool speaks one lattice.
 
+Trusted-worker image binding (PR #419) currently supports Linux only. The
+worker is opened once through the held-root resolver and must be a regular
+file. Landlock read/exec exceptions use that descriptor, and execution uses
+its `/proc/self/fd` operand with close-on-exec retained. Path replacement cannot
+change the launched object or widen the exception to a directory; this is an
+inode binding, not a claim that the file's contents are immutable. Missing
+procfs, unsupported descriptor execution, or a backend/platform without this
+binding refuses the launch. In particular, trusted-worker launches on macOS
+currently fail closed; ordinary model-selected Seatbelt spawns are unchanged.
+
 The non-bypassable invariant: a `Tool` can only act through a `ToolContext`,
 and a `ToolContext` can only be minted inside `Gate::authorize`. The tool
 receives the *meet* of granted-and-required authority — least authority by

@@ -26,6 +26,7 @@
 //! declaration time; an unresolvable comparison refuses.
 
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 mod named_root;
@@ -414,6 +415,7 @@ impl AdmittedFence {
 /// # Errors
 /// [`ToolError::Denied`] when the path cannot be resolved (a worker we cannot
 /// name exactly is a worker we refuse to authorize).
+#[cfg(target_os = "linux")]
 pub(crate) fn canonical_closure_program(program: &str) -> ToolResult<String> {
     Ok(Path::new(program)
         .canonicalize()

@@ -125,7 +125,7 @@ tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
 # `forbid(unsafe_code)`, so the signal cannot be a raw `libc` FFI call; rustix
 # provides it as a safe fn. Same primitive `agent-bridle-tool-shell` already
 # uses to reap a Brush worker tree, and already in the lockfile.
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 agent-bridle-fdguard = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
