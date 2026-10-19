@@ -155,6 +155,12 @@ forbids overclaiming.
 [5] M. Salaün, *Landlock*, Linux kernel, 2021– (L3).
 [6] E. Debenedetti et al., *Defeating Prompt Injections by Design (CaMeL)*,
     Google DeepMind, 2025.
+[7] W3C CCG, *Authorization Capabilities (ZCAP)*, v0.4.0-rc.6 draft, 2026.
+[8] B. Zelenka et al., *UCAN* v1.0.0, 2026.
+
+[7] and [8] are convergent designs. agent-mesh's interop survey first noted
+UCAN on 2026-08-18, and we took up both in depth on 2026-09-19, after this ADR
+was written. See the paper's §8.
 
 Full citations and the argument behind every invariant: *The Age of the Confused
 Deputy* (`docs/papers/2026-06-18-age-of-the-confused-deputy.md`).
