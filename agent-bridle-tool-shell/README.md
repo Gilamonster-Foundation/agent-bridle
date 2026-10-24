@@ -105,11 +105,11 @@ L3 (ADR 0005). Coverage is backend- and scope-shaped:
   `Interceptor` because the loader trampoline remains), and can deny all TCP on
   ABI-v4 kernels.
 - Seatbelt confines both filesystem axes and restricted exec. On the network
-  axis only the audited zero-grant `net:none` shape (unprivileged caller,
-  pipe/`/dev/null` or trusted-worker control stdio) reports kernel strength;
-  `unix:`/`mach:` grants are projected exactly but stay `Advisory`, and
-  loopback and remote-host scopes stay `Unknown`/`Advisory` and are refused by
-  a kernel net floor.
+  axis, with an unprivileged caller and audited stdio, zero-grant `net:none`
+  reports kernel strength and `unix:`/`mach:` grants project exactly but report
+  `Advisory` (only a kernel net floor rejects them). Loopback and remote-host
+  scopes, and any root or unaudited-stdio launch, resolve `Unknown` and are
+  refused at admission whatever the floor.
 - AppContainer confines filesystem paths, empty or loopback-only network
   scopes, and exec deny-all for supported subprocess engines; the Brush private
   transport is currently unavailable on Windows, so hosts select `ShellTool`.
