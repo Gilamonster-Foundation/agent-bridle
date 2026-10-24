@@ -103,7 +103,7 @@ sha2 = { version = "0.10", optional = true }
 # Optional: P-256 ECDSA verification for the ES256 WebAuthn verifier, gated by
 # `verifier-webauthn-es256`. `default-features = false` + `ecdsa` keeps it lean
 # (verification + deterministic RFC6979 signing for tests; no PEM/PKCS8).
-p256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdsa"] }
 
 # Optional: tokio-native pipe ends for `ConfinedCommand::spawn_tokio`, gated by
 # `spawn-tokio`. Inherits the workspace tokio features (rt/macros/…) and adds
