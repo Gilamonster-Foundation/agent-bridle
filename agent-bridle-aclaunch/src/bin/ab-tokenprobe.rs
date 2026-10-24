@@ -35,7 +35,12 @@ fn main() {
         "spawn-self" => {
             print_identity();
             let exe = std::env::current_exe().expect("current probe executable");
-            let out = std::process::Command::new(exe).arg("print").output();
+            // `output()` defaults an unset stdin to null (another NUL open from
+            // inside the AppContainer); piped stdin is closed straight away.
+            let out = std::process::Command::new(exe)
+                .arg("print")
+                .stdin(std::process::Stdio::piped())
+                .output();
             let out = match out {
                 Ok(out) => out,
                 Err(error) if error.raw_os_error() == Some(5) => {
