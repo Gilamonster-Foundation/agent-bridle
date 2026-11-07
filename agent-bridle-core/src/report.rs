@@ -1036,13 +1036,14 @@ mod tests {
     /// zero-grant shape. This is the end-to-end proof the mechanism's pure
     /// unit test (below) promised: the real production constant, not a
     /// parameterized stand-in. macOS-only: `seatbelt_mach_deputy_audit_complete`
-    /// is unconditionally `false` off macOS (the audit only exists where
-    /// Seatbelt does), so this assertion is platform-specific by
-    /// construction, not an oversight. The bare `SandboxKind::Seatbelt`
+    /// is unconditionally `false` off macOS or without the `macos-seatbelt`
+    /// feature (the audit only exists where Seatbelt does), so this
+    /// assertion is platform-specific by construction (agent-bridle#442).
+    /// The bare `SandboxKind::Seatbelt`
     /// conversion (`StdioPosture::Unaudited`) must NOT reach Kernel
     /// (agent-bridle#416 round-2 review, item 1).
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
     fn seatbelt_net_none_reports_kernel_now_the_audit_is_complete() {
         let none = Caveats {
             net: Scope::none(),
