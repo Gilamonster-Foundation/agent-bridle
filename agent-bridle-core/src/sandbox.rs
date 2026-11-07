@@ -7610,8 +7610,8 @@ print(d.value())
             seatbelt_trust_admin_writable_xcode: true,
             ..SandboxPolicy::default()
         };
-        let resolved =
-            SeatbeltSandbox::with_policy(std::sync::Arc::new(policy)).resolved_authority(&cav);
+        let resolved = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
+            .resolved_authority(&cav, crate::StdioPosture::Unaudited);
         let carries_class = matches!(
             &resolved.exec,
             crate::ResolvedScope::Bounded { classes, .. }
@@ -7648,8 +7648,8 @@ print(d.value())
             seatbelt_trust_admin_writable_xcode: true,
             ..SandboxPolicy::default()
         };
-        let resolved =
-            SeatbeltSandbox::with_policy(std::sync::Arc::new(policy)).resolved_authority(&cav);
+        let resolved = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
+            .resolved_authority(&cav, crate::StdioPosture::Unaudited);
         let carries_class = matches!(
             &resolved.exec,
             crate::ResolvedScope::Bounded { classes, .. }
@@ -7682,7 +7682,8 @@ print(d.value())
             exec: Scope::only([git.to_string()]),
             ..Caveats::top()
         };
-        let resolved = SeatbeltSandbox::new().resolved_authority(&cav);
+        let resolved =
+            SeatbeltSandbox::new().resolved_authority(&cav, crate::StdioPosture::Unaudited);
         let carries_class = matches!(
             &resolved.exec,
             crate::ResolvedScope::Bounded { classes, .. }
@@ -7723,7 +7724,7 @@ print(d.value())
             ..SandboxPolicy::default()
         };
         let sandbox = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy));
-        let resolved = sandbox.resolved_authority(&cav);
+        let resolved = sandbox.resolved_authority(&cav, crate::StdioPosture::Unaudited);
         let resolved_carries_class = matches!(
             &resolved.exec,
             crate::ResolvedScope::Bounded { classes, .. }
