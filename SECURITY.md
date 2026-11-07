@@ -52,6 +52,46 @@ mitigations an operator should apply:
 > Landlock+seccomp host; tracked under #57/#35. The host-sysctl mitigation above
 > closes the same gap today, and a strong principal already fails closed regardless.
 
+## Known security issues
+
+### macOS Seatbelt: the Xcode.app git-toolchain exception trusts an admin-writable directory (agent-bridle#408/#409, #2630 rounds 3-4)
+
+The `macos-seatbelt` `exec` axis (ADR 0014) admits `git`'s own re-exec of the
+active developer toolchain only when the toolchain binary's full ancestor
+chain is root-owned and unwritable (`ancestry_is_root_owned_and_unwritable`,
+`sandbox.rs`). **One named exception, OPT-IN ONLY** (default OFF —
+`SandboxPolicy::seatbelt_trust_admin_writable_xcode`, agent-bridle#409):
+when the operator explicitly sets it, `/Applications` itself may be
+admin-group-writable (`root:admin 0775`) without failing that walk, so the
+stock Xcode.app toolchain — reached through it — can still be trusted. With
+the flag unset (the default), `/Applications` under this bar fails closed
+exactly like every other ancestor, and `git worktree add` on a stock Xcode
+install stays denied. No other path gets this relaxation, at any ancestor
+level, for any candidate, regardless of the flag.
+
+**Risk (only when the operator has opted in):** on a Mac where `/Applications`
+carries its default admin-group-writable mode, any process running as a
+member of the `admin` group — ordinarily the logged-in user on a single-user
+Mac, but any locally-compromised admin-group process too — can replace
+`/Applications/Xcode.app` wholesale. Bridle's resolver would then admit the
+replacement's `git` binary into a `git`-only exec grant, because it only
+checks ownership/mode, never content or identity. This is a real narrowing
+of the trust boundary below "root-owned toolchain" elsewhere in this policy:
+it is an accepted, named, **opt-in** tradeoff, not an oversight and not the
+default.
+
+**Mitigation:** leave `seatbelt_trust_admin_writable_xcode` unset (the
+default), or run `xcode-select -s /Library/Developer/CommandLineTools`.
+CommandLineTools lives at a fully root-owned path end to end, so once it is
+the active toolchain, the exception never applies to admit anything even
+with the flag on — the resolver falls back to the unrelaxed ancestry bar
+this policy uses everywhere else, and the resolved-authority exec axis never
+carries the `seatbelt-admin-writable-xcode-toolchain` class.
+
+**Detection:** a grant admitted only through this exception is named on the
+resolved-authority exec axis as the class `seatbelt-admin-writable-xcode-toolchain`
+(see ADR 0014's amendment) — never silently folded into the concrete grant.
+
 ## Public-repository privacy rules (enforced)
 
 This repo is public. It must never contain the operational specifics of any real
