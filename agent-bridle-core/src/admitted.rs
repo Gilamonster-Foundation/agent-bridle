@@ -102,6 +102,7 @@ pub(crate) fn closure_is_harness_disjoint(closure: &ResolvedAuthority) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeClosure {
     exec: BTreeSet<String>,
+    fs_read: BTreeSet<String>,
 }
 
 impl RuntimeClosure {
@@ -124,10 +125,26 @@ impl RuntimeClosure {
         Ok(self)
     }
 
+    /// Declare one file the harness adds to the mechanism's `fs_read`
+    /// allow-list (agent-bridle#418: a trusted-worker executable must be
+    /// readable so it can be loaded, independent of whether `exec` itself is
+    /// restricted — Landlock enforces execute and read as separate rights).
+    /// Canonicalized by the caller; refused here if it reaches a
+    /// harness-private store.
+    ///
+    /// # Errors
+    /// [`ToolError::Denied`] when the entry violates harness-disjointness.
+    pub fn with_fs_read(mut self, path: impl Into<String>) -> ToolResult<Self> {
+        let path = path.into();
+        require_harness_disjoint(&path)?;
+        self.fs_read.insert(path);
+        Ok(self)
+    }
+
     /// Whether this closure declares nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.exec.is_empty()
+        self.exec.is_empty() && self.fs_read.is_empty()
     }
 }
 
@@ -226,10 +243,13 @@ fn compute_fence_id(
 impl AdmittedFence {
     /// Admit a spawn fence, fail-closed.
     ///
-    /// Derives the mechanism caveats as `delegated ∪ closure` on the exec axis
-    /// (a closure entry is inserted only into a restricted `Only(_)` scope — an
-    /// `All` axis already permits it), asks the backend to `project` what it will
-    /// actually install for those caveats, then refuses unless ALL hold:
+    /// Derives the mechanism caveats as `delegated ∪ closure` on the exec and
+    /// `fs_read` axes (a closure entry is inserted only into that axis's
+    /// restricted `Only(_)` scope — an `All` axis already permits it; each
+    /// axis is gated independently, so an `fs_read` entry is added whether or
+    /// not `exec` is itself restricted — agent-bridle#418), asks the backend
+    /// to `project` what it will actually install for those caveats, then
+    /// refuses unless ALL hold:
     ///
     /// 1. **L3 harness-disjoint:** the backend-declared runtime closure touches
     ///    no harness-private store and no undecidable axis
@@ -270,6 +290,12 @@ impl AdmittedFence {
         let mut mechanism_caveats = delegated.clone();
         if let Scope::Only(programs) = &mut mechanism_caveats.exec {
             programs.extend(closure.exec.iter().cloned());
+        }
+        // Same derivation, fs_read axis (#418): a closure entry is inserted
+        // only into a restricted `Only(_)` scope — an `All` axis already
+        // permits it — independent of whether `exec` is itself restricted.
+        if let Scope::Only(paths) = &mut mechanism_caveats.fs_read {
+            paths.extend(closure.fs_read.iter().cloned());
         }
 
         // The backend's conservative projection of what it will ACTUALLY install

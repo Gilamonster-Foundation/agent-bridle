@@ -103,7 +103,7 @@ sha2 = { version = "0.10", optional = true }
 # Optional: P-256 ECDSA verification for the ES256 WebAuthn verifier, gated by
 # `verifier-webauthn-es256`. `default-features = false` + `ecdsa` keeps it lean
 # (verification + deterministic RFC6979 signing for tests; no PEM/PKCS8).
-p256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdsa"] }
 
 # Optional: tokio-native pipe ends for `ConfinedCommand::spawn_tokio`, gated by
 # `spawn-tokio`. Inherits the workspace tokio features (rt/macros/…) and adds
@@ -125,7 +125,7 @@ tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
 # `forbid(unsafe_code)`, so the signal cannot be a raw `libc` FFI call; rustix
 # provides it as a safe fn. Same primitive `agent-bridle-tool-shell` already
 # uses to reap a Brush worker tree, and already in the lockfile.
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 agent-bridle-fdguard = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
