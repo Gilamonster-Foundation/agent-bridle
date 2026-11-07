@@ -234,6 +234,15 @@ Interceptor`, strong principal refuses), never imply the interpreter's interior 
 confined. Detection is a denylist + a heuristic (a binary that `dlopen`/`ctypes`-loads is
 undecidable to detect in general), so the rule is conservative: an *unrecognized* granted
 binary is treated as potentially-interpreting and does **not** earn `Kernel`.
+A granted program that resolves to a **multi-command binary** — a regular file with more
+than one hard link, or a recognized multicall (`busybox`, `toybox`, uutils `coreutils`) —
+grants every name linked to it, since exec rules attach to the file and the binary
+dispatches on `argv[0]` (Ubuntu 26.04's `cat`/`head`/`env` are one inode, #449); it is
+likewise `exec ≡ All` (`exec → Interceptor`, strong principal refuses).
+The one exception is the macOS Xcode developer-tool locator stub (`/usr/bin/git`,
+`python3`, … — one root-owned, many-link inode on the sealed system volume that imports
+`/usr/lib/libxcselect.dylib`), which only re-execs the selected toolchain's real tool under
+Seatbelt's `process-exec*` check, so its link count alone does not make it a multicall.
 
 ### D7 — Honesty posture: when `exec` may be reported `Kernel`
 
