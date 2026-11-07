@@ -278,7 +278,8 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 }
 
 /// Classify each restricted axis of `effective` under the `active` sandbox
-/// (ADR 0004 D1). Pure; no IO.
+/// (ADR 0004 D1). Pure except that a restricted `exec` grant is resolved and
+/// stat'ed to detect a multi-command binary (ADR 0011 D6, #449).
 ///
 /// The mapping reflects what each layer *actually* enforces today:
 ///
@@ -340,6 +341,10 @@ pub fn enforcement_report(
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(match active {
             _ if exec_boundary == ExecBoundary::NamedRoot => AxisEnforcement::Interceptor,
+            // ADR 0011 D6 (#449): a grant that resolves to a multi-command binary
+            // (hard-linked or busybox/toybox/coreutils) admits every name linked
+            // to it, so no backend's identity rule is an exact witness.
+            _ if crate::sandbox::exec_grant_is_multicall(effective) => AxisEnforcement::Interceptor,
             // `exec → kernel` is reserved for modes that close the axis by
             // *identity*: Seatbelt (macOS) via `process-exec*` — interior-covering,
             // no trampoline bypass on Apple Silicon (ADR 0014) — and the Linux
@@ -760,7 +765,8 @@ impl fmt::Display for UnenforceableAxis {
 }
 
 /// The first restricted axis whose enforcement (under `active`) fails to reach
-/// its per-axis floor, or `None` if every restricted axis meets it. Pure; no IO.
+/// its per-axis floor, or `None` if every restricted axis meets it. IO only as
+/// [`enforcement_report`] does.
 ///
 /// The acceptance rule, per restricted **Caveat** axis (not per report entry —
 /// the caveats decide the obligation):
@@ -826,12 +832,29 @@ mod tests {
     use super::*;
     use crate::{CountBound, Scope};
 
+    /// A granted program that resolves nowhere, keeping exec classification
+    /// host-independent: on Ubuntu 26.04 `echo`/`cat` resolve to the hard-linked
+    /// uutils multicall and are honestly `exec ≡ All` (#449).
+    const PROGRAM: &str = "agent-bridle-test-program";
+
+    /// `name` on macOS, where it resolves to the Xcode locator stub — a 78-link
+    /// inode that is *not* a multicall (#449) — else the host-independent
+    /// [`PROGRAM`].
+    fn via_macos_stub(name: &str) -> String {
+        if cfg!(target_os = "macos") {
+            name
+        } else {
+            PROGRAM
+        }
+        .to_string()
+    }
+
     /// All axes restricted, so every axis appears in the report.
     fn fully_restricted() -> Caveats {
         Caveats {
             fs_read: Scope::only(["/r".to_string()]),
             fs_write: Scope::only(["/w".to_string()]),
-            exec: Scope::only(["echo".to_string()]),
+            exec: Scope::only([PROGRAM.to_string()]),
             net: Scope::only(["example.com".to_string()]),
             max_calls: CountBound::Unlimited,
             valid_for_generation: Scope::All,
@@ -1154,7 +1177,7 @@ mod tests {
     #[test]
     fn exec_is_kernel_under_seatbelt_interceptor_elsewhere() {
         let cav = Caveats {
-            exec: Scope::only(["git".to_string()]),
+            exec: Scope::only([via_macos_stub("git")]),
             ..Caveats::top()
         };
         assert_eq!(
@@ -1189,7 +1212,7 @@ mod tests {
     #[test]
     fn exec_is_kernel_under_minimal_rootfs_interceptor_under_landlock() {
         let cav = Caveats {
-            exec: Scope::only(["cat".to_string()]),
+            exec: Scope::only([PROGRAM.to_string()]),
             ..Caveats::top()
         };
         assert_eq!(
@@ -1396,7 +1419,7 @@ mod tests {
             );
         }
         assert_eq!(
-            enforcement_report(&exec("echo"), SandboxKind::Seatbelt).exec,
+            enforcement_report(&exec(PROGRAM), SandboxKind::Seatbelt).exec,
             Some(AxisEnforcement::Kernel),
             "a no-variant allow-list is an exact identity witness → Kernel"
         );
@@ -1561,7 +1584,7 @@ mod tests {
     #[test]
     fn exec_kernel_is_identity_not_interpreter_behavior() {
         let interp = Caveats {
-            exec: Scope::only(["python3".to_string()]),
+            exec: Scope::only([via_macos_stub("python3")]),
             ..Caveats::top()
         };
         let r = enforcement_report(&interp, SandboxKind::Seatbelt);
@@ -1575,6 +1598,68 @@ mod tests {
         assert_eq!(r.fs_read, None);
         assert_eq!(r.fs_write, None);
         assert_eq!(r.net, None);
+    }
+
+    /// #449 / ADR 0011 D6: on Ubuntu 26.04 `cat` and `head` are one hard-linked
+    /// uutils inode, so an exec grant of one admits the other under every
+    /// identity-closing backend. A grant resolving to a multi-link file (or a
+    /// recognized multicall) must never be reported `Kernel`, and a strong
+    /// principal (exec floor `Kernel`) must refuse it. A single-link file is the
+    /// control: it keeps `Kernel`.
+    #[cfg(unix)]
+    #[test]
+    fn multicall_exec_grant_is_never_kernel_and_strong_principal_refuses() {
+        let dir = std::env::temp_dir().join(format!("agent-bridle-449-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let single = dir.join("single");
+        let linked = dir.join("cat");
+        let busybox = dir.join("busybox");
+        for f in [&single, &linked, &busybox] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        std::fs::hard_link(&linked, dir.join("head")).unwrap();
+        // Single-link multicalls reached by name: a versioned real file behind an
+        // applet symlink, and a `busybox` symlink to a renamed real file.
+        let versioned = dir.join("busybox.static");
+        let renamed = dir.join("bb");
+        for f in [&versioned, &renamed] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let applet = dir.join("applet");
+        std::os::unix::fs::symlink(&versioned, &applet).unwrap();
+        std::fs::create_dir_all(dir.join("l")).unwrap();
+        let bb_named = dir.join("l/busybox");
+        std::os::unix::fs::symlink(&renamed, &bb_named).unwrap();
+        let grant = |p: &std::path::Path| Caveats {
+            exec: Scope::only([p.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let strong = EnforcementFloor::from_scalar(AxisEnforcement::Kernel);
+        for kind in [
+            SandboxKind::Seatbelt,
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+        ] {
+            let control = grant(&single);
+            assert_eq!(
+                enforcement_report(&control, kind).exec,
+                Some(AxisEnforcement::Kernel),
+                "{kind:?}: single-link control keeps exec→kernel"
+            );
+            assert_eq!(unenforceable_axis(&control, kind, strong), None);
+            for multi in [&linked, &busybox, &applet, &bb_named] {
+                let cav = grant(multi);
+                assert_eq!(
+                    enforcement_report(&cav, kind).exec,
+                    Some(AxisEnforcement::Interceptor),
+                    "{kind:?}: multicall grant {multi:?} is exec ≡ All, never kernel"
+                );
+                let refused = unenforceable_axis(&cav, kind, strong)
+                    .expect("a strong principal must refuse a multicall exec grant");
+                assert_eq!(refused.axis, ConfinedAxis::Exec);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Per-axis strength floor (EnforcementFloor / unenforceable_axis) ──────
@@ -1602,11 +1687,11 @@ mod tests {
         }
     }
     fn only_exec() -> Caveats {
-        // A non-launcher program: `echo` does not pull an implementation variant,
+        // A non-launcher program: `PROGRAM` does not pull an implementation variant,
         // so Seatbelt's process-exec* fence is an exact identity witness (Kernel).
         // (A granted `sh` would widen to `/bin/bash` — model B, tested separately.)
         Caveats {
-            exec: Scope::only(["echo".to_string()]),
+            exec: Scope::only([PROGRAM.to_string()]),
             ..Caveats::top()
         }
     }

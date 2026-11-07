@@ -54,6 +54,7 @@ mod spawn;
 mod step_up;
 mod tool;
 mod unbridle;
+mod xcselect;
 
 pub use admitted::{
     AdmittedFence, AdmittedFenceBody, AdmittedFenceId, BackendProjection, RuntimeClosure,
