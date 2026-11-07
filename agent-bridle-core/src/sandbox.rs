@@ -584,6 +584,71 @@ pub(crate) fn exec_grant_pulls_launcher_variant(caveats: &Caveats) -> bool {
         if s.iter().any(|p| p == "sh" || p == "/bin/sh"))
 }
 
+/// Recognized multicall binaries that pick their behavior from `argv[0]`,
+/// matched as a file-name *prefix* (`busybox.static`, `busybox-1.36`, …).
+const MULTICALL_NAMES: &[&str] = &["busybox", "toybox", "coreutils"];
+
+/// Whether a restricted `exec` grant resolves to a **multi-command binary**: a
+/// regular file with more than one hard link, or a recognized multicall
+/// ([`MULTICALL_NAMES`], e.g. Ubuntu 26.04's uutils `coreutils`, where `cat`,
+/// `head`, `env`, … are one inode). Exec identity attaches to the *file*
+/// (Landlock `Execute`, a rootfs bind, an SBPL literal) while the binary
+/// dispatches on its name, so the grant admits every name linked to it and is
+/// `exec ≡ All` for honesty (ADR 0011 D6, agent-bridle#449). Not pure: it
+/// resolves bare names and stats the results.
+///
+/// Fail-closed: a bare name is checked at **every** hit across `$PATH` *and*
+/// the default search dirs, a superset of what any backend binds (rootfs:
+/// `$PATH`, else its fallback; Seatbelt: every trusted-dir hit), so a backend
+/// cannot bind a multicall this check did not see. Still a heuristic: a
+/// *renamed*, single-link multicall (busybox copied to `cat`) is not detected.
+/// The macOS Xcode locator stub is exempt from the link-count rule
+/// ([`crate::xcselect`]).
+#[must_use]
+pub(crate) fn exec_grant_is_multicall(caveats: &Caveats) -> bool {
+    let crate::Scope::Only(set) = &caveats.exec else {
+        return false;
+    };
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    dirs.extend(
+        crate::config::RootfsPolicy::default()
+            .search_dirs
+            .iter()
+            .map(std::path::PathBuf::from),
+    );
+    set.iter().any(|entry| {
+        if entry.contains('/') {
+            is_multicall_file(std::path::Path::new(entry))
+        } else {
+            dirs.iter().any(|d| is_multicall_file(&d.join(entry)))
+        }
+    })
+}
+
+/// `granted` (as named, before symlink resolution) is a multi-command binary.
+fn is_multicall_file(granted: &std::path::Path) -> bool {
+    let Ok(real) = granted.canonicalize() else {
+        return false;
+    };
+    let Ok(meta) = real.metadata() else {
+        return false;
+    };
+    // The macOS Xcode locator stub is one 78-link inode that only re-execs the
+    // selected toolchain's tool, so its links do not make it a multicall.
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(&meta) > 1
+        && !crate::xcselect::is_xcselect_stub(&real);
+    #[cfg(not(unix))]
+    let linked = false;
+    let named = |p: &std::path::Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| MULTICALL_NAMES.iter().any(|m| n.starts_with(m)))
+    };
+    meta.is_file() && (linked || named(granted) || named(&real))
+}
+
 /// `true` if this kernel supports Landlock TCP network rules (ABI V4, kernel ≥ 6.7).
 /// Always `false` on non-Linux or builds without `linux-landlock`.
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
@@ -4647,6 +4712,19 @@ mod landlock_kernel_tests {
         d
     }
 
+    /// A private copy of `cat` (still named `cat`, so a multicall dispatches on
+    /// it): its own inode, so granting it admits nothing else. On Ubuntu 26.04
+    /// the system `cat` is one hard-linked uutils inode with `head`, `env`, …
+    /// (#449), so granting it would admit the very tools these proofs deny.
+    fn private_cat(dir: &std::path::Path) -> String {
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let cat = dir.join("bin/cat");
+        fs::copy("/usr/bin/cat", &cat)
+            .or_else(|_| fs::copy("/bin/cat", &cat))
+            .expect("copy cat(1)");
+        cat.to_string_lossy().into_owned()
+    }
+
     /// A hermetically-configured `git` `Command`: no inherited environment
     /// beyond what's explicitly set here, and every ambient
     /// config/hooks/template source disabled. Used for BOTH the plain
@@ -5046,14 +5124,15 @@ mod landlock_kernel_tests {
         let dir = unique_dir("exec");
         fs::write(dir.join("data.txt"), b"payload\n").unwrap();
         let dir_t = dir.clone();
+        let cat = private_cat(&dir);
 
         let (granted, ungranted) = std::thread::spawn(move || {
             let cav = Caveats {
-                exec: Scope::only(["cat".to_string()]),
+                exec: Scope::only([cat.clone()]),
                 ..Caveats::top()
             };
             LandlockSandbox::new().apply(&cav).expect("apply landlock");
-            let granted = std::process::Command::new("cat")
+            let granted = std::process::Command::new(&cat)
                 .arg(dir_t.join("data.txt"))
                 .output();
             let ungranted = std::process::Command::new("head")
@@ -5129,9 +5208,11 @@ mod landlock_kernel_tests {
         .collect();
 
         let scratch_t = scratch.clone();
+        let bin = unique_dir("exec-escape-bin"); // outside the fs_write scope
+        let cat = private_cat(&bin);
         let (attempts, control) = std::thread::spawn(move || {
             let cav = Caveats {
-                exec: Scope::only(["cat".to_string()]),
+                exec: Scope::only([cat.clone()]),
                 fs_write: Scope::only([scratch_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
@@ -5167,7 +5248,7 @@ mod landlock_kernel_tests {
                 ));
             }
             // Control: the granted program still runs.
-            let control = std::process::Command::new("cat")
+            let control = std::process::Command::new(&cat)
                 .arg(scratch_t.join("data.txt"))
                 .output();
             (attempts, control)
@@ -5195,6 +5276,7 @@ mod landlock_kernel_tests {
         );
 
         let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&bin);
     }
 
     /// #57 / ADR 0011 D3: when BOTH `exec` and `fs_read` are confined, the read
@@ -5209,22 +5291,31 @@ mod landlock_kernel_tests {
         let dir = unique_dir("read-narrow");
         fs::write(dir.join("data.txt"), b"payload\n").unwrap();
         let dir_t = dir.clone();
+        let cat = private_cat(&dir);
+        // An un-granted program whose real file lives in a bin dir. On Ubuntu
+        // 26.04 `head` resolves into `/usr/lib/cargo/bin/coreutils/` — under the
+        // library read base, not a bin dir (#449) — so probe for one that is.
+        let probe = ["head", "rm", "ls"]
+            .iter()
+            .filter_map(|n| fs::canonicalize(format!("/usr/bin/{n}")).ok())
+            .find(|p| p.parent() == Some(std::path::Path::new("/usr/bin")))
+            .expect("an un-granted program whose file is in /usr/bin");
 
         let (granted, head_bytes) = std::thread::spawn(move || {
             let cav = Caveats {
-                exec: Scope::only(["cat".to_string()]),
+                exec: Scope::only([cat.clone()]),
                 fs_read: Scope::only([dir_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
             LandlockSandbox::new().apply(&cav).expect("apply landlock");
             // Granted `cat` loads (its binary + libs are read-allowed) and reads
             // the in-scope file.
-            let granted = std::process::Command::new("cat")
+            let granted = std::process::Command::new(&cat)
                 .arg(dir_t.join("data.txt"))
                 .output();
             // Reading an un-granted bin-dir binary's bytes (a would-be trampoline
             // payload) is denied — the bin dirs are not in the read set.
-            let head_bytes = std::fs::read("/usr/bin/head").or_else(|_| std::fs::read("/bin/head"));
+            let head_bytes = std::fs::read(&probe);
             (granted, head_bytes)
         })
         .join()

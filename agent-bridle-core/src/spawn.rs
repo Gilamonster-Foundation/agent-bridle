@@ -2574,6 +2574,12 @@ mod landlock_child_tests {
     }
 
     /// #419: replacing the admitted path must not execute the replacement.
+    ///
+    /// The original keeps its file name (moved to a subdirectory), and the
+    /// replacement is a script that exits 1: on Ubuntu 26.04 `echo`/`false` are
+    /// one uutils multicall that dispatches on its name and refuses when its own
+    /// file name no longer matches `argv[0]`, so a renamed original or a copied
+    /// `false` named `worker-echo` cannot tell the two images apart (#449).
     #[test]
     fn worker_image_replacement_keeps_the_admitted_object() {
         if !landlock_is_supported() {
@@ -2594,8 +2600,12 @@ mod landlock_child_tests {
                 cx.caveats().clone(),
                 SpawnAuthority::TrustedWorker,
                 move || {
-                    fs::rename(&swap, swap.with_extension("original")).unwrap();
-                    fs::copy("/bin/false", &swap).unwrap();
+                    use std::os::unix::fs::PermissionsExt;
+                    let moved = swap.parent().unwrap().join("original");
+                    fs::create_dir(&moved).unwrap();
+                    fs::rename(&swap, moved.join(swap.file_name().unwrap())).unwrap();
+                    fs::write(&swap, "#!/bin/sh\nexit 1\n").unwrap();
+                    fs::set_permissions(&swap, fs::Permissions::from_mode(0o755)).unwrap();
                 },
                 || {},
             );
