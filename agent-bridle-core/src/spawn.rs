@@ -40,6 +40,9 @@ use crate::{
     ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy,
     ToolContext, ToolError, ToolResult,
 };
+mod worker_image;
+use worker_image::WorkerImage;
+
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -369,6 +372,100 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
     serde_json::from_slice(body).map_err(|error| format!("invalid trusted-worker request: {error}"))
 }
 
+/// A child's stdio stream, named by WHICH descriptor produces it rather than
+/// an already-constructed [`Stdio`] whose actual shape would otherwise have
+/// to be taken on trust (agent-bridle#416 round-2 review, item 1: ADR 0015
+/// amendment E6 claimed the spawn mechanism "supplies only pipe/null stdio",
+/// but the builder defaulted to inherited stdio and accepted an arbitrary
+/// `Stdio`). [`Self::Piped`] and [`Self::Null`] are exactly the shape that
+/// audit covers — a descriptor this process just minted, which cannot already
+/// be a connected endpoint. [`Self::WorkerControl`] is the trusted-worker's
+/// one-shot authenticated control channel — audited for a DIFFERENT reason;
+/// see its own doc. [`Self::Other`] is everything else (inherited, a
+/// redirected file, an existing fd) and is a legitimate, supported shape
+/// (shell redirects) — it just does not qualify a Seatbelt `net:none` spawn
+/// for the Kernel witness; see [`ConfinementMechanism::with_stdio_posture`].
+#[derive(Debug)]
+pub enum ConfinedStdio {
+    /// `Stdio::piped()` — a pipe this process owns the opposite end of.
+    Piped,
+    /// `Stdio::null()` — `/dev/null`.
+    Null,
+    /// The trusted-worker's own half of a fresh `UnixStream::pair()`, wired as
+    /// its stdin and consumed by exactly one host-authored, challenge-bound,
+    /// digest-verified frame (ADR 0015 E7, agent-bridle#416 round-3/
+    /// newt#2673) — not a cryptographic signature. Audited for the same
+    /// reason `Piped`/`Null` are: the **worker itself** retires this
+    /// descriptor (`retire_worker_stdin`, `agent-bridle-tool-shell/src/
+    /// private_control.rs:146,688-693` — dup2's `/dev/null` over its own
+    /// stdin) immediately after acknowledging the frame, before it begins a
+    /// single caveat-governed action. That is a guarantee of the worker's own
+    /// control flow, not a claim about when the host — a separate process —
+    /// happens to drop its own end; no ordering between the two is assumed or
+    /// required. It cannot be an ongoing XPC-style network deputy because the
+    /// protocol riding it has no worker→host request at all, let alone one
+    /// that performs I/O. Constructible only by
+    /// [`SandboxedWorker::spawn_supported`] via [`WorkerControlHandle::new`]
+    /// (private to this module, round-2 review item 3 — narrower than merely
+    /// crate-private), so no other caller, in this crate or outside it, can
+    /// claim this credit for an arbitrary fd.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    WorkerControl(WorkerControlHandle),
+    /// Any other descriptor: inherited, a redirected file, a raw or dup'd fd.
+    Other(Stdio),
+}
+
+/// Opaque owner of the trusted-worker control descriptor, constructible only
+/// from this module's own trusted-worker spawn path (module-private
+/// constructor, narrower than crate-private — round-2 review item 3) — see
+/// [`ConfinedStdio::WorkerControl`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct WorkerControlHandle(std::os::fd::OwnedFd);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl WorkerControlHandle {
+    fn new(fd: std::os::fd::OwnedFd) -> Self {
+        Self(fd)
+    }
+}
+
+impl ConfinedStdio {
+    fn into_stdio(self) -> Stdio {
+        match self {
+            Self::Piped => Stdio::piped(),
+            Self::Null => Stdio::null(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::WorkerControl(handle) => Stdio::from(handle.0),
+            Self::Other(stdio) => stdio,
+        }
+    }
+
+    /// `true` for [`Self::Piped`]/[`Self::Null`] (ADR 0015 amendment E6) and
+    /// [`Self::WorkerControl`] (ADR 0015 amendment E7) — the shapes the
+    /// Seatbelt audit covers.
+    fn is_audited(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            matches!(self, Self::Piped | Self::Null | Self::WorkerControl(_))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            matches!(self, Self::Piped | Self::Null)
+        }
+    }
+}
+
+/// Any already-constructed [`Stdio`] converts in as [`ConfinedStdio::Other`] —
+/// deliberately conservative: a value built outside this type has no attached
+/// provenance, so a caller that wants [`ConfinedStdio::Piped`]/[`Null`] credit
+/// must say so by name, not by what the `Stdio` happens to contain.
+impl From<Stdio> for ConfinedStdio {
+    fn from(stdio: Stdio) -> Self {
+        Self::Other(stdio)
+    }
+}
+
 /// Builder for a subprocess confined by a [`ToolContext`].
 ///
 /// Like [`std::process::Command`], but: the environment starts **empty** (only
@@ -404,9 +501,9 @@ pub struct ConfinedCommand {
     args: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
-    stdin: Option<Stdio>,
-    stdout: Option<Stdio>,
-    stderr: Option<Stdio>,
+    stdin: Option<ConfinedStdio>,
+    stdout: Option<ConfinedStdio>,
+    stderr: Option<ConfinedStdio>,
     /// Put the child in a fresh process group so a supervising caller can
     /// terminate the complete descendant tree at a timeout boundary.
     new_process_group: bool,
@@ -482,24 +579,26 @@ impl ConfinedCommand {
         self
     }
 
-    /// Configure the child's stdin (e.g. [`Stdio::piped`] for an MCP server).
+    /// Configure the child's stdin (e.g. [`ConfinedStdio::Piped`] for an MCP
+    /// server). A plain [`Stdio`] also converts in, as [`ConfinedStdio::Other`]
+    /// (agent-bridle#416 round-2 review, item 1).
     #[must_use]
-    pub fn stdin(mut self, cfg: Stdio) -> Self {
-        self.stdin = Some(cfg);
+    pub fn stdin(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stdin = Some(cfg.into());
         self
     }
 
     /// Configure the child's stdout.
     #[must_use]
-    pub fn stdout(mut self, cfg: Stdio) -> Self {
-        self.stdout = Some(cfg);
+    pub fn stdout(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stdout = Some(cfg.into());
         self
     }
 
     /// Configure the child's stderr.
     #[must_use]
-    pub fn stderr(mut self, cfg: Stdio) -> Self {
-        self.stderr = Some(cfg);
+    pub fn stderr(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stderr = Some(cfg.into());
         self
     }
 
@@ -548,6 +647,19 @@ impl ConfinedCommand {
         effective: Caveats,
         authority: SpawnAuthority,
     ) -> ToolResult<ConfinedChild> {
+        self.spawn_authorized_observed(cx, effective, authority, || {}, || {})
+    }
+
+    // Private continuation seam: deterministic namespace-mutation controls exercise
+    // the real admission/apply/exec sequence without timers or racing threads.
+    fn spawn_authorized_observed(
+        self,
+        cx: &ToolContext,
+        effective: Caveats,
+        authority: SpawnAuthority,
+        after_admission: impl FnOnce(),
+        after_apply: impl FnOnce() + Send + 'static,
+    ) -> ToolResult<ConfinedChild> {
         // (1) Admission: model-selected programs must be in the exec grant.
         // A trusted worker transition is not model-selected; its fixed program
         // is added only to the mechanism policy below.
@@ -579,6 +691,20 @@ impl ConfinedCommand {
         // installs the seccomp `DenyDirect` leg at apply time. So the net witness
         // (Landlock `net:none` = Kernel only under `DenyDirect`) cannot diverge
         // from the mechanism actually applied to the spawn.
+        // The stdio shape ADR 0015 amendment E6's Seatbelt audit assumed —
+        // every one of stdin/stdout/stderr a pipe or `/dev/null` — checked
+        // against what THIS spawn actually configured, not assumed
+        // (agent-bridle#416 round-2 review, item 1). Unset defaults to the
+        // same inherited-stdio behavior `std::process::Command` always had,
+        // which is NOT the audited shape.
+        let stdio_audited = [&self.stdin, &self.stdout, &self.stderr]
+            .into_iter()
+            .all(|cfg| cfg.as_ref().is_some_and(ConfinedStdio::is_audited));
+        let stdio_posture = if stdio_audited {
+            crate::StdioPosture::Audited
+        } else {
+            crate::StdioPosture::Unaudited
+        };
         let mechanism = match sandbox.exec_boundary() {
             crate::ExecBoundary::ProcessTree => {
                 ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network)
@@ -588,7 +714,8 @@ impl ConfinedCommand {
                 self.sandbox_policy.child_network,
             ),
         }
-        .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace);
+        .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace)
+        .with_stdio_posture(stdio_posture);
 
         // (2) The declared runtime closure — the ONLY door for authority beyond
         // the delegated grant. A fixed worker executable is an internal
@@ -598,7 +725,19 @@ impl ConfinedCommand {
         // instead preserve exec deny-all so its launcher applies the
         // child-process block — so it declares nothing. Neither changes the
         // reported/effective authority.
-        let closure = trusted_worker_closure(kind, authority, &self.program)?;
+        // #418/#419 addresses Landlock's separate image read/exec rules.
+        // Other backends keep their own launch protocol; this is backend
+        // dispatch, never a pathname fallback after a failed Landlock bind.
+        let worker_image =
+            if authority == SpawnAuthority::TrustedWorker && kind == SandboxKind::Landlock {
+                Some(WorkerImage::bind(kind, &self.program)?)
+            } else {
+                None
+            };
+        let closure_program = worker_image
+            .as_ref()
+            .map_or(self.program.as_str(), |image| image.program.as_str());
+        let closure = trusted_worker_closure(kind, authority, closure_program)?;
 
         // (3) THE admission (L2+L3+L4, one object). `AdmittedFence::admit`
         // derives the mechanism caveats (delegated ∪ declared closure) exactly
@@ -615,7 +754,7 @@ impl ConfinedCommand {
                 mechanism,
                 cx.strength_floor(),
                 |caveats| BackendProjection {
-                    resolved: sandbox.resolved_authority(caveats),
+                    resolved: sandbox.resolved_authority(caveats, stdio_posture),
                     runtime_closure: sandbox.runtime_closure(caveats),
                 },
             )
@@ -652,7 +791,8 @@ impl ConfinedCommand {
                             kind,
                             self.sandbox_policy.appcontainer_nul_device_ace,
                             BackendProjection {
-                                resolved: sandbox.resolved_authority(mechanism_caveats),
+                                resolved: sandbox
+                                    .resolved_authority(mechanism_caveats, stdio_posture),
                                 runtime_closure: sandbox.runtime_closure(mechanism_caveats),
                             },
                         );
@@ -671,7 +811,7 @@ impl ConfinedCommand {
                     // fails closed until the io_uring egress floor lands (PR-1). No
                     // caveats-grain net override: `resolved` is the honest projection.
                     BackendProjection {
-                        resolved: sandbox.resolved_authority(mechanism_caveats),
+                        resolved: sandbox.resolved_authority(mechanism_caveats, stdio_posture),
                         runtime_closure: sandbox.runtime_closure(mechanism_caveats),
                     }
                 },
@@ -683,6 +823,7 @@ impl ConfinedCommand {
             }
             other => other,
         })?;
+        after_admission();
         let mechanism_effective = admitted.mechanism_caveats().clone();
 
         // ASM-CID / L2 at runtime: the caveats we are about to compile+apply must
@@ -726,12 +867,21 @@ impl ConfinedCommand {
             // supports only Landlock (no wrapper), so the actual program operand
             // is the root; unsupported wrappers refuse rather than guessing at
             // a second target string. Verification consumes fresh backend state.
-            let (spawn_program, spawn_args) = wrap_argv(&prefix, &program, &args);
+            let exec_operand = match &worker_image {
+                Some(image) => image.exec_operand()?,
+                None => program.clone(),
+            };
+            let (spawn_program, spawn_args) = wrap_argv(&prefix, &exec_operand, &args);
 
             // Wrap the child in the backend's command prefix when it confines via
             // a wrapper (Seatbelt, AppContainer); otherwise spawn the program directly.
             let mut cmd = Command::new(&spawn_program);
             cmd.args(&spawn_args);
+            #[cfg(unix)]
+            if let Some(image) = &worker_image {
+                use std::os::unix::process::CommandExt;
+                cmd.arg0(&image.program);
+            }
             cmd.env_clear(); // no ambient environment crosses the boundary …
             for (k, v) in &envs {
                 cmd.env(k, v); // … only the explicitly-granted vars.
@@ -740,13 +890,13 @@ impl ConfinedCommand {
                 cmd.current_dir(dir);
             }
             if let Some(cfg) = stdin {
-                cmd.stdin(cfg);
+                cmd.stdin(cfg.into_stdio());
             }
             if let Some(cfg) = stdout {
-                cmd.stdout(cfg);
+                cmd.stdout(cfg.into_stdio());
             }
             if let Some(cfg) = stderr {
-                cmd.stderr(cfg);
+                cmd.stderr(cfg.into_stdio());
             }
             #[cfg(unix)]
             if new_process_group {
@@ -774,7 +924,7 @@ impl ConfinedCommand {
                     &apply_policy.resolve_named_root_protected_roots()?,
                     mechanism,
                     BackendProjection {
-                        resolved: sandbox.resolved_authority(&mechanism_effective),
+                        resolved: sandbox.resolved_authority(&mechanism_effective, stdio_posture),
                         runtime_closure: sandbox.runtime_closure(&mechanism_effective),
                     },
                 )?;
@@ -790,9 +940,14 @@ impl ConfinedCommand {
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
             // non-empty.
             if prefix.is_empty() {
-                sandbox.apply(&mechanism_effective)?;
+                if let Some(image) = &worker_image {
+                    sandbox.apply_with_worker(&mechanism_effective, &image.program, &image.file)?;
+                } else {
+                    sandbox.apply(&mechanism_effective)?;
+                }
             }
 
+            after_apply();
             cmd.spawn().map_err(ToolError::from)
         })
         .join()
@@ -989,9 +1144,11 @@ impl SandboxedWorker {
             .args([flag, kind])
             .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
             .current_dir(cwd)
-            .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdin(ConfinedStdio::WorkerControl(WorkerControlHandle::new(
+                std::os::fd::OwnedFd::from(child_control),
+            )))
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
             .new_process_group()
             .sandbox_policy(self.sandbox_policy);
 
@@ -1088,18 +1245,25 @@ fn trusted_worker_projection(
 }
 
 /// The declared [`RuntimeClosure`] for a trusted worker transition — the only
-/// door by which the worker's executable reaches the mechanism's allow-list
+/// door by which the worker's executable reaches the mechanism's allow-lists
 /// (it then flows through [`AdmittedFence::admit`]'s scope check like any
 /// other closure entry; nothing widens the mechanism caveats silently).
 ///
-/// Landlock, Seatbelt, and the identity-closing stronger tiers need the fixed
-/// worker executable in their kernel execute allow-list so the boundary can
-/// launch it — those declare it. AppContainer is different: its launcher
-/// creates the worker as the initial confined process, and `exec: Only([])`
-/// must remain empty so `--no-child-process` is attached to that worker.
-/// Declaring the worker path there would silently turn deny-all into a
-/// non-empty allow-list, disable the kernel child-process mitigation, and
-/// leave an `exec → Kernel` report overclaiming — so it declares nothing.
+/// Seatbelt and the identity-closing stronger tiers declare only the fixed
+/// worker executable on the exec axis. Landlock additionally declares the
+/// worker on the read axis, binding both rules to its held descriptor.
+/// Execute and read are separate Landlock rights: a caller that restricts `fs_read` while
+/// leaving `exec` ambient (`Scope::All`) never merges the worker's path into
+/// the mechanism's exec scope (only a restricted `Only(_)` exec axis gets the
+/// closure's exec entries), so without a matching `fs_read` declaration the
+/// worker's own ELF would be outside every read-allowed root and the kernel
+/// would refuse the worker's self-re-exec with `EACCES` (agent-bridle#418).
+/// AppContainer is different: its launcher creates the worker as the initial
+/// confined process, and `exec: Only([])` must remain empty so
+/// `--no-child-process` is attached to that worker. Declaring the worker path
+/// there would silently turn deny-all into a non-empty allow-list, disable
+/// the kernel child-process mitigation, and leave an `exec → Kernel` report
+/// overclaiming — so it declares nothing on either axis.
 ///
 /// A model-selected spawn declares nothing: the closure exists for internal
 /// transitions only, never for authority the model chose.
@@ -1115,10 +1279,17 @@ fn trusted_worker_closure(
         return Ok(RuntimeClosure::empty());
     }
     match kind {
-        SandboxKind::Landlock
-        | SandboxKind::Seatbelt
-        | SandboxKind::MinimalRootfs
-        | SandboxKind::MicroVm => {
+        SandboxKind::Landlock => {
+            // WorkerImage already bound and validated this label. Landlock
+            // replaces it with rules on the held file and executes that object.
+            // Never re-resolve the name after binding.
+            RuntimeClosure::empty()
+                .with_exec(program.to_owned())?
+                .with_fs_read(program.to_owned())
+        }
+        SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
+            // Preserve the pre-#419 exec-only wrapper/domain declaration.
+            // The additional worker read authority belongs only to Landlock.
             RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
@@ -1704,6 +1875,32 @@ mod tests {
         );
     }
 
+    /// #419 round 2: Linux descriptor execution must not replace another
+    /// backend's worker route. A script exposes the erroneous CLOEXEC/proc-fd
+    /// route on Noop; on macOS the old unconditional bind refuses outright.
+    #[cfg(all(unix, not(all(target_os = "linux", feature = "linux-landlock"))))]
+    #[test]
+    fn non_landlock_trusted_worker_still_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("bridle-non-landlock-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = dir.join("worker");
+        std::fs::write(&worker, "#!/bin/sh\nprintf 'worker-started'\n").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cx = ctx(Caveats::top());
+        let result = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_authorized(&cx, cx.caveats().clone(), SpawnAuthority::TrustedWorker)
+            .and_then(|child| child.child.wait_with_output().map_err(ToolError::from));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let output = result.expect("the non-Landlock worker route must remain available");
+        assert!(output.status.success(), "worker failed: {:?}", output);
+        assert_eq!(output.stdout, b"worker-started");
+    }
+
     /// Core freezes authority at worker spawn and exposes only a one-shot
     /// payload sender. Payload fields that merely *look* authority-bearing do
     /// not replace the captured caveats, and a second send is structurally
@@ -2098,6 +2295,49 @@ mod tests {
         );
     }
 
+    /// #419 round 3: non-Landlock workers must retain the pre-PR exec-only
+    /// closure, without adding their image to a restricted read allowance.
+    #[test]
+    fn non_landlock_worker_closure_preserves_restricted_reads() {
+        let current = std::env::current_exe()
+            .expect("current executable")
+            .canonicalize()
+            .expect("canonical current executable")
+            .to_string_lossy()
+            .into_owned();
+        let delegated = Caveats {
+            exec: Scope::only([] as [String; 0]),
+            fs_read: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+        for kind in [
+            SandboxKind::Seatbelt,
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+        ] {
+            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
+                .expect("non-Landlock worker closure");
+            assert_eq!(
+                closure,
+                RuntimeClosure::empty().with_exec(current.clone()).unwrap(),
+                "{kind:?} must declare exec only, with no worker read grant"
+            );
+            let admitted = AdmittedFence::admit(
+                &delegated,
+                closure,
+                ConfinementMechanism::new(kind, crate::ChildNetworkPolicy::LandlockOnly),
+                EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+                worker_admitting_projection,
+            )
+            .expect("non-Landlock admission");
+            assert_eq!(admitted.mechanism_caveats().fs_read, delegated.fs_read);
+            assert_eq!(
+                admitted.mechanism_caveats().exec,
+                Scope::only([current.clone()])
+            );
+        }
+    }
+
     /// Backends whose wrapper/domain must execute the trusted worker still get
     /// its exact path as mechanism-only authority.
     #[test]
@@ -2401,6 +2641,247 @@ mod landlock_child_tests {
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&extra);
     }
+
+    /// Copy a small, real executable to a fresh directory that is covered by
+    /// neither the default policy's `base_read_paths`/`bin_read_paths` nor any
+    /// granted `fs_read` scope — "a worker binary outside the base read
+    /// paths" (agent-bridle#418).
+    fn worker_binary_outside_base_read_paths() -> PathBuf {
+        let dir = unique_dir("worker-outside-base-read");
+        let source = ["/bin/echo", "/usr/bin/echo"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("echo(1) must exist for this test");
+        let worker = dir.join("worker-echo");
+        fs::copy(source, &worker).expect("copy worker binary (preserves the exec bit)");
+        worker
+    }
+
+    /// agent-bridle#418 (round 2, strace-rooted): `trusted_worker_closure` used
+    /// to add the worker's canonical path to the mechanism's **exec** allow-list
+    /// only, and only when `exec` itself was restricted
+    /// (`AdmittedFence::admit` folds a closure entry into an axis solely when
+    /// that axis is `Scope::Only(_)`). A caller that restricts `fs_read` but
+    /// leaves `exec` ambient (`Scope::All`) therefore never got the worker's
+    /// own ELF into any read-allowed root, and the worker's self-re-exec died
+    /// with a kernel `EACCES` (measured red on `main` before this fix, matching
+    /// the real `execve(...) = -1 EACCES` observed via
+    /// `strace -f -e trace=openat,open,execve`). The fix declares the worker
+    /// image in the closure's `fs_read` too, independent of `exec`'s scope.
+    #[test]
+    fn trusted_worker_starts_under_restricted_fs_read_and_ambient_exec() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let granted_read = unique_dir("granted-read");
+
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([granted_read.to_string_lossy().into_owned()]),
+            exec: Scope::All,
+            ..Caveats::top()
+        });
+        let effective = cx.caveats().clone();
+
+        let mut confined = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg("hi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, effective, SpawnAuthority::TrustedWorker)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "trusted-worker spawn must survive restricted fs_read + ambient \
+                     exec with the worker binary outside the base read paths: {error}"
+                )
+            });
+        let status = confined.child.wait().expect("wait");
+        assert!(status.success(), "the worker must actually run: {status:?}");
+
+        let _ = fs::remove_dir_all(worker.parent().unwrap());
+        let _ = fs::remove_dir_all(&granted_read);
+    }
+
+    /// The companion case the fix must leave unchanged: `fs_read` AND `exec`
+    /// both restricted. This already worked (the worker's path reached
+    /// `mechanism_caveats.exec`, and `read_roots` adds the resolved exec
+    /// grants to the read allow-list when exec is confined) — proved here as a
+    /// real spawn, not just the closure-level unit test, so the #418 fix
+    /// (which also merges the closure into `fs_read`) is checked against it.
+    #[test]
+    fn trusted_worker_starts_under_restricted_fs_read_and_restricted_exec() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let granted_read = unique_dir("granted-read-both-restricted");
+
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([granted_read.to_string_lossy().into_owned()]),
+            exec: Scope::only([worker.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        let effective = cx.caveats().clone();
+
+        let mut confined = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg("hi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, effective, SpawnAuthority::TrustedWorker)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "trusted-worker spawn must still succeed with both fs_read and \
+                     exec restricted (the pre-#418 working case): {error}"
+                )
+            });
+        let status = confined.child.wait().expect("wait");
+        assert!(status.success(), "the worker must actually run: {status:?}");
+
+        let _ = fs::remove_dir_all(worker.parent().unwrap());
+        let _ = fs::remove_dir_all(&granted_read);
+    }
+
+    /// #419: replacing the admitted path must not execute the replacement.
+    ///
+    /// The original keeps its file name (moved to a subdirectory), and the
+    /// replacement is a script that exits 1: on Ubuntu 26.04 `echo`/`false` are
+    /// one uutils multicall that dispatches on its name and refuses when its own
+    /// file name no longer matches `argv[0]`, so a renamed original or a copied
+    /// `false` named `worker-echo` cannot tell the two images apart (#449).
+    #[test]
+    fn worker_image_replacement_keeps_the_admitted_object() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        });
+        let swap = worker.clone();
+        let spawned = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    use std::os::unix::fs::PermissionsExt;
+                    let moved = swap.parent().unwrap().join("original");
+                    fs::create_dir(&moved).unwrap();
+                    fs::rename(&swap, moved.join(swap.file_name().unwrap())).unwrap();
+                    fs::write(&swap, "#!/bin/sh\nexit 1\n").unwrap();
+                    fs::set_permissions(&swap, fs::Permissions::from_mode(0o755)).unwrap();
+                },
+                || {},
+            );
+        let safe = match spawned {
+            Err(_) => true,
+            Ok(mut child) => child.child.wait().unwrap().success(),
+        };
+        fs::remove_dir_all(worker.parent().unwrap()).unwrap();
+        assert!(
+            safe,
+            "replacement image ran instead of the admitted echo image"
+        );
+    }
+
+    // Hold an independent hard link to the original cat image in the delegated
+    // read scope. This keeps exec possible on the old implementation after we
+    // restore the pathname: failure to read the IMAGE cannot mask an overbroad
+    // directory grant. Mutations occur synchronously at both stage boundaries.
+    fn worker_read_substitution(symlink_to_parent: bool) {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let dir = unique_dir("worker-substitution");
+        let worker = dir.join("worker");
+        let original = dir.join("original");
+        fs::copy("/bin/cat", &worker).unwrap();
+        fs::hard_link(&worker, &original).unwrap();
+        let secret = if symlink_to_parent {
+            dir.join("sibling")
+        } else {
+            dir.join("widened/secret")
+        };
+        if symlink_to_parent {
+            fs::write(&secret, "sibling-secret").unwrap();
+        }
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([original.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        // Positive startup + ordinary sibling denial control, before substitution.
+        let control = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(&secret)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, cx.caveats().clone(), SpawnAuthority::TrustedWorker)
+            .expect("control worker starts")
+            .child
+            .wait_with_output()
+            .unwrap();
+        assert!(!control.status.success());
+        assert!(control.stdout.is_empty());
+
+        let before = worker.clone();
+        let after = worker.clone();
+        let restore = original.clone();
+        let spawned = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(&secret)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    fs::remove_file(&before).unwrap();
+                    if symlink_to_parent {
+                        std::os::unix::fs::symlink(before.parent().unwrap(), &before).unwrap();
+                    } else {
+                        fs::create_dir(&before).unwrap();
+                        fs::write(before.join("secret"), "directory-secret").unwrap();
+                    }
+                },
+                move || {
+                    if symlink_to_parent {
+                        fs::remove_file(&after).unwrap();
+                    } else {
+                        fs::rename(&after, after.parent().unwrap().join("widened")).unwrap();
+                    }
+                    fs::hard_link(&restore, &after).unwrap();
+                },
+            );
+        let safe = match spawned {
+            Err(_) => true,
+            Ok(child) => {
+                let out = child.child.wait_with_output().unwrap();
+                !out.status.success() && out.stdout.is_empty()
+            }
+        };
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            safe,
+            "worker closure widened to a directory and disclosed an ungranted file"
+        );
+    }
+
+    /// #419: substituting a directory during rule construction never grants it.
+    #[test]
+    fn worker_image_directory_substitution_never_grants_directory_read() {
+        worker_read_substitution(false);
+    }
+
+    /// #419: a symlink to the worker's parent must not make its sibling readable.
+    #[test]
+    fn worker_image_symlink_substitution_never_grants_sibling_read() {
+        worker_read_substitution(true);
+    }
 }
 
 // Kernel-enforcement proof for macOS: the *spawned child* (not just the parent)
@@ -2540,35 +3021,157 @@ mod seatbelt_child_tests {
         );
     }
 
-    /// Restricted Seatbelt network authority remains held: admission must refuse
-    /// before the program is spawned, regardless of the defense-in-depth profile.
+    /// A loopback listener answering one request, so an ALLOW assertion tests
+    /// a *reachable* socket (curl exit 0) rather than "connection refused"
+    /// (also exit 7, like a kernel deny) — mirrors
+    /// `seatbelt_kernel_tests::spawn_loopback_http` (sandbox.rs), duplicated
+    /// here rather than exposed across the module boundary for one helper.
+    fn one_shot_listener(bind: &str) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind(bind).expect("bind an owned listener");
+        let addr = listener.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        addr
+    }
+
+    /// agent-bridle#416 round 3 (fix-first review): a `net:none` spawn whose
+    /// stdio was never declared — `ConfinedCommand`'s `stdin`/`stdout`/
+    /// `stderr` default to `None`, which `ConfinedCommand::spawn` turns into
+    /// `std::process::Command`'s own inherited-stdio default — is exactly the
+    /// shape ADR 0015 amendment E6's audit never measured (a connected
+    /// endpoint could already live on an inherited descriptor, invisible to
+    /// Seatbelt's socket rules). It must refuse admission under the DEFAULT
+    /// floor, not resolve a named `Bounded(∅)` on `MACH_DEPUTY_AUDIT` alone —
+    /// the regression this round's L3 fix (`SeatbeltSandbox::resolved_authority`
+    /// now takes the spawn's `StdioPosture`) closes. This is the test that, by
+    /// construction, exercises the production default every caller gets
+    /// unless it explicitly asks for `ConfinedStdio::Piped`/`Null` (see the
+    /// positive control below).
     #[test]
-    fn restricted_net_authority_is_denied_before_spawn() {
+    fn net_none_with_default_stdio_refuses_admission() {
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
         }
-        let dir = unique_dir("net-held");
-        let marker = dir.join("must-not-spawn");
         let cx = ctx(Caveats {
             net: Scope::none(),
             ..Caveats::top()
         });
-        match ConfinedCommand::new("/usr/bin/touch")
-            .arg(&marker)
-            .spawn(&cx)
-        {
-            Err(ToolError::Denied { .. }) => {}
-            Err(other) => panic!("expected a restricted-network authority denial, got {other}"),
-            Ok(mut spawned) => {
-                let _ = spawned.child.kill();
-                panic!("restricted network authority must be denied before spawn");
-            }
-        }
+        // No .stdin()/.stdout()/.stderr() calls at all — the production
+        // default every caller gets who doesn't explicitly ask for the
+        // audited shape.
+        let res = ConfinedCommand::new("/usr/bin/true").spawn(&cx);
         assert!(
-            !marker.exists(),
-            "the denied command must never have executed"
+            matches!(res, Err(ToolError::Denied { .. })),
+            "net:none with default (inherited, unaudited) stdio must refuse before spawn, got {res:?}"
         );
+    }
+
+    /// The sibling of the above for an EXPLICIT, non-audited `Stdio`: a
+    /// caller that converts a raw [`std::process::Stdio`] in (even one that is
+    /// itself a freshly-made pipe) gets [`ConfinedStdio::Other`], not credit
+    /// for [`ConfinedStdio::Piped`] — "a caller that wants Piped/Null credit
+    /// must say so by name, not by what the `Stdio` happens to contain" (the
+    /// type's own doc comment). Proves the gate keys on the NAMED variant, not
+    /// on what the underlying descriptor would look like if inspected.
+    #[test]
+    fn net_none_with_other_stdio_refuses_admission() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        });
+        let res = ConfinedCommand::new("/usr/bin/true")
+            // A raw `Stdio::piped()` converts in as `Other`, same as the ADR's
+            // inherited/redirected-file cases — never `Piped` by inspection.
+            .stdin(std::process::Stdio::piped())
+            .stdout(ConfinedStdio::Null)
+            .stderr(ConfinedStdio::Null)
+            .spawn(&cx);
+        assert!(
+            matches!(res, Err(ToolError::Denied { .. })),
+            "an `Other` stdio channel must refuse net:none admission even though two of three channels are audited, got {res:?}"
+        );
+    }
+
+    /// agent-bridle#405 / ADR 0015 amendment E6 — the CI kernel proof the
+    /// promotion exists to back, now gated on the audited shape this round
+    /// added: with the deputy audit `Complete`, an unprivileged caller, AND
+    /// every one of stdin/stdout/stderr declared `Piped`/`Null` BY NAME, a
+    /// `net: none`, zero-`mach:`-grant scope ADMITS through the real
+    /// production path (`Gate::authorize` + `ConfinedCommand::spawn`;
+    /// `resolved.net` is the bottom element `∅`, trivially a subset of any
+    /// delegated grant). The real kernel still blocks the child's own egress:
+    /// an unconfined positive control proves the probe reaches an owned
+    /// loopback listener (curl exit 0); the SAME request through the confined
+    /// spawn must not (curl exit 7, the exact "couldn't connect" code — not a
+    /// timeout, not a malformed-profile exit 65).
+    #[test]
+    fn net_none_with_audited_stdio_admits_and_the_kernel_still_blocks_egress() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let dir = unique_dir("net-none-admits");
+        let marker = dir.join("ran");
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        });
+
+        // The benign leg: admission no longer refuses net:none before spawn,
+        // once the spawn declares the audited stdio shape BY NAME.
+        let mut touch = ConfinedCommand::new("/usr/bin/touch")
+            .arg(&marker)
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
+            .spawn(&cx)
+            .expect("net:none with zero mach: grants and audited stdio must now be admitted");
+        assert!(touch.child.wait().expect("wait").success());
+        assert!(
+            marker.exists(),
+            "the admitted command must actually have run"
+        );
+
+        // Positive control: an UNCONFINED curl reaches an owned listener.
+        let addr = one_shot_listener("127.0.0.1:0");
+        let url = format!("http://{addr}/");
+        let control = std::process::Command::new("/usr/bin/curl")
+            .args(["-sS", "--max-time", "5", &url])
+            .status()
+            .expect("spawn unconfined curl control");
+        assert!(
+            control.success(),
+            "positive control: an unconfined curl must reach the owned listener"
+        );
+
+        // Confined: the SAME request through the real spawn path must be
+        // kernel-denied before it ever reaches the listener.
+        let addr2 = one_shot_listener("127.0.0.1:0");
+        let url2 = format!("http://{addr2}/");
+        let mut curl = ConfinedCommand::new("/usr/bin/curl")
+            .args(["-sS", "--max-time", "5", &url2])
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
+            .spawn(&cx)
+            .expect("spawn");
+        assert_eq!(
+            curl.child.wait().expect("wait").code(),
+            Some(7),
+            "the confined child's own network attempt must be kernel-denied, exact exit 7"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

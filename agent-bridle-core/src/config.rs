@@ -192,6 +192,17 @@ pub struct SandboxPolicy {
     /// authority and enforcement report whenever it is active.
     #[serde(default, skip_serializing_if = "is_false")]
     pub appcontainer_nul_device_ace: bool,
+    /// macOS Seatbelt only: trust `/Applications/Xcode.app` as a git-exec
+    /// redirect target even though `/Applications` is admin-group-writable
+    /// (agent-bridle#409/#2630 round 3). **Default OFF** — fail closed: an
+    /// admin-group process can replace `/Applications/Xcode.app`, and this
+    /// flag, once set, tells the kernel to trust the replacement's `git`.
+    /// The operator sets it explicitly; see `SECURITY.md` for the known
+    /// issue and `xcode-select -s /Library/Developer/CommandLineTools` for
+    /// the no-exception-needed mitigation. `#[serde(default)]` so configs
+    /// written before this field existed keep parsing (opt-in stays off).
+    #[serde(default)]
+    pub seatbelt_trust_admin_writable_xcode: bool,
     /// Read base when `fs_read` restricted (`BASE_READ_PATHS`).
     pub base_read_paths: PathList,
     /// Executable dirs read-allowed only when `exec` is ambient (`BIN_READ_PATHS`).
@@ -280,6 +291,7 @@ impl Default for SandboxPolicy {
             child_network: ChildNetworkPolicy::default(),
             appcontainer_launcher_path: None,
             appcontainer_nul_device_ace: false,
+            seatbelt_trust_admin_writable_xcode: false,
             named_root_protected_roots: None,
             base_read_paths: PathList::from_defaults(base_read),
             device_sink_paths: default_device_sink_paths(),

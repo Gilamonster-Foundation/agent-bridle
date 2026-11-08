@@ -54,6 +54,7 @@ mod spawn;
 mod step_up;
 mod tool;
 mod unbridle;
+mod xcselect;
 
 pub use admitted::{
     AdmittedFence, AdmittedFenceBody, AdmittedFenceId, BackendProjection, RuntimeClosure,
@@ -83,7 +84,8 @@ pub use provenance::{
 pub use registry::{Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
-    EnforcementFloor, EnforcementReport, EnforcementWidening, ExecBoundary, UnenforceableAxis,
+    EnforcementFloor, EnforcementReport, EnforcementWidening, ExecBoundary, StdioPosture,
+    UnenforceableAxis,
 };
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
@@ -101,9 +103,10 @@ pub use spawn::{
     confinement_unenforceable, decode_trusted_worker_frame_header, decode_trusted_worker_hello,
     decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,
     spawn_confined_subprocess, trusted_worker_frame_digest, ConfinedChild, ConfinedCommand,
-    ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind, TrustedWorkerRequest,
-    TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP, TRUSTED_WORKER_FRAME_HEADER_LEN,
-    TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY, TRUSTED_WORKER_PROTOCOL_VERSION,
+    ConfinedStdio, ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind,
+    TrustedWorkerRequest, TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP,
+    TRUSTED_WORKER_FRAME_HEADER_LEN, TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY,
+    TRUSTED_WORKER_PROTOCOL_VERSION,
 };
 // The async-host confined spawn (tokio pipe handles). Unix-only, feature-gated,
 // so it re-exports only when built — mirroring the OS-sandbox re-exports above.

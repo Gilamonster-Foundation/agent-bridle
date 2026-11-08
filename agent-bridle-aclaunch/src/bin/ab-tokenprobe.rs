@@ -9,11 +9,15 @@ fn main() {
         "print" => print_identity(),
         "spawn-cmd" => {
             print_identity();
+            // Pipes, not `Stdio::null()`: that makes this (AppContainer) process
+            // open the NUL device itself, which newer Windows images deny with
+            // os error 5 ("Access is denied"). The pipes are never read; the child
+            // is killed below, so nothing can block on them.
             let child = std::process::Command::new("cmd.exe")
                 .args(["/d", "/q", "/k"])
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn();
             let mut child = match child {
                 Ok(child) => child,
@@ -31,7 +35,12 @@ fn main() {
         "spawn-self" => {
             print_identity();
             let exe = std::env::current_exe().expect("current probe executable");
-            let out = std::process::Command::new(exe).arg("print").output();
+            // `output()` defaults an unset stdin to null (another NUL open from
+            // inside the AppContainer); piped stdin is closed straight away.
+            let out = std::process::Command::new(exe)
+                .arg("print")
+                .stdin(std::process::Stdio::piped())
+                .output();
             let out = match out {
                 Ok(out) => out,
                 Err(error) if error.raw_os_error() == Some(5) => {

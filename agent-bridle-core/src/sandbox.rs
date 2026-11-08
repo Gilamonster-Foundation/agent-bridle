@@ -99,6 +99,19 @@ pub trait Sandbox: Send + Sync {
     /// confine via [`Sandbox::command_prefix`] instead and make this a no-op.
     fn apply(&self, effective: &Caveats) -> ToolResult<()>;
 
+    /// Apply with a held regular worker image replacing its read/exec pathname
+    /// entries. Backends that cannot bind both rules to that object refuse.
+    fn apply_with_worker(
+        &self,
+        _effective: &Caveats,
+        _program: &str,
+        _image: &std::fs::File,
+    ) -> ToolResult<()> {
+        Err(crate::ToolError::denied(
+            "sandbox cannot bind worker rules to a held image",
+        ))
+    }
+
     /// The argv prefix that wraps a child so a *wrapper-based* L3 backend
     /// confines it (macOS `sandbox-exec`). The returned vector, prepended to a
     /// `(program, args…)`, is the argv that must actually be spawned.
@@ -134,8 +147,22 @@ pub trait Sandbox: Send + Sync {
     /// refuses any restricted grant rather than silently admitting it — the
     /// conservative rule applied to the trait itself. Each concrete backend
     /// overrides this with the authority it can actually be shown to enforce.
-    fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
-        let _ = effective;
+    ///
+    /// `stdio` is the spawn's declared [`crate::StdioPosture`] — whether this
+    /// specific spawn's stdin/stdout/stderr are each a pipe/`/dev/null`
+    /// (`Audited`) or something this builder cannot vouch for (`Unaudited`,
+    /// the default). Only [`SeatbeltSandbox`] consults it today (the Mach
+    /// deputy audit's own precondition, agent-bridle#416 round 3: an L3 scope
+    /// bound is the admission gate under a non-Kernel floor, so it must share
+    /// the same stdio precondition `seatbelt_net_kernel_witness` already
+    /// requires at L4 — an unaudited restricted launch stays `Unknown`, never
+    /// a named bound); every other backend ignores it.
+    fn resolved_authority(
+        &self,
+        effective: &Caveats,
+        stdio: crate::StdioPosture,
+    ) -> crate::ResolvedAuthority {
+        let _ = (effective, stdio);
         crate::ResolvedAuthority {
             fs_read: crate::ResolvedScope::Unknown,
             fs_write: crate::ResolvedScope::Unknown,
@@ -179,7 +206,11 @@ impl Sandbox for NoopSandbox {
         Ok(())
     }
 
-    fn resolved_authority(&self, _effective: &Caveats) -> crate::ResolvedAuthority {
+    fn resolved_authority(
+        &self,
+        _effective: &Caveats,
+        _stdio: crate::StdioPosture,
+    ) -> crate::ResolvedAuthority {
         // Noop confines nothing, so it can deliver EVERYTHING on every axis:
         // the conservative upper bound is `Unbounded`. Any restricted (`Only(_)`)
         // grant is then a `Superset` of what was delegated ⇒ admission refuses —
@@ -225,7 +256,7 @@ mod resolved_authority_foundation_tests {
             }
         }
         let effective = exec_only("git");
-        let resolved = Bare.resolved_authority(&effective);
+        let resolved = Bare.resolved_authority(&effective, crate::StdioPosture::Unaudited);
         assert_eq!(resolved.exec, ResolvedScope::Unknown);
         assert!(matches!(
             admit(&resolved, &effective, &empty_closure()),
@@ -236,7 +267,7 @@ mod resolved_authority_foundation_tests {
     #[test]
     fn noop_backend_is_unbounded_and_refuses_restricted_grants() {
         let effective = exec_only("git");
-        let resolved = NoopSandbox.resolved_authority(&effective);
+        let resolved = NoopSandbox.resolved_authority(&effective, crate::StdioPosture::Unaudited);
         assert_eq!(resolved.exec, ResolvedScope::Unbounded);
         assert!(matches!(
             admit(&resolved, &effective, &empty_closure()),
@@ -250,7 +281,7 @@ mod resolved_authority_foundation_tests {
         // resolved authority is Subset/Equal of the (unbounded) delegated bound
         // ⇒ admit. The conservative rule only bites RESTRICTED axes.
         let effective = Caveats::top();
-        let resolved = NoopSandbox.resolved_authority(&effective);
+        let resolved = NoopSandbox.resolved_authority(&effective, crate::StdioPosture::Unaudited);
         assert!(matches!(
             admit(&resolved, &effective, &empty_closure()),
             AdmissionDecision::Admit
@@ -290,6 +321,71 @@ pub(crate) fn restricts_exec(caveats: &Caveats) -> bool {
 #[must_use]
 pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
+}
+
+/// `true` when the Seatbelt Mach-lookup deputy audit (agent-bridle#405) is
+/// complete on this build — i.e. [`seatbelt_impl::MACH_DEPUTY_AUDIT`] is
+/// `Complete`. A narrow, read-only crossing of the `seatbelt_impl` cfg
+/// boundary so `report.rs`'s cross-platform `enforcement_report` can gate a
+/// `net → Kernel` claim on the same audit state that already gates the L3
+/// `resolved_authority` projection ([`seatbelt_impl::seatbelt_net_projection`]),
+/// without making the enum or the constant itself public. On a non-macOS
+/// build (or without the `macos-seatbelt` feature) the audit cannot exist, so
+/// this is unconditionally `false` — never a claim this platform cannot back.
+#[must_use]
+pub(crate) fn seatbelt_mach_deputy_audit_complete() -> bool {
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    {
+        seatbelt_impl::MACH_DEPUTY_AUDIT == seatbelt_impl::MachDeputyAudit::Complete
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-seatbelt")))]
+    {
+        false
+    }
+}
+
+/// `true` when this process is NOT running as root (effective UID ≠ 0). ADR
+/// 0015 amendment E6's probes all ran unprivileged (agent-bridle#416 round-2
+/// review, item 2): a root-owned bridle process can reach kernel controls
+/// (privileged IOKit classes, sysctl write paths, privileged Mach services)
+/// the probes never exercised, so the Kernel net witness must not extend to
+/// it. Mirrors [`seatbelt_mach_deputy_audit_complete`]'s cfg-crossing shape:
+/// unconditionally `true` off a Seatbelt-capable build, since nothing there
+/// depends on it (`seatbelt_net_kernel_witness`'s `audit_complete` term is
+/// already `false` there).
+#[must_use]
+pub(crate) fn seatbelt_caller_is_unprivileged() -> bool {
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    {
+        !seatbelt_impl::caller_is_root()
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-seatbelt")))]
+    {
+        true
+    }
+}
+
+/// `true` when a Seatbelt `net` scope is a **Kernel** egress-deny witness: the
+/// deny-all shape (`net_fully_denied`, which already implies zero `mach:`/
+/// `unix:` grants — they are entries in the same non-empty scope set), a
+/// complete Mach-lookup deputy audit (agent-bridle#405/ADR 0015 E6), the
+/// spawn's stdio in the shape that audit covered, and an unprivileged
+/// spawning process (agent-bridle#416 round-2 review, items 1/2 — the ADR's
+/// probes assumed pipe/null-only stdio and ran unprivileged; neither was
+/// enforced by construction). Pure — every precondition is a parameter rather
+/// than read from ambient state, so `report.rs`'s test suite can pin this
+/// predicate directly, independent of whichever state the production
+/// constant ships or the actual privilege of whatever process runs the suite
+/// (`Complete` as of agent-bridle#405/ADR 0015 amendment E6, 2026-10-01; see
+/// [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc comment for the evidence).
+#[must_use]
+pub(crate) fn seatbelt_net_kernel_witness(
+    effective: &Caveats,
+    audit_complete: bool,
+    stdio_audited: bool,
+    caller_unprivileged: bool,
+) -> bool {
+    audit_complete && stdio_audited && caller_unprivileged && net_fully_denied(effective)
 }
 
 /// An explicit `unix:<path>` token names a path-anchored Unix-domain socket
@@ -486,6 +582,71 @@ pub(crate) fn exec_fully_denied(caveats: &Caveats) -> bool {
 pub(crate) fn exec_grant_pulls_launcher_variant(caveats: &Caveats) -> bool {
     matches!(&caveats.exec, crate::Scope::Only(s)
         if s.iter().any(|p| p == "sh" || p == "/bin/sh"))
+}
+
+/// Recognized multicall binaries that pick their behavior from `argv[0]`,
+/// matched as a file-name *prefix* (`busybox.static`, `busybox-1.36`, …).
+const MULTICALL_NAMES: &[&str] = &["busybox", "toybox", "coreutils"];
+
+/// Whether a restricted `exec` grant resolves to a **multi-command binary**: a
+/// regular file with more than one hard link, or a recognized multicall
+/// ([`MULTICALL_NAMES`], e.g. Ubuntu 26.04's uutils `coreutils`, where `cat`,
+/// `head`, `env`, … are one inode). Exec identity attaches to the *file*
+/// (Landlock `Execute`, a rootfs bind, an SBPL literal) while the binary
+/// dispatches on its name, so the grant admits every name linked to it and is
+/// `exec ≡ All` for honesty (ADR 0011 D6, agent-bridle#449). Not pure: it
+/// resolves bare names and stats the results.
+///
+/// Fail-closed: a bare name is checked at **every** hit across `$PATH` *and*
+/// the default search dirs, a superset of what any backend binds (rootfs:
+/// `$PATH`, else its fallback; Seatbelt: every trusted-dir hit), so a backend
+/// cannot bind a multicall this check did not see. Still a heuristic: a
+/// *renamed*, single-link multicall (busybox copied to `cat`) is not detected.
+/// The macOS Xcode locator stub is exempt from the link-count rule
+/// ([`crate::xcselect`]).
+#[must_use]
+pub(crate) fn exec_grant_is_multicall(caveats: &Caveats) -> bool {
+    let crate::Scope::Only(set) = &caveats.exec else {
+        return false;
+    };
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    dirs.extend(
+        crate::config::RootfsPolicy::default()
+            .search_dirs
+            .iter()
+            .map(std::path::PathBuf::from),
+    );
+    set.iter().any(|entry| {
+        if entry.contains('/') {
+            is_multicall_file(std::path::Path::new(entry))
+        } else {
+            dirs.iter().any(|d| is_multicall_file(&d.join(entry)))
+        }
+    })
+}
+
+/// `granted` (as named, before symlink resolution) is a multi-command binary.
+fn is_multicall_file(granted: &std::path::Path) -> bool {
+    let Ok(real) = granted.canonicalize() else {
+        return false;
+    };
+    let Ok(meta) = real.metadata() else {
+        return false;
+    };
+    // The macOS Xcode locator stub is one 78-link inode that only re-execs the
+    // selected toolchain's tool, so its links do not make it a multicall.
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(&meta) > 1
+        && !crate::xcselect::is_xcselect_stub(&real);
+    #[cfg(not(unix))]
+    let linked = false;
+    let named = |p: &std::path::Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| MULTICALL_NAMES.iter().any(|m| n.starts_with(m)))
+    };
+    meta.is_file() && (linked || named(granted) || named(&real))
 }
 
 /// `true` if this kernel supports Landlock TCP network rules (ABI V4, kernel ≥ 6.7).
@@ -961,7 +1122,11 @@ pub(crate) mod appcontainer_impl {
         /// `127.0.0.0/8` + `::1`, every port — not a requested subset), so union a
         /// `loopback-exemption` class to REVEAL that widening; a specific remote-host
         /// allowlist AppContainer cannot faithfully bound → `Unknown` ⇒ refuse.
-        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        fn resolved_authority(
+            &self,
+            effective: &Caveats,
+            _stdio: crate::StdioPosture,
+        ) -> crate::ResolvedAuthority {
             use crate::ResolvedScope as Rs;
             // fs: mirror the aclaunch DACL — a write ACE (FILE_GENERIC_READ_WRITE)
             // confers read, so the resolved read scope unions the write scope.
@@ -1250,7 +1415,8 @@ mod appcontainer_resolved_authority_tests {
     }
 
     fn decide(caveats: &Caveats) -> AdmissionDecision {
-        let resolved = AppContainerSandbox::new(None, false).resolved_authority(caveats);
+        let resolved = AppContainerSandbox::new(None, false)
+            .resolved_authority(caveats, crate::StdioPosture::Unaudited);
         admit(&resolved, caveats, &empty_closure())
     }
 
@@ -1274,7 +1440,8 @@ mod appcontainer_resolved_authority_tests {
             ),
         }
         // The projection itself must reveal the widening (never == the delegated read).
-        let resolved = AppContainerSandbox::new(None, false).resolved_authority(&c);
+        let resolved = AppContainerSandbox::new(None, false)
+            .resolved_authority(&c, crate::StdioPosture::Unaudited);
         assert_ne!(
             resolved.fs_read,
             ResolvedScope::from_scope(&c.fs_read),
@@ -1300,11 +1467,21 @@ mod appcontainer_resolved_authority_tests {
 
         let default_off = AppContainerSandbox::new(None, false);
         assert_eq!(default_off.runtime_closure(&c), empty_closure());
-        assert_ne!(default_off.resolved_authority(&c).fs_read, class);
-        assert_ne!(default_off.resolved_authority(&c).fs_write, class);
+        assert_ne!(
+            default_off
+                .resolved_authority(&c, crate::StdioPosture::Unaudited)
+                .fs_read,
+            class
+        );
+        assert_ne!(
+            default_off
+                .resolved_authority(&c, crate::StdioPosture::Unaudited)
+                .fs_write,
+            class
+        );
 
         let opted_in = AppContainerSandbox::new(None, true);
-        let resolved = opted_in.resolved_authority(&c);
+        let resolved = opted_in.resolved_authority(&c, crate::StdioPosture::Unaudited);
         let closure = opted_in.runtime_closure(&c);
         assert_eq!(
             resolved.fs_read,
@@ -1327,7 +1504,7 @@ mod appcontainer_resolved_authority_tests {
         let ambient = Caveats::top();
         assert_eq!(
             admit(
-                &opted_in.resolved_authority(&ambient),
+                &opted_in.resolved_authority(&ambient, crate::StdioPosture::Unaudited),
                 &ambient,
                 &opted_in.runtime_closure(&ambient),
             ),
@@ -1628,16 +1805,12 @@ pub(crate) mod landlock_impl {
         })
     }
 
-    impl Sandbox for LandlockSandbox {
-        fn kind(&self) -> SandboxKind {
-            SandboxKind::Landlock
-        }
-
-        fn exec_boundary(&self) -> crate::ExecBoundary {
-            self.exec_boundary
-        }
-
-        fn apply(&self, effective: &Caveats) -> ToolResult<()> {
+    impl LandlockSandbox {
+        fn apply_rules(
+            &self,
+            effective: &Caveats,
+            worker: Option<(&str, &std::fs::File)>,
+        ) -> ToolResult<()> {
             let write = AccessFs::from_write(fs_abi_floor(&self.policy));
             // Pure read rights — `from_read` also bundles `Execute`, which we
             // govern separately (only when `exec` is restricted), never via the
@@ -1669,6 +1842,22 @@ pub(crate) mod landlock_impl {
             // devices — when confined.) Built via the shared routine so the
             // resolved-authority projection anchors on the identical set.
             let write_roots = self.write_roots(effective);
+            // Remove the worker name BEFORE exec-path canonicalization (a
+            // replacement symlink may resolve to a directory). Only its held
+            // descriptor supplies the read/exec exception below.
+            let mut path_caveats = effective.clone();
+            if let Some((program, image)) = worker {
+                if !image.metadata()?.is_file() {
+                    return Err(ToolError::denied(
+                        "worker read/exec rule requires a regular file",
+                    ));
+                }
+                for scope in [&mut path_caveats.fs_read, &mut path_caveats.exec] {
+                    if let Scope::Only(paths) = scope {
+                        paths.remove(program);
+                    }
+                }
+            }
             // Build the ruleset: fs axes first (V3 floor), then optionally the
             // net axis (V4+). BestEffort means handle_access silently skips
             // access types the kernel doesn't know — so on pre-6.7 kernels the
@@ -1700,7 +1889,7 @@ pub(crate) mod landlock_impl {
                 // routine so the resolved-authority projection anchors on the
                 // identical set (ADR 0011 D3: confined-exec keeps bin dirs OUT of
                 // the trampoline corpus).
-                let read_roots = self.read_roots(effective, confine_exec);
+                let read_roots = self.read_roots(&path_caveats, confine_exec);
                 ruleset
                     .add_rules(path_beneath_rules(&read_roots, read))
                     .map_err(landlock_denied)?
@@ -1714,7 +1903,7 @@ pub(crate) mod landlock_impl {
                 // expose `/usr/lib`'s interpreters). A permitted binary still runs
                 // (its own execve + the loader + .so reads), but cannot DIRECTLY
                 // execve a different, un-granted program.
-                let exec_roots = self.exec_roots(effective);
+                let exec_roots = self.exec_roots(&path_caveats);
                 ruleset
                     .add_rules(path_beneath_rules(&exec_roots, AccessFs::Execute))
                     .map_err(landlock_denied)?
@@ -1722,6 +1911,18 @@ pub(crate) mod landlock_impl {
                 ruleset
             };
 
+            let ruleset = if let Some((_, image)) = worker {
+                let access = handled & (AccessFs::ReadFile | AccessFs::Execute);
+                if access.is_empty() {
+                    ruleset
+                } else {
+                    ruleset
+                        .add_rule(landlock::PathBeneath::new(image, access))
+                        .map_err(landlock_denied)?
+                }
+            } else {
+                ruleset
+            };
             let status = ruleset.restrict_self().map_err(landlock_denied)?;
 
             // Fail closed: if the kernel did not actually enforce the ruleset,
@@ -1743,8 +1944,35 @@ pub(crate) mod landlock_impl {
             }
             Ok(())
         }
+    }
 
-        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+    impl Sandbox for LandlockSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::Landlock
+        }
+
+        fn exec_boundary(&self) -> crate::ExecBoundary {
+            self.exec_boundary
+        }
+
+        fn apply(&self, effective: &Caveats) -> ToolResult<()> {
+            self.apply_rules(effective, None)
+        }
+
+        fn apply_with_worker(
+            &self,
+            effective: &Caveats,
+            program: &str,
+            image: &std::fs::File,
+        ) -> ToolResult<()> {
+            self.apply_rules(effective, Some((program, image)))
+        }
+
+        fn resolved_authority(
+            &self,
+            effective: &Caveats,
+            _stdio: crate::StdioPosture,
+        ) -> crate::ResolvedAuthority {
             use crate::ResolvedScope;
             use std::collections::BTreeSet;
 
@@ -2686,7 +2914,8 @@ pub(crate) mod landlock_impl {
             std::fs::create_dir_all(&base).unwrap();
             symlink("/", &link).unwrap();
             let delegated = fs_read_only(link.to_str().unwrap());
-            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            let resolved = LandlockSandbox::new()
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_eq!(resolved.fs_read, ResolvedScope::Unknown);
             assert!(matches!(
                 admit(&resolved, &delegated, &empty_closure()),
@@ -2705,7 +2934,8 @@ pub(crate) mod landlock_impl {
                 net: Scope::only(Vec::<String>::new()),
                 ..Caveats::top()
             };
-            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            let resolved = LandlockSandbox::new()
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_eq!(resolved.net, ResolvedScope::Unknown);
             assert!(matches!(
                 admit(&resolved, &delegated, &empty_closure()),
@@ -2729,8 +2959,8 @@ pub(crate) mod landlock_impl {
                 child_network: crate::ChildNetworkPolicy::DenyDirect,
                 ..crate::SandboxPolicy::default()
             };
-            let resolved =
-                LandlockSandbox::with_policy(Arc::new(policy)).resolved_authority(&delegated);
+            let resolved = LandlockSandbox::with_policy(Arc::new(policy))
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_ne!(
                 resolved.net,
                 ResolvedScope::Unknown,
@@ -2750,7 +2980,8 @@ pub(crate) mod landlock_impl {
         #[test]
         fn unrestricted_grant_admits() {
             let delegated = Caveats::top();
-            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            let resolved = LandlockSandbox::new()
+                .resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             assert_eq!(resolved.net, ResolvedScope::Unbounded);
             assert_eq!(resolved.fs_read, ResolvedScope::Unbounded);
             assert!(matches!(
@@ -2770,7 +3001,7 @@ pub(crate) mod landlock_impl {
             std::fs::create_dir_all(&dir).unwrap();
             let delegated = fs_read_only(dir.to_str().unwrap());
             let sb = LandlockSandbox::new();
-            let resolved = sb.resolved_authority(&delegated);
+            let resolved = sb.resolved_authority(&delegated, crate::StdioPosture::Unaudited);
             let closure = sb.runtime_closure(&delegated);
             assert!(
                 matches!(
@@ -2818,26 +3049,37 @@ mod seatbelt_impl {
     /// posture of ADR 0015's E4 ruling. Only a deputy-complete native proof
     /// (every reachable ambient IPC route shown closed, positive controls
     /// included) may flip [`MACH_DEPUTY_AUDIT`] to `Complete`. The constant
-    /// controls ONLY the resolved-authority projection (the L3 scope bound).
-    /// It does not touch the per-axis strength report (`report.rs`, which
-    /// keeps every restricted Seatbelt net shape Advisory) or the L4 strength
-    /// floor, so flipping it alone does not admit `net:none` under a CONFINED
-    /// (Kernel-net) contract. Report/floor integration and end-to-end
-    /// admission tests belong to the evidence-backed promotion PR.
+    /// controls ONLY the resolved-authority projection (the L3 scope bound);
+    /// `report.rs`'s Seatbelt `net` arm reads it too (via
+    /// `seatbelt_mach_deputy_audit_complete`/`seatbelt_net_kernel_witness`) so
+    /// the L3 projection and the L4 strength report promote together, never
+    /// one without the other.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum MachDeputyAudit {
         Incomplete,
-        /// Not yet constructible in production — reached only by the unit test
-        /// that pins the post-audit projection (see `MACH_DEPUTY_AUDIT`).
-        #[cfg_attr(not(test), allow(dead_code))]
         Complete,
     }
 
-    /// The audit state this build ships. **Incomplete**: the zero floor closes
-    /// every *named* Mach lookup, but other ambient IPC (AppleEvents, XPC via
-    /// inherited endpoints, the `nsurlsessiond` class of deputies reached by
-    /// other means) is not comprehensively certified.
-    pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Incomplete;
+    /// The audit state this build ships. **Complete** (agent-bridle#405, ADR
+    /// 0015 amendment E6, 2026-10-01; narrowed by the round-2 review,
+    /// agent-bridle#416): the zero floor closes every *named* Mach lookup, and
+    /// the measured legs of the channel sweep — unix-domain sockets,
+    /// `open(1)`/LaunchServices, Darwin notifications, pasteboard,
+    /// `iokit-open`, `sysctl-write`, a write-class `file-ioctl`, XPC beyond
+    /// `mach-lookup`, and AppleEvents — are each shown closed under an
+    /// UNPRIVILEGED probing process (full evidence table: ADR 0015 amendment
+    /// E6). `process-info`/`signal` and the shared-memory/file-drop surface
+    /// are stated as explicit ACCEPTED LIMITS of a direct-egress claim (they
+    /// carry no network authority), not as proof the deputy set is exhaustive;
+    /// "no ambient relay found" on the probed host is an observation about
+    /// that host, not a closure proof. This governs ONLY the deny-all,
+    /// zero-`mach:`-grant shape, and ONLY when the caller is unprivileged and
+    /// the spawn's stdio is pipe/null-only — [`super::seatbelt_net_kernel_witness`]'s
+    /// other parameters, enforced at `caller_is_root`/the spawn's declared
+    /// [`crate::StdioPosture`]. A named grant, a loopback scope, a remote-host
+    /// allowlist, a root-owned caller, or unaudited stdio are all unaffected
+    /// and stay `Unknown`/`Advisory`.
+    pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Complete;
 
     /// The conservative network projection for `effective` under `audit`.
     /// Pure. `All` is ambient (`Unbounded`). Every restricted shape is
@@ -2895,6 +3137,18 @@ mod seatbelt_impl {
     #[must_use]
     pub fn seatbelt_is_supported() -> bool {
         Path::new(SANDBOX_EXEC).exists()
+    }
+
+    /// `true` when this process's effective UID is 0 (root). ADR 0015 E6's
+    /// probes all ran unprivileged (agent-bridle#416 round-2 review, item 2).
+    /// Reads the real ambient UID via `rustix` (a safe wrapper, so core stays
+    /// `forbid(unsafe_code)`) — deliberately NOT a pure/parameterized
+    /// predicate, unlike [`super::seatbelt_net_kernel_witness`], which takes
+    /// the already-read value as a plain bool specifically so its logic stays
+    /// testable without depending on the actual privilege of whatever process
+    /// runs the suite.
+    pub(super) fn caller_is_root() -> bool {
+        rustix::process::geteuid().is_root()
     }
 
     /// A real, kernel-enforced Seatbelt sandbox (macOS).
@@ -2991,6 +3245,7 @@ mod seatbelt_impl {
                     &unix_socket_paths(effective)?,
                     &super::mach_service_grants(effective)?,
                     mach_floor,
+                    self.policy.seatbelt_trust_admin_writable_xcode,
                 ),
             ])
         }
@@ -3028,13 +3283,50 @@ mod seatbelt_impl {
         /// follows [`seatbelt_net_projection`] under the shipped
         /// [`MACH_DEPUTY_AUDIT`]: unrestricted authority is honestly ambient, and
         /// every restricted network scope remains `Unknown` (refused before spawn)
-        /// until the deputy audit is complete. The zero Mach floor and the named
-        /// `mach:` grants in the generated profile are real kernel rules, but they
-        /// are not used to promote restricted network authority to a bounded claim
-        /// (agent-bridle#405 D4: fail closed first).
-        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        /// until the deputy audit is complete AND this specific spawn's declared
+        /// [`crate::StdioPosture`]/caller privilege back it. The zero Mach floor and
+        /// the named `mach:` grants in the generated profile are real kernel rules,
+        /// but they are not used to promote restricted network authority to a
+        /// bounded claim on their own (agent-bridle#405 D4: fail closed first).
+        fn resolved_authority(
+            &self,
+            effective: &Caveats,
+            stdio: crate::StdioPosture,
+        ) -> crate::ResolvedAuthority {
             let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
-            resolved.net = seatbelt_net_projection(effective, MACH_DEPUTY_AUDIT);
+            // A root-owned process, or a spawn whose stdio is not declared
+            // audited, narrows straight back to `Incomplete` — the SAME
+            // `Unknown`/held-for-admission treatment an actually incomplete audit
+            // already gets (agent-bridle#416 round-2 review, items 1/2: the
+            // probes behind `MACH_DEPUTY_AUDIT` all ran unprivileged with
+            // pipe/null-only stdio, so nothing backs a claim about a root
+            // process's privileged kernel-control surface, or about a launch
+            // whose stdio could already be a connected endpoint Seatbelt's own
+            // socket rules never see). This is the L3 admission gate, not merely
+            // a strength label (round-3 review): it must share the SAME
+            // preconditions `seatbelt_net_kernel_witness` already requires at
+            // L4, or an unprivileged net:none spawn with unaudited stdio resolves
+            // a named `Bounded(∅)` bound here regardless of what L4 reports, and
+            // a non-Kernel floor (e.g. the shipped `EnforcementFloor::DEFAULT`,
+            // which accepts Advisory net) admits it on that bound alone.
+            let audit = if caller_is_root() || stdio != crate::StdioPosture::Audited {
+                MachDeputyAudit::Incomplete
+            } else {
+                MACH_DEPUTY_AUDIT
+            };
+            resolved.net = seatbelt_net_projection(effective, audit);
+            // ROUND 2 (#2630 macOS leg, operator decision 2026-09-29): when a
+            // git grant's kernel redirect was admitted only through the named
+            // /Applications widening, say so on the exec axis as a class —
+            // never silently folded into the ordinary concrete grant.
+            if resolve_exec_targets_uses_xcode_applications_exception(
+                &effective.exec,
+                self.policy.seatbelt_trust_admin_writable_xcode,
+            ) {
+                resolved.exec = resolved.exec.union(&crate::ResolvedScope::class(
+                    XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS,
+                ));
+            }
             resolved
         }
 
@@ -3053,6 +3345,19 @@ mod seatbelt_impl {
                         super::seatbelt_mach_service_class(g),
                     ))
                 });
+            }
+            // The exec-axis mirror of the net-axis Mach grants above: when
+            // `resolved_authority` names `XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS`
+            // on a grant, admission's `resolved ⊆ delegated ∪ runtime_closure`
+            // bound needs THIS closure to declare that class too, or the named
+            // widening it reports refuses at admission (reviewer-flagged gap).
+            if resolve_exec_targets_uses_xcode_applications_exception(
+                &effective.exec,
+                self.policy.seatbelt_trust_admin_writable_xcode,
+            ) {
+                closure.exec = closure.exec.union(&crate::ResolvedScope::class(
+                    XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS,
+                ));
             }
             closure
         }
@@ -3129,6 +3434,7 @@ mod seatbelt_impl {
             &unix_socket_paths(effective).expect("valid Unix socket grants in profile fixture"),
             &super::mach_service_grants(effective).expect("valid mach: grants in profile fixture"),
             NetNoneMachFloor::Closed,
+            policy.seatbelt_trust_admin_writable_xcode,
         )
     }
 
@@ -3145,6 +3451,7 @@ mod seatbelt_impl {
         unix_sockets: &[String],
         mach_grants: &[String],
         mach_floor: NetNoneMachFloor,
+        trust_admin_writable_xcode: bool,
     ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n");
 
@@ -3261,7 +3568,7 @@ mod seatbelt_impl {
         // ambient. SBPL is last-match-wins, so the trailing allow overrides.
         if let Scope::Only(_) = &effective.exec {
             p.push_str("(deny process-exec*)\n");
-            let targets = resolve_exec_targets(&effective.exec);
+            let targets = resolve_exec_targets(&effective.exec, trust_admin_writable_xcode);
             if !targets.is_empty() {
                 p.push_str("(allow process-exec*");
                 for t in &targets {
@@ -3346,13 +3653,35 @@ mod seatbelt_impl {
     /// unresolvable grant is dropped — it cannot anchor a rule, so the program
     /// stays denied (fail-closed). `All` yields nothing (callers pass a restricted
     /// axis). Results are sorted+deduped so the emitted profile is deterministic.
-    fn resolve_exec_targets(scope: &Scope<String>) -> Vec<String> {
+    ///
+    /// **macOS's system `git` re-execs itself through the active developer
+    /// toolchain (agent-bridle#408).** `/usr/bin/git` is not git — it is a
+    /// small root-owned locator stub that re-execs the real binary under
+    /// `/Applications/Xcode.app/Contents/Developer/…` or
+    /// `/Library/Developer/CommandLineTools/…`. Under a restricted exec axis
+    /// that re-exec is itself a kernel-checked `process-exec`, so a grant of
+    /// `["git"]` alone denies EVERY git invocation, not just worktree's
+    /// internal helpers (confirmed live: `git --version` fails with `can't
+    /// exec '/Applications/.../usr/bin/git' (errno=Operation not
+    /// permitted)`). [`git_toolchain_redirect_targets`] folds in the matching
+    /// toolchain binary, execution-free — see its doc comment for why this is
+    /// a narrower fix than Linux's #2630 (no static convention lets it be
+    /// *derived* from the grant; it is matched against a fixed, checked list
+    /// instead).
+    fn resolve_exec_targets(
+        scope: &Scope<String>,
+        trust_admin_writable_xcode: bool,
+    ) -> Vec<String> {
         let Scope::Only(set) = scope else {
             return Vec::new();
         };
         let canon_file = |path: &Path, out: &mut Vec<String>| {
             if let Ok(c) = std::fs::canonicalize(path) {
                 if c.is_file() {
+                    out.extend(git_toolchain_redirect_targets(
+                        &c,
+                        trust_admin_writable_xcode,
+                    ));
                     out.push(c.to_string_lossy().into_owned());
                 }
             }
@@ -3385,6 +3714,286 @@ mod seatbelt_impl {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// The class [`resolve_exec_targets`] reports on the resolved-authority
+    /// exec axis when any grant's redirect went through
+    /// [`XCODE_APPLICATIONS_EXCEPTION`] — the VISIBLE half of the round-2
+    /// widening (see that constant's doc comment for what it is and why).
+    pub(super) const XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS: &str =
+        "seatbelt-admin-writable-xcode-toolchain";
+
+    /// `true` iff resolving `scope`'s grants the way [`resolve_exec_targets`]
+    /// does would admit at least one binary ONLY via
+    /// [`XCODE_APPLICATIONS_EXCEPTION`] — i.e. the resolved-authority exec
+    /// axis for this grant should carry [`XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS`].
+    /// Mirrors [`resolve_exec_targets`]'s own token-resolution walk (absolute
+    /// grant canonicalized verbatim, bare name resolved against
+    /// [`TRUSTED_EXEC_DIRS`]) so it agrees with what that function actually
+    /// admits, without touching its return shape or its callers.
+    pub(super) fn resolve_exec_targets_uses_xcode_applications_exception(
+        scope: &Scope<String>,
+        trust_admin_writable_xcode: bool,
+    ) -> bool {
+        if !trust_admin_writable_xcode {
+            return false; // opt-in off: the exception is never consulted, let alone used.
+        }
+        let Scope::Only(set) = scope else {
+            return false;
+        };
+        let flagged = |path: &Path| -> bool {
+            std::fs::canonicalize(path).is_ok_and(|c| {
+                c.is_file() && git_toolchain_redirect_uses_xcode_applications_exception(&c)
+            })
+        };
+        set.iter().any(|token| {
+            if token.starts_with('/') {
+                flagged(Path::new(token))
+            } else if !token.contains('/') {
+                TRUSTED_EXEC_DIRS
+                    .iter()
+                    .any(|dir| flagged(&Path::new(dir).join(token)))
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Fixed, well-known Apple toolchain roots that ship their own `git`
+    /// binary, reached indirectly through `/usr/bin/git`'s locator-stub
+    /// redirect (agent-bridle#408, #2630's macOS leg). Unlike Linux's
+    /// `GIT_EXEC_PATH_CANDIDATES` (a fixed *relative* suffix derivable from
+    /// the granted binary's own directory), there is no such derivation here:
+    /// the stub's actual redirect target is "whichever developer directory
+    /// `xcode-select` currently points at", and learning that is either an
+    /// exec (`xcrun`/`xcode-select -p` — forbidden, same rule as #2630 round
+    /// 2) or an env read (`DEVELOPER_DIR` — forbidden, or a hostile value in
+    /// the CONFINED CHILD's own environment could steer what gets admitted).
+    /// `/var/db/xcode_select_link`, the one symlink that would answer this
+    /// without either, does not exist on a full-Xcode install (confirmed
+    /// live on macOS 15 / Xcode 26.3). So this list is deliberately the
+    /// narrowest HONEST option, not a full solve: admit each fixed root's own
+    /// `usr/bin/git` when it independently passes the same live
+    /// root-owned/unwritable ancestry bar every other trust decision here
+    /// uses — never executed, never read from env, both admitted if both
+    /// happen to be installed. A toolchain living anywhere else still fails
+    /// exactly as it did before this fix (fail closed, never wrongly
+    /// permissive).
+    const GIT_TOOLCHAIN_ROOTS: &[&str] = &[
+        "/Applications/Xcode.app/Contents/Developer",
+        "/Library/Developer/CommandLineTools",
+    ];
+
+    /// The one [`GIT_TOOLCHAIN_ROOTS`] entry [`XCODE_APPLICATIONS_EXCEPTION`]
+    /// applies to. CommandLineTools gets no exception — it is fully
+    /// root-owned end to end and needs none.
+    const XCODE_TOOLCHAIN_ROOT: &str = "/Applications/Xcode.app/Contents/Developer";
+
+    /// ROUND 2 (operator decision 2026-09-29): the one named widening this
+    /// resolver ever applies. `/Applications` — and only `/Applications` —
+    /// may be admin-group-writable (root:admin, mode `0o775`: group-write
+    /// set, other-write clear) without failing the ancestry bar, so the
+    /// active toolchain on a stock Xcode install (reached through it) can be
+    /// trusted. Every OTHER ancestor — Xcode.app itself, everything below
+    /// it, and every ancestor of any other candidate (including
+    /// CommandLineTools) — still needs the ordinary fully-root-owned,
+    /// fully-unwritable bar.
+    ///
+    /// **KNOWN SECURITY ISSUE** (see `SECURITY.md`, ADR 0015 amendment): an
+    /// admin-group process can replace `/Applications/Xcode.app`, and this
+    /// resolver then tells the kernel to trust the replacement's `git`.
+    /// Mitigation: `xcode-select -s /Library/Developer/CommandLineTools`
+    /// (fully root-owned, no exception needed, no relaxed check ever
+    /// applies to it).
+    const XCODE_APPLICATIONS_EXCEPTION: &str = "/Applications";
+
+    /// `true` iff `path` is exactly [`XCODE_APPLICATIONS_EXCEPTION`], owned by
+    /// root, not other-writable, and (the whole point) IS group-writable —
+    /// the one path the relaxed ancestry walk below tolerates.
+    fn is_xcode_applications_exception(path: &Path, meta: OwnerMode) -> bool {
+        path == Path::new(XCODE_APPLICATIONS_EXCEPTION)
+            && meta.uid == 0
+            && (meta.mode & 0o002) == 0 // no other-write
+            && (meta.mode & 0o020) != 0 // admin/group-write, the widening itself
+    }
+
+    /// Same ancestor walk as [`ancestry_passes`], with exactly one relaxation:
+    /// at [`XCODE_APPLICATIONS_EXCEPTION`], admin-group-writable passes too
+    /// (see [`is_xcode_applications_exception`]). Every other ancestor — at
+    /// every level, including Xcode.app itself — still needs the ordinary
+    /// root-owned/fully-unwritable bar. Used ONLY for the Xcode.app toolchain
+    /// candidate; every other candidate (CommandLineTools) still goes through
+    /// the strict [`ancestry_passes`].
+    fn ancestry_passes_with_xcode_applications_exception(
+        path: &Path,
+        lookup: &dyn Fn(&Path) -> Option<OwnerMode>,
+    ) -> bool {
+        let Some(meta) = lookup(path) else {
+            return false;
+        };
+        let ordinary_pass = meta.uid == 0 && (meta.mode & 0o022) == 0;
+        if !ordinary_pass && !is_xcode_applications_exception(path, meta) {
+            return false;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                ancestry_passes_with_xcode_applications_exception(parent, lookup)
+            }
+            _ => true,
+        }
+    }
+
+    /// Production entry point for [`ancestry_passes_with_xcode_applications_exception`],
+    /// backed by live `symlink_metadata` — the Xcode.app-only counterpart to
+    /// [`ancestry_is_root_owned_and_unwritable`].
+    fn xcode_toolchain_ancestry_is_trusted(path: &Path) -> bool {
+        ancestry_passes_with_xcode_applications_exception(path, &|p| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).ok().map(|m| OwnerMode {
+                uid: m.uid(),
+                mode: m.mode(),
+            })
+        })
+    }
+
+    /// If `canon_git_bin` is a `git` binary living directly inside one of
+    /// [`TRUSTED_EXEC_DIRS`], return the [`GIT_TOOLCHAIN_ROOTS`] entries whose
+    /// own `usr/bin/git` passes [`ancestry_is_root_owned_and_unwritable`] —
+    /// the toolchain binary(ies) `/usr/bin/git`'s locator-stub redirect can
+    /// land on. Empty for a grant that isn't a trusted system `git` stub, or
+    /// when no fixed root's git passes the ancestry check.
+    ///
+    /// **Never executes `canon_git_bin` or anything else.** The only
+    /// filesystem operations are `canonicalize` and `symlink_metadata` (via
+    /// [`ancestry_is_root_owned_and_unwritable`]) — no `exec`, no
+    /// `std::env::var`/`var_os` call anywhere in this function.
+    ///
+    /// git's own internal exec-path aliases (`git-branch`, `git-commit`, …)
+    /// need no separate entry once the toolchain binary itself is admitted:
+    /// on macOS they are themselves symlinks to `<root>/usr/bin/git`
+    /// (confirmed live: `.../usr/libexec/git-core/git-branch -> ../../bin/git`),
+    /// and Seatbelt's `process-exec*` matches the *resolved* target — so the
+    /// one canonical binary already covers them (verified live: `git
+    /// worktree add` succeeds with exactly the stub plus this one extra
+    /// literal, no `git-core` entries admitted at all).
+    pub(super) fn git_toolchain_redirect_targets(
+        canon_git_bin: &Path,
+        trust_admin_writable_xcode: bool,
+    ) -> Vec<String> {
+        if canon_git_bin.file_name().and_then(|n| n.to_str()) != Some("git") {
+            return Vec::new();
+        }
+        let is_trusted_stub = canon_git_bin.parent().is_some_and(|bin_dir| {
+            TRUSTED_EXEC_DIRS
+                .iter()
+                .any(|trusted| std::fs::canonicalize(trusted).is_ok_and(|c| c == bin_dir))
+        });
+        if !is_trusted_stub || !ancestry_is_root_owned_and_unwritable(canon_git_bin) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for root in GIT_TOOLCHAIN_ROOTS {
+            let Ok(candidate) = Path::new(root).join("usr/bin/git").canonicalize() else {
+                continue;
+            };
+            if candidate == *canon_git_bin {
+                continue; // same path as the granted binary — nothing extra to add.
+            }
+            let trusted = if *root == XCODE_TOOLCHAIN_ROOT {
+                ancestry_is_root_owned_and_unwritable(&candidate)
+                    || (trust_admin_writable_xcode
+                        && xcode_toolchain_ancestry_is_trusted(&candidate))
+            } else {
+                ancestry_is_root_owned_and_unwritable(&candidate)
+            };
+            if trusted {
+                out.push(candidate.to_string_lossy().into_owned());
+            }
+        }
+        out
+    }
+
+    /// `true` iff the Xcode.app candidate in [`GIT_TOOLCHAIN_ROOTS`] would be
+    /// admitted by [`git_toolchain_redirect_targets`] for `canon_git_bin`
+    /// ONLY via [`XCODE_APPLICATIONS_EXCEPTION`] — i.e. the ordinary strict
+    /// ancestry bar fails but the named widening passes. Recomputes the same
+    /// prerequisites `git_toolchain_redirect_targets` checks (trusted stub,
+    /// strict ancestry on the granted binary itself) so it agrees with what
+    /// actually gets admitted, without changing that function's return type.
+    /// Used only to NAME the class on the resolved-authority exec axis —
+    /// never to decide what the kernel allows.
+    pub(super) fn git_toolchain_redirect_uses_xcode_applications_exception(
+        canon_git_bin: &Path,
+    ) -> bool {
+        // Only ever called once the opt-in flag has already gated the caller
+        // (see `resolve_exec_targets_uses_xcode_applications_exception`), so
+        // this recomputes the exception-only admission unconditionally —
+        // `true` here means "the exception, if enabled, is what would carry it".
+        if git_toolchain_redirect_targets(canon_git_bin, true).is_empty() {
+            return false;
+        }
+        let Ok(candidate) = Path::new(XCODE_TOOLCHAIN_ROOT)
+            .join("usr/bin/git")
+            .canonicalize()
+        else {
+            return false;
+        };
+        if candidate == *canon_git_bin {
+            return false;
+        }
+        !ancestry_is_root_owned_and_unwritable(&candidate)
+            && xcode_toolchain_ancestry_is_trusted(&candidate)
+    }
+
+    /// The subset of a filesystem object's identity the ancestry walk needs:
+    /// owning uid and permission mode. The Seatbelt analog of the same seam
+    /// in the Landlock git-exec-path fix (agent-bridle#407, #2630 round 3),
+    /// duplicated here rather than shared because that module compiles only
+    /// under `target_os = "linux"`. Broken out as plain data so the walk
+    /// itself ([`ancestry_passes`]) can be driven by either live
+    /// `symlink_metadata` (production) or a synthetic lookup (tests).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct OwnerMode {
+        uid: u32,
+        mode: u32,
+    }
+
+    /// The actual ancestry walk: `path` and every ancestor up to and
+    /// including `/` must each pass `lookup` as root-owned (`uid == 0`) and
+    /// not group/other-writable (`mode & 0o022 == 0`). `lookup` returning
+    /// `None` fails closed. Both production
+    /// ([`ancestry_is_root_owned_and_unwritable`], backed by live
+    /// `symlink_metadata`) and the adversarial unit tests (backed by a
+    /// synthetic `HashMap`) call this SAME function.
+    fn ancestry_passes(path: &Path, lookup: &dyn Fn(&Path) -> Option<OwnerMode>) -> bool {
+        let Some(meta) = lookup(path) else {
+            return false;
+        };
+        if meta.uid != 0 || (meta.mode & 0o022) != 0 {
+            return false;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => ancestry_passes(parent, lookup),
+            _ => true,
+        }
+    }
+
+    /// `true` iff `path` itself AND every ancestor directory up to and
+    /// including `/` is owned by root (uid 0) and carries no group- or
+    /// other-write bit. Rejects a trusted-looking leaf sitting under a
+    /// writable grandparent. `path` must already be canonicalized by the
+    /// caller — this checks the object at that path, not what a symlink
+    /// there might point to (`symlink_metadata`, not `metadata`, via
+    /// [`ancestry_passes`]'s `lookup`), so a still-symlinked path fails
+    /// closed.
+    fn ancestry_is_root_owned_and_unwritable(path: &Path) -> bool {
+        ancestry_passes(path, &|p| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).ok().map(|m| OwnerMode {
+                uid: m.uid(),
+                mode: m.mode(),
+            })
+        })
     }
 
     /// Resolve `p` to an absolute, symlink-free path suitable for `(subpath …)`
@@ -3546,16 +4155,57 @@ mod seatbelt_impl {
             assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
         }
 
-        /// Support remains held (agent-bridle#405 D4, fail closed first): every
-        /// restricted network scope — `net:none`, a `mach:` grant, loopback — is
-        /// `Unknown` while `MACH_DEPUTY_AUDIT` is incomplete, even though the
-        /// profile installs the zero floor and the named grants for real.
+        /// agent-bridle#405/ADR 0015 amendment E6: the deputy audit is now
+        /// `Complete` (the full channel sweep closed, AppleEvents included).
+        /// `net:none` zero grants resolves to the bottom element `∅` — the
+        /// promotion this whole audit exists to back.
         #[test]
-        fn every_restricted_network_scope_resolves_unknown() {
-            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Incomplete);
+        fn net_none_resolves_bounded_empty_now_the_audit_is_complete() {
+            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Complete);
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&cav, crate::StdioPosture::Audited)
+                    .net,
+                ResolvedScope::empty(),
+                "net:none zero grants must resolve to the bottom element now the audit is complete"
+            );
+        }
+
+        /// A named `mach:` grant resolves to its own class, never to `∅` and
+        /// never to `Unknown` — the "never collapse to ∅" requirement from
+        /// #405's acceptance criteria, now exercised through the real
+        /// `resolved_authority`, not just the pure projection function.
+        #[test]
+        fn mach_grant_resolves_its_named_class_not_unknown_or_empty() {
+            let cav = Caveats {
+                net: Scope::only(["mach:com.apple.SecurityServer".to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&cav, crate::StdioPosture::Audited)
+                    .net,
+                ResolvedScope::class(super::super::seatbelt_mach_service_class(
+                    "com.apple.SecurityServer"
+                )),
+                "a named grant must never collapse to ∅ nor remain Unknown"
+            );
+        }
+
+        /// Support remains held for shapes this audit never covered: loopback
+        /// and a general remote-host allowlist carry no Mach floor at all (no
+        /// `(deny mach-lookup)` is ever emitted for them — see
+        /// `seatbelt_profile_with`), so a complete deputy audit for the
+        /// deny-all shape says nothing about them. #405's acceptance criteria
+        /// ("named grants stay Unknown until each is audited" extends to
+        /// shapes with no floor to audit at all).
+        #[test]
+        fn loopback_and_remote_host_stay_unknown_even_with_a_complete_audit() {
             for net in [
-                Scope::none(),
-                Scope::only(["mach:com.apple.SecurityServer".to_string()]),
                 Scope::only(["127.0.0.1".to_string()]),
                 Scope::only(["example.com".to_string()]),
             ] {
@@ -3564,14 +4214,16 @@ mod seatbelt_impl {
                     ..Caveats::top()
                 };
                 assert_eq!(
-                    SeatbeltSandbox::new().resolved_authority(&cav).net,
+                    SeatbeltSandbox::new()
+                        .resolved_authority(&cav, crate::StdioPosture::Audited)
+                        .net,
                     ResolvedScope::Unknown,
-                    "{net:?} support must remain held at admission"
+                    "{net:?} has no Mach floor at all; the audit doesn't bound it"
                 );
             }
             assert_eq!(
                 SeatbeltSandbox::new()
-                    .resolved_authority(&Caveats::top())
+                    .resolved_authority(&Caveats::top(), crate::StdioPosture::Audited)
                     .net,
                 ResolvedScope::Unbounded
             );
@@ -4057,6 +4709,315 @@ mod seatbelt_impl {
             // exec:All (the default) is ambient on the exec axis — no rules.
             let prof = seatbelt_profile(&Caveats::top());
             assert!(!prof.contains("process-exec"), "{prof}");
+        }
+    }
+
+    /// agent-bridle#408 (macOS leg of #2630): `resolve_exec_targets` never
+    /// executes a grant-selected binary while computing the toolchain-redirect
+    /// allow-list, and only trusts a directory whose LIVE permissions it has
+    /// checked.
+    #[cfg(test)]
+    mod git_exec_chain_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn unique_dir(tag: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let mut d = std::env::temp_dir();
+            d.push(format!(
+                "ab-408-{}-{}-{}",
+                tag,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn write_executable_marker_script(path: &std::path::Path, marker: &std::path::Path) {
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch \"{}\"\necho /nonexistent/hostile-toolchain\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// The real system `git` (if present at a trusted location) resolves
+        /// into one of the fixed toolchain roots — proving the fold-in fires
+        /// for the actual on-host redirect, not just synthetic fixtures.
+        #[test]
+        fn a_real_trusted_git_grant_admits_its_toolchain_redirect() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a TRUSTED_EXEC_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_targets(&Scope::only([git.to_string()]), true);
+            assert!(
+                resolved.iter().any(|p| p == git),
+                "the git stub itself must still be admitted: {resolved:?}"
+            );
+            let has_toolchain_hit = GIT_TOOLCHAIN_ROOTS.iter().any(|root| {
+                Path::new(root)
+                    .join("usr/bin/git")
+                    .canonicalize()
+                    .is_ok_and(|c| resolved.iter().any(|p| p == &c.to_string_lossy()))
+            });
+            if !has_toolchain_hit {
+                eprintln!(
+                    "skipping strict assertion: no known toolchain root installed on this host"
+                );
+                return;
+            }
+            assert!(
+                has_toolchain_hit,
+                "git's toolchain redirect target must be folded in: {resolved:?}"
+            );
+        }
+
+        /// A `git`-named binary OUTSIDE `TRUSTED_EXEC_DIRS` — a repo-local
+        /// `./tools/git`-style plant — gets no toolchain redirect, and (the
+        /// load-bearing assertion) is never executed while resolution decides
+        /// that: a marker-writing stand-in script proves it was never run.
+        #[test]
+        fn a_git_outside_trusted_dirs_gets_no_redirect_and_is_never_executed() {
+            let dir = unique_dir("outside-trusted");
+            let marker = dir.join("was-executed");
+            let fake_git = dir.join("git");
+            write_executable_marker_script(&fake_git, &marker);
+
+            let resolved = resolve_exec_targets(
+                &Scope::only([fake_git.to_string_lossy().into_owned()]),
+                true,
+            );
+
+            assert!(
+                !marker.exists(),
+                "a git outside the trusted dirs must NEVER be executed during resolution"
+            );
+            let canon_fake_git = fake_git.canonicalize().unwrap();
+            assert_eq!(
+                resolved,
+                vec![canon_fake_git.to_string_lossy().into_owned()],
+                "an untrusted git must admit only itself, no toolchain redirect: {resolved:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A hostile ambient `DEVELOPER_DIR`/`GIT_EXEC_PATH` is irrelevant by
+        // construction: neither `resolve_exec_targets` nor
+        // `git_toolchain_redirect_targets` calls `std::env::var`/`var_os`
+        // anywhere — there is nothing in either function body that reads
+        // them, so no in-process env mutation is needed to prove it (that
+        // would only race every other test in this binary for no coverage,
+        // per bridle PR #407 review finding 4). The end-to-end, real-kernel
+        // proof that a hostile env in the CONFINED CHILD's own environment
+        // cannot widen the allow-list lives in
+        // `seatbelt_kernel_tests::hostile_developer_dir_env_does_not_extend_the_git_grant`.
+
+        /// A directory that LOOKS like a toolchain root but is writable by
+        /// non-root must not be trusted — an attacker who can write there
+        /// could plant a binary the kernel would then be told to allow.
+        #[test]
+        fn a_group_writable_candidate_directory_is_not_trusted() {
+            let dir = unique_dir("writable-root");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&dir),
+                "a world-writable directory must never be trusted, regardless of owner"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `ancestry_is_root_owned_and_unwritable` walks the FULL ancestor
+        /// chain, not just the immediate parent — a writable grandparent must
+        /// still fail a root-owned leaf. Driven through the same
+        /// `ancestry_passes` traversal via a synthetic lookup so the walk
+        /// itself, not a parallel reimplementation, is what's under test.
+        #[test]
+        fn ancestry_walk_rejects_a_writable_grandparent_even_with_a_root_owned_leaf() {
+            use std::collections::HashMap;
+            let root_owned = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let writable = OwnerMode {
+                uid: 0,
+                mode: 0o777,
+            };
+            let leaf = Path::new("/grandparent-writable/trusted/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned);
+            fixture.insert(leaf.parent().unwrap().to_path_buf(), root_owned);
+            fixture.insert(
+                leaf.parent().unwrap().parent().unwrap().to_path_buf(),
+                writable,
+            );
+            fixture.insert(Path::new("/").to_path_buf(), root_owned);
+            let lookup = |p: &Path| fixture.get(p).copied();
+            assert!(
+                !ancestry_passes(leaf, &lookup),
+                "a writable grandparent must fail the leaf's ancestry, even though the leaf \
+                 and its immediate parent are individually root-owned and unwritable"
+            );
+
+            // A fully root-owned, fully unwritable chain passes.
+            let mut clean = fixture.clone();
+            clean.insert(
+                leaf.parent().unwrap().parent().unwrap().to_path_buf(),
+                root_owned,
+            );
+            let lookup_clean = |p: &Path| clean.get(p).copied();
+            assert!(ancestry_passes(leaf, &lookup_clean));
+        }
+
+        #[test]
+        fn same_image_git_stub_is_never_treated_as_its_own_redirect() {
+            // The stub and a candidate that happens to canonicalize to the
+            // exact same path must not be double-admitted or treated as a
+            // "found" redirect — `git_toolchain_redirect_targets` explicitly
+            // skips a candidate equal to the granted binary itself.
+            let dir = unique_dir("same-path");
+            let git = dir.join("git");
+            std::fs::write(&git, b"not real git\n").unwrap();
+            let out = git_toolchain_redirect_targets(&git, true);
+            assert!(
+                out.is_empty(),
+                "a non-trusted-dir git must never yield a redirect target: {out:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ----- ROUND 2 (operator decision 2026-09-29): the named
+        // /Applications widening, and its limits -----
+
+        fn synthetic_lookup(
+            fixture: &std::collections::HashMap<std::path::PathBuf, OwnerMode>,
+        ) -> impl Fn(&Path) -> Option<OwnerMode> + '_ {
+            move |p: &Path| fixture.get(p).copied()
+        }
+
+        /// The positive case: `/Applications` itself is root-owned,
+        /// admin-group-writable, not other-writable — every ancestor above
+        /// and below it (Xcode.app, its own leaf) is fully root-owned and
+        /// unwritable. The relaxed walk passes; the ordinary strict walk does
+        /// not — proving the exception is what carries it.
+        #[test]
+        fn xcode_applications_exception_admits_a_group_writable_applications_root() {
+            use std::collections::HashMap;
+            let root_owned_leaf = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let applications = OwnerMode {
+                uid: 0,
+                mode: 0o775, // root:admin, group-writable, no other-write
+            };
+            let leaf = Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned_leaf);
+            let mut anc = leaf.parent();
+            while let Some(p) = anc {
+                if p == Path::new("/Applications") {
+                    fixture.insert(p.to_path_buf(), applications);
+                } else if !p.as_os_str().is_empty() {
+                    fixture.insert(p.to_path_buf(), root_owned_leaf);
+                }
+                anc = p.parent();
+            }
+            fixture.insert(Path::new("/").to_path_buf(), root_owned_leaf);
+            let lookup = synthetic_lookup(&fixture);
+
+            assert!(
+                ancestry_passes_with_xcode_applications_exception(leaf, &lookup),
+                "a group-writable /Applications, and only /Applications, must be tolerated"
+            );
+            assert!(
+                !ancestry_passes(leaf, &lookup),
+                "the ordinary strict walk must still refuse a group-writable ancestor — the \
+                 exception is a separate, narrower relaxation, not a change to the default bar"
+            );
+        }
+
+        /// The exception is keyed to the exact path `/Applications`, not to
+        /// "any admin-group-writable directory named like it". A different
+        /// admin-writable directory sitting in the same ancestor position
+        /// must still be refused.
+        #[test]
+        fn xcode_applications_exception_does_not_apply_to_a_lookalike_elsewhere() {
+            use std::collections::HashMap;
+            let root_owned_leaf = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let admin_writable = OwnerMode {
+                uid: 0,
+                mode: 0o775,
+            };
+            let leaf = Path::new("/opt/not-applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned_leaf);
+            let mut anc = leaf.parent();
+            while let Some(p) = anc {
+                if p == Path::new("/opt/not-applications") {
+                    fixture.insert(p.to_path_buf(), admin_writable);
+                } else if !p.as_os_str().is_empty() {
+                    fixture.insert(p.to_path_buf(), root_owned_leaf);
+                }
+                anc = p.parent();
+            }
+            fixture.insert(Path::new("/").to_path_buf(), root_owned_leaf);
+            let lookup = synthetic_lookup(&fixture);
+
+            assert!(
+                !ancestry_passes_with_xcode_applications_exception(leaf, &lookup),
+                "an admin-writable directory anywhere other than exactly /Applications must \
+                 still be refused, even with the exception-aware walk"
+            );
+        }
+
+        /// A world/other-writable `/Applications` (not just admin-group)
+        /// must still be refused — the exception tolerates the group-write
+        /// bit only, never other-write.
+        #[test]
+        fn other_writable_applications_is_refused_even_with_the_exception() {
+            use std::collections::HashMap;
+            let root_owned_leaf = OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            };
+            let other_writable_applications = OwnerMode {
+                uid: 0,
+                mode: 0o777, // group AND other writable
+            };
+            let leaf = Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
+            let mut fixture: HashMap<std::path::PathBuf, OwnerMode> = HashMap::new();
+            fixture.insert(leaf.to_path_buf(), root_owned_leaf);
+            let mut anc = leaf.parent();
+            while let Some(p) = anc {
+                if p == Path::new("/Applications") {
+                    fixture.insert(p.to_path_buf(), other_writable_applications);
+                } else if !p.as_os_str().is_empty() {
+                    fixture.insert(p.to_path_buf(), root_owned_leaf);
+                }
+                anc = p.parent();
+            }
+            fixture.insert(Path::new("/").to_path_buf(), root_owned_leaf);
+            let lookup = synthetic_lookup(&fixture);
+
+            assert!(
+                !ancestry_passes_with_xcode_applications_exception(leaf, &lookup),
+                "other-write on /Applications must still be refused; the exception is \
+                 group-write only"
+            );
         }
     }
 }
@@ -4572,6 +5533,19 @@ mod landlock_kernel_tests {
         d
     }
 
+    /// A private copy of `cat` (still named `cat`, so a multicall dispatches on
+    /// it): its own inode, so granting it admits nothing else. On Ubuntu 26.04
+    /// the system `cat` is one hard-linked uutils inode with `head`, `env`, …
+    /// (#449), so granting it would admit the very tools these proofs deny.
+    fn private_cat(dir: &std::path::Path) -> String {
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let cat = dir.join("bin/cat");
+        fs::copy("/usr/bin/cat", &cat)
+            .or_else(|_| fs::copy("/bin/cat", &cat))
+            .expect("copy cat(1)");
+        cat.to_string_lossy().into_owned()
+    }
+
     /// A hermetically-configured `git` `Command`: no inherited environment
     /// beyond what's explicitly set here, and every ambient
     /// config/hooks/template source disabled. Used for BOTH the plain
@@ -4971,14 +5945,15 @@ mod landlock_kernel_tests {
         let dir = unique_dir("exec");
         fs::write(dir.join("data.txt"), b"payload\n").unwrap();
         let dir_t = dir.clone();
+        let cat = private_cat(&dir);
 
         let (granted, ungranted) = std::thread::spawn(move || {
             let cav = Caveats {
-                exec: Scope::only(["cat".to_string()]),
+                exec: Scope::only([cat.clone()]),
                 ..Caveats::top()
             };
             LandlockSandbox::new().apply(&cav).expect("apply landlock");
-            let granted = std::process::Command::new("cat")
+            let granted = std::process::Command::new(&cat)
                 .arg(dir_t.join("data.txt"))
                 .output();
             let ungranted = std::process::Command::new("head")
@@ -5054,9 +6029,11 @@ mod landlock_kernel_tests {
         .collect();
 
         let scratch_t = scratch.clone();
+        let bin = unique_dir("exec-escape-bin"); // outside the fs_write scope
+        let cat = private_cat(&bin);
         let (attempts, control) = std::thread::spawn(move || {
             let cav = Caveats {
-                exec: Scope::only(["cat".to_string()]),
+                exec: Scope::only([cat.clone()]),
                 fs_write: Scope::only([scratch_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
@@ -5092,7 +6069,7 @@ mod landlock_kernel_tests {
                 ));
             }
             // Control: the granted program still runs.
-            let control = std::process::Command::new("cat")
+            let control = std::process::Command::new(&cat)
                 .arg(scratch_t.join("data.txt"))
                 .output();
             (attempts, control)
@@ -5120,6 +6097,7 @@ mod landlock_kernel_tests {
         );
 
         let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&bin);
     }
 
     /// #57 / ADR 0011 D3: when BOTH `exec` and `fs_read` are confined, the read
@@ -5134,22 +6112,31 @@ mod landlock_kernel_tests {
         let dir = unique_dir("read-narrow");
         fs::write(dir.join("data.txt"), b"payload\n").unwrap();
         let dir_t = dir.clone();
+        let cat = private_cat(&dir);
+        // An un-granted program whose real file lives in a bin dir. On Ubuntu
+        // 26.04 `head` resolves into `/usr/lib/cargo/bin/coreutils/` — under the
+        // library read base, not a bin dir (#449) — so probe for one that is.
+        let probe = ["head", "rm", "ls"]
+            .iter()
+            .filter_map(|n| fs::canonicalize(format!("/usr/bin/{n}")).ok())
+            .find(|p| p.parent() == Some(std::path::Path::new("/usr/bin")))
+            .expect("an un-granted program whose file is in /usr/bin");
 
         let (granted, head_bytes) = std::thread::spawn(move || {
             let cav = Caveats {
-                exec: Scope::only(["cat".to_string()]),
+                exec: Scope::only([cat.clone()]),
                 fs_read: Scope::only([dir_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
             LandlockSandbox::new().apply(&cav).expect("apply landlock");
             // Granted `cat` loads (its binary + libs are read-allowed) and reads
             // the in-scope file.
-            let granted = std::process::Command::new("cat")
+            let granted = std::process::Command::new(&cat)
                 .arg(dir_t.join("data.txt"))
                 .output();
             // Reading an un-granted bin-dir binary's bytes (a would-be trampoline
             // payload) is denied — the bin dirs are not in the read set.
-            let head_bytes = std::fs::read("/usr/bin/head").or_else(|_| std::fs::read("/bin/head"));
+            let head_bytes = std::fs::read(&probe);
             (granted, head_bytes)
         })
         .join()
@@ -6522,6 +7509,512 @@ print(d.value())
         assert!(
             status.success(),
             "an allow-listed dynamic binary must load + run under exec confinement"
+        );
+    }
+
+    /// A hermetically-configured, optionally Seatbelt-wrapped `git` `Command`:
+    /// no inherited environment beyond what's explicitly set here. Mirrors
+    /// `landlock_kernel_tests::hermetic_git_command` (bridle PR #407 review,
+    /// P1-3/P2-4) — the pre-push hook sets `GIT_DIR` in ITS OWN environment
+    /// (pointing at this repository), and an unscrubbed test process inherits
+    /// it regardless of `current_dir()`, silently operating on the real
+    /// repository instead of the synthetic fixture; `env_clear()` (not a
+    /// denylist of individually-removed vars) closes the whole class.
+    /// `prefix` is either empty (the plain unconfined fixture setup) or the
+    /// `sandbox-exec -p <profile>` wrapper `SeatbeltSandbox::command_prefix`
+    /// built — always absolute-path invocations, so clearing `PATH` too is
+    /// safe.
+    fn hermetic_git_command(
+        prefix: &[String],
+        git: &str,
+        dir: &Path,
+        home: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Command {
+        let mut cmd = if prefix.is_empty() {
+            std::process::Command::new(git)
+        } else {
+            let mut c = std::process::Command::new(&prefix[0]);
+            c.args(&prefix[1..]).arg(git);
+            c
+        };
+        cmd.current_dir(dir);
+        cmd.env_clear();
+        cmd.env("HOME", home);
+        cmd.env("GIT_AUTHOR_NAME", "t");
+        cmd.env("GIT_AUTHOR_EMAIL", "t@example.invalid");
+        cmd.env("GIT_COMMITTER_NAME", "t");
+        cmd.env("GIT_COMMITTER_EMAIL", "t@example.invalid");
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        cmd.env("GIT_TEMPLATE_DIR", "/dev/null");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// The active developer toolchain's `git`, per `xcode-select -p` — used
+    /// ONLY here, as test-harness ground truth for what a git worktree op
+    /// SHOULD resolve to, never by the shipped resolver itself (which reads
+    /// neither `xcode-select`/`xcrun` output nor `DEVELOPER_DIR`; see
+    /// `git_toolchain_redirect_targets`'s doc comment for why).
+    fn active_toolchain_git() -> Option<PathBuf> {
+        let out = std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if dir.is_empty() {
+            return None;
+        }
+        Path::new(&dir).join("usr/bin/git").canonicalize().ok()
+    }
+
+    /// `true` iff [`git_toolchain_redirect_targets`] — the SAME production
+    /// routine `resolve_exec_targets` calls — actually admits this host's
+    /// ACTIVE toolchain git. `git_toolchain_redirect_targets` folds in every
+    /// [`GIT_TOOLCHAIN_ROOTS`] entry whose ancestry passes, which is not
+    /// necessarily the one `/usr/bin/git`'s stub actually redirects to (a
+    /// host can have both Xcode.app AND CommandLineTools installed with only
+    /// one active) — so this check is against the ACTIVE one specifically,
+    /// via [`active_toolchain_git`].
+    fn active_toolchain_is_trusted(git: &str, trust_admin_writable_xcode: bool) -> bool {
+        let Ok(canon_git) = Path::new(git).canonicalize() else {
+            return false;
+        };
+        let Some(active) = active_toolchain_git() else {
+            return false;
+        };
+        super::seatbelt_impl::git_toolchain_redirect_targets(&canon_git, trust_admin_writable_xcode)
+            .iter()
+            .any(|p| Path::new(p) == active)
+    }
+
+    /// agent-bridle#408 — the macOS/Seatbelt twin of bridle PR #407: a REAL
+    /// kernel-confined `git worktree add` under `exec: Only(["git"])`. Shared
+    /// by the default-off and opt-in ROUND 3 tests below (agent-bridle#409):
+    /// `trust_admin_writable_xcode` is the exact opt-in flag
+    /// (`SandboxPolicy::seatbelt_trust_admin_writable_xcode`), threaded
+    /// through the SAME `SeatbeltSandbox` construction production uses.
+    /// Confirmed red first (pre-#408 `resolve_exec_targets`, no toolchain
+    /// redirect fold-in): `fatal: cannot exec
+    /// '/Applications/Xcode.app/Contents/Developer/usr/bin/git': Operation
+    /// not permitted` (git's own re-exec of the active toolchain binary,
+    /// denied at the kernel `process-exec*` check before worktree logic ever
+    /// runs — even `git --version` fails the same way under the pre-fix
+    /// resolver).
+    ///
+    /// Asserts SUCCESS only when the active toolchain is one this flag
+    /// setting actually trusts ([`active_toolchain_is_trusted`]); a host
+    /// whose active toolchain fails even the relaxed bar still fails closed
+    /// — asserted in the `else` branch, so this exercises a real
+    /// kernel-enforced outcome either way and never silently skips.
+    /// Serializes every real confined `git worktree add` proof in this
+    /// module (agent-bridle#409, round 3). Discovered under the full
+    /// parallel `--lib` suite (never under this module alone, and never
+    /// under round 2's smaller set of the same proofs): Apple's `git`
+    /// occasionally shells out to `xcodebuild` for a toolchain
+    /// license/registration check keyed off MACHINE-GLOBAL state (not this
+    /// process's own `HOME`), and two of these tests racing that check
+    /// concurrently can make a THIRD, unrelated confined `git` decide it
+    /// needs the same check — an exec this resolver correctly does not
+    /// admit (it is not part of git's own binary chain), so the confined
+    /// child fails for a reason outside this fix's scope. Serializing only
+    /// these real-git-spawn tests (never the pure/fast ones) removes the
+    /// race without weakening what any single test proves.
+    fn lock_out_concurrent_git_worktree_proofs() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn assert_git_worktree_add_matches_trust_setting(trust_admin_writable_xcode: bool) {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let _guard = lock_out_concurrent_git_worktree_proofs();
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let main = unique_dir("git-wt-main");
+        let wt = unique_dir("git-wt-out");
+        let _ = fs::remove_dir_all(&wt); // `worktree add` requires the target not exist yet.
+        let home = unique_dir("git-wt-home");
+
+        assert!(
+            hermetic_git_command(&[], git, &main, &home, &[])
+                .args(["init", "-q"])
+                .status()
+                .expect("spawn git init")
+                .success(),
+            "unconfined git init must succeed"
+        );
+        assert!(
+            hermetic_git_command(&[], git, &main, &home, &[])
+                .args(["commit", "--allow-empty", "-q", "-m", "init"])
+                .status()
+                .expect("spawn git commit")
+                .success(),
+            "unconfined git commit must succeed"
+        );
+
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: trust_admin_writable_xcode,
+            ..SandboxPolicy::default()
+        };
+        let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
+            .command_prefix(&cav)
+            .expect("a restricted exec axis must yield a wrapper prefix");
+        let status = hermetic_git_command(&prefix, git, &main, &home, &[])
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "task-408",
+            ])
+            .status()
+            .expect("spawn confined worktree add");
+
+        if active_toolchain_is_trusted(git, trust_admin_writable_xcode) {
+            assert!(
+                status.success(),
+                "git worktree add must succeed under a git-only exec grant once the active \
+                 toolchain passes the ancestry bar (trust_admin_writable_xcode={trust_admin_writable_xcode})"
+            );
+            assert!(
+                wt.join(".git").exists(),
+                "the new worktree must actually have been created"
+            );
+        } else {
+            eprintln!(
+                "NOTE: this host's active git toolchain does not pass the ancestry bar for \
+                 trust_admin_writable_xcode={trust_admin_writable_xcode} (e.g. Xcode.app under \
+                 a group-writable /Applications, with the opt-in off) — the fix correctly \
+                 declines to trust it, so worktree add must still fail exactly as before this \
+                 fix. The positive case is exercised on a host/setting combination whose active \
+                 toolchain passes (e.g. CommandLineTools-only, or the opt-in enabled)."
+            );
+            assert!(
+                !status.success(),
+                "an untrusted toolchain redirect must still fail closed, never wrongly permissive"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&main);
+        let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// ROUND 3 (agent-bridle#409, operator decision 2026-09-29): DEFAULT OFF.
+    /// On this Mac (active toolchain = Xcode.app under a group-writable
+    /// `/Applications`), `git worktree add` must still fail closed — round
+    /// 2's exception no longer fires unless the operator opts in.
+    #[test]
+    fn git_worktree_add_fails_closed_by_default_without_the_xcode_opt_in() {
+        assert_git_worktree_add_matches_trust_setting(false);
+    }
+
+    /// ROUND 3: opt-in ON reproduces round 2's behavior — on THIS Mac, `git
+    /// worktree add` succeeds once the operator explicitly sets
+    /// `seatbelt_trust_admin_writable_xcode`.
+    #[test]
+    fn git_worktree_add_succeeds_under_a_git_only_exec_grant_when_the_toolchain_is_trusted() {
+        assert_git_worktree_add_matches_trust_setting(true);
+    }
+
+    /// agent-bridle#408, P2: a hostile `DEVELOPER_DIR`/`GIT_EXEC_PATH` set ONLY
+    /// in the CONFINED CHILD's own environment (never a global/process
+    /// mutation — each test spawns its own subprocess) must not extend or
+    /// redirect the grant: `git_toolchain_redirect_targets` never reads
+    /// either variable, so the confined `worktree add` must still resolve
+    /// (and succeed) against the REAL toolchain, and the hostile fake
+    /// toolchain's `git` — a marker-writing stand-in — must never run.
+    #[test]
+    fn hostile_developer_dir_env_does_not_extend_the_git_grant() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let _guard = lock_out_concurrent_git_worktree_proofs();
+        use std::os::unix::fs::PermissionsExt;
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let main = unique_dir("git-hostile-main");
+        let wt = unique_dir("git-hostile-out");
+        let _ = fs::remove_dir_all(&wt);
+        let home = unique_dir("git-hostile-home");
+        let fake_dev = unique_dir("git-hostile-fake-dev");
+        let marker = fake_dev.join("was-executed");
+        fs::create_dir_all(fake_dev.join("usr/bin")).unwrap();
+        fs::write(
+            fake_dev.join("usr/bin/git"),
+            format!("#!/bin/sh\ntouch \"{}\"\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(
+            fake_dev.join("usr/bin/git"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        hermetic_git_command(&[], git, &main, &home, &[])
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git init");
+        hermetic_git_command(&[], git, &main, &home, &[])
+            .args(["commit", "--allow-empty", "-q", "-m", "init"])
+            .status()
+            .expect("spawn git commit");
+
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        // Opt-in ON: exercises this Mac's actual trusted-toolchain path (round
+        // 3's default-off case already has its own dedicated test above, where
+        // the base grant alone denies everything and this proof would be moot).
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
+            .command_prefix(&cav)
+            .expect("a restricted exec axis must yield a wrapper prefix");
+        let fake_exec_path = fake_dev.join("usr/libexec/git-core");
+        let status = hermetic_git_command(
+            &prefix,
+            git,
+            &main,
+            &home,
+            &[
+                ("DEVELOPER_DIR", fake_dev.to_str().unwrap()),
+                ("GIT_EXEC_PATH", fake_exec_path.to_str().unwrap()),
+            ],
+        )
+        .args([
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "task-408-hostile",
+        ])
+        .status()
+        .expect("spawn confined worktree add");
+
+        assert!(
+            !marker.exists(),
+            "a hostile DEVELOPER_DIR/GIT_EXEC_PATH must never be executed"
+        );
+        // Discovered live (ROUND 2, once the active toolchain became
+        // trusted on this Mac and this test's positive branch could
+        // actually fire): when `DEVELOPER_DIR` names a bogus directory,
+        // Apple's `/usr/bin/git` locator stub itself — not our resolver —
+        // tries an internal `xcrun` to resolve it, and THAT exec is
+        // correctly kernel-denied (`xcrun` is not in the grant). So the
+        // command fails regardless of `active_toolchain_is_trusted`, but for
+        // the right reason: the hostile env is never followed to a widened
+        // or fallback toolchain — it fails closed one exec earlier than
+        // `git worktree`'s own logic would even start. The load-bearing
+        // assertion remains that the marker (the fake toolchain) never runs.
+        assert!(
+            !status.success(),
+            "a hostile DEVELOPER_DIR must fail closed (git's own stub tries an unauthorized \
+             xcrun to resolve it, which the exec grant correctly denies) — never fall back to \
+             a hostile toolchain, and never silently succeed via env-driven redirection"
+        );
+
+        let _ = fs::remove_dir_all(&main);
+        let _ = fs::remove_dir_all(&wt);
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&fake_dev);
+    }
+
+    /// ROUND 2 (operator decision 2026-09-29): when a git grant's redirect
+    /// is admitted only via `XCODE_APPLICATIONS_EXCEPTION`, the
+    /// resolved-authority exec axis must carry
+    /// `XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS` — the VISIBLE half of the
+    /// widening. Checked against the real production predicate
+    /// (`resolve_exec_targets_uses_xcode_applications_exception`), which is
+    /// what actually decides this on this host — never a fixed expectation,
+    /// since whether the exception is *needed* here depends on live
+    /// filesystem state (which toolchain is installed, `/Applications`'
+    /// mode).
+    #[test]
+    fn resolved_authority_names_the_xcode_admin_writable_exception_class() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let scope = Scope::only([git.to_string()]);
+        let uses_exception =
+            super::seatbelt_impl::resolve_exec_targets_uses_xcode_applications_exception(
+                &scope, true,
+            );
+        let cav = Caveats {
+            exec: scope,
+            ..Caveats::top()
+        };
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let resolved = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
+            .resolved_authority(&cav, crate::StdioPosture::Unaudited);
+        let carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert_eq!(
+            uses_exception, carries_class,
+            "resolved_authority's exec axis must name the exception class iff the exception \
+             was actually needed to admit this host's git redirect: uses_exception={uses_exception} \
+             carries_class={carries_class}"
+        );
+    }
+
+    /// ROUND 2: a CommandLineTools-anchored `git` grant carries NO exception
+    /// class — CommandLineTools is fully root-owned end to end and needs no
+    /// widening. Skips (not fails) when CommandLineTools is not installed on
+    /// this host, since the assertion is about that specific toolchain root.
+    #[test]
+    fn commandlinetools_git_carries_no_exception_class() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let clt_git = Path::new("/Library/Developer/CommandLineTools/usr/bin/git");
+        if !clt_git.exists() {
+            eprintln!("skipping: CommandLineTools not installed on this host");
+            return;
+        }
+        let scope = Scope::only([clt_git.to_string_lossy().into_owned()]);
+        let cav = Caveats {
+            exec: scope,
+            ..Caveats::top()
+        };
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let resolved = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
+            .resolved_authority(&cav, crate::StdioPosture::Unaudited);
+        let carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert!(
+            !carries_class,
+            "a CommandLineTools-anchored grant must never carry the Xcode admin-writable \
+             exception class — CommandLineTools needs no widening"
+        );
+    }
+
+    /// ROUND 3 (agent-bridle#409): DEFAULT OFF — `resolved_authority` must
+    /// never name the exception class when
+    /// `seatbelt_trust_admin_writable_xcode` is unset, regardless of what
+    /// this host's live filesystem state would otherwise qualify for.
+    #[test]
+    fn resolved_authority_never_carries_the_exception_class_when_the_opt_in_is_off() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        let resolved =
+            SeatbeltSandbox::new().resolved_authority(&cav, crate::StdioPosture::Unaudited);
+        let carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert!(
+            !carries_class,
+            "the Xcode admin-writable exception class must never appear with the opt-in off, \
+             even on a host whose active toolchain would qualify once enabled"
+        );
+    }
+
+    /// ROUND 3 (agent-bridle#409), the reviewer-flagged gap: admission needs
+    /// `resolved ⊆ delegated ∪ runtime_closure`, so when `resolved_authority`
+    /// names `XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS` on the exec axis (opt-in
+    /// ON, and this host's grant actually used the exception), the SAME
+    /// sandbox's `runtime_closure` must declare that class too — otherwise
+    /// the named widening it reports would refuse at admission rather than
+    /// being honestly bounded.
+    #[test]
+    fn runtime_closure_declares_the_exception_class_whenever_resolved_authority_names_it() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            fail_required_or_skip("no git in a trusted dir on this host");
+            return;
+        };
+        let cav = Caveats {
+            exec: Scope::only([git.to_string()]),
+            ..Caveats::top()
+        };
+        let policy = SandboxPolicy {
+            seatbelt_trust_admin_writable_xcode: true,
+            ..SandboxPolicy::default()
+        };
+        let sandbox = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy));
+        let resolved = sandbox.resolved_authority(&cav, crate::StdioPosture::Unaudited);
+        let resolved_carries_class = matches!(
+            &resolved.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        let closure = sandbox.runtime_closure(&cav);
+        let closure_carries_class = matches!(
+            &closure.exec,
+            crate::ResolvedScope::Bounded { classes, .. }
+                if classes.contains(super::seatbelt_impl::XCODE_ADMIN_WRITABLE_TOOLCHAIN_CLASS)
+        );
+        assert_eq!(
+            resolved_carries_class, closure_carries_class,
+            "runtime_closure must declare the exception class iff resolved_authority named it, \
+             or admission's resolved ⊆ delegated ∪ runtime_closure bound refuses a widening \
+             this sandbox itself reports: resolved_carries_class={resolved_carries_class} \
+             closure_carries_class={closure_carries_class}"
         );
     }
 }

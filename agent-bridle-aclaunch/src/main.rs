@@ -76,6 +76,7 @@ mod windows {
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE,
         SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     };
@@ -233,6 +234,10 @@ mod windows {
             &mut p_sd,
         );
         if err != ERROR_SUCCESS {
+            eprintln!(
+                "agent-bridle-aclaunch: cleanup could not read the DACL of {path:?} to \
+                 revoke its AppContainer ACE: {err}"
+            );
             return;
         }
 
@@ -1057,9 +1062,39 @@ mod windows {
         //     is unsafe under overlapping launches on the same resource.
         let mut fs_grants: Vec<String> = Vec::new();
 
-        // Grant read+write for write paths first (superset of read).
+        // A path beneath an --fs-write root already inherits that root's ACE, and
+        // the child may rename anything beneath a write root (#438). An ACE of its
+        // own would add no access, only one the child could carry out of reach of
+        // the by-name cleanup, so such a path gets none (if its DACL is protected
+        // from inheritance, it stays denied).
+        let write_roots: Vec<_> = fs_write
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .collect();
+        let beneath_write_root = |path: &str| {
+            std::fs::canonicalize(path).is_ok_and(|p| {
+                write_roots
+                    .iter()
+                    .any(|root| p != *root && p.starts_with(root))
+            })
+        };
+
+        // Grant read+write for write paths first (superset of read), plus
+        // FILE_DELETE_CHILD (#438): the child can delete and rename what is under
+        // the root (Git's index.lock dance) but not the root itself, which needs
+        // DELETE on it or FILE_DELETE_CHILD on its parent. Landlock likewise checks
+        // removal on the parent directory. Not DELETE: that would sit on each file
+        // record, which all of a file's hard links share, so a link inside the root
+        // would let the child remove the file's names outside it.
         for path in fs_write {
-            let granted = grant_path_access(path, ac_sid, FILE_GENERIC_READ_WRITE_EXECUTE);
+            if beneath_write_root(path) {
+                continue;
+            }
+            let granted = grant_path_access(
+                path,
+                ac_sid,
+                FILE_GENERIC_READ_WRITE_EXECUTE | FILE_DELETE_CHILD,
+            );
             if !granted {
                 eprintln!(
                     "agent-bridle-aclaunch: could not grant write access to {path:?}; \
@@ -1073,7 +1108,7 @@ mod windows {
         }
         // Grant read-only for remaining read paths not already granted.
         for path in fs_read {
-            if fs_grants.iter().any(|p| p == path) {
+            if fs_grants.iter().any(|p| p == path) || beneath_write_root(path) {
                 continue;
             }
             let granted = grant_path_access(path, ac_sid, FILE_GENERIC_READ_EXECUTE);

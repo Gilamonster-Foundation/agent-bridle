@@ -6,7 +6,11 @@
 //! `enforcement_report` tests by proving the route really selects AppContainer
 //! and fails closed when `agent-bridle-aclaunch.exe` cannot be found.
 
-#![cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+#![cfg(all(
+    target_os = "windows",
+    feature = "windows-appcontainer",
+    feature = "shell"
+))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
