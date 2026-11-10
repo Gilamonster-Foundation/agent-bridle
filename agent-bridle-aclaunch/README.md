@@ -41,6 +41,15 @@ External profile deletion is outside this lifecycle and does not resolve residua
 host authority. See `SECURITY.md`, ADR 0009 amendment D6.1, and
 [agent-bridle #408](https://github.com/Gilamonster-Foundation/agent-bridle/issues/408).
 
+`--mount-manager-ace` is a second, separate opt-in for the same case. Native
+`git status` resolves its working directory through the host MountPointManager.
+When requested, the launcher adds one non-inheriting
+`FILE_READ_ATTRIBUTES | SYNCHRONIZE` ACE for this launch's SID to the host
+`\\?\GLOBALROOT\Device\MountPointManager` DACL. The `WRITE_DAC`, fresh-SID,
+exact-cleanup, and profile-retention rules above apply to it unchanged. It lets the
+child query the host volume and mount-point layout. See `SECURITY.md` for why it
+cannot change mount state.
+
 On non-Windows platforms the launcher compiles to an explicit unsupported
 stub.
 

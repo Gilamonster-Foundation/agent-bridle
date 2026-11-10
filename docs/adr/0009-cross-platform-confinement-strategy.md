@@ -1,6 +1,6 @@
 # ADR 0009 — Cross-platform confinement strategy (the L3 boundary across Windows, Linux, macOS)
 
-- Status: Accepted (2026-06-29); amended D6.1 (2026-09-29)
+- Status: Accepted (2026-06-29); amended D6.1 (2026-09-29), D6.2 (2026-11-09)
 - Date: 2026-06-29
 - Context: ADR 0006 established per-OS L3 backends behind `best_available_sandbox()` /
   `SandboxKind`, with the Landlock backend as the template. agent-bridle ships as a unified
@@ -169,6 +169,29 @@ exit criterion is an upstream Git for Windows release that avoids the unconditio
 trigger is documented in [Git for Windows `setup.c`](https://github.com/git-for-windows/git/blob/49d759b698127791a5f3f2759c69b983846711dd/setup.c#L2249-L2257).
 At that point, remove the option and its host-DACL mutation rather than retaining
 the widening for convenience.
+
+### Amendment D6.2 — opt-in MountPointManager ACE (#408, 2026-11-09)
+
+D6.1 alone does not make native `git status` work. Git's `mingw_getcwd` calls
+`GetFinalPathNameByHandleW(VOLUME_NAME_DOS)`, which needs
+`\Device\MountPointManager`, and the AppContainer SID is denied there. A
+**second, separate, default-off** opt-in, `--mount-manager-ace` (policy field
+`appcontainer_mount_manager_ace`), adds one non-inheriting
+`FILE_READ_ATTRIBUTES | SYNCHRONIZE` (`0x00100080`, the measured minimum) ACE on
+that device for the per-launch SID. It has the same lifecycle as D6.1: exact
+serialized add and remove, a `WRITE_DAC` refusal, and profile retention on
+cleanup failure. It also needs AppContainer, with no fallback. Its named closure is
+`appcontainer-mount-manager-ace` on the read axis only.
+`EnforcementReport.widenings` is now an ordered list that carries every active
+widening, `NUL` first. The approved safety gate is the static IOCTL access argument
+in `SECURITY.md`, which rests on documented header semantics and was not probed
+live. Every state-changing or notification IOCTL needs `FILE_READ_DATA` or
+`FILE_WRITE_DATA`, and this mask holds neither. What remains exposed is the
+`FILE_ANY_ACCESS` queries, which reveal the volume, mount-point, and drive-letter
+layout. The retirement criterion matches D6.1's. The proof in `nul_device_ace.rs`
+covers three things. The `NUL` opt-in alone still fails `git status` at getcwd on
+Server. Both opt-ins together pass. The mount-manager ACE is default-off, removed
+exactly on cleanup, and SID-scoped under overlap.
 
 ## Consequences
 

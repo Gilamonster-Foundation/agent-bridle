@@ -130,6 +130,58 @@ valid (the current call path is visible in
 [Git for Windows `setup.c`](https://github.com/git-for-windows/git/blob/49d759b698127791a5f3f2759c69b983846711dd/setup.c#L2249-L2257)).
 ADR 0009 records the boundary and retirement criterion.
 
+#### Second opt-in: the MountPointManager ACE (`--mount-manager-ace`)
+
+The `NUL` ACE alone does not make `git status` work. Git for Windows' `mingw_getcwd`
+(`compat/mingw.c`, `v2.56.0.windows.4`) calls
+`GetFinalPathNameByHandleW(VOLUME_NAME_DOS)`, which queries
+`\Device\MountPointManager`. The AppContainer SID is denied there, so Git dies with
+`Unable to read current working directory: Permission denied`. A separate,
+default-off opt-in, `--mount-manager-ace` (policy field
+`appcontainer_mount_manager_ace`), adds one explicit, non-inheriting ACE on that
+device (opened as `\\?\GLOBALROOT\Device\MountPointManager`) for the launch's own
+AppContainer SID. It grants `FILE_READ_ATTRIBUTES | SYNCHRONIZE` (`0x00100080`).
+This is the measured minimum on the Windows Server CI runner: `0x00100000`, `0x80`,
+`0x20000`, and `0x8` each fail alone. Enabling one opt-in never enables the other.
+It follows the same lifecycle as the `NUL` ACE. That means it is per-launch SID
+only, its add and remove are exact and serialized by its own global mutex, it fails
+closed without `WRITE_DAC`, and it retains the profile, refusing SID reuse, when
+cleanup fails. Its resolved-authority class is `appcontainer-mount-manager-ace`.
+That class sits on the read axis only, and the report lists it as the widening
+`appcontainer-mount-manager-ace`. When both opt-ins are on, the report lists both
+widenings.
+
+**Why this mask cannot change mount state.** The argument rests on documented
+semantics, not on a live measurement. No mount-manager IOCTL was sent to test it.
+The source is the MountPointManager IOCTL definitions in the driver-kit header
+`mountmgr.h`, read from the mingw-w64 copy. Each IOCTL's `CTL_CODE` encodes the
+access it requires:
+
+- **State-changing IOCTLs need `FILE_READ_ACCESS | FILE_WRITE_ACCESS`:**
+  `CREATE_POINT`, `DELETE_POINTS`, `DELETE_POINTS_DBONLY`, `NEXT_DRIVE_LETTER`,
+  `AUTO_DL_ASSIGNMENTS`, `VOLUME_MOUNT_POINT_CREATED`/`DELETED`,
+  `KEEP_LINKS_WHEN_OFFLINE`, `SCRUB_REGISTRY`, `SET_AUTO_MOUNT`, and
+  `BOOT_DL_ASSIGNMENT`.
+- **Notification and trace IOCTLs need `FILE_READ_ACCESS`:** `CHANGE_NOTIFY`,
+  `CHECK_UNPROCESSED_VOLUMES`, `VOLUME_ARRIVAL_NOTIFICATION`, and
+  `TRACELOG_CACHE`.
+- **Only the queries are `FILE_ANY_ACCESS`:** `QUERY_POINTS`,
+  `QUERY_DOS_VOLUME_PATH(S)`, and `QUERY_AUTO_MOUNT`.
+
+(The mingw-w64 copy also carries two Wine-only codes, `DEFINE_UNIX_DRIVE` and
+`QUERY_UNIX_DRIVE`. They are not Windows IOCTLs, and even so they require read or
+read/write access.) The I/O manager compares the handle's granted access with the
+IOCTL's required access before the driver sees the request. `FILE_READ_ACCESS`
+is `FILE_READ_DATA` and `FILE_WRITE_ACCESS` is `FILE_WRITE_DATA`. The
+`0x00100080` mask contains neither, so no handle the child can open satisfies any
+state-changing or notification IOCTL.
+
+**Exposure.** The child can issue the `FILE_ANY_ACCESS` queries. They reveal the
+host's volume, mount-point, and drive-letter layout, plus the automount setting.
+That read-only disclosure is the accepted cost of this opt-in. The opt-in shares
+the retirement criterion of the `NUL` ACE: remove it once Git for Windows no longer
+needs the mount manager to resolve its working directory inside an AppContainer.
+
 ## Public-repository privacy rules (enforced)
 
 This repo is public. It must never contain the operational specifics of any real
