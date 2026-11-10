@@ -79,5 +79,15 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: cargo test -p agent-bridle-aclaunch --test local_deputy -- --test-threads=1
 
+      # #408: strict nightly proof of the opt-in host NUL-device DACL widening.
+      # Native Git, a real AppContainer, and elevated WRITE_DAC are all required;
+      # none may silently reduce this to a passing skip.
+      - name: AppContainer opt-in NUL device ACE regression (require real Git)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+          BRIDLE_REQUIRE_NATIVE_GIT: "1"
+          BRIDLE_REQUIRE_ELEVATED: "1"
+        run: cargo test -p agent-bridle-aclaunch --test nul_device_ace -- --test-threads=1
+
       - name: AppContainer Newt CONFINED route contract
         run: cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test windows_appcontainer_contract -- --test-threads=1

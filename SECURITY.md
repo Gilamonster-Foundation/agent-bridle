@@ -92,6 +92,96 @@ carries the `seatbelt-admin-writable-xcode-toolchain` class.
 resolved-authority exec axis as the class `seatbelt-admin-writable-xcode-toolchain`
 (see ADR 0014's amendment) — never silently folded into the concrete grant.
 
+### Windows AppContainer: the opt-in `NUL` device ACE widens a host device DACL (agent-bridle#408)
+
+On affected Windows Server AppContainer policies, Git for Windows opens `NUL` during
+startup even when all three standard handles are valid. The normal AppContainer
+filesystem grant cannot authorize that host device. For the narrow native-Git
+compatibility case tracked in [#408](https://github.com/Gilamonster-Foundation/agent-bridle/issues/408),
+the launcher offers the explicit, default-off `--nul-device-ace` opt-in.
+Without that option, it neither opens nor modifies `\\.\NUL`, and its
+AppContainer-profile handling remains the existing baseline.
+
+This is a documented security widening, not ordinary `fs_read`, `fs_write`, or
+`exec` authority. When an operator explicitly enables it, the launcher modifies
+the host `\\.\NUL` device DACL by adding one ACE for that launch's freshly created
+AppContainer SID. The ACE grants only `FILE_GENERIC_READ | FILE_GENERIC_WRITE`;
+it grants neither execute nor access to another AppContainer SID. The resolved
+authority and enforcement disclosure name this closure
+`appcontainer-nul-device-ace` so it cannot disappear into an empty report.
+
+The caller must have `WRITE_DAC` on `\\.\NUL` (normally an elevated Windows token).
+If that right is absent, the launcher refuses before spawning the child; it does
+not retry without the requested grant. On every ordinary launcher exit it removes
+exactly its own SID's ACE, never restores a saved whole DACL, because overlapping
+launches must not delete or resurrect one another's grants. If the launcher
+crashes before cleanup, or a revocation fails, its profile remains and a later
+launcher invocation reaches the existing baseline failure:
+`CreateAppContainerProfile` does not return a fresh SID for an existing profile,
+so the child cannot start or reactivate that deterministic SID. External deletion
+of the retained profile is outside this launcher lifecycle and can make a later
+same-name creation possible while an unresolved ACE remains. The possible ACE is
+therefore documented residual host state; it is not silently normalized into the
+baseline.
+
+This escape hatch must be retired when Git for Windows ships an upstream change
+that avoids its unconditional `/dev/null` startup open when stdio is already
+valid (the current call path is visible in
+[Git for Windows `setup.c`](https://github.com/git-for-windows/git/blob/49d759b698127791a5f3f2759c69b983846711dd/setup.c#L2249-L2257)).
+ADR 0009 records the boundary and retirement criterion.
+
+#### Second opt-in: the MountPointManager ACE (`--mount-manager-ace`)
+
+The `NUL` ACE alone does not make `git status` work. Git for Windows' `mingw_getcwd`
+(`compat/mingw.c`, `v2.56.0.windows.4`) calls
+`GetFinalPathNameByHandleW(VOLUME_NAME_DOS)`, which queries
+`\Device\MountPointManager`. The AppContainer SID is denied there, so Git dies with
+`Unable to read current working directory: Permission denied`. A separate,
+default-off opt-in, `--mount-manager-ace` (policy field
+`appcontainer_mount_manager_ace`), adds one explicit, non-inheriting ACE on that
+device (opened as `\\?\GLOBALROOT\Device\MountPointManager`) for the launch's own
+AppContainer SID. It grants `FILE_READ_ATTRIBUTES | SYNCHRONIZE` (`0x00100080`).
+This is the measured minimum on the Windows Server CI runner: `0x00100000`, `0x80`,
+`0x20000`, and `0x8` each fail alone. Enabling one opt-in never enables the other.
+It follows the same lifecycle as the `NUL` ACE. That means it is per-launch SID
+only, its add and remove are exact and serialized by its own global mutex, it fails
+closed without `WRITE_DAC`, and it retains the profile, refusing SID reuse, when
+cleanup fails. Its resolved-authority class is `appcontainer-mount-manager-ace`.
+That class sits on the read axis only, and the report lists it as the widening
+`appcontainer-mount-manager-ace`. When both opt-ins are on, the report lists both
+widenings.
+
+**Why this mask cannot change mount state.** The argument rests on documented
+semantics, not on a live measurement. No mount-manager IOCTL was sent to test it.
+The source is the MountPointManager IOCTL definitions in the driver-kit header
+`mountmgr.h`, read from the mingw-w64 copy. Each IOCTL's `CTL_CODE` encodes the
+access it requires:
+
+- **State-changing IOCTLs need `FILE_READ_ACCESS | FILE_WRITE_ACCESS`:**
+  `CREATE_POINT`, `DELETE_POINTS`, `DELETE_POINTS_DBONLY`, `NEXT_DRIVE_LETTER`,
+  `AUTO_DL_ASSIGNMENTS`, `VOLUME_MOUNT_POINT_CREATED`/`DELETED`,
+  `KEEP_LINKS_WHEN_OFFLINE`, `SCRUB_REGISTRY`, `SET_AUTO_MOUNT`, and
+  `BOOT_DL_ASSIGNMENT`.
+- **Notification and trace IOCTLs need `FILE_READ_ACCESS`:** `CHANGE_NOTIFY`,
+  `CHECK_UNPROCESSED_VOLUMES`, `VOLUME_ARRIVAL_NOTIFICATION`, and
+  `TRACELOG_CACHE`.
+- **Only the queries are `FILE_ANY_ACCESS`:** `QUERY_POINTS`,
+  `QUERY_DOS_VOLUME_PATH(S)`, and `QUERY_AUTO_MOUNT`.
+
+(The mingw-w64 copy also carries two Wine-only codes, `DEFINE_UNIX_DRIVE` and
+`QUERY_UNIX_DRIVE`. They are not Windows IOCTLs, and even so they require read or
+read/write access.) The I/O manager compares the handle's granted access with the
+IOCTL's required access before the driver sees the request. `FILE_READ_ACCESS`
+is `FILE_READ_DATA` and `FILE_WRITE_ACCESS` is `FILE_WRITE_DATA`. The
+`0x00100080` mask contains neither, so no handle the child can open satisfies any
+state-changing or notification IOCTL.
+
+**Exposure.** The child can issue the `FILE_ANY_ACCESS` queries. They reveal the
+host's volume, mount-point, and drive-letter layout, plus the automount setting.
+That read-only disclosure is the accepted cost of this opt-in. The opt-in shares
+the retirement criterion of the `NUL` ACE: remove it once Git for Windows no longer
+needs the mount manager to resolve its working directory inside an AppContainer.
+
 ## Public-repository privacy rules (enforced)
 
 This repo is public. It must never contain the operational specifics of any real

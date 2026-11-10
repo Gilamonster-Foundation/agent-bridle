@@ -140,7 +140,10 @@ check-security:
 # module and the `agent-bridle-aclaunch` launcher only compile on Windows, so this
 # skips gracefully on a non-Windows host (like py-test/cov-ci). BRIDLE_REQUIRE_APPCONTAINER
 # makes the fs/exec/net kernel proofs hard-FAIL if a container cannot be created,
-# matching the CI job (#74 parity).
+# matching the CI job (#74 parity). The #408 NUL-device test also runs here with
+# that boundary guard, but deliberately leaves native Git/elevation optional:
+# CI and nightly arm BRIDLE_REQUIRE_NATIVE_GIT and BRIDLE_REQUIRE_ELEVATED, while
+# a local noninteractive or non-admin Windows session reports its explicit skip.
 #
 # HOOK PARITY: run by .githooks/pre-push and mirrored by the `check-windows` CI job.
 [windows]
@@ -160,6 +163,7 @@ check-windows:
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test fs_adversarial -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test descendants -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test local_deputy -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:BRIDLE_REQUIRE_APPCONTAINER='1'; cargo test -p agent-bridle-aclaunch --test nul_device_ace -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test windows_appcontainer_contract -- --test-threads=1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test unbridle; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

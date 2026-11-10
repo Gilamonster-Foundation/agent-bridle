@@ -3,7 +3,8 @@
 # HOOK PARITY: This pipeline is mirrored by .githooks/pre-push and the `check` /
 # `publish-check` / `py-test` recipes in justfile. When editing this file, update
 # the push hook to match — including the REQUIRE_* environment guards
-# (BRIDLE_REQUIRE_LANDLOCK / _SEATBELT / _FD_FIXTURES), not just the commands. A
+# (BRIDLE_REQUIRE_LANDLOCK / _SEATBELT / _FD_FIXTURES / _APPCONTAINER /
+# _NATIVE_GIT / _ELEVATED), not just the commands. A
 # flag armed here and not in the hook means the local gate silently tests a
 # weaker property than CI (agent-bridle#352).
 #
@@ -299,6 +300,17 @@ jobs:
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: cargo test -p agent-bridle-aclaunch --test local_deputy -- --test-threads=1
+
+      # #408: Git-for-Windows reopens NUL on startup even with valid inherited
+      # stdio on affected Server policies. This is an explicit host-device-DACL
+      # widening, so CI must prove both its fail-closed default and its per-SID,
+      # overlap-safe cleanup with real Git and an elevated WRITE_DAC token.
+      - name: AppContainer opt-in NUL device ACE regression (require real Git)
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+          BRIDLE_REQUIRE_NATIVE_GIT: "1"
+          BRIDLE_REQUIRE_ELEVATED: "1"
+        run: cargo test -p agent-bridle-aclaunch --test nul_device_ace -- --test-threads=1
 
       - name: AppContainer Newt CONFINED route contract
         run: cargo test -p agent-bridle-tool-shell --features windows-appcontainer --test windows_appcontainer_contract -- --test-threads=1
