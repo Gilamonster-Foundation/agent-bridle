@@ -1,10 +1,13 @@
-//! Native proof for the opt-in AppContainer `\\.\NUL` device ACE (#408).
+//! Native proof for the opt-in AppContainer host-device ACEs (#408): `\\.\NUL`
+//! (`--nul-device-ace`) and MountPointManager (`--mount-manager-ace`).
 //!
 //! This test is deliberately strict on the Server CI runner: without the
-//! explicit flag Git for Windows must retain its documented NUL-open failure;
-//! with it, a per-profile SID receives exactly one non-inheriting
-//! `FILE_GENERIC_READ | FILE_GENERIC_WRITE` ACE for the lifetime of that
-//! launch. The test reads the device DACL directly rather than treating a
+//! explicit flags Git for Windows must retain its documented NUL-open failure;
+//! with the NUL flag alone `git status` must still fail at its working-directory
+//! lookup; with both, a per-profile SID receives exactly one non-inheriting ACE
+//! per device (`FILE_GENERIC_READ | FILE_GENERIC_WRITE` on NUL,
+//! `FILE_READ_ATTRIBUTES | SYNCHRONIZE` on MountPointManager) for the lifetime of
+//! that launch. The test reads the device DACLs directly rather than treating a
 //! successful child as sufficient evidence of cleanup or overlap safety.
 
 #![cfg(target_os = "windows")]
@@ -36,7 +39,10 @@ use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
 const LAUNCHER: &str = env!("CARGO_BIN_EXE_agent-bridle-aclaunch");
 const FSPROBE: &str = env!("CARGO_BIN_EXE_ab-fsprobe");
+const NUL_DEVICE: &str = r"\\.\NUL";
 const NUL_ACCESS: u32 = 0x0012_0089 | 0x0012_0116; // FILE_GENERIC_READ | FILE_GENERIC_WRITE
+const MM_DEVICE: &str = r"\\?\GLOBALROOT\Device\MountPointManager";
+const MM_ACCESS: u32 = 0x0010_0080; // FILE_READ_ATTRIBUTES | SYNCHRONIZE
 
 static N: AtomicU64 = AtomicU64::new(0);
 
@@ -97,7 +103,7 @@ fn skip_unless_nul_dacl_writable() -> bool {
     }
     if required("BRIDLE_REQUIRE_ELEVATED") || required("BRIDLE_REQUIRE_NATIVE_GIT") {
         panic!(
-            "the strict NUL-device ACE proof requires an elevated token with WRITE_DAC on \\\\.\\NUL"
+            "the strict host-device ACE proof requires an elevated token with WRITE_DAC on NUL and MountPointManager"
         );
     }
     eprintln!("skipping NUL-device ACE mutation proof: not elevated (needs WRITE_DAC)");
@@ -116,11 +122,11 @@ fn derive_sid(name: &str) -> PSID {
     sid
 }
 
-/// Return every explicit access-allowed ACE for `sid` on the NUL device.
-/// The direct DACL read is the cleanup/overlap oracle; `NUL` must be opened by
-/// handle because the named-security APIs do not work for this device object.
-fn nul_access_aces(sid: PSID) -> Vec<(u32, u8)> {
-    let device = to_wide(OsStr::new(r"\\.\NUL"));
+/// Return every explicit access-allowed ACE for `sid` on a host device.
+/// The direct DACL read is the cleanup/overlap oracle; a device must be opened
+/// by handle because the named-security APIs do not work for device objects.
+fn device_access_aces(device_path: &str, sid: PSID) -> Vec<(u32, u8)> {
+    let device = to_wide(OsStr::new(device_path));
     unsafe {
         let handle: HANDLE = CreateFileW(
             device.as_ptr(),
@@ -134,7 +140,7 @@ fn nul_access_aces(sid: PSID) -> Vec<(u32, u8)> {
         assert_ne!(
             handle,
             INVALID_HANDLE_VALUE,
-            "open \\\\.\\NUL with READ_CONTROL for DACL assertion: {:?}",
+            "open {device_path} with READ_CONTROL for DACL assertion: {:?}",
             std::io::Error::last_os_error()
         );
 
@@ -152,11 +158,11 @@ fn nul_access_aces(sid: PSID) -> Vec<(u32, u8)> {
         );
         assert_eq!(
             result, ERROR_SUCCESS,
-            "GetSecurityInfo(\\\\.\\NUL) failed: {result}"
+            "GetSecurityInfo({device_path}) failed: {result}"
         );
         assert!(
             !dacl.is_null(),
-            "NUL must have an explicit DACL for this proof"
+            "{device_path} must have an explicit DACL for this proof"
         );
 
         let mut matches = Vec::new();
@@ -180,19 +186,27 @@ fn nul_access_aces(sid: PSID) -> Vec<(u32, u8)> {
     }
 }
 
-fn assert_exact_nul_ace(sid: PSID, context: &str) {
+fn assert_exact_device_ace(device: &str, access: u32, sid: PSID, context: &str) {
     assert_eq!(
-        nul_access_aces(sid),
-        vec![(NUL_ACCESS, NO_INHERITANCE as u8)],
-        "{context}: NUL must have one non-inheriting FILE_GENERIC_READ | FILE_GENERIC_WRITE ACE for this launch SID"
+        device_access_aces(device, sid),
+        vec![(access, NO_INHERITANCE as u8)],
+        "{context}: {device} must have one non-inheriting {access:#010x} ACE for this launch SID"
+    );
+}
+
+fn assert_no_device_ace(device: &str, sid: PSID, context: &str) {
+    assert!(
+        device_access_aces(device, sid).is_empty(),
+        "{context}: the per-launch {device} ACE must be gone"
     );
 }
 
 fn assert_no_nul_ace(sid: PSID, context: &str) {
-    assert!(
-        nul_access_aces(sid).is_empty(),
-        "{context}: the per-launch NUL ACE must be gone"
-    );
+    assert_no_device_ace(NUL_DEVICE, sid, context);
+}
+
+fn assert_no_mm_ace(sid: PSID, context: &str) {
+    assert_no_device_ace(MM_DEVICE, sid, context);
 }
 
 /// The reused-profile refusal must occur before *any* filesystem DACL grant.
@@ -310,7 +324,16 @@ fn configure_hermetic_git(command: &mut Command, safe_directory: Option<&Path>) 
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE");
     if let Some(path) = safe_directory {
+        // Git compares safe.directory with the long-name, drive-letter path its
+        // getcwd reports, so pass the canonical path without the `\\?\`
+        // verbatim prefix (and never `*`): the ownership check must pass for
+        // exactly this fixture.
         let canonical = path.canonicalize().expect("canonicalize safe.directory");
+        let canonical = canonical.to_string_lossy();
+        let canonical = canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical)
+            .replace('\\', "/");
         command
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "safe.directory")
@@ -383,12 +406,9 @@ fn git_fixture(git: &Path) -> GitFixture {
     GitFixture { root, repo }
 }
 
-fn run_confined_git(git: &Path, name: &str, grant_nul: bool, repo: Option<&Path>) -> Output {
+fn run_confined_git(git: &Path, name: &str, flags: &[&str], repo: Option<&Path>) -> Output {
     let mut command = Command::new(LAUNCHER);
-    command.arg("--name").arg(name);
-    if grant_nul {
-        command.arg("--nul-device-ace");
-    }
+    command.arg("--name").arg(name).args(flags);
     if let Some(repo) = repo {
         command.arg("--fs-write").arg(repo);
     }
@@ -440,12 +460,10 @@ fn launch_holding_child(
     start: &Path,
     end: &Path,
     sleep_ms: &str,
-    grant_nul: bool,
+    flags: &[&str],
 ) -> Child {
     let mut args = vec!["--name".to_string(), name.to_string()];
-    if grant_nul {
-        args.push("--nul-device-ace".to_string());
-    }
+    args.extend(flags.iter().map(|flag| (*flag).to_string()));
     args.extend([
         "--fs-write".to_string(),
         workspace.to_string_lossy().into_owned(),
@@ -479,7 +497,7 @@ fn native_git_needs_the_opt_in_nul_ace_and_cleanup_removes_it() {
     };
 
     let denied_name = tag("git-no-nul");
-    let denied = run_confined_git(&git, &denied_name, false, None);
+    let denied = run_confined_git(&git, &denied_name, &[], None);
     if denied.status.success() {
         if required("BRIDLE_REQUIRE_NATIVE_GIT") {
             panic!(
@@ -514,10 +532,14 @@ fn native_git_needs_the_opt_in_nul_ace_and_cleanup_removes_it() {
         denied_sid,
         "default-off native Git failure must not add a NUL-device ACE",
     );
+    assert_no_mm_ace(
+        denied_sid,
+        "default-off native Git failure must not add a MountPointManager ACE",
+    );
     unsafe { FreeSid(denied_sid) };
 
     let version_name = tag("git-with-nul-version");
-    let version = run_confined_git(&git, &version_name, true, None);
+    let version = run_confined_git(&git, &version_name, &["--nul-device-ace"], None);
     assert!(
         version.status.success()
             && String::from_utf8_lossy(&version.stdout).contains("git version"),
@@ -530,16 +552,54 @@ fn native_git_needs_the_opt_in_nul_ace_and_cleanup_removes_it() {
     unsafe { FreeSid(version_sid) };
 
     let fixture = git_fixture(&git);
-    let status_name = tag("git-with-nul-status");
-    let status = run_confined_git(&git, &status_name, true, Some(&fixture.repo));
+
+    // Negative leg: the NUL opt-in alone gets Git past its NUL open, but
+    // `mingw_getcwd` still needs MountPointManager and must fail there.
+    let nul_only_name = tag("git-nul-only-status");
+    let nul_only = run_confined_git(
+        &git,
+        &nul_only_name,
+        &["--nul-device-ace"],
+        Some(&fixture.repo),
+    );
+    let nul_only_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&nul_only.stdout),
+        String::from_utf8_lossy(&nul_only.stderr)
+    );
+    assert!(
+        !nul_only.status.success()
+            && nul_only_text.contains("Unable to read current working directory")
+            && nul_only_text.contains("Permission denied"),
+        "with only --nul-device-ace git status must fail at its getcwd step; status={:?} stdout={} stderr={}",
+        nul_only.status.code(),
+        String::from_utf8_lossy(&nul_only.stdout).trim(),
+        String::from_utf8_lossy(&nul_only.stderr).trim()
+    );
+    let nul_only_sid = derive_sid(&nul_only_name);
+    assert_no_nul_ace(nul_only_sid, "NUL-only git status cleanup");
+    assert_no_mm_ace(
+        nul_only_sid,
+        "the NUL opt-in must not add a MountPointManager ACE",
+    );
+    unsafe { FreeSid(nul_only_sid) };
+
+    let status_name = tag("git-with-both-status");
+    let status = run_confined_git(
+        &git,
+        &status_name,
+        &["--nul-device-ace", "--mount-manager-ace"],
+        Some(&fixture.repo),
+    );
     assert!(
         status.status.success(),
-        "with --nul-device-ace hermetic git status must succeed; stdout={} stderr={}",
+        "with --nul-device-ace and --mount-manager-ace hermetic git status must succeed; stdout={} stderr={}",
         String::from_utf8_lossy(&status.stdout).trim(),
         String::from_utf8_lossy(&status.stderr).trim()
     );
     let status_sid = derive_sid(&status_name);
     assert_no_nul_ace(status_sid, "normal hermetic git status cleanup");
+    assert_no_mm_ace(status_sid, "normal hermetic git status cleanup");
     unsafe { FreeSid(status_sid) };
 }
 
@@ -570,35 +630,57 @@ fn create_process_failure_after_nul_grant_removes_the_exact_ace() {
     unsafe { FreeSid(sid) };
 }
 
+/// With both opt-ins, a `CreateProcessW` failure must revoke both exact ACEs.
+#[test]
+fn create_process_failure_after_both_device_grants_removes_both_aces() {
+    if skip_unless_appcontainer() || skip_unless_nul_dacl_writable() {
+        return;
+    }
+
+    let name = tag("both-create-process-failure");
+    let missing_exe = format!(r"C:\\Windows\\ab-device-missing-{}.exe", tag("exe"));
+    let output = launch(&[
+        "--name",
+        &name,
+        "--nul-device-ace",
+        "--mount-manager-ace",
+        &missing_exe,
+    ]);
+    assert!(
+        !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("CreateProcessW"),
+        "the failure must occur after both grant points; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let sid = derive_sid(&name);
+    assert_no_nul_ace(sid, "post-CreateProcessW failure cleanup (NUL)");
+    assert_no_mm_ace(
+        sid,
+        "post-CreateProcessW failure cleanup (MountPointManager)",
+    );
+    unsafe { FreeSid(sid) };
+}
+
 /// If a post-grant cleanup fails, deleting the profile would make its
 /// deterministic SID reusable by a later launch. The launcher therefore keeps
 /// the profile, preserving the launcher's existing no-reuse behavior. This seam
 /// simulates that outcome without touching the host `\\.\NUL` DACL.
-#[test]
-fn nul_cleanup_failure_retains_the_profile_and_refuses_sid_reuse() {
+fn assert_cleanup_failure_retains_the_profile(flag: &str, seam: &str, label: &str) {
     if skip_unless_appcontainer() {
         return;
     }
 
-    let name = tag("nul-cleanup-retained-profile");
+    let name = tag("device-cleanup-retained-profile");
     let _cleanup = RetainedProfileCleanup { name: name.clone() };
-    let first = launch(&[
-        "--name",
-        &name,
-        "--nul-device-ace",
-        "--test-force-nul-cleanup-failure",
-        "cmd.exe",
-        "/c",
-        "exit",
-        "0",
-    ]);
+    let first = launch(&["--name", &name, flag, seam, "cmd.exe", "/c", "exit", "0"]);
     assert!(
         !first.status.success(),
-        "a simulated NUL cleanup failure must make the launcher fail"
+        "a simulated {label} cleanup failure must make the launcher fail"
     );
     let first_stderr = String::from_utf8_lossy(&first.stderr);
     assert!(
-        first_stderr.contains("forced NUL-device ACE cleanup failure"),
+        first_stderr.contains(&format!("forced {label} ACE cleanup failure")),
         "the test seam must exercise post-child cleanup: stderr={first_stderr}"
     );
     assert!(
@@ -617,7 +699,7 @@ fn nul_cleanup_failure_retains_the_profile_and_refuses_sid_reuse() {
     ]);
     assert!(
         !second.status.success(),
-        "an existing profile must be refused after a NUL cleanup failure"
+        "an existing profile must be refused after a {label} cleanup failure"
     );
     assert!(
         !String::from_utf8_lossy(&second.stdout).contains(REUSED_PROFILE_CHILD_STARTED),
@@ -629,6 +711,24 @@ fn nul_cleanup_failure_retains_the_profile_and_refuses_sid_reuse() {
         String::from_utf8_lossy(&second.stderr).contains("AppContainer SID is null"),
         "the retained profile must preserve the launcher's existing no-reuse refusal: stderr={}",
         String::from_utf8_lossy(&second.stderr).trim()
+    );
+}
+
+#[test]
+fn nul_cleanup_failure_retains_the_profile_and_refuses_sid_reuse() {
+    assert_cleanup_failure_retains_the_profile(
+        "--nul-device-ace",
+        "--test-force-nul-cleanup-failure",
+        "NUL-device",
+    );
+}
+
+#[test]
+fn mount_manager_cleanup_failure_retains_the_profile_and_refuses_sid_reuse() {
+    assert_cleanup_failure_retains_the_profile(
+        "--mount-manager-ace",
+        "--test-force-mount-manager-cleanup-failure",
+        "MountPointManager",
     );
 }
 
@@ -645,7 +745,7 @@ fn no_nul_flag_preserves_existing_profile_refusal() {
     let name = tag("default-off-existing-profile");
     let start = workspace.join("first-start");
     let end = workspace.join("first-end");
-    let mut first = launch_holding_child(&name, &workspace, &start, &end, "1500", false);
+    let mut first = launch_holding_child(&name, &workspace, &start, &end, "1500", &[]);
     wait_for_file(&start);
 
     const SECOND_CHILD_MARKER: &str = "DEFAULT_OFF_SECOND_CHILD_STARTED";
@@ -696,7 +796,7 @@ fn nul_device_ace_refuses_a_live_reused_profile_name_before_spawn() {
     let name = tag("nul-same-name");
     let start = workspace.join("first-start");
     let end = workspace.join("first-end");
-    let mut first = launch_holding_child(&name, &workspace, &start, &end, "8000", false);
+    let mut first = launch_holding_child(&name, &workspace, &start, &end, "8000", &[]);
     wait_for_file(&start);
 
     const CHILD_MARKER: &str = "SHOULD_NOT_START";
@@ -742,45 +842,105 @@ fn nul_device_ace_refuses_a_live_reused_profile_name_before_spawn() {
     let _ = std::fs::remove_dir_all(&second_only_workspace);
 }
 
-#[test]
-fn overlapping_nul_grants_keep_the_other_live_sid_and_remove_only_their_own_ace() {
+/// Two overlapping launches with the same device opt-in: each holds exactly
+/// its own ACE, and the first launch's cleanup leaves the other live SID's ACE.
+fn assert_overlapping_grants_are_sid_scoped(flag: &str, device: &str, access: u32) {
     if skip_unless_appcontainer() || skip_unless_nul_dacl_writable() {
         return;
     }
 
     let workspace = fresh_low_workspace("overlap");
 
-    let a_name = tag("nul-overlap-a");
-    let b_name = tag("nul-overlap-b");
+    let a_name = tag("device-overlap-a");
+    let b_name = tag("device-overlap-b");
     let a_start = workspace.join("a-start");
     let a_end = workspace.join("a-end");
     let b_start = workspace.join("b-start");
     let b_end = workspace.join("b-end");
     // The sleep bounds work; readiness is the file signal. B deliberately lasts
     // much longer than A so the post-A DACL read observes B's still-live grant.
-    let mut a = launch_holding_child(&a_name, &workspace, &a_start, &a_end, "4000", true);
+    let mut a = launch_holding_child(&a_name, &workspace, &a_start, &a_end, "4000", &[flag]);
     wait_for_file(&a_start);
     let a_sid = derive_sid(&a_name);
-    assert_exact_nul_ace(a_sid, "while launch A is live");
+    assert_exact_device_ace(device, access, a_sid, "while launch A is live");
 
-    let mut b = launch_holding_child(&b_name, &workspace, &b_start, &b_end, "9000", true);
+    let mut b = launch_holding_child(&b_name, &workspace, &b_start, &b_end, "9000", &[flag]);
     wait_for_file(&b_start);
     let b_sid = derive_sid(&b_name);
-    assert_exact_nul_ace(a_sid, "while launches A and B overlap (A)");
-    assert_exact_nul_ace(b_sid, "while launches A and B overlap (B)");
+    assert_exact_device_ace(device, access, a_sid, "while launches A and B overlap (A)");
+    assert_exact_device_ace(device, access, b_sid, "while launches A and B overlap (B)");
 
     let a_status = a.wait().expect("wait launch A");
     assert!(a_status.success(), "launch A must complete successfully");
-    assert_no_nul_ace(a_sid, "after launch A exits");
-    assert_exact_nul_ace(b_sid, "launch A cleanup must not remove B's live ACE");
+    assert_no_device_ace(device, a_sid, "after launch A exits");
+    assert_exact_device_ace(
+        device,
+        access,
+        b_sid,
+        "launch A cleanup must not remove B's live ACE",
+    );
 
     let b_status = b.wait().expect("wait launch B");
     assert!(b_status.success(), "launch B must complete successfully");
-    assert_no_nul_ace(b_sid, "after launch B exits");
+    assert_no_device_ace(device, b_sid, "after launch B exits");
 
     unsafe {
         FreeSid(a_sid);
         FreeSid(b_sid);
     }
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn overlapping_nul_grants_keep_the_other_live_sid_and_remove_only_their_own_ace() {
+    assert_overlapping_grants_are_sid_scoped("--nul-device-ace", NUL_DEVICE, NUL_ACCESS);
+}
+
+#[test]
+fn overlapping_mount_manager_grants_keep_the_other_live_sid_and_remove_only_their_own_ace() {
+    assert_overlapping_grants_are_sid_scoped("--mount-manager-ace", MM_DEVICE, MM_ACCESS);
+}
+
+/// `--mount-manager-ace` is default-off and independent: a plain launch adds
+/// no MountPointManager ACE, the opt-in adds exactly one (and no NUL ACE) for
+/// the launch's lifetime, and ordinary cleanup removes exactly that ACE.
+#[test]
+fn mount_manager_ace_is_default_off_and_cleanup_removes_exactly_its_ace() {
+    if skip_unless_appcontainer() || skip_unless_nul_dacl_writable() {
+        return;
+    }
+    let workspace = fresh_low_workspace("mm-default-off");
+
+    let plain_name = tag("mm-default-off");
+    let (start, end) = (workspace.join("plain-start"), workspace.join("plain-end"));
+    let mut plain = launch_holding_child(&plain_name, &workspace, &start, &end, "1500", &[]);
+    wait_for_file(&start);
+    let plain_sid = derive_sid(&plain_name);
+    assert_no_mm_ace(plain_sid, "a launch without --mount-manager-ace");
+    assert!(plain.wait().expect("wait plain launch").success());
+    unsafe { FreeSid(plain_sid) };
+
+    let name = tag("mm-opt-in");
+    let (start, end) = (workspace.join("mm-start"), workspace.join("mm-end"));
+    let mut child = launch_holding_child(
+        &name,
+        &workspace,
+        &start,
+        &end,
+        "1500",
+        &["--mount-manager-ace"],
+    );
+    wait_for_file(&start);
+    let sid = derive_sid(&name);
+    assert_exact_device_ace(
+        MM_DEVICE,
+        MM_ACCESS,
+        sid,
+        "while the opted-in launch is live",
+    );
+    assert_no_nul_ace(sid, "the mount-manager opt-in must not add a NUL ACE");
+    assert!(child.wait().expect("wait opted-in launch").success());
+    assert_no_mm_ace(sid, "after the opted-in launch exits");
+    unsafe { FreeSid(sid) };
     let _ = std::fs::remove_dir_all(&workspace);
 }

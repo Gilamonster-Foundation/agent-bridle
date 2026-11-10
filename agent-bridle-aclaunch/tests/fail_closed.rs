@@ -146,3 +146,23 @@ fn nul_device_ace_write_dac_denial_refuses_before_spawn() {
     ]);
     assert_refused_before_spawn(&out, "WRITE_DAC");
 }
+
+/// The MountPointManager opt-in fails closed exactly like the NUL one.
+#[test]
+fn mount_manager_ace_write_dac_denial_refuses_before_spawn() {
+    if skip_proof_unless_appcontainer() {
+        return;
+    }
+
+    let out = launch(&[
+        "--name",
+        &tag("mm-write-dac-denied"),
+        "--mount-manager-ace",
+        "--test-force-mount-manager-write-dac-denied",
+        "cmd.exe",
+        "/c",
+        "echo",
+        STARTED,
+    ]);
+    assert_refused_before_spawn(&out, "WRITE_DAC");
+}
