@@ -102,6 +102,11 @@ pub struct ConfinementMechanism {
     /// off unless the operator chose it in [`crate::SandboxPolicy`].
     #[serde(default, skip_serializing_if = "is_false")]
     appcontainer_nul_device_ace: bool,
+    /// An explicitly enabled per-AppContainer-SID `FILE_READ_ATTRIBUTES |
+    /// SYNCHRONIZE` ACE on the host MountPointManager device. Same rules as
+    /// the `NUL` widening above.
+    #[serde(default, skip_serializing_if = "is_false")]
+    appcontainer_mount_manager_ace: bool,
     // Omission preserves the existing default canonical body and fence CID.
     #[serde(default, skip_serializing_if = "ExecBoundary::is_process_tree")]
     exec_boundary: ExecBoundary,
@@ -119,6 +124,7 @@ impl ConfinementMechanism {
             kind,
             child_network,
             appcontainer_nul_device_ace: false,
+            appcontainer_mount_manager_ace: false,
             exec_boundary: ExecBoundary::ProcessTree,
             stdio: StdioPosture::Unaudited,
         }
@@ -131,6 +137,7 @@ impl ConfinementMechanism {
             kind,
             child_network,
             appcontainer_nul_device_ace: false,
+            appcontainer_mount_manager_ace: false,
             exec_boundary: ExecBoundary::NamedRoot,
             stdio: StdioPosture::Unaudited,
         }
@@ -141,6 +148,15 @@ impl ConfinementMechanism {
     #[must_use]
     pub fn with_appcontainer_nul_device_ace(mut self, enabled: bool) -> Self {
         self.appcontainer_nul_device_ace = enabled;
+        self
+    }
+
+    /// Carry the explicit Windows AppContainer MountPointManager device-ACE
+    /// mechanism choice into reporting. Like the `NUL` ACE, it does not alter
+    /// any Caveat or enforcement strength.
+    #[must_use]
+    pub fn with_appcontainer_mount_manager_ace(mut self, enabled: bool) -> Self {
+        self.appcontainer_mount_manager_ace = enabled;
         self
     }
 
@@ -232,6 +248,10 @@ pub enum EnforcementWidening {
     /// launch's AppContainer SID on the host `\\.\NUL` device.
     #[serde(rename = "appcontainer-nul-device-ace")]
     AppContainerNulDeviceAce,
+    /// The launcher installed `FILE_READ_ATTRIBUTES | SYNCHRONIZE` for this
+    /// launch's AppContainer SID on the host MountPointManager device.
+    #[serde(rename = "appcontainer-mount-manager-ace")]
+    AppContainerMountManagerAce,
 }
 
 impl AxisEnforcement {
@@ -273,11 +293,12 @@ impl PartialOrd for AxisEnforcement {
 /// `All` is unrestricted — there is nothing to confine — and is `None`. The
 /// `max_calls` / `valid_for_generation` axes are gate-enforced budget/causality,
 /// not OS-confinement axes, so they are not part of this report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EnforcementReport {
-    /// Explicit host mechanism widening, when one was used for this run.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub widening: Option<EnforcementWidening>,
+    /// Every explicit host mechanism widening active for this run, in a fixed
+    /// order (`NUL` before MountPointManager). Empty — and omitted — by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widenings: Vec<EnforcementWidening>,
     /// Enforcement of the `fs_read` axis, when restricted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_read: Option<AxisEnforcement>,
@@ -297,7 +318,7 @@ impl EnforcementReport {
     /// carries no information and may be omitted from a result envelope.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.widening.is_none()
+        self.widenings.is_empty()
             && self.fs_read.is_none()
             && self.fs_write.is_none()
             && self.exec.is_none()
@@ -344,9 +365,24 @@ pub fn enforcement_report(
         kind: active,
         child_network,
         appcontainer_nul_device_ace,
+        appcontainer_mount_manager_ace,
         exec_boundary,
         stdio,
     } = mechanism.into();
+    let appcontainer = active == SandboxKind::AppContainer;
+    let widenings = [
+        (
+            appcontainer_nul_device_ace,
+            EnforcementWidening::AppContainerNulDeviceAce,
+        ),
+        (
+            appcontainer_mount_manager_ace,
+            EnforcementWidening::AppContainerMountManagerAce,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, widening)| (appcontainer && enabled).then_some(widening))
+    .collect();
     // Filesystem axes: kernel when an OS sandbox actually governs them, else the
     // in-process interceptor. Exhaustive over `SandboxKind` so a new backend
     // must decide its mapping rather than silently defaulting.
@@ -371,8 +407,7 @@ pub fn enforcement_report(
         })
     };
     EnforcementReport {
-        widening: (active == SandboxKind::AppContainer && appcontainer_nul_device_ace)
-            .then_some(EnforcementWidening::AppContainerNulDeviceAce),
+        widenings,
         fs_read: fs(&effective.fs_read),
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(match active {
@@ -909,7 +944,10 @@ mod tests {
     #[test]
     fn appcontainer_nul_device_ace_widening_is_explicit_in_the_report() {
         let off = enforcement_report(&Caveats::top(), SandboxKind::AppContainer);
-        assert_eq!(off.widening, None, "the default report must remain quiet");
+        assert!(
+            off.widenings.is_empty(),
+            "the default report must remain quiet"
+        );
 
         let on = enforcement_report(
             &Caveats::top(),
@@ -917,12 +955,59 @@ mod tests {
                 .with_appcontainer_nul_device_ace(true),
         );
         assert_eq!(
-            on.widening,
-            Some(EnforcementWidening::AppContainerNulDeviceAce)
+            on.widenings,
+            [EnforcementWidening::AppContainerNulDeviceAce]
         );
         assert_eq!(
-            serde_json::to_value(on).unwrap()["widening"],
-            "appcontainer-nul-device-ace"
+            serde_json::to_value(&on).unwrap()["widenings"],
+            serde_json::json!(["appcontainer-nul-device-ace"])
+        );
+    }
+
+    #[test]
+    fn every_active_appcontainer_device_widening_is_reported_in_order() {
+        let mechanism =
+            ConfinementMechanism::new(SandboxKind::AppContainer, ChildNetworkPolicy::LandlockOnly);
+        let mm_only = enforcement_report(
+            &Caveats::top(),
+            mechanism.with_appcontainer_mount_manager_ace(true),
+        );
+        assert_eq!(
+            mm_only.widenings,
+            [EnforcementWidening::AppContainerMountManagerAce]
+        );
+        assert!(!mm_only.is_empty());
+
+        let both = enforcement_report(
+            &Caveats::top(),
+            mechanism
+                .with_appcontainer_mount_manager_ace(true)
+                .with_appcontainer_nul_device_ace(true),
+        );
+        assert_eq!(
+            both.widenings,
+            [
+                EnforcementWidening::AppContainerNulDeviceAce,
+                EnforcementWidening::AppContainerMountManagerAce,
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&both).unwrap()["widenings"],
+            serde_json::json!([
+                "appcontainer-nul-device-ace",
+                "appcontainer-mount-manager-ace"
+            ])
+        );
+
+        let elsewhere = enforcement_report(
+            &Caveats::top(),
+            ConfinementMechanism::new(SandboxKind::None, ChildNetworkPolicy::LandlockOnly)
+                .with_appcontainer_mount_manager_ace(true)
+                .with_appcontainer_nul_device_ace(true),
+        );
+        assert!(
+            elsewhere.widenings.is_empty(),
+            "a widening is reported only when the AppContainer launcher applied it"
         );
     }
 

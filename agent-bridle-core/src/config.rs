@@ -192,6 +192,13 @@ pub struct SandboxPolicy {
     /// authority and enforcement report whenever it is active.
     #[serde(default, skip_serializing_if = "is_false")]
     pub appcontainer_nul_device_ace: bool,
+    /// Explicit operator opt-in for the Windows AppContainer launcher's
+    /// per-container `FILE_READ_ATTRIBUTES | SYNCHRONIZE` ACE on the host
+    /// `\\?\GLOBALROOT\Device\MountPointManager` DACL (native Git's working-
+    /// directory lookup, #408). Separate from, and independent of, the NUL
+    /// opt-in; default-off and disclosed like it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub appcontainer_mount_manager_ace: bool,
     /// macOS Seatbelt only: trust `/Applications/Xcode.app` as a git-exec
     /// redirect target even though `/Applications` is admin-group-writable
     /// (agent-bridle#409/#2630 round 3). **Default OFF** — fail closed: an
@@ -227,6 +234,22 @@ pub struct SandboxPolicy {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+impl SandboxPolicy {
+    /// The launcher flags of every enabled AppContainer host-device ACE opt-in
+    /// (#408), in launcher order. Empty by default.
+    #[must_use]
+    pub fn appcontainer_device_ace_flags(&self) -> Vec<&'static str> {
+        let mut flags = Vec::new();
+        if self.appcontainer_nul_device_ace {
+            flags.push("--nul-device-ace");
+        }
+        if self.appcontainer_mount_manager_ace {
+            flags.push("--mount-manager-ace");
+        }
+        flags
+    }
 }
 
 /// The `device_sink_paths` default: the null/zero/full discard devices —
@@ -291,6 +314,7 @@ impl Default for SandboxPolicy {
             child_network: ChildNetworkPolicy::default(),
             appcontainer_launcher_path: None,
             appcontainer_nul_device_ace: false,
+            appcontainer_mount_manager_ace: false,
             seatbelt_trust_admin_writable_xcode: false,
             named_root_protected_roots: None,
             base_read_paths: PathList::from_defaults(base_read),
@@ -809,6 +833,41 @@ mod tests {
         assert_eq!(json["appcontainer_nul_device_ace"], true);
         let policy: SandboxPolicy = serde_json::from_value(json).unwrap();
         assert!(policy.appcontainer_nul_device_ace);
+    }
+
+    #[test]
+    fn appcontainer_mount_manager_ace_is_a_separate_explicit_opt_in() {
+        let default = SandboxPolicy::default();
+        assert!(!default.appcontainer_mount_manager_ace);
+        assert!(default.appcontainer_device_ace_flags().is_empty());
+        let json = serde_json::to_value(&default).unwrap();
+        assert!(
+            json.get("appcontainer_mount_manager_ace").is_none(),
+            "default-off must not change the serialized policy"
+        );
+
+        let policy = SandboxPolicy {
+            appcontainer_mount_manager_ace: true,
+            ..SandboxPolicy::default()
+        };
+        assert_eq!(
+            policy.appcontainer_device_ace_flags(),
+            ["--mount-manager-ace"],
+            "the mount-manager opt-in must not imply the NUL opt-in"
+        );
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["appcontainer_mount_manager_ace"], true);
+        let policy: SandboxPolicy = serde_json::from_value(json).unwrap();
+        assert!(policy.appcontainer_mount_manager_ace);
+
+        let both = SandboxPolicy {
+            appcontainer_nul_device_ace: true,
+            ..policy
+        };
+        assert_eq!(
+            both.appcontainer_device_ace_flags(),
+            ["--nul-device-ace", "--mount-manager-ace"]
+        );
     }
 
     #[test]

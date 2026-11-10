@@ -673,7 +673,7 @@ impl ConfinedCommand {
             best_available_sandbox(&self.sandbox_policy)
         };
         let kind = sandbox.kind();
-        require_appcontainer_for_nul_device_ace(&self.sandbox_policy, kind)?;
+        require_appcontainer_for_device_aces(&self.sandbox_policy, kind)?;
         // The kind that actually GOVERNS this spawn: the backend's kind only when
         // it will actually confine something (fs or net restricted), else `None`.
         // The fail-closed
@@ -715,6 +715,7 @@ impl ConfinedCommand {
             ),
         }
         .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace)
+        .with_appcontainer_mount_manager_ace(self.sandbox_policy.appcontainer_mount_manager_ace)
         .with_stdio_posture(stdio_posture);
 
         // (2) The declared runtime closure — the ONLY door for authority beyond
@@ -782,14 +783,17 @@ impl ConfinedCommand {
                         // widening (resolved.exec ⊋ delegated.exec) under this mechanism.
                         // Preserve the backend's net result: an Unknown/Unbounded native
                         // network boundary cannot borrow Brush's fs/exec interception.
-                        // The sole exception is the explicit AppContainer NUL-device
-                        // ACE: it is a real host-side fs widening, so preserve its
+                        // The sole exception is the explicit AppContainer host-device
+                        // ACEs: they are real host-side fs widenings, so preserve their
                         // declared named closure for admission without borrowing the
                         // backend's ordinary fs/exec projection.
                         return trusted_worker_projection(
                             &effective,
                             kind,
-                            self.sandbox_policy.appcontainer_nul_device_ace,
+                            !self
+                                .sandbox_policy
+                                .appcontainer_device_ace_flags()
+                                .is_empty(),
                             BackendProjection {
                                 resolved: sandbox
                                     .resolved_authority(mechanism_caveats, stdio_posture),
@@ -1186,19 +1190,21 @@ impl SandboxedWorker {
     }
 }
 
-/// An explicit `NUL` device-ACE request has no safe generic fallback. In
-/// particular, do not silently run an ordinary child when the Windows
-/// AppContainer wrapper is unavailable: that would discard the requested host
-/// grant while making the operator believe it was applied.
-fn require_appcontainer_for_nul_device_ace(
+/// An explicit host device-ACE request (`NUL` or MountPointManager) has no
+/// safe generic fallback. In particular, do not silently run an ordinary child
+/// when the Windows AppContainer wrapper is unavailable: that would discard the
+/// requested host grant while making the operator believe it was applied.
+fn require_appcontainer_for_device_aces(
     policy: &SandboxPolicy,
     available: SandboxKind,
 ) -> ToolResult<()> {
-    if policy.appcontainer_nul_device_ace && available != SandboxKind::AppContainer {
-        return Err(ToolError::denied(
-            "appcontainer_nul_device_ace requires the Windows AppContainer backend; \
-             refusing without the requested --nul-device-ace grant",
-        ));
+    let flags = policy.appcontainer_device_ace_flags();
+    if !flags.is_empty() && available != SandboxKind::AppContainer {
+        return Err(ToolError::denied(format!(
+            "the AppContainer device-ACE opt-in requires the Windows AppContainer backend; \
+             refusing without the requested {} grant",
+            flags.join(" ")
+        )));
     }
     Ok(())
 }
@@ -1208,13 +1214,13 @@ fn require_appcontainer_for_nul_device_ace(
 ///
 /// Brush mediates the delegated filesystem and executable grant, whereas the
 /// native backend remains authoritative for networking. The explicit
-/// AppContainer NUL-device ACE is different: it is a host-side capability that
-/// Brush cannot stand in for, so its exact backend-declared runtime closure is
-/// retained on both filesystem axes for admission.
+/// AppContainer host-device ACEs are different: they are host-side capabilities
+/// that Brush cannot stand in for, so their exact backend-declared runtime
+/// closure is retained on the filesystem axes for admission.
 fn trusted_worker_projection(
     effective: &Caveats,
     kind: SandboxKind,
-    appcontainer_nul_device_ace: bool,
+    appcontainer_device_ace: bool,
     backend: BackendProjection,
 ) -> BackendProjection {
     let BackendProjection {
@@ -1225,7 +1231,7 @@ fn trusted_worker_projection(
     // Brush does not mediate an external descendant's sockets or ambient IPC.
     resolved.net = backend_resolved.net;
 
-    if kind == SandboxKind::AppContainer && appcontainer_nul_device_ace {
+    if kind == SandboxKind::AppContainer && appcontainer_device_ace {
         // Do not borrow AppContainer's ordinary DACL projection (notably its
         // write-implies-read expansion): Brush continues to bound that part of
         // the trusted-worker route. The declared closure is the one named
@@ -1857,10 +1863,10 @@ mod tests {
             ..SandboxPolicy::default()
         };
         assert!(
-            require_appcontainer_for_nul_device_ace(&enabled, SandboxKind::AppContainer).is_ok(),
+            require_appcontainer_for_device_aces(&enabled, SandboxKind::AppContainer).is_ok(),
             "the requested host grant is meaningful only through the AppContainer wrapper"
         );
-        let error = require_appcontainer_for_nul_device_ace(&enabled, SandboxKind::None)
+        let error = require_appcontainer_for_device_aces(&enabled, SandboxKind::None)
             .expect_err("an explicit NUL-device grant must not silently fall back to no sandbox");
         assert!(
             error
@@ -1869,9 +1875,26 @@ mod tests {
             "the refusal must identify the unavailable required mechanism: {error}"
         );
         assert!(
-            require_appcontainer_for_nul_device_ace(&SandboxPolicy::default(), SandboxKind::None)
+            require_appcontainer_for_device_aces(&SandboxPolicy::default(), SandboxKind::None)
                 .is_ok(),
             "the default-off policy must retain the existing no-backend behavior"
+        );
+    }
+
+    #[test]
+    fn mount_manager_ace_policy_refuses_when_appcontainer_is_unavailable() {
+        let enabled = SandboxPolicy {
+            appcontainer_mount_manager_ace: true,
+            ..SandboxPolicy::default()
+        };
+        assert!(require_appcontainer_for_device_aces(&enabled, SandboxKind::AppContainer).is_ok());
+        let error = require_appcontainer_for_device_aces(&enabled, SandboxKind::None)
+            .expect_err("an explicit mount-manager grant must not silently fall back");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing without the requested --mount-manager-ace grant"),
+            "the refusal must name exactly the skipped mechanism: {error}"
         );
     }
 
@@ -2275,6 +2298,32 @@ mod tests {
             opted_in.runtime_closure, backend.runtime_closure,
             "the exact NUL-device runtime closure must be admitted"
         );
+
+        let mm = crate::ResolvedScope::class("appcontainer-mount-manager-ace");
+        let mm_backend = BackendProjection {
+            runtime_closure: crate::ResolvedAuthority {
+                fs_read: mm.clone(),
+                ..crate::empty_closure()
+            },
+            ..backend.clone()
+        };
+        let mm_only = trusted_worker_projection(
+            &effective,
+            SandboxKind::AppContainer,
+            true,
+            mm_backend.clone(),
+        );
+        assert_eq!(
+            mm_only.resolved.fs_read,
+            crate::ResolvedScope::from_scope(&effective.fs_read).union(&mm),
+            "the read-only mount-manager class augments delegated read access"
+        );
+        assert_eq!(
+            mm_only.resolved.fs_write,
+            crate::ResolvedScope::from_scope(&effective.fs_write),
+            "the read-only mount-manager class must not reach the write axis"
+        );
+        assert_eq!(mm_only.runtime_closure, mm_backend.runtime_closure);
 
         let default_off =
             trusted_worker_projection(&effective, SandboxKind::AppContainer, false, backend);

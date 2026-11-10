@@ -920,7 +920,8 @@ pub fn effective_sandbox_kind_with_policy(
                 || net_loopback_only(caveats)
                 || exec_fully_denied(caveats)
                 || restricts_fs(caveats)
-                || policy.appcontainer_nul_device_ace =>
+                || policy.appcontainer_nul_device_ace
+                || policy.appcontainer_mount_manager_ace =>
         {
             SandboxKind::AppContainer
         }
@@ -943,6 +944,7 @@ pub fn best_available_sandbox(policy: &Arc<SandboxPolicy>) -> Box<dyn Sandbox> {
         Box::new(appcontainer_impl::AppContainerSandbox::new(
             policy.appcontainer_launcher_path.clone(),
             policy.appcontainer_nul_device_ace,
+            policy.appcontainer_mount_manager_ace,
         ))
     }
 
@@ -1014,15 +1016,21 @@ pub(crate) mod appcontainer_impl {
     pub struct AppContainerSandbox {
         launcher_path: Option<String>,
         nul_device_ace: bool,
+        mount_manager_ace: bool,
     }
 
     impl AppContainerSandbox {
         /// Construct the sandbox. Confinement is per-process; the optional path
         /// pins the trusted launcher when it is not shipped beside the binary.
-        pub fn new(launcher_path: Option<String>, nul_device_ace: bool) -> Self {
+        pub fn new(
+            launcher_path: Option<String>,
+            nul_device_ace: bool,
+            mount_manager_ace: bool,
+        ) -> Self {
             Self {
                 launcher_path,
                 nul_device_ace,
+                mount_manager_ace,
             }
         }
     }
@@ -1138,6 +1146,11 @@ pub(crate) mod appcontainer_impl {
                 fs_read = fs_read.union(&class);
                 fs_write = fs_write.union(&class);
             }
+            // FILE_READ_ATTRIBUTES | SYNCHRONIZE on the mount manager: a read-only
+            // host-device widening, so it reaches only the read axis.
+            if self.mount_manager_ace {
+                fs_read = fs_read.union(&Rs::class("appcontainer-mount-manager-ace"));
+            }
             // exec: bounded ONLY by the deny-all child-process block; any non-empty
             // allowlist is Unknown (Interceptor, not a kernel bound).
             let exec = if exec_fully_denied(effective) {
@@ -1169,15 +1182,22 @@ pub(crate) mod appcontainer_impl {
         }
 
         fn runtime_closure(&self, _effective: &Caveats) -> crate::ResolvedAuthority {
-            if !self.nul_device_ace {
-                return crate::empty_closure();
+            use crate::ResolvedScope as Rs;
+            let mut closure = crate::empty_closure();
+            if self.nul_device_ace {
+                let class = Rs::class("appcontainer-nul-device-ace");
+                closure.fs_read = class.clone();
+                closure.fs_write = class;
             }
-            let class = crate::ResolvedScope::class("appcontainer-nul-device-ace");
-            crate::ResolvedAuthority {
-                fs_read: class.clone(),
-                fs_write: class,
-                ..crate::empty_closure()
+            if self.mount_manager_ace {
+                let class = Rs::class("appcontainer-mount-manager-ace");
+                closure.fs_read = if self.nul_device_ace {
+                    closure.fs_read.union(&class)
+                } else {
+                    class
+                };
             }
+            closure
         }
 
         /// No-op: AppContainer confinement is applied at process creation via the
@@ -1217,6 +1237,7 @@ pub(crate) mod appcontainer_impl {
                 && !exec_fully_denied(effective)
                 && !restricts_fs(effective)
                 && !self.nul_device_ace
+                && !self.mount_manager_ace
             {
                 return Ok(Vec::new());
             }
@@ -1232,6 +1253,9 @@ pub(crate) mod appcontainer_impl {
 
             if self.nul_device_ace {
                 prefix.push("--nul-device-ace".to_string());
+            }
+            if self.mount_manager_ace {
+                prefix.push("--mount-manager-ace".to_string());
             }
 
             // Grant network capabilities only when net is fully unrestricted
@@ -1307,40 +1331,75 @@ pub(crate) mod appcontainer_impl {
                 ..Caveats::top()
             };
 
-            let opted_in =
-                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), true)
-                    .command_prefix(&caveats)
-                    .expect("opted-in prefix");
+            let opted_in = AppContainerSandbox::new(
+                Some(launcher.to_string_lossy().into_owned()),
+                true,
+                false,
+            )
+            .command_prefix(&caveats)
+            .expect("opted-in prefix");
             assert!(
                 opted_in.iter().any(|arg| arg == "--nul-device-ace"),
                 "the explicit opt-in must reach the launcher: {opted_in:?}"
             );
 
-            let default_off =
-                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), false)
-                    .command_prefix(&caveats)
-                    .expect("default-off prefix");
+            let default_off = AppContainerSandbox::new(
+                Some(launcher.to_string_lossy().into_owned()),
+                false,
+                false,
+            )
+            .command_prefix(&caveats)
+            .expect("default-off prefix");
             assert!(
                 !default_off.iter().any(|arg| arg == "--nul-device-ace"),
                 "the default must not widen the host NUL device DACL: {default_off:?}"
             );
 
-            let ambient_opted_in =
-                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), true)
-                    .command_prefix(&Caveats::top())
-                    .expect("ambient opted-in prefix");
+            let ambient_opted_in = AppContainerSandbox::new(
+                Some(launcher.to_string_lossy().into_owned()),
+                true,
+                false,
+            )
+            .command_prefix(&Caveats::top())
+            .expect("ambient opted-in prefix");
             assert!(
                 ambient_opted_in.iter().any(|arg| arg == "--nul-device-ace"),
                 "the policy-only opt-in must still invoke the launcher: {ambient_opted_in:?}"
             );
 
-            let ambient_default_off =
-                AppContainerSandbox::new(Some(launcher.to_string_lossy().into_owned()), false)
-                    .command_prefix(&Caveats::top())
-                    .expect("ambient default-off prefix");
+            let ambient_default_off = AppContainerSandbox::new(
+                Some(launcher.to_string_lossy().into_owned()),
+                false,
+                false,
+            )
+            .command_prefix(&Caveats::top())
+            .expect("ambient default-off prefix");
             assert!(
                 ambient_default_off.is_empty(),
                 "ambient Caveats without the opt-in must remain unwrapped: {ambient_default_off:?}"
+            );
+            assert!(
+                !opted_in.iter().any(|arg| arg == "--mount-manager-ace")
+                    && !default_off.iter().any(|arg| arg == "--mount-manager-ace"),
+                "the NUL opt-in must not imply the mount-manager opt-in"
+            );
+
+            let mount_manager_only = AppContainerSandbox::new(
+                Some(launcher.to_string_lossy().into_owned()),
+                false,
+                true,
+            )
+            .command_prefix(&Caveats::top())
+            .expect("ambient mount-manager prefix");
+            assert!(
+                mount_manager_only
+                    .iter()
+                    .any(|arg| arg == "--mount-manager-ace")
+                    && !mount_manager_only
+                        .iter()
+                        .any(|arg| arg == "--nul-device-ace"),
+                "the mount-manager opt-in alone must invoke the launcher with only its flag: \
+                 {mount_manager_only:?}"
             );
             std::fs::remove_file(launcher).expect("remove test launcher");
             std::fs::remove_dir(launcher_dir).expect("remove test launcher directory");
@@ -1370,7 +1429,7 @@ pub(crate) mod appcontainer_impl {
                 net: Scope::only(names.iter().map(|name| (*name).to_owned())),
                 ..Caveats::top()
             };
-            let result = AppContainerSandbox::new(None, false).command_prefix(&caveats);
+            let result = AppContainerSandbox::new(None, false, false).command_prefix(&caveats);
             assert!(
                 matches!(&result, Err(ToolError::Denied { reason }) if reason.contains("Unix")),
                 "unsupported Unix authority must refuse before launcher lookup: {result:?}"
@@ -1415,7 +1474,7 @@ mod appcontainer_resolved_authority_tests {
     }
 
     fn decide(caveats: &Caveats) -> AdmissionDecision {
-        let resolved = AppContainerSandbox::new(None, false)
+        let resolved = AppContainerSandbox::new(None, false, false)
             .resolved_authority(caveats, crate::StdioPosture::Unaudited);
         admit(&resolved, caveats, &empty_closure())
     }
@@ -1440,7 +1499,7 @@ mod appcontainer_resolved_authority_tests {
             ),
         }
         // The projection itself must reveal the widening (never == the delegated read).
-        let resolved = AppContainerSandbox::new(None, false)
+        let resolved = AppContainerSandbox::new(None, false, false)
             .resolved_authority(&c, crate::StdioPosture::Unaudited);
         assert_ne!(
             resolved.fs_read,
@@ -1465,7 +1524,7 @@ mod appcontainer_resolved_authority_tests {
         let c = fs_probe(&["C:/repo"], &["C:/repo"]);
         let class = ResolvedScope::class("appcontainer-nul-device-ace");
 
-        let default_off = AppContainerSandbox::new(None, false);
+        let default_off = AppContainerSandbox::new(None, false, false);
         assert_eq!(default_off.runtime_closure(&c), empty_closure());
         assert_ne!(
             default_off
@@ -1480,7 +1539,7 @@ mod appcontainer_resolved_authority_tests {
             class
         );
 
-        let opted_in = AppContainerSandbox::new(None, true);
+        let opted_in = AppContainerSandbox::new(None, true, false);
         let resolved = opted_in.resolved_authority(&c, crate::StdioPosture::Unaudited);
         let closure = opted_in.runtime_closure(&c);
         assert_eq!(
@@ -1510,6 +1569,52 @@ mod appcontainer_resolved_authority_tests {
             ),
             AdmissionDecision::Admit,
             "the explicit mechanism remains admissible when ordinary Caveats are ambient"
+        );
+    }
+
+    /// The MountPointManager ACE is read-only (`FILE_READ_ATTRIBUTES |
+    /// SYNCHRONIZE`), so its named class reaches the read axis only, and it is
+    /// independent of the NUL class.
+    #[test]
+    fn mount_manager_ace_is_a_visible_read_only_runtime_closure_only_when_opted_in() {
+        let c = fs_probe(&["C:/repo"], &["C:/repo"]);
+        let mm = ResolvedScope::class("appcontainer-mount-manager-ace");
+        let nul = ResolvedScope::class("appcontainer-nul-device-ace");
+        let base_read =
+            ResolvedScope::from_scope(&c.fs_read).union(&ResolvedScope::from_scope(&c.fs_write));
+        let base_write = ResolvedScope::from_scope(&c.fs_write);
+
+        let mm_only = AppContainerSandbox::new(None, false, true);
+        let resolved = mm_only.resolved_authority(&c, crate::StdioPosture::Unaudited);
+        let closure = mm_only.runtime_closure(&c);
+        assert_eq!(resolved.fs_read, base_read.union(&mm));
+        assert_eq!(resolved.fs_write, base_write, "read-only: no write class");
+        assert_eq!(
+            closure,
+            crate::ResolvedAuthority {
+                fs_read: mm.clone(),
+                ..empty_closure()
+            }
+        );
+        assert_eq!(admit(&resolved, &c, &closure), AdmissionDecision::Admit);
+
+        let both = AppContainerSandbox::new(None, true, true);
+        let resolved = both.resolved_authority(&c, crate::StdioPosture::Unaudited);
+        let closure = both.runtime_closure(&c);
+        assert_eq!(resolved.fs_read, base_read.union(&nul).union(&mm));
+        assert_eq!(resolved.fs_write, base_write.union(&nul));
+        assert_eq!(closure.fs_read, nul.union(&mm));
+        assert_eq!(closure.fs_write, nul);
+        assert_eq!(admit(&resolved, &c, &closure), AdmissionDecision::Admit);
+
+        let ambient = Caveats::top();
+        assert_eq!(
+            admit(
+                &mm_only.resolved_authority(&ambient, crate::StdioPosture::Unaudited),
+                &ambient,
+                &mm_only.runtime_closure(&ambient),
+            ),
+            AdmissionDecision::Admit
         );
     }
 
@@ -5434,6 +5539,23 @@ mod tests {
             effective_sandbox_kind(SandboxKind::AppContainer, &Caveats::top()),
             SandboxKind::None,
             "the legacy caveat-only helper preserves the default-off behavior"
+        );
+        let mount_manager = SandboxPolicy {
+            appcontainer_mount_manager_ace: true,
+            ..SandboxPolicy::default()
+        };
+        assert_eq!(
+            effective_sandbox_kind_with_policy(
+                SandboxKind::AppContainer,
+                &Caveats::top(),
+                &mount_manager,
+            ),
+            SandboxKind::AppContainer,
+            "the mount-manager widening alone also engages the wrapper"
+        );
+        assert_eq!(
+            effective_sandbox_kind_with_policy(SandboxKind::None, &Caveats::top(), &mount_manager),
+            SandboxKind::None
         );
     }
 
