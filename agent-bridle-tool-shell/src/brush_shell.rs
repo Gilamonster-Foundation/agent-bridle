@@ -293,7 +293,10 @@ impl Tool for BrushShellTool {
         // the reported net witness honest (Landlock `net:none` is Kernel only under
         // `DenyDirect`), never over-claiming from the kind alone.
         let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network)
-            .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace);
+            .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace)
+            .with_appcontainer_mount_manager_ace(
+                self.sandbox_policy.appcontainer_mount_manager_ace,
+            );
         let timeout = self.timeout;
         let worker_output = output.clone();
         let supervised = tokio::task::spawn_blocking(move || {

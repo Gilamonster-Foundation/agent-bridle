@@ -154,7 +154,7 @@ impl Spawner for OsSpawner {
         env: &BTreeMap<String, String>,
         cfg: &SpawnCfg,
     ) -> ToolResult<Captured> {
-        require_appcontainer_for_nul_device_ace(
+        require_appcontainer_for_device_aces(
             &cfg.sandbox,
             cfg.unbridled,
             best_available_sandbox(&cfg.sandbox).kind(),
@@ -340,21 +340,25 @@ fn intended_sandbox_kind(caveats: &Caveats, sandbox: &Arc<SandboxPolicy>) -> San
     effective_sandbox_kind_with_policy(best_available_sandbox(sandbox).kind(), caveats, sandbox)
 }
 
-/// An explicitly requested host `NUL` ACE cannot degrade to an ordinary shell
-/// run. This protects both the direct pipeline route and the egress-proxy route;
+/// An explicitly requested host device ACE (`NUL` or MountPointManager) cannot
+/// degrade to an ordinary shell run. This protects both the direct pipeline route and the egress-proxy route;
 /// [`OsSpawner::run`] repeats the guard so no internal caller can bypass it.
-fn require_appcontainer_for_nul_device_ace(
+fn require_appcontainer_for_device_aces(
     policy: &SandboxPolicy,
     unbridled: bool,
     available: SandboxKind,
 ) -> ToolResult<()> {
-    if policy.appcontainer_nul_device_ace && (unbridled || available != SandboxKind::AppContainer) {
-        let reason = if unbridled {
-            "appcontainer_nul_device_ace cannot run while unbridled; refusing without the requested --nul-device-ace grant"
+    let flags = policy.appcontainer_device_ace_flags();
+    if !flags.is_empty() && (unbridled || available != SandboxKind::AppContainer) {
+        let why = if unbridled {
+            "cannot run while unbridled"
         } else {
-            "appcontainer_nul_device_ace requires the Windows AppContainer backend; refusing without the requested --nul-device-ace grant"
+            "requires the Windows AppContainer backend"
         };
-        return Err(ToolError::denied(reason));
+        return Err(ToolError::denied(format!(
+            "the AppContainer device-ACE opt-in {why}; refusing without the requested {} grant",
+            flags.join(" ")
+        )));
     }
     Ok(())
 }
@@ -637,7 +641,8 @@ impl Tool for ShellTool {
         // read THIS, so neither over-claims the net axis (a Landlock `net:none` is
         // Kernel only under `DenyDirect`).
         let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox.child_network)
-            .with_appcontainer_nul_device_ace(self.sandbox.appcontainer_nul_device_ace);
+            .with_appcontainer_nul_device_ace(self.sandbox.appcontainer_nul_device_ace)
+            .with_appcontainer_mount_manager_ace(self.sandbox.appcontainer_mount_manager_ace);
         let enforcement = enforcement_report(cx.caveats(), mechanism);
 
         // An explicit host-device grant is not advisory: reject before parsing,
@@ -647,13 +652,13 @@ impl Tool for ShellTool {
         if self.spawner.requires_backend_admission() {
             let available = best_available_sandbox(&self.sandbox).kind();
             if let Err(error) =
-                require_appcontainer_for_nul_device_ace(&self.sandbox, unbridled, available)
+                require_appcontainer_for_device_aces(&self.sandbox, unbridled, available)
             {
                 return Ok(deny(
                     sandbox_kind,
                     enforcement,
                     DenialKind::Exec,
-                    "appcontainer-nul-device-ace",
+                    "appcontainer-device-ace",
                     &error,
                 ));
             }
@@ -2058,7 +2063,7 @@ mod tests {
             ..SandboxPolicy::default()
         };
         assert!(
-            require_appcontainer_for_nul_device_ace(&enabled, false, SandboxKind::AppContainer)
+            require_appcontainer_for_device_aces(&enabled, false, SandboxKind::AppContainer)
                 .is_ok(),
             "the explicit widening may use only the AppContainer route"
         );
@@ -2066,7 +2071,7 @@ mod tests {
             (false, SandboxKind::None),
             (true, SandboxKind::AppContainer),
         ] {
-            let error = require_appcontainer_for_nul_device_ace(&enabled, unbridled, available)
+            let error = require_appcontainer_for_device_aces(&enabled, unbridled, available)
                 .expect_err("the requested NUL-device ACE must never degrade to a shell fallback");
             assert!(
                 error
@@ -2076,7 +2081,7 @@ mod tests {
             );
         }
         assert!(
-            require_appcontainer_for_nul_device_ace(
+            require_appcontainer_for_device_aces(
                 &SandboxPolicy::default(),
                 false,
                 SandboxKind::None
@@ -2084,6 +2089,31 @@ mod tests {
             .is_ok(),
             "default-off preserves ordinary no-backend behavior"
         );
+    }
+
+    #[test]
+    fn mount_manager_ace_policy_has_no_shell_or_unbridled_fallback() {
+        let enabled = SandboxPolicy {
+            appcontainer_mount_manager_ace: true,
+            ..SandboxPolicy::default()
+        };
+        assert!(
+            require_appcontainer_for_device_aces(&enabled, false, SandboxKind::AppContainer)
+                .is_ok()
+        );
+        for (unbridled, available) in [
+            (false, SandboxKind::None),
+            (true, SandboxKind::AppContainer),
+        ] {
+            let error = require_appcontainer_for_device_aces(&enabled, unbridled, available)
+                .expect_err("the requested mount-manager ACE must never degrade to a fallback");
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing without the requested --mount-manager-ace grant"),
+                "the refusal must name exactly the skipped mechanism: {error}"
+            );
+        }
     }
 
     /// The schema loads from the embedded `shell_tool.schema.json` data file (not
