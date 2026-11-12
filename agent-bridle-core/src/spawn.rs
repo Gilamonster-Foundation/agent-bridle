@@ -1675,10 +1675,10 @@ mod tokio_spawn_tests {
             eprintln!("skipping: no cat(1) found");
             return;
         };
-        let cx = ctx(Caveats {
-            exec: Scope::only(["cat".to_string()]),
-            ..Caveats::top()
-        });
+        // exec ≡ All: this proves the pipes, not exec narrowing. An `only(cat)`
+        // grant is a widening under a no-backend build (L3 BOUND refuses it),
+        // which failed the weekly `--features spawn-tokio` powerset leg.
+        let cx = ctx(Caveats::top());
         let mut child = ConfinedCommand::new(cat)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1712,10 +1712,8 @@ mod tokio_spawn_tests {
             eprintln!("skipping: no cat(1) found");
             return;
         };
-        let cx = ctx(Caveats {
-            exec: Scope::only(["cat".to_string()]),
-            ..Caveats::top()
-        });
+        // exec ≡ All for the same reason as the round-trip test above.
+        let cx = ctx(Caveats::top());
         let mut child = ConfinedCommand::new(cat)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
