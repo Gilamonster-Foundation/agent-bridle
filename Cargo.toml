@@ -67,7 +67,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "gzip",
 ] }
 url = "2"
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 dom_smoothie = "0.17"
 htmd = "0.5"
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use agent_bridle_core::{Caveats, Scope, Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
 use url::Url;
 
 use crate::net_guard::{screen_host, NetGuardError};
@@ -212,19 +212,22 @@ struct FetchOutcome {
 
 /// Build a Tokio DNS resolver from the system config, falling back to a public
 /// default if the system config cannot be read (e.g. minimal CI containers).
-fn build_resolver() -> ToolResult<TokioAsyncResolver> {
-    use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-    match TokioAsyncResolver::tokio_from_system_conf() {
-        Ok(r) => Ok(r),
-        Err(_) => Ok(TokioAsyncResolver::tokio(
-            ResolverConfig::default(),
-            ResolverOpts::default(),
-        )),
-    }
+fn build_resolver() -> ToolResult<TokioResolver> {
+    use hickory_resolver::config::{ResolverConfig, GOOGLE};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    let builder = TokioResolver::builder_tokio().unwrap_or_else(|_| {
+        TokioResolver::builder_with_config(
+            ResolverConfig::udp_and_tcp(&GOOGLE),
+            TokioRuntimeProvider::default(),
+        )
+    });
+    builder
+        .build()
+        .map_err(|e| ToolError::denied(format!("could not build DNS resolver: {e}")))
 }
 
 /// Resolve `host` to a set of IPs. A literal IP host is returned as-is (no DNS).
-async fn resolve_host(resolver: &TokioAsyncResolver, host: &str) -> ToolResult<Vec<IpAddr>> {
+async fn resolve_host(resolver: &TokioResolver, host: &str) -> ToolResult<Vec<IpAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
@@ -241,7 +244,7 @@ async fn resolve_host(resolver: &TokioAsyncResolver, host: &str) -> ToolResult<V
 async fn fetch_with_leashed_redirects(
     cx: &ToolContext,
     net_private: &Scope<String>,
-    resolver: &TokioAsyncResolver,
+    resolver: &TokioResolver,
     start: FetchArgs,
 ) -> ToolResult<FetchOutcome> {
     let max_bytes = start.max_bytes;
