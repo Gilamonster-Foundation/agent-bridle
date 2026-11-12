@@ -36,6 +36,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # ~1160 combinations into one target filled the hosted Linux runner's disk.
+  # No debug info and no incremental state cut the target several-fold.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   # Linux: the native L3 backend is Landlock. The power set here toggles
@@ -60,6 +65,11 @@ jobs:
       # Clippy across the full power set: catches feature-gate combinations that
       # don't compile or that trip a lint only in a specific corner.
       - name: Clippy — full feature power set
+        # Own target dir: clippy's check-only (rmeta) artifacts must not be
+        # picked up by the test step's link (macOS: "required to be available
+        # in rlib format").
+        env:
+          CARGO_TARGET_DIR: target/clippy
         run: >-
           cargo hack --workspace --exclude agent-bridle-py
           --feature-powerset --optional-deps
@@ -100,6 +110,11 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
 
       - name: Clippy — full feature power set
+        # Own target dir: clippy's check-only (rmeta) artifacts must not be
+        # picked up by the test step's link (macOS: "required to be available
+        # in rlib format").
+        env:
+          CARGO_TARGET_DIR: target/clippy
         run: >-
           cargo hack --workspace --exclude agent-bridle-py
           --feature-powerset --optional-deps
@@ -136,6 +151,11 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
 
       - name: Clippy — full feature power set
+        # Own target dir: clippy's check-only (rmeta) artifacts must not be
+        # picked up by the test step's link (macOS: "required to be available
+        # in rlib format").
+        env:
+          CARGO_TARGET_DIR: target/clippy
         run: >-
           cargo hack --workspace --exclude agent-bridle-py
           --feature-powerset --optional-deps
