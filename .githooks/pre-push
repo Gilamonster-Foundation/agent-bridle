@@ -12,6 +12,7 @@
 # The #408 NUL-device target is intentionally asymmetric only for native Git and
 # elevation: CI/nightly require both; local `just check-windows` still hard-requires
 # AppContainer but permits its documented explicit Git/elevation skip.
+# CI-only: the `cargo-audit` job in security-audit.yml (whole-lockfile audit).
 #
 # Do NOT bypass with --no-verify. If this fails, fix the issue.
 
