@@ -159,11 +159,29 @@ mod tests {
     #[cfg(all(feature = "shell", not(feature = "carried-coreutils"), windows))]
     const OK_PROGRAM: &str = "cmd";
 
-    #[cfg(all(feature = "shell", not(feature = "carried-coreutils"), not(windows)))]
+    #[cfg(all(
+        feature = "shell",
+        not(feature = "carried-coreutils"),
+        not(windows),
+        any(
+            all(target_os = "linux", feature = "linux-landlock"),
+            all(target_os = "macos", feature = "macos-seatbelt"),
+            all(windows, feature = "windows-appcontainer")
+        )
+    ))]
     fn ok_args() -> serde_json::Value {
         serde_json::json!(["hi"])
     }
-    #[cfg(all(feature = "shell", not(feature = "carried-coreutils"), windows))]
+    #[cfg(all(
+        feature = "shell",
+        not(feature = "carried-coreutils"),
+        windows,
+        any(
+            all(target_os = "linux", feature = "linux-landlock"),
+            all(target_os = "macos", feature = "macos-seatbelt"),
+            all(windows, feature = "windows-appcontainer")
+        )
+    ))]
     fn ok_args() -> serde_json::Value {
         serde_json::json!(["/c", "echo hi"])
     }
@@ -207,7 +225,18 @@ mod tests {
     // surfaced as an in-band denial, and a free-form denial read from the
     // structured `denied` field (not stderr).
 
-    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
+    // A narrowed `exec` grant only spawns where an OS backend can enforce it;
+    // a no-backend build refuses it (L3 BOUND, covered in tool-shell's
+    // `real_no_backend_restricted_exec_refuses_before_spawn`).
+    #[cfg(all(
+        feature = "shell",
+        not(feature = "carried-coreutils"),
+        any(
+            all(target_os = "linux", feature = "linux-landlock"),
+            all(target_os = "macos", feature = "macos-seatbelt"),
+            all(windows, feature = "windows-appcontainer")
+        )
+    ))]
     #[tokio::test]
     async fn call_in_scope_succeeds() {
         let reg = agent_bridle::registry();
@@ -275,7 +304,18 @@ mod tests {
     /// denied free-form `cmd` must leave the budget intact so a later in-scope
     /// call still runs. Before the typed `Invocation` accounting this in-band
     /// denial silently spent the call, and the follow-up would fail with Budget.
-    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
+    // A narrowed `exec` grant only spawns where an OS backend can enforce it;
+    // a no-backend build refuses it (L3 BOUND, covered in tool-shell's
+    // `real_no_backend_restricted_exec_refuses_before_spawn`).
+    #[cfg(all(
+        feature = "shell",
+        not(feature = "carried-coreutils"),
+        any(
+            all(target_os = "linux", feature = "linux-landlock"),
+            all(target_os = "macos", feature = "macos-seatbelt"),
+            all(windows, feature = "windows-appcontainer")
+        )
+    ))]
     #[tokio::test]
     async fn mcp_inband_denial_does_not_consume_budget() {
         use agent_bridle::{CountBound, Scope};
