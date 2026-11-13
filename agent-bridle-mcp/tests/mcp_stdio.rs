@@ -18,7 +18,17 @@
 //! The granted leash is supplied via `$AGENT_BRIDLE_CAVEATS` (the same path a
 //! real orchestrator uses), restricted to `exec: Only{echo}`.
 
-#![cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
+// The `exec: Only{echo}` grant only spawns where an OS backend can enforce it;
+// a no-backend build refuses it (L3 BOUND).
+#![cfg(all(
+    feature = "shell",
+    not(feature = "carried-coreutils"),
+    any(
+        all(target_os = "linux", feature = "linux-landlock"),
+        all(target_os = "macos", feature = "macos-seatbelt"),
+        all(windows, feature = "windows-appcontainer")
+    )
+))]
 
 use std::process::Stdio;
 use std::time::Duration;
