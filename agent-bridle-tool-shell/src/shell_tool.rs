@@ -27,19 +27,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{PipeReader, PipeWriter, Read};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    admit, best_available_sandbox, effective_sandbox_kind_with_policy, is_unbridled,
-    unenforceable_axis, AdmissionDecision, AdmittedFence, BackendProjection, Caveats, ConfinedAxis,
-    ConfinementMechanism, Denial, DenialKind, Invocation, LimitsPolicy, ResolvedScope,
-    RuntimeClosure, SandboxKind, SandboxPolicy, Scope, StdioPosture, Tool, ToolContext,
-    ToolEnvelope, ToolError, ToolResult,
+    AppliedFence, Caveats, ConfinedLaunch, ConfinementMechanism, Denial, DenialKind, Invocation,
+    LaunchPlan, LimitsPolicy, SandboxPolicy, Tool, ToolContext, ToolEnvelope, ToolError,
+    ToolResult,
 };
 use async_trait::async_trait;
 
@@ -94,16 +90,14 @@ pub(crate) struct SpawnCfg {
     pub max_output: usize,
     /// Egress audit sink path ([`LimitsPolicy::audit_sink`]; `None` = off).
     pub audit_sink: Option<String>,
-    /// Sandbox read/exec allow-lists + ABI floors ([`SandboxPolicy`]).
-    pub sandbox: Arc<SandboxPolicy>,
     /// Explicit private-host approvals (#385/#386, forward-ported from the 0.7
     /// line), independently intersected with the invocation's ordinary network
     /// scope by the shared egress proxy.
     pub private_hosts: HashSet<String>,
-    /// Process is **unbridled** (ADR 0018): drop the L3 OS sandbox and run the
-    /// pipeline natively. The L2 grant checks in `invoke` still gate (advisory);
-    /// only the kernel mechanism is skipped. Read once from the process marker.
-    pub unbridled: bool,
+    /// The fence core admitted for this invocation (#493): every child is built
+    /// and started through it. `None` only for a mock spawner, which starts no
+    /// process; the real spawner refuses to run without one.
+    pub launch: Option<ConfinedLaunch>,
     /// Bounded presentation observer for this invocation (authority-neutral).
     pub output: OutputEmitter,
     /// One deadline for the invocation, shared through every script/pipeline
@@ -156,76 +150,45 @@ impl Spawner for OsSpawner {
         env: &BTreeMap<String, String>,
         cfg: &SpawnCfg,
     ) -> ToolResult<Captured> {
-        require_appcontainer_for_device_aces(
-            &cfg.sandbox,
-            cfg.unbridled,
-            best_available_sandbox(&cfg.sandbox).kind(),
-        )?;
-        // Unbridled (ADR 0018): the operator explicitly dropped the L3 mechanism —
-        // run natively, no OS sandbox and no egress proxy. The L2 grant checks in
-        // `invoke` already gated this run (advisory); confinement is off by consent.
-        if cfg.unbridled {
-            return run_pipeline(
-                stages,
-                cwd,
-                &[],
-                env,
-                cfg.max_output,
-                cfg.output.clone(),
-                &cfg.deadline,
-                // Unbridled: dropping the mechanism is what the operator
-                // acknowledged — redirect opens stay unbounded (#351).
-                &Scope::All,
-                &Scope::All,
-            );
+        // Core admitted this launch in `invoke` (the device-ACE guard, every
+        // stage's exec check and the fence itself, #493) and decides the route:
+        // native when unbridled (ADR 0018), on the caller's thread when no
+        // backend engages, else under the applied fence. A general remote-host
+        // `net` allow-list that cannot be named in SBPL is enforced by the
+        // loopback egress proxy (#124, ADR 0016), which this engine owns.
+        let _ = caveats; // the launch carries the admitted caveats
+        let launch = cfg.launch.as_ref().ok_or_else(|| {
+            ToolError::denied("refusing to spawn: no admitted launch for this invocation")
+        })?;
+        if let Some(allow_hosts) = launch.egress_hosts() {
+            return run_with_egress_proxy(stages, cwd, env, allow_hosts.to_vec(), launch, cfg);
         }
-        // A general remote-host `net` allow-list that cannot be named in SBPL is
-        // enforced by the loopback egress proxy (#124, ADR 0016): fence the child
-        // to loopback and route it through the proxy. Self-gating — `Some` only
-        // where the fence is actually emittable (macOS + seatbelt).
-        if let Some((allow_hosts, fenced)) = egress_proxy_plan(caveats, &cfg.sandbox) {
-            return run_with_egress_proxy(stages, cwd, &fenced, env, allow_hosts, cfg);
-        }
-        // When a native OS sandbox will actually confine this run, apply its
-        // thread- or wrapper-based launch path (ADR 0005 L3 / ADR 0006 D4).
-        // Otherwise run directly — no need to spend a thread.
-        if intended_sandbox_kind(caveats, &cfg.sandbox) == SandboxKind::None {
+        let stages = stages.to_vec();
+        let cwd = cwd.map(str::to_string);
+        let env = env.clone();
+        let max_output = cfg.max_output;
+        let output = cfg.output.clone();
+        let deadline = cfg.deadline.clone();
+        launch.run(move |fence| {
             run_pipeline(
-                stages,
-                cwd,
-                &[],
-                env,
-                cfg.max_output,
-                cfg.output.clone(),
-                &cfg.deadline,
-                &caveats.fs_read,
-                &caveats.fs_write,
+                &stages,
+                cwd.as_deref(),
+                fence,
+                &env,
+                max_output,
+                output,
+                &deadline,
             )
-        } else {
-            run_confined(stages, cwd, caveats, env, cfg)
-        }
+        })
     }
 }
 
-/// The egress-proxy plan for `caveats`, or `None` to fall through to the ordinary
-/// confinement paths (#124, ADR 0016). Since #257 this is the SHARED core
-/// decision ([`agent_bridle_core::egress_proxy_plan`]) — the same one
-/// `ConfinedCommand::spawn_tokio` routes through — kept as a thin local alias so
-/// the spawn routing ([`OsSpawner::run`]) and the reported `sandbox_kind`
-/// ([`ShellTool::invoke`]) keep one call-shape and cannot disagree.
-fn egress_proxy_plan(
-    caveats: &Caveats,
-    sandbox: &Arc<SandboxPolicy>,
-) -> Option<(Vec<String>, Caveats)> {
-    agent_bridle_core::egress_proxy_plan(caveats, sandbox)
-}
-
-/// Run the pipeline under the loopback egress proxy (#124, ADR 0016). Mirrors
-/// [`run_confined`] but, before spawning: (1) starts a loopback forward proxy
-/// bound to the `allow_hosts` — **fail-closed** if it cannot bind; (2) computes
-/// the fence prefix from the loopback-`fenced` caveats — fail-closed if the
-/// wrapper is missing; (3) injects `*_PROXY` into a clone of the env-seam map so
-/// the child routes its HTTP/HTTPS out through the proxy. The [`ProxyHandle`] is
+/// Run the pipeline under the loopback egress proxy (#124, ADR 0016). Before
+/// running under the admitted fence it: (1) starts a loopback forward proxy
+/// bound to the `allow_hosts` — **fail-closed** if it cannot bind; (2) injects
+/// `*_PROXY` into a clone of the env-seam map so the child routes its
+/// HTTP/HTTPS out through the proxy. The fence prefix and apply are core's
+/// ([`ConfinedLaunch::run`], #493). The [`ProxyHandle`] is
 /// held until the confined child has been reaped, then explicitly finalized via
 /// [`agent_bridle_core::net_proxy::ProxyHandle::shutdown_and_join`] (#372) — so
 /// the proxy's lifetime brackets the child's, and the `net_denials` this
@@ -234,14 +197,12 @@ fn egress_proxy_plan(
 fn run_with_egress_proxy(
     stages: &[Command],
     cwd: Option<&str>,
-    fenced: &Caveats,
     env: &BTreeMap<String, String>,
     allow_hosts: Vec<String>,
+    launch: &ConfinedLaunch,
     cfg: &SpawnCfg,
 ) -> ToolResult<Captured> {
-    // (1) Fence prefix first (pure, cheap) — fail-closed if the wrapper is gone.
-    let prefix = best_available_sandbox(&cfg.sandbox).command_prefix(fenced)?;
-    // (2) Start the proxy — fail-closed if it cannot bind loopback (never spawn
+    // (1) Start the proxy — fail-closed if it cannot bind loopback (never spawn
     //     an unfenced child that would then egress freely). Audit is opt-in via the
     //     configured audit sink (observability only; off = zero overhead).
     let proxy = net_proxy::start_with_private_hosts(
@@ -251,7 +212,7 @@ fn run_with_egress_proxy(
         net_audit_sink(cfg.audit_sink.as_deref()),
     )
     .map_err(ToolError::Exec)?;
-    // (3) Point the child at the proxy via the env seam (a clone — never mutate
+    // (2) Point the child at the proxy via the env seam (a clone — never mutate
     //     the caller's map).
     let mut env = env.clone();
     for (k, v) in proxy.proxy_env() {
@@ -260,32 +221,20 @@ fn run_with_egress_proxy(
 
     let stages = stages.to_vec();
     let cwd = cwd.map(str::to_string);
-    let fenced = fenced.clone();
     let max_output = cfg.max_output;
     let output = cfg.output.clone();
-    let sandbox = cfg.sandbox.clone();
     let deadline = cfg.deadline.clone();
-    let captured = std::thread::Builder::new()
-        .name("agent-bridle-confined".to_string())
-        .spawn(move || {
-            best_available_sandbox(&sandbox).apply(&fenced)?;
-            run_pipeline(
-                &stages,
-                cwd.as_deref(),
-                &prefix,
-                &env,
-                max_output,
-                output,
-                &deadline,
-                &fenced.fs_read,
-                &fenced.fs_write,
-            )
-        })
-        .map_err(ToolError::Exec)?
-        .join()
-        .map_err(|_| {
-            ToolError::Exec(std::io::Error::other("confined execution thread panicked"))
-        })?;
+    let captured = launch.run(move |fence| {
+        run_pipeline(
+            &stages,
+            cwd.as_deref(),
+            fence,
+            &env,
+            max_output,
+            output,
+            &deadline,
+        )
+    });
     // #372: the child is reaped, but that does NOT mean every proxy connection
     // is complete — a connection worker can still be finishing (or, for an idle
     // tunnel, blocked until force-closed). Finalize explicitly: this blocks
@@ -331,86 +280,6 @@ fn net_audit_sink(configured: Option<&str>) -> Arc<dyn net_proxy::AuditSink> {
             .unwrap_or_else(|_| Arc::new(net_proxy::NullSink)),
         _ => Arc::new(net_proxy::NullSink),
     }
-}
-
-/// The L3 `SandboxKind` that will actually be enforced for these caveats in this
-/// build, on this host — the value reported in the result envelope (I9 / ADR
-/// 0006 D3). [`effective_sandbox_kind`] is the shared honesty rule: the strongest
-/// available backend's kind when these caveats engage one of its governed axis
-/// shapes, else `None`. The same rule backs the subprocess primitive in core.
-fn intended_sandbox_kind(caveats: &Caveats, sandbox: &Arc<SandboxPolicy>) -> SandboxKind {
-    effective_sandbox_kind_with_policy(best_available_sandbox(sandbox).kind(), caveats, sandbox)
-}
-
-/// An explicitly requested host device ACE (`NUL` or MountPointManager) cannot
-/// degrade to an ordinary shell run. This protects both the direct pipeline route and the egress-proxy route;
-/// [`OsSpawner::run`] repeats the guard so no internal caller can bypass it.
-fn require_appcontainer_for_device_aces(
-    policy: &SandboxPolicy,
-    unbridled: bool,
-    available: SandboxKind,
-) -> ToolResult<()> {
-    let flags = policy.appcontainer_device_ace_flags();
-    if !flags.is_empty() && (unbridled || available != SandboxKind::AppContainer) {
-        let why = if unbridled {
-            "cannot run while unbridled"
-        } else {
-            "requires the Windows AppContainer backend"
-        };
-        return Err(ToolError::denied(format!(
-            "the AppContainer device-ACE opt-in {why}; refusing without the requested {} grant",
-            flags.join(" ")
-        )));
-    }
-    Ok(())
-}
-
-/// Run the pipeline on a dedicated thread that first applies the OS sandbox.
-///
-/// Two confinement mechanisms, honored uniformly (ADR 0006): a thread-confining
-/// backend (Landlock) restricts this very thread in `apply` — per-thread,
-/// irreversible, inherited across `fork`/`execve`, so it must run on a throwaway
-/// thread (never the shared blocking pool) immediately before spawning the
-/// children. Wrapper backends (Seatbelt/AppContainer) return an argv prefix from
-/// `command_prefix`, prepended to every stage so the child is
-/// spawned already confined. Both are fail-closed (ADR 0006 D4): if confinement
-/// cannot be established the run errors rather than proceeding unconfined.
-fn run_confined(
-    stages: &[Command],
-    cwd: Option<&str>,
-    caveats: &Caveats,
-    env: &BTreeMap<String, String>,
-    cfg: &SpawnCfg,
-) -> ToolResult<Captured> {
-    // Computed before the spawn so a fail-closed wrapper error aborts the run.
-    let prefix = best_available_sandbox(&cfg.sandbox).command_prefix(caveats)?;
-    let stages = stages.to_vec();
-    let cwd = cwd.map(str::to_string);
-    let caveats = caveats.clone();
-    let env = env.clone();
-    let max_output = cfg.max_output;
-    let output = cfg.output.clone();
-    let sandbox = cfg.sandbox.clone();
-    let deadline = cfg.deadline.clone();
-    std::thread::Builder::new()
-        .name("agent-bridle-confined".to_string())
-        .spawn(move || {
-            best_available_sandbox(&sandbox).apply(&caveats)?;
-            run_pipeline(
-                &stages,
-                cwd.as_deref(),
-                &prefix,
-                &env,
-                max_output,
-                output,
-                &deadline,
-                &caveats.fs_read,
-                &caveats.fs_write,
-            )
-        })
-        .map_err(ToolError::Exec)?
-        .join()
-        .map_err(|_| ToolError::Exec(std::io::Error::other("confined execution thread panicked")))?
 }
 
 /// The tool's input schema, parsed once from the embedded `shell_tool.schema.json`
@@ -619,62 +488,45 @@ impl Tool for ShellTool {
         cx: &ToolContext,
     ) -> ToolResult<Invocation> {
         let parsed = ShellArgs::parse(&args, &self.limits)?;
-        // Unbridled (ADR 0018): the operator dropped the L3 mechanism. Report
-        // `None` (no OS sandbox) — the per-axis report then honestly shows the
-        // remaining L2/interceptor or advisory strength, never `kernel`.
-        // Authority is unchanged; only the mechanism is off. Every envelope
-        // discloses `unbridled` (D5).
-        let unbridled = is_unbridled();
-        // Honest reporting (ADR 0005 D1 / I9 / ADR 0006 D3): report the L3 kind
-        // that will actually be enforced for these caveats on this host and
-        // backend. `OsSpawner` applies exactly this decision, fail-closed.
+        // Unbridled (ADR 0018): the operator dropped the L3 mechanism. The plan
+        // then reports `None` (no OS sandbox) — the per-axis report honestly
+        // shows the remaining L2/interceptor or advisory strength, never
+        // `kernel`. Authority is unchanged; only the mechanism is off. Every
+        // envelope discloses `unbridled` (D5).
         //
-        // For a remote-host allow-list on a profile-capable host,
-        // `egress_proxy_plan` derives candidate loopback-fenced backend caveats.
-        // Profile emission is not authority evidence: the ruleset-grain admission
-        // below projects these exact candidate caveats and rejects an Unknown net
-        // axis before `OsSpawner` can run. The candidate kind/report are retained
-        // for the structured refusal. If a future backend establishes a faithful
-        // bounded projection, this same derivation becomes the executable route.
-        let backend_caveats = if unbridled {
-            cx.caveats().clone()
-        } else {
-            match egress_proxy_plan(cx.caveats(), &self.sandbox) {
-                Some((_, fenced)) => fenced,
-                None => cx.caveats().clone(),
-            }
-        };
-        let sandbox_kind = if unbridled {
-            SandboxKind::None
-        } else {
-            intended_sandbox_kind(&backend_caveats, &self.sandbox)
-        };
+        // Honest reporting (ADR 0005 D1 / I9 / ADR 0006 D3): core's launch plan
+        // decides the mechanism once (#493) — the L3 kind that will actually be
+        // enforced for these caveats on this host and backend — and admission
+        // and apply below reuse that same plan, so they cannot disagree.
+        //
+        // For a remote-host allow-list on a profile-capable host, the plan's
+        // backend caveats are the loopback-fenced candidate. Profile emission is
+        // not authority evidence: the ruleset-grain admission below projects
+        // these exact caveats and rejects an Unknown net axis before anything
+        // runs. The candidate kind/report are retained for the structured
+        // refusal. If a future backend establishes a faithful bounded
+        // projection, this same derivation becomes the executable route.
+        //
         // Axis-granular honesty (ADR 0004 D1 / #30): every envelope this run
-        // returns carries the per-axis report alongside the coarse sandbox_kind.
-        // The mechanism governing this run: reported backend kind + the
-        // child-network policy on `self.sandbox` (the same policy the engine
-        // confines with). The per-axis report and the fail-closed guard below both
-        // read THIS, so neither over-claims the net axis (a Landlock `net:none` is
-        // Kernel only under `DenyDirect`).
-        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox.child_network)
-            .with_appcontainer_nul_device_ace(self.sandbox.appcontainer_nul_device_ace)
-            .with_appcontainer_mount_manager_ace(self.sandbox.appcontainer_mount_manager_ace);
+        // returns carries the per-axis report alongside the coarse sandbox_kind,
+        // both computed from this mechanism, so neither over-claims the net axis
+        // (a Landlock `net:none` is Kernel only under `DenyDirect`).
+        let plan = LaunchPlan::new(cx, &self.sandbox);
+        let mechanism = plan.mechanism();
+        let sandbox_kind = mechanism.kind();
 
         // An explicit host-device grant is not advisory: reject before parsing,
         // egress-proxy setup, or spawning if this route cannot reach the
         // AppContainer launcher. Mock spawners execute no process and remain
         // available to exercise ordinary parser/admission tests.
         if self.spawner.requires_backend_admission() {
-            let available = best_available_sandbox(&self.sandbox).kind();
-            if let Err(error) =
-                require_appcontainer_for_device_aces(&self.sandbox, unbridled, available)
-            {
+            if let Err(refusal) = plan.require_device_aces() {
                 return Ok(deny(
                     cx,
                     mechanism,
-                    DenialKind::Exec,
-                    "appcontainer-device-ace",
-                    &error,
+                    refusal.kind,
+                    &refusal.target,
+                    &refusal.error,
                 ));
             }
         }
@@ -870,97 +722,50 @@ impl Tool for ShellTool {
         // `ConfinedCommand`. Strength reporting alone is insufficient: a backend
         // may honestly report Advisory while its conservative authority projection
         // is Unknown, which must refuse independently of the principal's floor.
-        // Project the exact caveats `OsSpawner` will apply (including the egress
-        // proxy's loopback fence), so the admission and wrapper cannot equivocate.
-        // Unbridled skips this fail-closed guard by consent: dropping the L3
-        // mechanism is *exactly* what the operator acknowledged (ADR 0018 D1). The
-        // L2 grant checks above still ran (advisory), and every axis reports
-        // advisory + `disclosure.unbridled` — honest, not silent.
-        if !unbridled {
-            // Production spawners must pass backend admission even when no native
-            // sandbox engages. The no-op backend projects unbounded authority, so
-            // a restricted grant is refused here instead of spawning fail-open.
-            if self.spawner.requires_backend_admission() {
-                let sandbox = best_available_sandbox(&self.sandbox);
-                // `Unaudited`: this route builds each pipeline stage's stdio with
-                // raw `std::process::Stdio` (file redirects, OS pipes between
-                // stages), never `agent_bridle_core::ConfinedStdio` — so it is
-                // never the "only production caller with actual, per-channel
-                // knowledge of what it configured" `StdioPosture::Audited` requires
-                // (report.rs's `ConfinementMechanism::with_stdio_posture` doc
-                // comment; `ConfinedCommand::spawn` is that caller, this is not).
-                // Passing anything else here would assert a per-channel audit this
-                // builder genuinely cannot vouch for (agent-bridle#416 round 3).
-                let mut resolved =
-                    sandbox.resolved_authority(&backend_caveats, StdioPosture::Unaudited);
-                // AppContainer cannot express a non-empty exec allowlist in its
-                // native policy, but this route has already atomically checked
-                // every pipeline stage through the ShellTool exec interceptor.
-                // Intersect that route-local bound with the active AppContainer
-                // projection without changing the backend's native claim or its
-                // runtime closure. The EFFECTIVE-kind guard is load-bearing:
-                // exec-only caveats do not engage AppContainer and must retain the
-                // no-backend Unbounded refusal rather than borrow this interceptor.
-                if sandbox_kind == SandboxKind::AppContainer
-                    && matches!(
-                        &backend_caveats.exec,
-                        Scope::Only(programs) if !programs.is_empty()
-                    )
-                {
-                    resolved.exec = ResolvedScope::from_scope(&backend_caveats.exec);
-                }
-                let projection = BackendProjection {
-                    resolved,
-                    runtime_closure: sandbox.runtime_closure(&backend_caveats),
-                };
-                let rejected_axis = match admit(
-                    &projection.resolved,
-                    &backend_caveats,
-                    &projection.runtime_closure,
-                ) {
-                    AdmissionDecision::Admit => None,
-                    AdmissionDecision::Reject(reject) => Some(reject.axis),
-                };
-
-                if let Err(error) = AdmittedFence::admit(
-                    &backend_caveats,
-                    RuntimeClosure::empty(),
-                    mechanism,
-                    cx.strength_floor(),
-                    |_| projection,
-                ) {
-                    let rejected_axis = rejected_axis.or_else(|| {
-                        unenforceable_axis(cx.caveats(), mechanism, cx.strength_floor())
-                            .map(|unmet| unmet.axis)
-                    });
-                    let (kind, target) = match rejected_axis {
-                        Some(ConfinedAxis::FsRead | ConfinedAxis::FsWrite) => {
-                            (DenialKind::Open, "filesystem")
-                        }
-                        Some(ConfinedAxis::Net) => (DenialKind::Net, "network"),
-                        Some(ConfinedAxis::Exec) | None => (DenialKind::Exec, "confinement"),
-                    };
-                    return Ok(deny(cx, mechanism, kind, target, &error));
+        // Core admits the exact caveats the plan decided (including the egress
+        // proxy's loopback fence) and later applies that same fence, so the
+        // admission and wrapper cannot equivocate (#493).
+        // Unbridled skips the fence by consent: dropping the L3 mechanism is
+        // *exactly* what the operator acknowledged (ADR 0018 D1). The L2 grant
+        // checks above still ran (advisory), and every axis reports advisory +
+        // `disclosure.unbridled` — honest, not silent.
+        //
+        // Production spawners must pass backend admission even when no native
+        // sandbox engages. The no-op backend projects unbounded authority, so a
+        // restricted grant is refused here instead of spawning fail-open. A
+        // mock spawner starts no process; it still owes the strength floor.
+        let launch = if self.spawner.requires_backend_admission() {
+            let programs = script
+                .iter()
+                .flat_map(|item| &item.pipeline)
+                .filter_map(|stage| match stage.argv.first() {
+                    Some(Arg::Lit(program)) => Some(program.clone()),
+                    _ => None,
+                });
+            match ConfinedLaunch::admit(&plan, cx, programs) {
+                Ok(launch) => Some(launch),
+                Err(refusal) => {
+                    return Ok(deny(
+                        cx,
+                        mechanism,
+                        refusal.kind,
+                        &refusal.target,
+                        &refusal.error,
+                    ));
                 }
             }
-
-            if let Some(unmet) = unenforceable_axis(cx.caveats(), mechanism, cx.strength_floor()) {
-                let (kind, target) = match unmet.axis {
-                    ConfinedAxis::FsRead | ConfinedAxis::FsWrite => {
-                        (DenialKind::Open, "filesystem")
-                    }
-                    ConfinedAxis::Net => (DenialKind::Net, "network"),
-                    ConfinedAxis::Exec => (DenialKind::Exec, "confinement"),
-                };
+        } else {
+            if let Err(refusal) = plan.check_strength(cx) {
                 return Ok(deny(
                     cx,
                     mechanism,
-                    kind,
-                    target,
-                    &ToolError::denied(format!("{unmet}; refusing to run unconfined")),
+                    refusal.kind,
+                    &refusal.target,
+                    &refusal.error,
                 ));
             }
-        }
+            None
+        };
 
         // All pipelines share one clock, including time queued before the
         // blocking owner starts. Timeout cancels and joins that owner.
@@ -973,9 +778,8 @@ impl Tool for ShellTool {
         let cfg = SpawnCfg {
             max_output: self.limits.max_output_bytes,
             audit_sink: self.limits.audit_sink.clone(),
-            sandbox: Arc::clone(&self.sandbox),
             private_hosts: self.private_hosts.clone(),
-            unbridled,
+            launch,
             output,
             deadline: deadline.clone(),
         };
@@ -986,7 +790,7 @@ impl Tool for ShellTool {
         // failed on a denied service. Computed from the SAME backend caveats the
         // fence installs; a malformed `mach:` token refuses here, before spawn.
         let mach_services =
-            agent_bridle_core::mach_service_disclosure(&backend_caveats, sandbox_kind)?;
+            agent_bridle_core::mach_service_disclosure(plan.backend_caveats(), sandbox_kind)?;
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
         // AB-004: loader/interpreter/hook vars (LD_PRELOAD, PYTHONPATH,
@@ -1632,25 +1436,23 @@ fn expand_stage_argv(stage: &Command, _cwd: Option<&str>) -> Vec<String> {
 /// Deadlock-free: every stage's stderr and the last stage's stdout are drained by
 /// their own threads, so no pipe can fill while we `wait()` the children.
 ///
-/// `wrap` is the OS-sandbox command prefix (macOS Seatbelt's `sandbox-exec -p
-/// <profile>`), prepended to **every** stage so each spawned program is confined;
-/// it is empty for thread-confining (Landlock) and unconfined runs.
-#[allow(clippy::too_many_arguments)] // house precedent (shell_inspect/gate): flat args over a one-off bag
+/// Every stage is built and started through `fence` (#493): core prepends the
+/// backend's wrapper prefix, fixes the process group and the environment
+/// baseline, and refuses a program it did not admit. `fence` also carries the
+/// fs scopes that bound the redirect opens below (#351): `open_scoped_*`
+/// resolves-and-opens beneath the granted roots in one kernel-checked step, so
+/// a component swapped for a symlink after the leash check cannot steer the
+/// open (the check→open TOCTOU).
 fn run_pipeline(
     stages: &[Command],
     cwd: Option<&str>,
-    wrap: &[String],
+    fence: &AppliedFence,
     env: &BTreeMap<String, String>,
     max_output: usize,
     output: OutputEmitter,
     deadline: &crate::supervisor::Deadline,
-    // #351: the effective fs axes bound the PARENT-side redirect opens below —
-    // `open_scoped_*` resolves-and-opens beneath the granted roots in one
-    // kernel-checked step, so a component swapped for a symlink after the leash
-    // check cannot steer the open (the check→open TOCTOU).
-    fs_read: &Scope<String>,
-    fs_write: &Scope<String>,
 ) -> ToolResult<Captured> {
+    let (fs_read, fs_write) = (fence.fs_read(), fence.fs_write());
     debug_assert!(!stages.is_empty(), "the parser guarantees ≥1 stage");
     let n = stages.len();
     let last = n - 1;
@@ -1670,69 +1472,22 @@ fn run_pipeline(
         }
         let is_last = i == last;
         let stage_argv = expand_stage_argv(stage, cwd);
-        // Prepend the sandbox wrapper (Seatbelt) so the program is spawned
-        // confined: `sandbox-exec -p <profile> <program> <args…>`. Empty wrap is
-        // the identity. `sandbox-exec` forwards stdio + cwd to the child, so the
-        // pipe/redirect plumbing below is unchanged.
-        let argv: Vec<String> = if wrap.is_empty() {
-            stage_argv
-        } else {
-            wrap.iter().cloned().chain(stage_argv).collect()
-        };
-        let mut cmd = std::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        // Each stage leads its own process group so a timeout can SIGKILL the
-        // whole group — stage plus any descendants (AB-006, #269).
-        #[cfg(unix)]
-        cmd.process_group(0);
+        // Core builds the command (#493): the sandbox wrapper prefix (Seatbelt's
+        // `sandbox-exec -p <profile> <program> <args…>`, which forwards stdio,
+        // cwd and its own environment to the child), the stage's own process
+        // group so a timeout can stop the whole group (AB-006, #269), and no
+        // ambient environment — a fixed minimal baseline only (AB-016 / #323).
+        let mut cmd = ok_or_kill_tool(
+            fence.command(&stage_argv[0], &stage_argv[1..]),
+            &mut children,
+        )?;
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        // Host/operator-supplied environment (the env seam, newt #783): set the
-        // provided vars on the child, additive over the inherited ambient env.
-        // The values are structured host input (never model-authored command
-        // text), so they grant no new authority — the exec/fs leash that already
-        // admitted this stage checked the *real* program (argv[0]), not env. When
-        // a Seatbelt `wrap` prefix is present, `sandbox-exec` forwards its own
-        // environment to the wrapped program, so setting it here still reaches the
-        // confined child.
-        // AB-016 / #323: do NOT inherit the parent's ambient environment (which
-        // may carry provider secrets — `OPENAI_API_KEY` etc.) — start empty with a
-        // fixed, minimal baseline, then apply only the (already loader-fenced)
-        // caller env. Brings this engine to the env_clear posture the Brush
-        // (`do_not_inherit_env`) and Host (`ConfinedCommand`) engines already have.
-        //
-        // #323 (a 0.8 blocker): this was Unix-only, so on Windows the ambient env
-        // leaked all the way to the AppContainer child via
-        // `dispatch_bridled_shell → ShellTool → aclaunch → AppContainer` (aclaunch
-        // forwards its own env, exactly as Seatbelt's `sandbox-exec` does). Clear on
-        // every platform; the child gets the baseline + only the delegated vars.
-        cmd.env_clear();
-        cmd.env("PATH", agent_bridle_core::default_exec_path());
-        #[cfg(unix)]
-        cmd.env("LC_ALL", "C");
-        #[cfg(windows)]
-        {
-            // Minimal Windows execution baseline — well-known non-secret platform
-            // paths, NOT ambient authority (a provider secret like `OPENAI_API_KEY`
-            // is never in this set):
-            //   - `SystemRoot`   — process / DLL initialisation.
-            //   - `LOCALAPPDATA` — the AppContainer runtime's per-profile storage /
-            //     redirection root. WITHOUT it, `CreateProcessW` for an AppContainer
-            //     child fails with `ERROR_ENVVAR_NOT_FOUND (203)` — so clearing the
-            //     env without it would break every confined Windows spawn.
-            //   - `PATHEXT`      — executable resolution.
-            for var in ["SystemRoot", "LOCALAPPDATA"] {
-                if let Some(v) = std::env::var_os(var) {
-                    cmd.env(var, v);
-                }
-            }
-            cmd.env(
-                "PATHEXT",
-                std::env::var_os("PATHEXT")
-                    .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD")),
-            );
-        }
+        // Host/operator-supplied environment (the env seam, newt #783), already
+        // loader-fenced: structured host input, never model-authored command
+        // text, so it grants no new authority — the exec/fs leash that admitted
+        // this stage checked the *real* program (argv[0]), not env.
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1806,20 +1561,12 @@ fn run_pipeline(
             }
         }
 
-        // #319: close ambient descriptors the parent left open so a confined
-        // stage does not inherit un-delegated object capabilities (the descriptor
-        // analog of the `env_clear` above). Encapsulated in `agent-bridle-fdguard`
-        // (the single `unsafe` seam); enforced on Linux + macOS (the macOS leg
-        // refuses the spawn when the descriptor universe cannot be bounded, #352),
-        // no-op elsewhere. Runs
-        // last so it applies regardless of the stdio disposition chosen above.
-        #[cfg(unix)]
-        agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
-
         if deadline.remaining().is_zero() {
             break;
         }
-        let mut child = ok_or_kill(cmd.spawn(), &mut children)?;
+        // `launch` closes ambient descriptors first (#319), whatever stdio was
+        // chosen above.
+        let mut child = ok_or_kill(cmd.launch(), &mut children)?;
 
         if matches!(stage.stderr_disposition(), StderrTo::Capture) {
             let err = child.stderr.take().expect("stderr is piped");
@@ -1985,66 +1732,6 @@ mod tests {
     use agent_bridle_core::{Caveats, Gate, Scope};
     use std::collections::HashMap;
     use std::sync::{mpsc, Mutex};
-
-    #[test]
-    fn nul_device_ace_policy_has_no_shell_or_unbridled_fallback() {
-        let enabled = SandboxPolicy {
-            appcontainer_nul_device_ace: true,
-            ..SandboxPolicy::default()
-        };
-        assert!(
-            require_appcontainer_for_device_aces(&enabled, false, SandboxKind::AppContainer)
-                .is_ok(),
-            "the explicit widening may use only the AppContainer route"
-        );
-        for (unbridled, available) in [
-            (false, SandboxKind::None),
-            (true, SandboxKind::AppContainer),
-        ] {
-            let error = require_appcontainer_for_device_aces(&enabled, unbridled, available)
-                .expect_err("the requested NUL-device ACE must never degrade to a shell fallback");
-            assert!(
-                error
-                    .to_string()
-                    .contains("refusing without the requested --nul-device-ace"),
-                "the refusal must name the skipped mechanism: {error}"
-            );
-        }
-        assert!(
-            require_appcontainer_for_device_aces(
-                &SandboxPolicy::default(),
-                false,
-                SandboxKind::None
-            )
-            .is_ok(),
-            "default-off preserves ordinary no-backend behavior"
-        );
-    }
-
-    #[test]
-    fn mount_manager_ace_policy_has_no_shell_or_unbridled_fallback() {
-        let enabled = SandboxPolicy {
-            appcontainer_mount_manager_ace: true,
-            ..SandboxPolicy::default()
-        };
-        assert!(
-            require_appcontainer_for_device_aces(&enabled, false, SandboxKind::AppContainer)
-                .is_ok()
-        );
-        for (unbridled, available) in [
-            (false, SandboxKind::None),
-            (true, SandboxKind::AppContainer),
-        ] {
-            let error = require_appcontainer_for_device_aces(&enabled, unbridled, available)
-                .expect_err("the requested mount-manager ACE must never degrade to a fallback");
-            assert!(
-                error
-                    .to_string()
-                    .contains("refusing without the requested --mount-manager-ace grant"),
-                "the refusal must name exactly the skipped mechanism: {error}"
-            );
-        }
-    }
 
     /// The schema loads from the embedded `shell_tool.schema.json` data file (not
     /// an inline literal) with the expected shape. Guards the data file against
@@ -2270,9 +1957,8 @@ mod tests {
         let cfg = SpawnCfg {
             max_output: 100,
             audit_sink: None,
-            sandbox: Arc::new(SandboxPolicy::default()),
             private_hosts: HashSet::new(),
-            unbridled: false,
+            launch: None,
             output: OutputEmitter::default(),
             deadline: crate::supervisor::Deadline::with_clock(Duration::from_secs(60), move || {
                 Duration::from_secs(clock.load(Ordering::SeqCst))
@@ -2777,19 +2463,20 @@ mod tests {
     /// (permissive, Advisory-floor) principal runs in either case. This closes the
     /// shell's run-unconfined gap and matches `ConfinedCommand`'s fail-closed
     /// posture. The test's expectation is derived from the *same* honesty rule the
-    /// production path uses (`intended_sandbox_kind` + `enforcement_report`), so the
+    /// production path uses (`LaunchPlan` + `enforcement_report`), so the
     /// two cannot disagree across platforms/features.
     #[tokio::test]
     async fn strong_principal_fails_closed_on_unenforceable_exec() {
         let granted = exec_only(&["echo"]);
         // Does the backend that will actually govern this run kernel-confine `exec`?
         // Seatbelt does (`process-exec*`, ADR 0014); Landlock/Noop do not (#31/#57).
-        let exec_is_kernel_confined = agent_bridle_core::enforcement_report(
-            &granted,
-            intended_sandbox_kind(&granted, &Arc::new(SandboxPolicy::default())),
-        )
-        .exec
-            == Some(agent_bridle_core::AxisEnforcement::Kernel);
+        let plan = LaunchPlan::new(
+            &ctx_strong(granted.clone()),
+            &Arc::new(SandboxPolicy::default()),
+        );
+        let exec_is_kernel_confined =
+            agent_bridle_core::enforcement_report(&granted, plan.mechanism()).exec
+                == Some(agent_bridle_core::AxisEnforcement::Kernel);
 
         let mock = Arc::new(MockSpawner::default());
         let out = ShellTool::with_spawner(mock.clone())

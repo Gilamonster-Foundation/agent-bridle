@@ -77,6 +77,25 @@ pub enum SandboxKind {
     None,
 }
 
+/// Proof that a [`Sandbox`] confinement method is being called by core's spawn
+/// funnel (#493).
+///
+/// [`Sandbox::apply`], [`Sandbox::apply_with_worker`] and
+/// [`Sandbox::command_prefix`] take one, and only core can construct it. An
+/// engine therefore cannot apply a sandbox, or build its wrapper prefix,
+/// outside the funnel that admits the fence and verifies what it applies
+/// (`ConfinedCommand`, `ConfinedLaunch`). A backend outside core can still
+/// implement the trait: it receives the token, it never makes one.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyToken(());
+
+impl ApplyToken {
+    /// The funnel's token. Crate-private by design: see the type docs.
+    pub(crate) const fn core() -> Self {
+        Self(())
+    }
+}
+
 /// An OS-level confinement that can be applied from a set of [`Caveats`].
 ///
 /// Implementations translate the lattice's `fs_read`/`fs_write`/`exec`/`net`
@@ -97,7 +116,7 @@ pub trait Sandbox: Send + Sync {
     /// This is the confinement mechanism for *thread-confining* backends
     /// (Landlock's `restrict_self`). *Wrapper-based* backends (macOS Seatbelt)
     /// confine via [`Sandbox::command_prefix`] instead and make this a no-op.
-    fn apply(&self, effective: &Caveats) -> ToolResult<()>;
+    fn apply(&self, effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()>;
 
     /// Apply with a held regular worker image replacing its read/exec pathname
     /// entries. Backends that cannot bind both rules to that object refuse.
@@ -106,6 +125,7 @@ pub trait Sandbox: Send + Sync {
         _effective: &Caveats,
         _program: &str,
         _image: &std::fs::File,
+        _token: crate::ApplyToken,
     ) -> ToolResult<()> {
         Err(crate::ToolError::denied(
             "sandbox cannot bind worker rules to a held image",
@@ -124,7 +144,11 @@ pub trait Sandbox: Send + Sync {
     /// **Fail-closed:** a backend that is selected but cannot build its wrapper
     /// (e.g. the wrapper binary is missing) returns `Err` — never an empty
     /// (silently unconfined) prefix. The default is the empty prefix.
-    fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+    fn command_prefix(
+        &self,
+        effective: &Caveats,
+        _token: crate::ApplyToken,
+    ) -> ToolResult<Vec<String>> {
         let _ = effective;
         Ok(Vec::new())
     }
@@ -200,7 +224,7 @@ impl Sandbox for NoopSandbox {
         SandboxKind::None
     }
 
-    fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+    fn apply(&self, _effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
         // Intentionally a no-op: the advisory default. Real kernel enforcement
         // lives in `LandlockSandbox` (Linux + `linux-landlock`).
         Ok(())
@@ -251,7 +275,7 @@ mod resolved_authority_foundation_tests {
             fn kind(&self) -> SandboxKind {
                 SandboxKind::None
             }
-            fn apply(&self, _e: &Caveats) -> ToolResult<()> {
+            fn apply(&self, _e: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
                 Ok(())
             }
         }
@@ -1204,7 +1228,7 @@ pub(crate) mod appcontainer_impl {
         /// `command_prefix` launcher wrapper (`agent-bridle-aclaunch`), not via
         /// this thread. `apply` is reached only when `command_prefix` returned an
         /// empty prefix (nothing to confine), so a no-op is correct here.
-        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+        fn apply(&self, _effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
             Ok(())
         }
 
@@ -1215,7 +1239,11 @@ pub(crate) mod appcontainer_impl {
         /// (so the spawn runs unwrapped — the backend engages only when it
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
-        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+        fn command_prefix(
+            &self,
+            effective: &Caveats,
+            _token: crate::ApplyToken,
+        ) -> ToolResult<Vec<String>> {
             if super::has_unix_socket_grants(effective) {
                 return Err(ToolError::denied(
                     "windows-appcontainer: exact Unix endpoint grants require Seatbelt",
@@ -1336,7 +1364,7 @@ pub(crate) mod appcontainer_impl {
                 true,
                 false,
             )
-            .command_prefix(&caveats)
+            .command_prefix(&caveats, crate::ApplyToken::core())
             .expect("opted-in prefix");
             assert!(
                 opted_in.iter().any(|arg| arg == "--nul-device-ace"),
@@ -1348,7 +1376,7 @@ pub(crate) mod appcontainer_impl {
                 false,
                 false,
             )
-            .command_prefix(&caveats)
+            .command_prefix(&caveats, crate::ApplyToken::core())
             .expect("default-off prefix");
             assert!(
                 !default_off.iter().any(|arg| arg == "--nul-device-ace"),
@@ -1360,7 +1388,7 @@ pub(crate) mod appcontainer_impl {
                 true,
                 false,
             )
-            .command_prefix(&Caveats::top())
+            .command_prefix(&Caveats::top(), crate::ApplyToken::core())
             .expect("ambient opted-in prefix");
             assert!(
                 ambient_opted_in.iter().any(|arg| arg == "--nul-device-ace"),
@@ -1372,7 +1400,7 @@ pub(crate) mod appcontainer_impl {
                 false,
                 false,
             )
-            .command_prefix(&Caveats::top())
+            .command_prefix(&Caveats::top(), crate::ApplyToken::core())
             .expect("ambient default-off prefix");
             assert!(
                 ambient_default_off.is_empty(),
@@ -1389,7 +1417,7 @@ pub(crate) mod appcontainer_impl {
                 false,
                 true,
             )
-            .command_prefix(&Caveats::top())
+            .command_prefix(&Caveats::top(), crate::ApplyToken::core())
             .expect("ambient mount-manager prefix");
             assert!(
                 mount_manager_only
@@ -1429,7 +1457,8 @@ pub(crate) mod appcontainer_impl {
                 net: Scope::only(names.iter().map(|name| (*name).to_owned())),
                 ..Caveats::top()
             };
-            let result = AppContainerSandbox::new(None, false, false).command_prefix(&caveats);
+            let result = AppContainerSandbox::new(None, false, false)
+                .command_prefix(&caveats, crate::ApplyToken::core());
             assert!(
                 matches!(&result, Err(ToolError::Denied { reason }) if reason.contains("Unix")),
                 "unsupported Unix authority must refuse before launcher lookup: {result:?}"
@@ -2060,7 +2089,7 @@ pub(crate) mod landlock_impl {
             self.exec_boundary
         }
 
-        fn apply(&self, effective: &Caveats) -> ToolResult<()> {
+        fn apply(&self, effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
             self.apply_rules(effective, None)
         }
 
@@ -2069,6 +2098,7 @@ pub(crate) mod landlock_impl {
             effective: &Caveats,
             program: &str,
             image: &std::fs::File,
+            _token: crate::ApplyToken,
         ) -> ToolResult<()> {
             self.apply_rules(effective, Some((program, image)))
         }
@@ -3480,14 +3510,18 @@ mod seatbelt_impl {
             closure
         }
 
-        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+        fn apply(&self, _effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
             // Deliberate no-op: Seatbelt confines via the `sandbox-exec` wrapper
             // (see `command_prefix`), not by restricting the calling thread. The
             // boundary is the wrapped spawn.
             Ok(())
         }
 
-        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+        fn command_prefix(
+            &self,
+            effective: &Caveats,
+            _token: crate::ApplyToken,
+        ) -> ToolResult<Vec<String>> {
             let unix_sockets = unix_socket_paths(effective)?;
             let mach_grants = super::mach_service_grants(effective)?;
             if !unix_sockets.is_empty()
@@ -4162,6 +4196,104 @@ mod seatbelt_impl {
         use super::*;
         use crate::{ResolvedScope, Scope};
 
+        /// Two live Unix listeners in a private temp dir (moved here with the
+        /// test below from `tests/unix_socket_grants.rs`, #493).
+        struct Endpoints {
+            dir: std::path::PathBuf,
+            first: std::path::PathBuf,
+            _listeners: [std::os::unix::net::UnixListener; 2],
+        }
+        impl Endpoints {
+            fn new() -> Self {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "bridle-unix-unit-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir(&dir).unwrap();
+                let dir = dir.canonicalize().unwrap();
+                let first = dir.join("first.sock");
+                let listeners = [
+                    std::os::unix::net::UnixListener::bind(&first).unwrap(),
+                    std::os::unix::net::UnixListener::bind(dir.join("second.sock")).unwrap(),
+                ];
+                Self {
+                    dir,
+                    first,
+                    _listeners: listeners,
+                }
+            }
+            fn grant(&self) -> String {
+                format!("unix:{}", self.first.display())
+            }
+        }
+        impl Drop for Endpoints {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn scoped(names: &[&str]) -> Caveats {
+            Caveats {
+                net: Scope::only(names.iter().map(|s| (*s).to_owned())),
+                ..Caveats::top()
+            }
+        }
+
+        #[test]
+        fn unix_socket_profile_is_exact_outbound_only_and_validates_existing_paths() {
+            let ep = Endpoints::new();
+            let grant = ep.grant();
+            let prefix = SeatbeltSandbox::new()
+                .command_prefix(&scoped(&[&grant]), crate::ApplyToken::core())
+                .unwrap();
+            assert!(
+                !prefix.is_empty(),
+                "Unix-only authority must engage a network fence"
+            );
+            let profile = &prefix[2];
+            assert!(profile.contains("(deny network*)"));
+            assert!(profile.contains(&format!(
+                "(allow network-outbound (literal \"{}\"))",
+                ep.first.display()
+            )));
+            assert!(!profile.contains("(allow network*"));
+            assert!(!profile.contains("(allow network-inbound"));
+            assert!(
+                SeatbeltSandbox::new()
+                    .command_prefix(
+                        &scoped(&[&grant, "example.test"]),
+                        crate::ApplyToken::core()
+                    )
+                    .is_err(),
+                "mixed remote authority requires proxy projection before direct spawn"
+            );
+            std::os::unix::fs::symlink(&ep.first, ep.dir.join("alias.sock")).unwrap();
+            std::fs::write(ep.dir.join("ordinary-file"), b"not a socket").unwrap();
+            for value in [
+                "unix:relative.sock".to_owned(),
+                "unix:".to_owned(),
+                format!("unix:{}/*", ep.dir.display()),
+                format!("unix:{}/alias.sock", ep.dir.display()),
+                format!("unix:{}/ordinary-file", ep.dir.display()),
+                format!("unix:{}/missing.sock", ep.dir.display()),
+                format!(
+                    "unix:{}/../{}/first.sock",
+                    ep.dir.display(),
+                    ep.dir.file_name().unwrap().to_str().unwrap()
+                ),
+            ] {
+                assert!(
+                    SeatbeltSandbox::new()
+                        .command_prefix(&scoped(&[&value]), crate::ApplyToken::core())
+                        .is_err(),
+                    "must reject {value:?}"
+                );
+            }
+        }
+
         /// The production `net:none` profile installs the ZERO Mach-lookup floor
         /// (agent-bridle#405): default-deny named lookup and re-allow NOTHING —
         /// no candidate, no former compatibility service, no `nsurlsessiond`.
@@ -4254,13 +4386,15 @@ mod seatbelt_impl {
                 net: Scope::only(["mach:com.apple.*".to_string()]),
                 ..Caveats::top()
             };
-            assert!(SeatbeltSandbox::new().command_prefix(&bad).is_err());
+            assert!(SeatbeltSandbox::new()
+                .command_prefix(&bad, crate::ApplyToken::core())
+                .is_err());
             let floorless = Caveats {
                 net: Scope::only(["localhost".to_string(), "mach:com.apple.logd".to_string()]),
                 ..Caveats::top()
             };
             let err = SeatbeltSandbox::new()
-                .command_prefix(&floorless)
+                .command_prefix(&floorless, crate::ApplyToken::core())
                 .expect_err("loopback leaves Mach ambient; a grant there is refused");
             assert!(err.to_string().contains("network-denied"), "{err}");
         }
@@ -4450,7 +4584,7 @@ mod seatbelt_impl {
         #[test]
         fn unrestricted_caveats_make_no_wrapper() {
             assert!(SeatbeltSandbox::new()
-                .command_prefix(&Caveats::top())
+                .command_prefix(&Caveats::top(), crate::ApplyToken::core())
                 .unwrap()
                 .is_empty());
         }
@@ -4481,7 +4615,9 @@ mod seatbelt_impl {
             };
 
             // Control: the default read base does NOT admit the extra dir.
-            let default_prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            let default_prefix = SeatbeltSandbox::new()
+                .command_prefix(&cav, crate::ApplyToken::core())
+                .unwrap();
             assert!(
                 !default_prefix.iter().any(|a| a.contains(&want)),
                 "default read base must not include the extra dir: {default_prefix:?}"
@@ -4495,7 +4631,7 @@ mod seatbelt_impl {
                 ..SandboxPolicy::default()
             });
             let widened_prefix = SeatbeltSandbox::with_policy(policy)
-                .command_prefix(&cav)
+                .command_prefix(&cav, crate::ApplyToken::core())
                 .unwrap();
             assert!(
                 widened_prefix.iter().any(|a| a.contains(&want)),
@@ -4517,7 +4653,7 @@ mod seatbelt_impl {
             assert!(prof.contains("(deny network*)"), "{prof}");
             assert!(
                 !SeatbeltSandbox::new()
-                    .command_prefix(&cav)
+                    .command_prefix(&cav, crate::ApplyToken::core())
                     .unwrap()
                     .is_empty(),
                 "net:none must engage the sandbox-exec wrapper"
@@ -4568,7 +4704,7 @@ mod seatbelt_impl {
                 );
                 assert!(
                     !SeatbeltSandbox::new()
-                        .command_prefix(&cav)
+                        .command_prefix(&cav, crate::ApplyToken::core())
                         .unwrap()
                         .is_empty(),
                     "{host}: a loopback-only net grant must engage the wrapper"
@@ -4623,7 +4759,9 @@ mod seatbelt_impl {
                 fs_write: Scope::only(["/tmp".to_string()]),
                 ..Caveats::top()
             };
-            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            let prefix = SeatbeltSandbox::new()
+                .command_prefix(&cav, crate::ApplyToken::core())
+                .unwrap();
             assert_eq!(prefix[0], SANDBOX_EXEC);
             assert_eq!(prefix[1], "-p");
             assert!(prefix[2].contains("(deny file-write*)"));
@@ -4788,7 +4926,9 @@ mod seatbelt_impl {
                 exec: Scope::only(["/bin/echo".to_string()]),
                 ..Caveats::top()
             };
-            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            let prefix = SeatbeltSandbox::new()
+                .command_prefix(&cav, crate::ApplyToken::core())
+                .unwrap();
             assert_eq!(prefix.first().map(String::as_str), Some(SANDBOX_EXEC));
         }
 
@@ -5152,7 +5292,7 @@ mod tests {
     fn noop_reports_none_and_never_fails() {
         let s = NoopSandbox;
         assert_eq!(s.kind(), SandboxKind::None);
-        assert!(s.apply(&Caveats::top()).is_ok());
+        assert!(s.apply(&Caveats::top(), crate::ApplyToken::core()).is_ok());
     }
 
     // ── agent-bridle#405: `mach:` service grants are structural net tokens ──
@@ -5632,7 +5772,7 @@ mod tests {
         // AppContainer's `apply` is a deliberate no-op (confinement is applied at
         // process creation via `command_prefix`, not to the current thread).
         let sb = best_available_sandbox(&Arc::new(SandboxPolicy::default()));
-        assert!(sb.apply(&Caveats::top()).is_ok());
+        assert!(sb.apply(&Caveats::top(), crate::ApplyToken::core()).is_ok());
     }
 
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
@@ -5846,7 +5986,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::only([allowed_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
 
             let inside = fs::write(allowed_t.join("ok.txt"), b"hi");
             let outside = fs::write(forbidden_t.join("escape.txt"), b"nope");
@@ -5888,7 +6030,9 @@ mod landlock_kernel_tests {
         // Control: with the DEFAULT policy the out-of-scope `extra` dir is denied.
         let (extra_c, cav_c) = (extra.clone(), cav.clone());
         let denied = std::thread::spawn(move || {
-            LandlockSandbox::new().apply(&cav_c).expect("apply");
+            LandlockSandbox::new()
+                .apply(&cav_c, crate::ApplyToken::core())
+                .expect("apply");
             fs::read(extra_c.join("data.txt"))
         })
         .join()
@@ -5908,7 +6052,7 @@ mod landlock_kernel_tests {
         let extra_w = extra.clone();
         let allowed_read = std::thread::spawn(move || {
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply");
             fs::read(extra_w.join("data.txt"))
         })
@@ -5935,7 +6079,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::none(),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             fs::write(dir_t.join("x.txt"), b"nope")
         })
         .join()
@@ -5968,7 +6114,9 @@ mod landlock_kernel_tests {
                 fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             let inside = fs::read(allowed_t.join("ok.txt"));
             let outside = fs::read(forbidden_t.join("secret.txt"));
             (inside, outside)
@@ -6009,7 +6157,9 @@ mod landlock_kernel_tests {
                 fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             let inside = std::process::Command::new("cat")
                 .arg(allowed_t.join("ok.txt"))
                 .output();
@@ -6056,7 +6206,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::only([write_t.to_string_lossy().into_owned()]),
                 ..Caveats::top() // fs_read stays All
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             fs::read(outside_t.join("readable.txt"))
         })
         .join()
@@ -6090,7 +6242,9 @@ mod landlock_kernel_tests {
                 exec: Scope::only([cat.clone()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             let granted = std::process::Command::new(&cat)
                 .arg(dir_t.join("data.txt"))
                 .output();
@@ -6175,7 +6329,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::only([scratch_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
 
             let mut attempts = vec![
                 (
@@ -6266,7 +6422,9 @@ mod landlock_kernel_tests {
                 fs_read: Scope::only([dir_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             // Granted `cat` loads (its binary + libs are read-allowed) and reads
             // the in-scope file.
             let granted = std::process::Command::new(&cat)
@@ -6321,7 +6479,7 @@ mod landlock_kernel_tests {
                 ..Caveats::top()
             };
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply landlock + seccomp");
             let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").is_err();
             let udp6 = std::net::UdpSocket::bind("[::1]:0").is_err();
@@ -6357,7 +6515,7 @@ mod landlock_kernel_tests {
                 ..Caveats::top()
             };
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply landlock");
             std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
         })
@@ -6385,7 +6543,7 @@ mod landlock_kernel_tests {
             // net = All (ambient) → a granted net scope; DenyDirect must NOT fire.
             let cav = Caveats::top();
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply landlock");
             std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
         })
@@ -6456,7 +6614,9 @@ mod landlock_kernel_tests {
                 net: Scope::none(),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             hermetic_git_command(git, &main_t, &home_t)
                 .arg("worktree")
                 .arg("add")
@@ -6538,7 +6698,9 @@ mod landlock_kernel_tests {
                     net: Scope::none(),
                     ..Caveats::top()
                 };
-                LandlockSandbox::new().apply(&cav).expect("apply landlock");
+                LandlockSandbox::new()
+                    .apply(&cav, crate::ApplyToken::core())
+                    .expect("apply landlock");
                 hermetic_git_command(&git, &main, &home)
                     .arg("worktree")
                     .arg("add")
@@ -6736,7 +6898,7 @@ mod seatbelt_kernel_tests {
     /// status. This exercises the *production* profile path end to end.
     fn run_wrapped(cav: &Caveats, program: &str, args: &[&str]) -> std::process::ExitStatus {
         let prefix = SeatbeltSandbox::new()
-            .command_prefix(cav)
+            .command_prefix(cav, crate::ApplyToken::core())
             .expect("a restricted axis must yield a wrapper prefix");
         assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
         std::process::Command::new(&prefix[0])
@@ -6810,7 +6972,9 @@ mod seatbelt_kernel_tests {
             ..Caveats::top()
         };
         let target = dir.join("x.txt");
-        let prefix = SeatbeltSandbox::new().command_prefix(&cav).expect("prefix");
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(&cav, crate::ApplyToken::core())
+            .expect("prefix");
         let out = std::process::Command::new(&prefix[0])
             .args(&prefix[1..])
             .arg("/usr/bin/touch")
@@ -7151,7 +7315,7 @@ print(d.value())
             .net_none_ambient_mach_prefix(&cav)
             .expect("typed ambient-Mach characterization prefix");
         let production = sandbox
-            .command_prefix(&cav)
+            .command_prefix(&cav, crate::ApplyToken::core())
             .expect("production net:none prefix");
 
         let before = match run_deputy(&ambient, &probe.binary, &unique_probe_url("before")) {
@@ -7530,7 +7694,7 @@ print(d.value())
     /// kernel produced — the L3-grain the `exec` axis claims.
     fn run_wrapped_output(cav: &Caveats, program: &str, args: &[&str]) -> std::process::Output {
         let prefix = SeatbeltSandbox::new()
-            .command_prefix(cav)
+            .command_prefix(cav, crate::ApplyToken::core())
             .expect("a restricted axis must yield a wrapper prefix");
         assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
         std::process::Command::new(&prefix[0])
@@ -7813,7 +7977,7 @@ print(d.value())
             ..SandboxPolicy::default()
         };
         let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
-            .command_prefix(&cav)
+            .command_prefix(&cav, crate::ApplyToken::core())
             .expect("a restricted exec axis must yield a wrapper prefix");
         let status = hermetic_git_command(&prefix, git, &main, &home, &[])
             .args([
@@ -7934,7 +8098,7 @@ print(d.value())
             ..SandboxPolicy::default()
         };
         let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
-            .command_prefix(&cav)
+            .command_prefix(&cav, crate::ApplyToken::core())
             .expect("a restricted exec axis must yield a wrapper prefix");
         let fake_exec_path = fake_dev.join("usr/libexec/git-core");
         let status = hermetic_git_command(
