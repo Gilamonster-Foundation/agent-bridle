@@ -1,5 +1,5 @@
 # Empty table: detaches this draft from the agent-bridle workspace so the core
-# CI never resolves its private cross-repo git-dep.
+# CI never resolves its cross-repo git-dep.
 [workspace]
 
 [package]
@@ -8,10 +8,10 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
-description = "Integration draft: agent-bridle leash denials -> Steward's Charter refusals, recorded into the scar. NOT a workspace member; not CI-wired (private git-dep on steward-charter). The live edge proving the Charter is cited, not just described."
+description = "Integration draft: agent-bridle leash denials -> Steward's Charter refusals, recorded into the scar. NOT a workspace member; not CI-wired (git-dep on steward-charter). The live edge proving the Charter is cited, not just described."
 
 # Same convention as integrations/pi-bridle: a draft integration kept OUT of the
-# agent-bridle workspace so the core CI never pulls a private cross-repo git-dep.
+# agent-bridle workspace so the core CI never pulls a cross-repo git-dep.
 # Build/test it standalone:  cd integrations/charter-bridle && cargo test
 [dependencies]
 agent-bridle-core = { path = "../../agent-bridle-core" }
