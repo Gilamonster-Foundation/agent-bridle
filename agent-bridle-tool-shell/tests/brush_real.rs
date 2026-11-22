@@ -147,6 +147,12 @@ fn run_platform() {
         "brush_deny_direct_denies_a_childs_socket",
         brush_deny_direct_denies_a_childs_socket,
     );
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    run_async_case(
+        &runtime,
+        "fs_restricted_command_runs_under_landlock",
+        fs_restricted_command_runs_under_landlock,
+    );
     // agent-bridle#416 round-3 / newt#2673 regression: the trusted-worker
     // control channel is now an audited stdio shape (ADR 0015 E7), so a
     // `net: none` BrushShellTool spawn resolves a real bound instead of
@@ -832,6 +838,37 @@ async fn restricted_exec_allows_in_scope_command() {
 
     assert_ne!(out["denied"], true, "in-scope command must run: {out}");
     assert_eq!(out["stdout"].as_str().unwrap_or("").trim(), "ok", "{out}");
+}
+
+/// #498: a filesystem-restricted Brush command runs under Landlock whether or
+/// not the host allows unprivileged user namespaces. Core refused the worker
+/// on a host that allows them; the `Userns Proofs` lane runs this with them on.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+async fn fs_restricted_command_runs_under_landlock() {
+    if !agent_bridle_core::landlock_is_supported() {
+        eprintln!("skipping: kernel lacks Landlock");
+        return;
+    }
+    let dir = unique_temp("fs-restricted");
+    std::fs::create_dir_all(&dir).expect("create the granted directory");
+    let caveats = Caveats {
+        fs_write: Scope::only([dir.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let out = tool()
+        .invoke(
+            serde_json::json!({ "cmd": format!("echo written > '{}/out'", dir.display()) }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("an fs-restricted Brush command must run");
+    assert_ne!(out["denied"], true, "{out}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out")).expect("the command wrote its file"),
+        "written\n",
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A restricted filesystem grant is never silently downgraded to the L2

@@ -27,6 +27,7 @@ on:
       - ".github/workflows/userns-proofs.yml"
       - "agent-bridle-core/src/spawn.rs"
       - "agent-bridle-core/src/sandbox.rs"
+      - "agent-bridle-tool-shell/tests/brush_real.rs"
 
 permissions:
   contents: read
@@ -59,3 +60,11 @@ jobs:
         run: >-
           cargo test -p agent-bridle-core --all-features --lib --
           bind_mount_in_a_new_user_namespace --nocapture
+      # Runs even when the proof above fails, so one run reports both.
+      - name: An fs-restricted Brush command runs (user namespaces on)
+        if: always()
+        env:
+          BRIDLE_REQUIRE_LANDLOCK: "1"
+        run: >-
+          cargo test -p agent-bridle-tool-shell --all-features --test brush_real --
+          fs_restricted_command_runs_under_landlock
