@@ -2817,7 +2817,7 @@ mod landlock_child_tests {
             .find(|p| std::path::Path::new(p).exists())
             .expect("echo(1) must exist for this test");
         let worker = dir.join("worker-echo");
-        fs::copy(source, &worker).expect("copy worker binary (preserves the exec bit)");
+        crate::sandbox::copy_executable(source, &worker);
         worker
     }
 
@@ -2965,7 +2965,7 @@ mod landlock_child_tests {
         let dir = unique_dir("worker-substitution");
         let worker = dir.join("worker");
         let original = dir.join("original");
-        fs::copy("/bin/cat", &worker).unwrap();
+        crate::sandbox::copy_executable("/bin/cat", &worker);
         fs::hard_link(&worker, &original).unwrap();
         let secret = if symlink_to_parent {
             dir.join("sibling")
