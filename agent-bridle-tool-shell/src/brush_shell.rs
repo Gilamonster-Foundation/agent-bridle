@@ -94,6 +94,7 @@ pub struct BrushShellTool {
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     execution_lease: Option<crate::ExecutionLease>,
+    held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
     limits: agent_bridle_core::LimitsPolicy,
     /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
     /// and reported `timed_out:true` with exit 124.
@@ -123,6 +124,7 @@ impl BrushShellTool {
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
             limits: agent_bridle_core::LimitsPolicy::default(),
             timeout: default_timeout(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
@@ -147,6 +149,16 @@ impl BrushShellTool {
         tool.timeout = Duration::from_secs(limits.default_timeout_secs);
         tool.limits = limits;
         Ok(tool)
+    }
+
+    /// Carry already admitted read roots to the kernel fence by descriptor
+    /// (#494). This changes the mechanism, never the tool's filesystem
+    /// authority: core refuses a root that is not in the admitted `fs_read`
+    /// scope, and a backend that cannot anchor on a descriptor.
+    #[must_use]
+    pub fn with_held_read_roots(mut self, roots: Vec<agent_bridle_core::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
+        self
     }
 
     /// Retain caller-owned execution resources through worker shutdown.
@@ -310,6 +322,7 @@ impl Tool for BrushShellTool {
         );
         let confined = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))
+            .held_read_roots(self.held_read_roots.clone())
             .spawn(cx, &nonce, &cwd)?;
         // The mechanism the funnel admitted for the worker, stdio posture
         // included (#492). Rebuilding it here would drop that posture and

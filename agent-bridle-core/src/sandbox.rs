@@ -34,8 +34,77 @@
 //! [`Sandbox::command_prefix`] (Seatbelt/AppContainer); a spawn site honors both,
 //! so the mechanism is uniform at the call site.
 
-use crate::{Caveats, SandboxPolicy, ToolResult};
+use crate::{Caveats, SandboxPolicy, ToolError, ToolResult};
 use std::sync::Arc;
+
+/// A read root the caller already HOLDS as a directory descriptor, for a
+/// backend that can anchor its rule on the descriptor itself (Linux Landlock:
+/// `PathBeneath` takes any `AsFd`). The fence then covers the object the
+/// caller verified — not whatever `provenance` names by the time the rule is
+/// added — so a swap at the pathname between the caller's check and the
+/// ruleset cannot re-point it. `provenance` is how the grant spells the same
+/// root: it is matched to drop that root's path-opened rule, never opened.
+/// Reads are ambient under `fs_read: All`, so held roots add nothing there.
+#[derive(Debug, Clone)]
+pub struct HeldReadRoot {
+    provenance: String,
+    #[cfg(unix)]
+    fd: Arc<std::os::fd::OwnedFd>,
+}
+
+impl HeldReadRoot {
+    /// Bind `fd` — a file or directory descriptor the caller keeps, or a dup of one
+    /// (same object) — to `provenance`, the root the grant spells it as. This
+    /// is the ONLY constructor: fields are private and there is no public
+    /// struct literal, and this one REFUSES unless `fd`'s `(dev, ino)` equals
+    /// what `provenance` names right now (`fstat(fd)` vs `stat(path)` — the
+    /// path is never reopened to do this). A caller cannot install a
+    /// (label, descriptor) pair admission never saw as matching: neither an
+    /// honestly-paired but un-admitted root (the spawn funnel refuses that
+    /// one — newt #2674 P1) nor a falsely labelled one (a mismatched pair is
+    /// refused right here, before any `HeldReadRoot` for it can exist).
+    ///
+    /// # Errors
+    /// [`ToolError::Denied`] when `fd` and `provenance` do not name the same
+    /// object, or either cannot be inspected.
+    #[cfg(unix)]
+    pub fn bind(
+        provenance: impl Into<String>,
+        fd: std::os::fd::OwnedFd,
+    ) -> crate::ToolResult<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let provenance = provenance.into();
+        // `File::from`/`OwnedFd::from` are plain ownership retyping (no
+        // syscall) — `file` is the SAME object `fd` was, just typed so
+        // `.metadata()` can `fstat` it.
+        let file = std::fs::File::from(fd);
+        let held = file.metadata().map_err(crate::ToolError::from)?;
+        let named = std::fs::metadata(&provenance).map_err(crate::ToolError::from)?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(crate::ToolError::denied(format!(
+                "held descriptor does not name '{provenance}'"
+            )));
+        }
+        Ok(Self {
+            provenance,
+            fd: Arc::new(std::os::fd::OwnedFd::from(file)),
+        })
+    }
+
+    /// The pathname the grant spells this root as (provenance only).
+    #[must_use]
+    pub fn provenance(&self) -> &str {
+        &self.provenance
+    }
+
+    /// The held file or directory descriptor the rule anchors on.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.fd.as_fd()
+    }
+}
 
 /// Which OS-level sandbox actually backs an authorization.
 ///
@@ -118,13 +187,38 @@ pub trait Sandbox: Send + Sync {
     /// confine via [`Sandbox::command_prefix`] instead and make this a no-op.
     fn apply(&self, effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()>;
 
+    /// [`Sandbox::apply`] with read roots the caller holds as descriptors
+    /// ([`HeldReadRoot`], #494). A backend that can anchor a rule on a
+    /// descriptor (Landlock) adds `PathBeneath` on each one and never re-opens
+    /// that root by path. Every other backend REFUSES a non-empty `held`
+    /// rather than fall back to the pathname (fail-closed); with none held
+    /// this is [`Sandbox::apply`]. Sealed by the [`ApplyToken`] like `apply`:
+    /// held roots reach a backend only through the spawn funnel, which first
+    /// checks each one against the admitted `fs_read` scope.
+    fn apply_with_held_roots(
+        &self,
+        effective: &Caveats,
+        held: &[HeldReadRoot],
+        token: crate::ApplyToken,
+    ) -> ToolResult<()> {
+        if held.is_empty() {
+            return self.apply(effective, token);
+        }
+        Err(ToolError::denied(format!(
+            "the {:?} sandbox cannot anchor a read root on a held descriptor",
+            self.kind()
+        )))
+    }
+
     /// Apply with a held regular worker image replacing its read/exec pathname
-    /// entries. Backends that cannot bind both rules to that object refuse.
+    /// entries, together with any held read roots. Both bindings are installed
+    /// in one ruleset; backends that cannot bind them to those objects refuse.
     fn apply_with_worker(
         &self,
         _effective: &Caveats,
         _program: &str,
         _image: &std::fs::File,
+        _held: &[HeldReadRoot],
         _token: crate::ApplyToken,
     ) -> ToolResult<()> {
         Err(crate::ToolError::denied(
@@ -1710,8 +1804,8 @@ pub(crate) mod landlock_impl {
     use super::{Sandbox, SandboxKind};
     use crate::{Caveats, ChildNetworkPolicy, SandboxPolicy, Scope, ToolError, ToolResult};
     use landlock::{
-        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
-        RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath,
+        Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
     };
     use std::sync::Arc;
 
@@ -1944,6 +2038,7 @@ pub(crate) mod landlock_impl {
             &self,
             effective: &Caveats,
             worker: Option<(&str, &std::fs::File)>,
+            held: &[super::HeldReadRoot],
         ) -> ToolResult<()> {
             let write = AccessFs::from_write(fs_abi_floor(&self.policy));
             // Pure read rights — `from_read` also bundles `Execute`, which we
@@ -2023,10 +2118,28 @@ pub(crate) mod landlock_impl {
                 // routine so the resolved-authority projection anchors on the
                 // identical set (ADR 0011 D3: confined-exec keeps bin dirs OUT of
                 // the trampoline corpus).
-                let read_roots = self.read_roots(&path_caveats, confine_exec);
-                ruleset
+                let mut read_roots = self.read_roots(&path_caveats, confine_exec);
+                // A held root is anchored on its descriptor below; its path
+                // form is dropped so nothing re-opens that root by name after
+                // the caller's check. (The resolved-authority projection still
+                // lists the path: it is the same object's provenance.)
+                read_roots.retain(|p| !held.iter().any(|h| p.as_str() == h.provenance()));
+                let ruleset = ruleset
                     .add_rules(path_beneath_rules(&read_roots, read))
-                    .map_err(landlock_denied)?
+                    .map_err(landlock_denied)?;
+                held.iter().try_fold(ruleset, |rs, h| {
+                    // Landlock rejects ReadDir on a regular file. Determine
+                    // type from the held object, never reopen its pathname.
+                    let file =
+                        std::fs::File::from(h.fd().try_clone_to_owned().map_err(landlock_denied)?);
+                    let access = if file.metadata().map_err(landlock_denied)?.is_dir() {
+                        read
+                    } else {
+                        AccessFs::ReadFile.into()
+                    };
+                    rs.add_rule(PathBeneath::new(h.fd(), access))
+                        .map_err(landlock_denied)
+                })?
             } else {
                 ruleset
             };
@@ -2090,7 +2203,16 @@ pub(crate) mod landlock_impl {
         }
 
         fn apply(&self, effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
-            self.apply_rules(effective, None)
+            self.apply_rules(effective, None, &[])
+        }
+
+        fn apply_with_held_roots(
+            &self,
+            effective: &Caveats,
+            held: &[super::HeldReadRoot],
+            _token: crate::ApplyToken,
+        ) -> ToolResult<()> {
+            self.apply_rules(effective, None, held)
         }
 
         fn apply_with_worker(
@@ -2098,9 +2220,10 @@ pub(crate) mod landlock_impl {
             effective: &Caveats,
             program: &str,
             image: &std::fs::File,
+            held: &[super::HeldReadRoot],
             _token: crate::ApplyToken,
         ) -> ToolResult<()> {
-            self.apply_rules(effective, Some((program, image)))
+            self.apply_rules(effective, Some((program, image)), held)
         }
 
         fn resolved_authority(
@@ -5767,6 +5890,35 @@ mod tests {
             SandboxKind::AppContainer
         );
     }
+    /// A descriptor that does not name the label it is bound to — the fd is
+    /// open on object B while the caller claims it is root A — is refused by
+    /// the validated constructor itself: `HeldReadRoot::bind` never returns an
+    /// object for a (label, descriptor) pair that disagree about which object
+    /// they name. No sandbox backend is involved; this is pure `fstat`/`stat`.
+    ///
+    /// Regression for newt #2674 P1 (ported with #494): previously `HeldReadRoot::new` took any
+    /// `(String, OwnedFd)` pair with no check at all, so a falsely labelled
+    /// `HeldReadRoot(A, fd(B))` was fully constructible.
+    #[cfg(unix)]
+    #[test]
+    fn falsely_labelled_held_root_is_refused_at_construction() {
+        let pid = std::process::id();
+        let a = std::env::temp_dir().join(format!("agent-bridle-bind-a-{pid}"));
+        let b = std::env::temp_dir().join(format!("agent-bridle-bind-b-{pid}"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let fd_b = std::os::fd::OwnedFd::from(std::fs::File::open(&b).unwrap());
+
+        let err = crate::HeldReadRoot::bind(a.to_string_lossy().into_owned(), fd_b)
+            .expect_err("a's label over b's descriptor must not bind");
+        assert!(
+            err.to_string().contains("does not name"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
 }
 
 // Real kernel enforcement test. Only meaningful with the feature on Linux; it
@@ -5991,6 +6143,126 @@ mod landlock_kernel_tests {
 
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    /// File grants need ReadFile, not ReadDir, and must not admit siblings
+    /// or a replacement inode at the original pathname.
+    #[test]
+    fn held_regular_file_root_stays_object_bound_and_does_not_grant_parent() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let root = unique_dir("held-file-root");
+        let path = root.join("gitconfig");
+        let aside = root.join("original");
+        let sibling = root.join("private");
+        fs::write(&path, b"held").unwrap();
+        fs::write(&sibling, b"private").unwrap();
+        let held = crate::HeldReadRoot::bind(
+            path.to_string_lossy().into_owned(),
+            fs::File::open(&path).unwrap().into(),
+        )
+        .unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::only([path.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        fs::rename(&path, &aside).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        std::thread::spawn(move || {
+            LandlockSandbox::new()
+                .apply_with_held_roots(&caveats, &[held], crate::ApplyToken::core())
+                .unwrap();
+            assert_eq!(fs::read(&aside).unwrap(), b"held");
+            for denied in [&path, &sibling] {
+                assert_eq!(
+                    fs::read(denied).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+        })
+        .join()
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A read root bound to a HELD descriptor anchors on the object, not the
+    /// pathname: after the held directory is renamed aside and a different
+    /// directory takes its path, the confined thread still reads the held
+    /// object at its new name and is denied at the old path. Control: the same
+    /// grant with no held root follows the pathname — the swapped-in directory
+    /// is readable and the held object is not.
+    #[test]
+    fn held_read_root_anchors_on_the_object_not_the_path() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let root = unique_dir("held-root");
+        let aside = std::path::PathBuf::from(format!("{}.aside", root.display()));
+        fs::write(root.join("held.txt"), b"held").unwrap();
+        let fd = std::os::fd::OwnedFd::from(fs::File::open(&root).unwrap());
+        let cav = Caveats {
+            fs_read: Scope::only([root.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        // Bind while `root` still names the held object — the validated
+        // constructor checks `(dev, ino)` NOW, before the swap below.
+        let held = crate::HeldReadRoot::bind(root.to_string_lossy().into_owned(), fd)
+            .expect("bind before the swap");
+
+        // The swap: the held directory goes aside; a different directory takes
+        // its pathname.
+        fs::rename(&root, &aside).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("swapped.txt"), b"swapped").unwrap();
+
+        let (root_t, aside_t, cav_t) = (root.clone(), aside.clone(), cav.clone());
+        let (held_read, swapped_read) = std::thread::spawn(move || {
+            LandlockSandbox::new()
+                .apply_with_held_roots(&cav_t, &[held], crate::ApplyToken::core())
+                .expect("apply landlock");
+            (
+                fs::read(aside_t.join("held.txt")),
+                fs::read(root_t.join("swapped.txt")),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            held_read.expect("the held object stays readable at its new name"),
+            b"held"
+        );
+        assert_eq!(
+            swapped_read
+                .expect_err("the swapped-in directory is outside the held fence")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        // Control: the path-opened rule follows the pathname.
+        let (root_c, aside_c) = (root.clone(), aside.clone());
+        let (held_read, swapped_read) = std::thread::spawn(move || {
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
+            (
+                fs::read(aside_c.join("held.txt")),
+                fs::read(root_c.join("swapped.txt")),
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(
+            held_read.is_err(),
+            "control: the renamed-aside object is ungranted"
+        );
+        assert_eq!(
+            swapped_read.expect("control: the path rule admits the swapped-in directory"),
+            b"swapped"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&aside);
     }
 
     /// #144 (I5-B): the Landlock read base is config-driven. Widening

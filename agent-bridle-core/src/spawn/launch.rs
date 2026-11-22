@@ -27,13 +27,14 @@ use std::ffi::OsString;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
-use super::wrap_argv;
+use super::{require_held_roots_admitted, wrap_argv, HELD_ROOTS_NEED_A_DESCRIPTOR_BACKEND};
 use crate::sandbox::best_available_sandbox;
 use crate::{
     admit, effective_sandbox_kind_with_policy, egress_proxy_plan, unenforceable_axis,
     AdmissionDecision, AdmittedFence, ApplyToken, BackendProjection, Caveats, ConfinedAxis,
-    ConfinementMechanism, DenialKind, ResolvedAuthority, ResolvedScope, RuntimeClosure, Sandbox,
-    SandboxKind, SandboxPolicy, Scope, StdioPosture, ToolContext, ToolError, ToolResult,
+    ConfinementMechanism, DenialKind, HeldReadRoot, ResolvedAuthority, ResolvedScope,
+    RuntimeClosure, Sandbox, SandboxKind, SandboxPolicy, Scope, StdioPosture, ToolContext,
+    ToolError, ToolResult,
 };
 
 /// Why a launch was refused, in the terms an engine reports: the denial kind
@@ -75,6 +76,7 @@ pub struct LaunchPlan {
     /// are the loopback-fenced form of a remote-host `net` allow-list.
     egress_hosts: Option<Vec<String>>,
     mechanism: ConfinementMechanism,
+    held_read_roots: Vec<HeldReadRoot>,
 }
 
 impl LaunchPlan {
@@ -113,7 +115,20 @@ impl LaunchPlan {
             backend_caveats,
             egress_hosts,
             mechanism,
+            held_read_roots: Vec::new(),
         }
+    }
+
+    /// Bind read roots the caller already holds as descriptors
+    /// ([`HeldReadRoot`], #494). The Landlock ruleset anchors on each
+    /// descriptor instead of re-opening that root by path. This changes how the
+    /// fence is built, never what is admitted: [`ConfinedLaunch::admit`] refuses
+    /// a root that is not in the admitted `fs_read` scope, and a backend that
+    /// cannot anchor on a descriptor.
+    #[must_use]
+    pub fn held_read_roots(mut self, roots: Vec<HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
+        self
     }
 
     /// The mechanism every envelope of this invocation reports.
@@ -229,6 +244,9 @@ struct Fenced {
     /// The caveats `run` applies: the admitted fence's own, copied out once at
     /// admission. `run` re-verifies them against the fence before every apply.
     apply_caveats: Caveats,
+    /// Read roots anchored on held descriptors, each one already checked
+    /// against the admitted `fs_read` scope.
+    held_read_roots: Vec<HeldReadRoot>,
     /// The backend engages for these caveats. When it does not there is
     /// nothing to apply and the body runs on the caller's thread.
     engaged: bool,
@@ -271,6 +289,19 @@ impl ConfinedLaunch {
         after_admission: impl FnOnce(&mut Caveats),
     ) -> Result<Self, LaunchRefusal> {
         plan.require_device_aces()?;
+        // Only a backend that confines the spawning thread can anchor a rule
+        // on a descriptor. A wrapper backend names paths in its profile, so it
+        // refuses a held root rather than silently re-open it by name (#494).
+        if !plan.held_read_roots.is_empty()
+            && best_available_sandbox(&plan.policy).kind() != SandboxKind::Landlock
+        {
+            return Err(LaunchRefusal::axis(
+                Some(ConfinedAxis::FsRead),
+                ToolError::denied(HELD_ROOTS_NEED_A_DESCRIPTOR_BACKEND),
+            ));
+        }
+        require_held_roots_admitted(&plan.held_read_roots, &plan.backend_caveats.fs_read)
+            .map_err(|error| LaunchRefusal::axis(Some(ConfinedAxis::FsRead), error))?;
         let programs: BTreeSet<String> = programs.into_iter().collect();
         for program in &programs {
             cx.check_exec(program).map_err(|error| LaunchRefusal {
@@ -328,6 +359,7 @@ impl ConfinedLaunch {
                 sandbox,
                 admitted,
                 apply_caveats,
+                held_read_roots: plan.held_read_roots.clone(),
                 engaged: kind != SandboxKind::None,
             })),
         })
@@ -391,8 +423,15 @@ impl ConfinedLaunch {
             .spawn(move || {
                 // Wrapper backends confine through the prefix; their `apply`
                 // is not the mechanism and is skipped, as in `ConfinedCommand`.
+                // The held roots stay alive here, past `restrict_self`.
                 if applied.prefix.is_empty() {
-                    fenced.sandbox.apply(&caveats, ApplyToken::core())?;
+                    fenced.sandbox.apply_with_held_roots(
+                        &caveats,
+                        &fenced.held_read_roots,
+                        ApplyToken::core(),
+                    )?;
+                } else if !fenced.held_read_roots.is_empty() {
+                    return Err(ToolError::denied(HELD_ROOTS_NEED_A_DESCRIPTOR_BACKEND));
                 }
                 body(&applied)
             })
@@ -738,5 +777,72 @@ mod tests {
         assert_re_derived_fence_is_refused(&granted, move |caveats| {
             caveats.fs_write = Scope::only([dir, "/".to_string()]);
         });
+    }
+
+    /// #494: a held root whose label is not in the `fs_read` grant is refused
+    /// at admission, and so is any held root on a backend that cannot anchor
+    /// a rule on a descriptor (Seatbelt, AppContainer, none).
+    #[cfg(unix)]
+    #[test]
+    fn held_roots_are_admitted_only_in_scope_and_only_under_landlock() {
+        let pid = std::process::id();
+        let granted_dir = std::env::temp_dir().join(format!("ab-494-launch-granted-{pid}"));
+        let other_dir = std::env::temp_dir().join(format!("ab-494-launch-other-{pid}"));
+        for dir in [&granted_dir, &other_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let held = |dir: &std::path::Path| {
+            HeldReadRoot::bind(
+                dir.to_string_lossy().into_owned(),
+                std::fs::File::open(dir).unwrap().into(),
+            )
+            .unwrap()
+        };
+        let cx = ctx(&Caveats {
+            fs_read: Scope::only([granted_dir.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        let admit = |root: HeldReadRoot| {
+            let plan = LaunchPlan::new(&cx, &policy()).held_read_roots(vec![root]);
+            ConfinedLaunch::admit(&plan, &cx, ["echo".to_string()])
+        };
+
+        let anchors = best_available_sandbox(&policy()).kind() == SandboxKind::Landlock;
+        let out_of_scope = admit(held(&other_dir)).unwrap_err();
+        assert_eq!(out_of_scope.kind, DenialKind::Open);
+        if anchors {
+            assert!(
+                out_of_scope
+                    .error
+                    .to_string()
+                    .contains("not in the admitted fs_read scope"),
+                "{}",
+                out_of_scope.error
+            );
+        }
+        match admit(held(&granted_dir)) {
+            Ok(_) => assert!(anchors, "only Landlock may admit a held root"),
+            Err(refusal) => {
+                // Without Landlock the backend cannot anchor; with it, the
+                // only other refusal is a kernel that lacks Landlock.
+                assert!(
+                    !anchors || !crate_landlock_supported(),
+                    "an in-scope held root must admit under Landlock: {}",
+                    refusal.error
+                );
+            }
+        }
+        for dir in [&granted_dir, &other_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    fn crate_landlock_supported() -> bool {
+        crate::landlock_is_supported()
+    }
+    #[cfg(all(unix, not(all(target_os = "linux", feature = "linux-landlock"))))]
+    fn crate_landlock_supported() -> bool {
+        false
     }
 }

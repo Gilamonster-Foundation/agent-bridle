@@ -311,6 +311,7 @@ pub struct ShellTool {
     private_hosts: HashSet<String>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     execution_lease: Option<crate::ExecutionLease>,
+    held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -340,6 +341,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -361,6 +363,16 @@ impl ShellTool {
     #[must_use]
     pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
         self.execution_lease = Some(lease);
+        self
+    }
+
+    /// Carry already admitted read roots to the kernel fence by descriptor
+    /// (#494). This changes the mechanism, never the tool's filesystem
+    /// authority: core refuses a root that is not in the admitted `fs_read`
+    /// scope, and a backend that cannot anchor on a descriptor.
+    #[must_use]
+    pub fn with_held_read_roots(mut self, roots: Vec<agent_bridle_core::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
         self
     }
 
@@ -400,6 +412,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -417,6 +430,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -438,6 +452,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 }
@@ -511,7 +526,7 @@ impl Tool for ShellTool {
         // returns carries the per-axis report alongside the coarse sandbox_kind,
         // both computed from this mechanism, so neither over-claims the net axis
         // (a Landlock `net:none` is Kernel only under `DenyDirect`).
-        let plan = LaunchPlan::new(cx, &self.sandbox);
+        let plan = LaunchPlan::new(cx, &self.sandbox).held_read_roots(self.held_read_roots.clone());
         let mechanism = plan.mechanism();
         let sandbox_kind = mechanism.kind();
 
