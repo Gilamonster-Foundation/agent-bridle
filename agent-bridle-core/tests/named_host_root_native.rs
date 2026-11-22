@@ -360,7 +360,7 @@ fn named_root_runs_distinct_descendants_with_unchanged_read_grants() {
 }
 
 fn envelope(run: &Run, caveats: &Caveats) -> ToolEnvelope {
-    let mut result = ToolEnvelope::new(if run.started {
+    let mut result = ToolEnvelope::bare(if run.started {
         SandboxKind::Landlock
     } else {
         SandboxKind::None

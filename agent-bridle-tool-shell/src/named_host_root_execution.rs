@@ -166,7 +166,7 @@ impl NamedRootCollector {
             },
             None => SandboxKind::None,
         };
-        let mut envelope = ToolEnvelope::new(sandbox_kind)
+        let mut envelope = ToolEnvelope::bare(sandbox_kind)
             .with_disclosure(disclosure)
             .with_timed_out(timed_out);
         match &terminal.kind {

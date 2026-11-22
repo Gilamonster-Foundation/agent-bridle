@@ -275,3 +275,22 @@ async fn unbridled_never_overclaims_kernel_appcontainer() {
     }
     assert_eq!(out["disclosure"]["unbridled"], true, "{out}");
 }
+
+/// #492: the host engine discloses the unbridled posture like the others
+/// (ADR 0018 D5). Before the shared envelope constructor it never did.
+#[cfg(all(unix, feature = "host-shell"))]
+#[tokio::test]
+async fn unbridled_host_engine_discloses_unbridled() {
+    use agent_bridle_tool_shell::HostShellTool;
+    set_unbridled(); // this binary runs unbridled (dedicated, isolated marker)
+    let tool = HostShellTool::new();
+    let cx = Gate::new(0)
+        .authorize(&tool, &Caveats::top())
+        .expect("authorize");
+    let out = tool
+        .invoke(serde_json::json!({"cmd": "echo hi"}), &cx)
+        .await
+        .expect("invoke");
+    assert_eq!(out["disclosure"]["unbridled"], true, "{out}");
+    assert_eq!(out["disclosure"]["engine"], "host", "{out}");
+}

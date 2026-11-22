@@ -794,6 +794,9 @@ async fn trusted_worker_net_none_runs_after_worker_control_audit() {
         "two",
         "the piped command must have actually executed, not merely been admitted: {out}"
     );
+    // #492: the envelope reports the mechanism the funnel admitted, audited
+    // stdio included, so `net: none` is kernel-enforced, not advisory.
+    assert_eq!(out["enforcement"]["net"], "kernel", "{out}");
 
     let _ = std::fs::remove_file(&file);
 }

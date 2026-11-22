@@ -35,11 +35,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    admit, best_available_sandbox, effective_sandbox_kind_with_policy, enforcement_report,
-    human_gate, is_unbridled, unenforceable_axis, AdmissionDecision, AdmittedFence,
-    BackendProjection, Caveats, ConfinedAxis, ConfinementMechanism, Denial, DenialKind, Disclosure,
-    EnforcementReport, Invocation, LimitsPolicy, ResolvedScope, RuntimeClosure, SandboxKind,
-    SandboxPolicy, Scope, StdioPosture, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    admit, best_available_sandbox, effective_sandbox_kind_with_policy, is_unbridled,
+    unenforceable_axis, AdmissionDecision, AdmittedFence, BackendProjection, Caveats, ConfinedAxis,
+    ConfinementMechanism, Denial, DenialKind, Invocation, LimitsPolicy, ResolvedScope,
+    RuntimeClosure, SandboxKind, SandboxPolicy, Scope, StdioPosture, Tool, ToolContext,
+    ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -110,6 +110,9 @@ pub(crate) struct SpawnCfg {
     /// stage. Expiry kills/reaps owned groups before the worker returns.
     pub deadline: crate::supervisor::Deadline,
 }
+
+/// The engine identity stamped on every envelope's disclosure (#492).
+const ENGINE_NAME: &str = crate::ShellEngine::SafeSubset.as_str();
 
 pub(crate) trait Spawner: Send + Sync {
     /// Whether this spawner crosses the native process boundary and therefore
@@ -656,7 +659,6 @@ impl Tool for ShellTool {
         let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox.child_network)
             .with_appcontainer_nul_device_ace(self.sandbox.appcontainer_nul_device_ace)
             .with_appcontainer_mount_manager_ace(self.sandbox.appcontainer_mount_manager_ace);
-        let enforcement = enforcement_report(cx.caveats(), mechanism);
 
         // An explicit host-device grant is not advisory: reject before parsing,
         // egress-proxy setup, or spawning if this route cannot reach the
@@ -668,8 +670,8 @@ impl Tool for ShellTool {
                 require_appcontainer_for_device_aces(&self.sandbox, unbridled, available)
             {
                 return Ok(deny(
-                    sandbox_kind,
-                    enforcement,
+                    cx,
+                    mechanism,
                     DenialKind::Exec,
                     "appcontainer-device-ace",
                     &error,
@@ -682,8 +684,8 @@ impl Tool for ShellTool {
             Ok(s) => s,
             Err(refusal) => {
                 return Ok(refused_envelope(
-                    sandbox_kind,
-                    enforcement,
+                    cx,
+                    mechanism,
                     &refusal,
                     parsed.cmd.as_deref(),
                 ))
@@ -714,8 +716,8 @@ impl Tool for ShellTool {
                                     Ok(p) => Some(p),
                                     Err((target, e)) => {
                                         return Ok(deny(
-                                            sandbox_kind,
-                                            enforcement,
+                                            cx,
+                                            mechanism,
                                             DenialKind::Exec,
                                             &target,
                                             &e,
@@ -738,15 +740,7 @@ impl Tool for ShellTool {
                                 self.limits.max_glob_matches,
                             ) {
                                 Ok(ms) => new_argv.extend(ms.into_iter().map(Arg::Lit)),
-                                Err(e) => {
-                                    return Ok(deny(
-                                        sandbox_kind,
-                                        enforcement,
-                                        DenialKind::Open,
-                                        &p,
-                                        &e,
-                                    ))
-                                }
+                                Err(e) => return Ok(deny(cx, mechanism, DenialKind::Open, &p, &e)),
                             }
                         }
                         None => new_argv.push(arg),
@@ -763,13 +757,7 @@ impl Tool for ShellTool {
                     match expand_redirect_target(segs, &*self.env, &self.limits.var_allowlist) {
                         Ok(resolved) => *segs = vec![Seg::Lit(resolved)],
                         Err((target, e)) => {
-                            return Ok(deny(
-                                sandbox_kind,
-                                enforcement,
-                                DenialKind::Open,
-                                &target,
-                                &e,
-                            ))
+                            return Ok(deny(cx, mechanism, DenialKind::Open, &target, &e))
                         }
                     }
                 }
@@ -786,19 +774,13 @@ impl Tool for ShellTool {
                 match stage.argv.first() {
                     Some(Arg::Lit(program)) => {
                         if let Err(e) = cx.check_exec(program) {
-                            return Ok(deny(
-                                sandbox_kind,
-                                enforcement,
-                                DenialKind::Exec,
-                                program,
-                                &e,
-                            ));
+                            return Ok(deny(cx, mechanism, DenialKind::Exec, program, &e));
                         }
                     }
                     Some(Arg::Glob(pattern)) => {
                         return Ok(deny(
-                            sandbox_kind,
-                            enforcement,
+                            cx,
+                            mechanism,
                             DenialKind::Exec,
                             pattern,
                             &ToolError::denied("a glob pattern is not allowed as a program name"),
@@ -806,8 +788,8 @@ impl Tool for ShellTool {
                     }
                     Some(Arg::Var(_segs)) => {
                         return Ok(deny(
-                            sandbox_kind,
-                            enforcement,
+                            cx,
+                            mechanism,
                             DenialKind::Exec,
                             "$VAR",
                             &ToolError::denied("a variable is not allowed as a program name"),
@@ -817,8 +799,8 @@ impl Tool for ShellTool {
                     // exhaustiveness and mirrors the glob-program refusal.
                     Some(Arg::VarGlob(_)) => {
                         return Ok(deny(
-                            sandbox_kind,
-                            enforcement,
+                            cx,
+                            mechanism,
                             DenialKind::Exec,
                             "$VAR/glob",
                             &ToolError::denied("a glob pattern is not allowed as a program name"),
@@ -835,8 +817,8 @@ impl Tool for ShellTool {
                                 if let Seg::Var(name) = seg {
                                     if !is_allowed_var(name, &self.limits.var_allowlist) {
                                         return Ok(deny(
-                                            sandbox_kind,
-                                            enforcement,
+                                            cx,
+                                            mechanism,
                                             DenialKind::Exec,
                                             &format!("${name}"),
                                             &ToolError::denied(format!(
@@ -870,7 +852,7 @@ impl Tool for ShellTool {
                         Redirect::StderrToStdout => continue,
                     };
                     if let Err(e) = checked {
-                        return Ok(deny(sandbox_kind, enforcement, DenialKind::Open, path, &e));
+                        return Ok(deny(cx, mechanism, DenialKind::Open, path, &e));
                     }
                 }
             }
@@ -878,7 +860,7 @@ impl Tool for ShellTool {
         // Leash: a provided cwd must be within fs_read scope.
         if let Some(cwd) = &parsed.cwd {
             if let Err(e) = cx.check_path_read(Path::new(cwd)) {
-                return Ok(deny(sandbox_kind, enforcement, DenialKind::Open, cwd, &e));
+                return Ok(deny(cx, mechanism, DenialKind::Open, cwd, &e));
             }
         }
 
@@ -958,7 +940,7 @@ impl Tool for ShellTool {
                         Some(ConfinedAxis::Net) => (DenialKind::Net, "network"),
                         Some(ConfinedAxis::Exec) | None => (DenialKind::Exec, "confinement"),
                     };
-                    return Ok(deny(sandbox_kind, enforcement, kind, target, &error));
+                    return Ok(deny(cx, mechanism, kind, target, &error));
                 }
             }
 
@@ -971,8 +953,8 @@ impl Tool for ShellTool {
                     ConfinedAxis::Exec => (DenialKind::Exec, "confinement"),
                 };
                 return Ok(deny(
-                    sandbox_kind,
-                    enforcement,
+                    cx,
+                    mechanism,
                     kind,
                     target,
                     &ToolError::denied(format!("{unmet}; refusing to run unconfined")),
@@ -1003,15 +985,8 @@ impl Tool for ShellTool {
         // candidates — so a host can offer an operator grant for a child that
         // failed on a denied service. Computed from the SAME backend caveats the
         // fence installs; a malformed `mach:` token refuses here, before spawn.
-        let disclosure = Disclosure {
-            unbridled,
-            human_gate: human_gate(),
-            mach_services: agent_bridle_core::mach_service_disclosure(
-                &backend_caveats,
-                sandbox_kind,
-            )?,
-            ..Disclosure::default()
-        };
+        let mach_services =
+            agent_bridle_core::mach_service_disclosure(&backend_caveats, sandbox_kind)?;
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
         // AB-004: loader/interpreter/hook vars (LD_PRELOAD, PYTHONPATH,
@@ -1050,9 +1025,9 @@ impl Tool for ShellTool {
                 self.limits.max_output_bytes,
             );
         }
-        let envelope = ToolEnvelope::new(sandbox_kind)
-            .with_enforcement(enforcement)
-            .with_disclosure(disclosure)
+        let mut envelope = ToolEnvelope::new(ENGINE_NAME, cx, mechanism);
+        envelope.disclosure.mach_services = mach_services;
+        let envelope = envelope
             .with_exit_code(captured.exit_code)
             .with_truncation(captured.stdout_truncated, captured.stderr_truncated)
             .with_stdout(captured.stdout)
@@ -1138,16 +1113,14 @@ fn run_script(
 /// the registry charges zero calls even though the envelope surfaces to the
 /// caller as an ordinary `Ok` value.
 fn deny(
-    sandbox_kind: SandboxKind,
-    enforcement: EnforcementReport,
+    cx: &ToolContext,
+    mechanism: ConfinementMechanism,
     kind: DenialKind,
     target: &str,
     err: &ToolError,
 ) -> Invocation {
     Invocation::Denied(
-        ToolEnvelope::new(sandbox_kind)
-            .with_enforcement(enforcement)
-            .with_disclosure(unbridle_disclosure())
+        ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
             .with_denials(vec![Denial {
                 kind,
                 target: target.to_string(),
@@ -1157,29 +1130,16 @@ fn deny(
     )
 }
 
-/// The disclosure block stamped on **every** envelope (ADR 0018 D5): reads the
-/// process-level unbridle marker so a denied/refused result is as honest about
-/// the posture as a successful one.
-fn unbridle_disclosure() -> Disclosure {
-    Disclosure {
-        unbridled: is_unbridled(),
-        human_gate: human_gate(),
-        ..Disclosure::default()
-    }
-}
-
 /// Build a structured `denied` envelope for a parser [`Refusal`]. Like
 /// [`deny`], this is a **pre-execution** refusal, so it is returned as an
 /// [`Invocation::Denied`] (charges zero calls).
 fn refused_envelope(
-    sandbox_kind: SandboxKind,
-    enforcement: EnforcementReport,
+    cx: &ToolContext,
+    mechanism: ConfinementMechanism,
     refusal: &Refusal,
     cmd: Option<&str>,
 ) -> Invocation {
-    let envelope = ToolEnvelope::new(sandbox_kind)
-        .with_enforcement(enforcement)
-        .with_disclosure(unbridle_disclosure())
+    let envelope = ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
         .with_denials(vec![Denial {
             kind: DenialKind::Exec,
             target: refusal.construct(),
@@ -2824,7 +2784,7 @@ mod tests {
         let granted = exec_only(&["echo"]);
         // Does the backend that will actually govern this run kernel-confine `exec`?
         // Seatbelt does (`process-exec*`, ADR 0014); Landlock/Noop do not (#31/#57).
-        let exec_is_kernel_confined = enforcement_report(
+        let exec_is_kernel_confined = agent_bridle_core::enforcement_report(
             &granted,
             intended_sandbox_kind(&granted, &Arc::new(SandboxPolicy::default())),
         )

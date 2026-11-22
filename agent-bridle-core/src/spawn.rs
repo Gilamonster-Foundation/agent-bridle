@@ -75,6 +75,9 @@ pub struct ConfinedChild {
     pub fence_id: AdmittedFenceId,
     /// The inspectable body verified at the actual NamedRoot launch boundary.
     pub admitted: Option<AdmittedFenceBody>,
+    /// The mechanism the funnel admitted, stdio posture included (#492). An
+    /// engine reports this, never a mechanism it rebuilds for itself.
+    pub mechanism: ConfinementMechanism,
 }
 
 /// A confined child together with **every** fence whose lifetime brackets it.
@@ -115,6 +118,9 @@ pub struct SandboxedWorkerChild {
     pub child: Child,
     /// The OS-level sandbox actually applied to the worker.
     pub sandbox_kind: SandboxKind,
+    /// The mechanism the funnel admitted for the worker, stdio posture
+    /// included (#492).
+    pub mechanism: ConfinementMechanism,
     control: Option<TrustedWorkerControl>,
 }
 
@@ -964,6 +970,7 @@ impl ConfinedCommand {
             // confirmed above — copied out, never recomputed downstream.
             fence_id: admitted.fence_id().clone(),
             admitted: admitted.admitted_body().cloned(),
+            mechanism: admitted.mechanism(),
         })
     }
 
@@ -1025,6 +1032,7 @@ impl ConfinedCommand {
             sandbox_kind,
             fence_id,
             admitted,
+            ..
         } = self.spawn_authorized(cx, effective, authority)?;
 
         Ok(ManagedSpawn {
@@ -1180,6 +1188,7 @@ impl SandboxedWorker {
         Ok(SandboxedWorkerChild {
             child: confined.child,
             sandbox_kind: confined.sandbox_kind,
+            mechanism: confined.mechanism,
             control: Some(TrustedWorkerControl {
                 stream: control,
                 nonce: nonce.to_string(),
@@ -1524,8 +1533,7 @@ mod tokio_spawn {
             let ConfinedChild {
                 mut child,
                 sandbox_kind,
-                fence_id: _,
-                admitted: _,
+                ..
             } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
@@ -1981,6 +1989,10 @@ mod tests {
         let mut worker = SandboxedWorkerChild {
             child: process,
             sandbox_kind: SandboxKind::None,
+            mechanism: ConfinementMechanism::new(
+                SandboxKind::None,
+                crate::ChildNetworkPolicy::LandlockOnly,
+            ),
             control: Some(control),
         };
         let forged_payload = serde_json::json!({
