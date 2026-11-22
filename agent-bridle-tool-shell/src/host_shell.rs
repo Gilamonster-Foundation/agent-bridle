@@ -66,6 +66,7 @@ pub struct HostShellTool {
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     execution_lease: Option<crate::ExecutionLease>,
+    held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
 }
 
 impl std::fmt::Debug for HostShellTool {
@@ -97,6 +98,7 @@ impl HostShellTool {
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -114,6 +116,16 @@ impl HostShellTool {
     #[must_use]
     pub fn with_sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
         self.sandbox = policy;
+        self
+    }
+
+    /// Carry already admitted read roots to the kernel fence by descriptor
+    /// (#494). This changes the mechanism, never the tool's filesystem
+    /// authority: core refuses a root that is not in the admitted `fs_read`
+    /// scope, and a backend that cannot anchor on a descriptor.
+    #[must_use]
+    pub fn with_held_read_roots(mut self, roots: Vec<agent_bridle_core::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
         self
     }
 
@@ -271,6 +283,7 @@ impl Tool for HostShellTool {
         // permitted under exec=All), fail-closes on unenforceable fs, applies the
         // OS jail, and reports the honest kind.
         let mut command = ConfinedCommand::new(&self.shell)
+            .held_read_roots(self.held_read_roots.iter().cloned())
             .new_process_group()
             .arg("-c")
             .arg(&cmd)

@@ -60,6 +60,8 @@ fn run() {
                 ));
             }
         }
+        #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+        runtime.block_on(held_read_root_follows_the_object(engine));
         ran += 1;
     }
     assert!(ran > 0, "no engine was compiled into this lane");
@@ -169,4 +171,84 @@ async fn refuses_out_of_scope(
     );
     let _ = std::fs::remove_dir_all(&inside);
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// #494: an engine built with a held read root keeps reading the HELD object
+/// after its path is swapped, and cannot read the directory swapped in. The
+/// control, built without the held root, follows the pathname instead.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+async fn held_read_root_follows_the_object(engine: ShellEngine) {
+    use agent_bridle_core::HeldReadRoot;
+    if !agent_bridle_core::landlock_is_supported() {
+        eprintln!("skip held-root proof for {engine}: Landlock unavailable");
+        return;
+    }
+    let root = temp_dir(&format!("{engine}-held-root"));
+    let aside = PathBuf::from(format!("{}.aside", root.display()));
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::write(root.join("held.txt"), "held").expect("write held file");
+    // Bind while `root` still names the held object, then swap the path.
+    let held = HeldReadRoot::bind(
+        root.to_string_lossy().into_owned(),
+        std::fs::File::open(&root).expect("open root").into(),
+    )
+    .expect("bind before the swap");
+    std::fs::rename(&root, &aside).expect("move the held object aside");
+    std::fs::create_dir(&root).expect("swap in a new directory");
+    std::fs::write(root.join("swapped.txt"), "swapped").expect("write swapped file");
+
+    let granted = Caveats {
+        fs_read: only(&root),
+        ..Caveats::top()
+    };
+    let cat = |tool: std::sync::Arc<dyn Tool>, file: PathBuf| {
+        let granted = granted.clone();
+        let cwd = root.clone();
+        async move {
+            tool.invoke(
+                serde_json::json!({"cmd": format!("cat {}", file.display()), "cwd": cwd}),
+                &ctx(&*tool, &granted),
+            )
+            .await
+        }
+    };
+    let with_held = engine
+        .build(ShellOptions {
+            held_read_roots: vec![held],
+            ..ShellOptions::default()
+        })
+        .expect("build with a held root");
+    let held_read = cat(with_held.clone(), aside.join("held.txt")).await;
+    // Brush refuses an fs-restricted grant on a host that leaves unprivileged
+    // user namespaces available (#498); there is nothing to prove there.
+    if let Err(error) = &held_read {
+        if engine == ShellEngine::Brush && error.to_string().contains("user namespaces") {
+            eprintln!("skip held-root proof for {engine}: {error}");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&aside);
+            return;
+        }
+    }
+    let held_read = held_read.unwrap_or_else(|error| panic!("{engine} held read: {error}"));
+    assert_eq!(held_read["stdout"], "held", "{engine}: {held_read}");
+    let swapped_read = cat(with_held, root.join("swapped.txt"))
+        .await
+        .unwrap_or_else(|error| panic!("{engine} swapped read: {error}"));
+    assert_ne!(
+        swapped_read["exit_code"], 0,
+        "{engine}: the swapped-in directory is outside the held fence: {swapped_read}"
+    );
+    assert_eq!(swapped_read["stdout"], "", "{engine}: {swapped_read}");
+
+    // Control: with no held root the path rule follows the pathname.
+    let by_path = engine
+        .build(ShellOptions::default())
+        .expect("build control");
+    let control = cat(by_path, root.join("swapped.txt"))
+        .await
+        .unwrap_or_else(|error| panic!("{engine} control read: {error}"));
+    assert_eq!(control["stdout"], "swapped", "{engine} control: {control}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&aside);
 }

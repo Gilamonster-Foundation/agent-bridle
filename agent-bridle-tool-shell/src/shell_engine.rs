@@ -91,12 +91,14 @@ impl ShellEngine {
             sandbox,
             output_observer,
             execution_lease,
+            held_read_roots,
         } = options;
         match self {
             #[cfg(feature = "shell")]
             Self::SafeSubset => {
-                let mut tool =
-                    crate::ShellTool::with_config(limits).with_sandbox_policy((*sandbox).clone());
+                let mut tool = crate::ShellTool::with_config(limits)
+                    .with_sandbox_policy((*sandbox).clone())
+                    .with_held_read_roots(held_read_roots);
                 if let Some(observer) = output_observer {
                     tool = tool.with_output_observer(observer);
                 }
@@ -109,7 +111,8 @@ impl ShellEngine {
             Self::Host => {
                 let mut tool = crate::HostShellTool::new()
                     .with_limits(limits)
-                    .with_sandbox_policy(sandbox);
+                    .with_sandbox_policy(sandbox)
+                    .with_held_read_roots(held_read_roots);
                 if let Some(observer) = output_observer {
                     tool = tool.with_output_observer(observer);
                 }
@@ -122,7 +125,8 @@ impl ShellEngine {
             Self::Brush => {
                 let mut tool = crate::BrushShellTool::new()
                     .with_limits(limits)?
-                    .with_sandbox_policy(sandbox);
+                    .with_sandbox_policy(sandbox)
+                    .with_held_read_roots(held_read_roots);
                 if let Some(observer) = output_observer {
                     tool = tool.with_output_observer(observer);
                 }
@@ -243,6 +247,10 @@ pub struct ShellOptions {
     pub output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     /// Caller resources held until the child is reaped.
     pub execution_lease: Option<crate::ExecutionLease>,
+    /// Read roots the caller holds as descriptors (#494): the fence anchors
+    /// on them instead of re-opening each root by path. Each must also be in
+    /// the grant's `fs_read` scope.
+    pub held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
 }
 
 impl std::fmt::Debug for ShellOptions {
