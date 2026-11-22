@@ -43,4 +43,5 @@ toml = "0.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "time"] }
