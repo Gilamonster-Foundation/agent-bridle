@@ -230,6 +230,13 @@ pub struct SandboxPolicy {
     /// before this field existed keep parsing (they get the defaults).
     #[serde(default = "default_device_sink_paths")]
     pub device_sink_paths: PathList,
+    /// Path markers naming harness-private stores (#500): a runtime closure
+    /// entry containing one as a component sequence is refused at declaration,
+    /// at admission, and by the backend's canonical-identity check. An embedder
+    /// adds its own; dropping a default needs `replace = true`.
+    /// `#[serde(default)]` so configs written before this field keep parsing.
+    #[serde(default = "default_harness_private_markers")]
+    pub harness_private_markers: PathList,
     /// Execute allow-list: the dynamic loader files only (`LOADER_PATHS`).
     pub loader_paths: PathList,
     /// Loopback identifiers for the net axis (`LOOPBACK_HOSTS`).
@@ -268,6 +275,12 @@ impl SandboxPolicy {
 /// resolve to arbitrary files and would widen the grant).
 fn default_device_sink_paths() -> PathList {
     PathList::from_defaults(&["/dev/null", "/dev/zero", "/dev/full"])
+}
+
+/// The `harness_private_markers` default: the harness's OCAP store, key
+/// material, and credential stores.
+pub(crate) fn default_harness_private_markers() -> PathList {
+    PathList::from_defaults(&[".newt", ".ssh", ".gnupg", ".aws", ".config/gh"])
 }
 
 impl Default for SandboxPolicy {
@@ -327,6 +340,7 @@ impl Default for SandboxPolicy {
             named_root_protected_roots: None,
             base_read_paths: PathList::from_defaults(base_read),
             device_sink_paths: default_device_sink_paths(),
+            harness_private_markers: default_harness_private_markers(),
             bin_read_paths: PathList::from_defaults(&[
                 "/usr/bin",
                 "/bin",
@@ -964,6 +978,24 @@ mod tests {
             SandboxPolicy::default().loopback_hosts,
             to_vec(crate::sandbox::LOOPBACK_HOSTS)
         );
+    }
+
+    /// #500: the harness-private marker default pins today's five markers, and
+    /// a config written before the field existed still parses to it.
+    #[test]
+    fn harness_private_markers_default_is_todays_five_and_old_configs_parse() {
+        let d = SandboxPolicy::default();
+        assert_eq!(
+            d.harness_private_markers.resolve(),
+            to_vec(&[".newt", ".ssh", ".gnupg", ".aws", ".config/gh"]),
+            "harness-private marker drift"
+        );
+        let mut old = serde_json::to_value(&d).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("harness_private_markers");
+        let parsed: SandboxPolicy = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.harness_private_markers, d.harness_private_markers);
     }
 
     #[test]

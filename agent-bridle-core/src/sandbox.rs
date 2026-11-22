@@ -2342,14 +2342,15 @@ pub(crate) mod landlock_impl {
                     // the evidence that no extra authority was added.
                     return bounded(s);
                 }
+                let markers = self.policy.harness_private_markers.resolve();
                 let reaches_private = s.iter().any(|entry| {
-                    crate::admitted::entry_reaches_harness_private(entry)
+                    crate::admitted::entry_reaches_harness_private(entry, &markers)
                         || std::fs::canonicalize(entry)
                             .ok()
                             .and_then(|canon| {
-                                canon
-                                    .to_str()
-                                    .map(crate::admitted::entry_reaches_harness_private)
+                                canon.to_str().map(|c| {
+                                    crate::admitted::entry_reaches_harness_private(c, &markers)
+                                })
                             })
                             .unwrap_or(false)
                 });
@@ -3151,11 +3152,17 @@ pub(crate) mod landlock_impl {
                 ResolvedScope::Unknown,
                 "a closure root whose canonical identity reaches .newt must poison the axis"
             );
-            assert!(!crate::admitted::closure_is_harness_disjoint(&closure));
+            assert!(!crate::admitted::closure_is_harness_disjoint(
+                &closure,
+                &SandboxPolicy::default().harness_private_markers.resolve(),
+            ));
             // The default policy (benign merged-/usr symlinks) stays disjoint.
             let benign = LandlockSandbox::new().runtime_closure(&fs_read_only("/tmp"));
             assert!(
-                crate::admitted::closure_is_harness_disjoint(&benign),
+                crate::admitted::closure_is_harness_disjoint(
+                    &benign,
+                    &SandboxPolicy::default().harness_private_markers.resolve(),
+                ),
                 "benign system aliases (loader/lib) must remain harness-disjoint"
             );
             let _ = std::fs::remove_dir_all(&dir);
@@ -3284,12 +3291,18 @@ pub(crate) mod landlock_impl {
         fn runtime_closure_is_harness_disjoint() {
             let delegated = fs_read_only("/tmp");
             let closure = LandlockSandbox::new().runtime_closure(&delegated);
-            assert!(crate::admitted::closure_is_harness_disjoint(&closure));
+            assert!(crate::admitted::closure_is_harness_disjoint(
+                &closure,
+                &SandboxPolicy::default().harness_private_markers.resolve(),
+            ));
             let mut bad = closure;
             if let ResolvedScope::Bounded { concrete, .. } = &mut bad.fs_read {
                 concrete.insert("/home/agent/.newt/ocap/state".to_string());
             }
-            assert!(!crate::admitted::closure_is_harness_disjoint(&bad));
+            assert!(!crate::admitted::closure_is_harness_disjoint(
+                &bad,
+                &SandboxPolicy::default().harness_private_markers.resolve(),
+            ));
         }
     }
 }
@@ -4659,7 +4672,10 @@ mod seatbelt_impl {
                     ]),
                 }
             );
-            assert!(crate::admitted::closure_is_harness_disjoint(&closure));
+            assert!(crate::admitted::closure_is_harness_disjoint(
+                &closure,
+                &SandboxPolicy::default().harness_private_markers.resolve(),
+            ));
             assert!(matches!(
                 admit(&resolved, &cav, &closure),
                 AdmissionDecision::Admit

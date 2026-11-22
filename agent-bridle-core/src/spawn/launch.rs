@@ -337,7 +337,7 @@ impl ConfinedLaunch {
         };
         let admitted = AdmittedFence::admit(
             caveats,
-            RuntimeClosure::empty(),
+            RuntimeClosure::for_policy(&plan.policy),
             plan.mechanism,
             cx.strength_floor(),
             |_| projection,
@@ -688,6 +688,19 @@ mod tests {
             ResolvedScope::Unbounded,
             "unrestricted exec is untouched"
         );
+    }
+
+    /// #500: this funnel checks the backend closure against the plan's
+    /// harness-private markers, as `ConfinedCommand` does. `empty()` would
+    /// check an embedder's policy against the default markers instead.
+    #[test]
+    fn the_launch_closure_takes_its_markers_from_the_policy() {
+        let code = include_str!("launch.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(code.contains("RuntimeClosure::for_policy(&plan.policy)"));
+        assert!(!code.contains("RuntimeClosure::empty()"));
     }
 
     /// #493: a program outside the `exec` grant is refused at admission, and
