@@ -587,6 +587,8 @@ async fn stderr_observer_and_brush_envelope_apply_the_output_cap() {
         out["stderr"].as_str().expect("stderr string").as_bytes(),
         observed
     );
+    // #489: the dropped bytes must surface as a truncation flag.
+    assert_eq!(out["stderr_truncated"], true, "{out}");
 }
 
 /// Full-access: a `$(...)` command substitution — refused by the safe-subset
