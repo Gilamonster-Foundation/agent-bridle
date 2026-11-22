@@ -39,22 +39,17 @@ use crate::provenance::{
     admit, AdmissionDecision, ResolvedAuthority, ResolvedScope, ScopeRelation,
 };
 use crate::{
-    unenforceable_axis, Caveats, ConfinementMechanism, EnforcementFloor, Scope, ToolError,
-    ToolResult,
+    unenforceable_axis, Caveats, ConfinementMechanism, EnforcementFloor, SandboxPolicy, Scope,
+    ToolError, ToolResult,
 };
 
-/// Path fragments that name the harness's own secret/private stores. A closure
-/// entry that would make any of these child-visible is refused at declaration
-/// time — the closure is *harness-disjoint* by definition (the OCAP store, key
-/// material, and agent state are the harness's authority, never the child's).
-const HARNESS_PRIVATE_MARKERS: &[&str] = &[".newt", ".ssh", ".gnupg", ".aws", ".config/gh"];
-
-/// Whether a single path entry reaches one of the harness-private stores — the
+/// Whether a single path entry reaches one of the harness-private stores named
+/// by `markers` (`SandboxPolicy::harness_private_markers`, #500) — the
 /// one canonical predicate every harness-disjoint check shares (the per-entry
 /// declaration guard, the whole-closure lattice guard, and the backend's
 /// object-identity check on a closure root's *canonical* form), so there is
 /// exactly one definition of "harness-private" in the crate.
-pub(crate) fn entry_reaches_harness_private(entry: &str) -> bool {
+pub(crate) fn entry_reaches_harness_private(entry: &str, markers: &[String]) -> bool {
     // Treat each marker as a path-COMPONENT SEQUENCE, so a MULTI-segment marker
     // like `.config/gh` matches a path INSIDE it (`…/.config/gh/hosts.yml`) — a
     // per-segment match misses that (found by the PR-0b final adversarial pass).
@@ -62,13 +57,13 @@ pub(crate) fn entry_reaches_harness_private(entry: &str) -> bool {
     // sibling like `/opt/newt-tools` does NOT match `.newt` and `/home/u/.sshfoo`
     // does NOT match `.ssh`.
     let padded = format!("/{}/", entry.trim_matches('/'));
-    HARNESS_PRIVATE_MARKERS
+    markers
         .iter()
         .any(|marker| padded.contains(&format!("/{}/", marker.trim_matches('/'))))
 }
 
-fn require_harness_disjoint(entry: &str) -> ToolResult<()> {
-    if entry_reaches_harness_private(entry) {
+fn require_harness_disjoint(entry: &str, markers: &[String]) -> ToolResult<()> {
+    if entry_reaches_harness_private(entry, markers) {
         return Err(ToolError::denied(format!(
             "refusing closure entry {entry:?}: it reaches a harness-private store \
              (the runtime closure must be harness-disjoint)"
@@ -84,11 +79,11 @@ fn require_harness_disjoint(entry: &str) -> ToolResult<()> {
 /// reaches a harness-private store; an `Unbounded`/`Unknown` axis is non-disjoint
 /// by definition (it would authorize everything / cannot be decided) and so fails
 /// closed — a closure may never launder unbounded or undecidable authority.
-pub(crate) fn closure_is_harness_disjoint(closure: &ResolvedAuthority) -> bool {
+pub(crate) fn closure_is_harness_disjoint(closure: &ResolvedAuthority, markers: &[String]) -> bool {
     let axis_ok = |scope: &ResolvedScope| match scope {
         ResolvedScope::Bounded { concrete, .. } => concrete
             .iter()
-            .all(|entry| !entry_reaches_harness_private(entry)),
+            .all(|entry| !entry_reaches_harness_private(entry, markers)),
         ResolvedScope::Unbounded | ResolvedScope::Unknown => false,
     };
     axis_ok(&closure.fs_read) && axis_ok(&closure.fs_write) && axis_ok(&closure.exec)
@@ -99,17 +94,37 @@ pub(crate) fn closure_is_harness_disjoint(closure: &ResolvedAuthority) -> bool {
 ///
 /// Empty by default: the common spawn adds nothing. Each entry is refused at
 /// declaration time if it reaches a harness-private store.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeClosure {
     exec: BTreeSet<String>,
     fs_read: BTreeSet<String>,
+    /// The harness-private markers entries are checked against (#500).
+    harness_private: Vec<String>,
+}
+
+impl Default for RuntimeClosure {
+    fn default() -> Self {
+        Self::for_policy(&SandboxPolicy::default())
+    }
 }
 
 impl RuntimeClosure {
-    /// The empty closure — the harness adds nothing beyond the grant.
+    /// The empty closure — the harness adds nothing beyond the grant. Uses the
+    /// default harness-private markers.
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// The empty closure, checked against `policy.harness_private_markers`
+    /// (#500) at declaration and at [`AdmittedFence::admit`].
+    #[must_use]
+    pub fn for_policy(policy: &SandboxPolicy) -> Self {
+        Self {
+            exec: BTreeSet::new(),
+            fs_read: BTreeSet::new(),
+            harness_private: policy.harness_private_markers.resolve(),
+        }
     }
 
     /// Declare one executable the harness adds to the mechanism's exec
@@ -120,7 +135,7 @@ impl RuntimeClosure {
     /// [`ToolError::Denied`] when the entry violates harness-disjointness.
     pub fn with_exec(mut self, program: impl Into<String>) -> ToolResult<Self> {
         let program = program.into();
-        require_harness_disjoint(&program)?;
+        require_harness_disjoint(&program, &self.harness_private)?;
         self.exec.insert(program);
         Ok(self)
     }
@@ -136,7 +151,7 @@ impl RuntimeClosure {
     /// [`ToolError::Denied`] when the entry violates harness-disjointness.
     pub fn with_fs_read(mut self, path: impl Into<String>) -> ToolResult<Self> {
         let path = path.into();
-        require_harness_disjoint(&path)?;
+        require_harness_disjoint(&path, &self.harness_private)?;
         self.fs_read.insert(path);
         Ok(self)
     }
@@ -310,7 +325,7 @@ impl AdmittedFence {
         // L3 (a): the declared runtime closure must be harness-disjoint — it may
         // rest on system loader/base-read substrate but never the harness's own
         // stores, and never launder unbounded or undecidable authority.
-        if !closure_is_harness_disjoint(&projection.runtime_closure) {
+        if !closure_is_harness_disjoint(&projection.runtime_closure, &closure.harness_private) {
             return Err(ToolError::denied(
                 "refusing to spawn: the backend runtime closure reaches harness-private \
                  authority or an undecidable axis (L3 BOUND: closure must be harness-disjoint)",
@@ -468,6 +483,10 @@ mod tests {
             identity_projection,
         )
         .expect("advisory floor + identity projection admits")
+    }
+
+    fn markers() -> Vec<String> {
+        SandboxPolicy::default().harness_private_markers.resolve()
     }
 
     fn empty_closure_ledger() -> RuntimeClosure {
@@ -696,15 +715,55 @@ mod tests {
         );
     }
 
+    /// #500: an embedder's own marker, added through the policy, refuses a
+    /// closure entry under it at declaration and at admission.
+    #[test]
+    fn an_embedder_marker_from_the_policy_refuses_at_declaration_and_admission() {
+        let mut policy = SandboxPolicy::default();
+        policy
+            .harness_private_markers
+            .extra
+            .push(".example-harness".into());
+        let entry = "/home/u/.example-harness/store";
+        assert!(
+            RuntimeClosure::for_policy(&policy)
+                .with_exec(entry)
+                .is_err(),
+            "declaration must refuse the embedder's store"
+        );
+        assert!(RuntimeClosure::empty().with_exec(entry).is_ok());
+
+        let delegated = exec_only(&["/usr/bin/git"]);
+        let project = |_caveats: &Caveats| BackendProjection {
+            resolved: ResolvedAuthority::from_delegated(&exec_only(&["/usr/bin/git"])),
+            runtime_closure: ResolvedAuthority {
+                fs_read: exec_scope(&[entry]),
+                ..empty_closure()
+            },
+        };
+        let err = AdmittedFence::admit(
+            &delegated,
+            RuntimeClosure::for_policy(&policy),
+            mechanism_none(),
+            advisory_floor(),
+            project,
+        )
+        .unwrap_err();
+        let ToolError::Denied { reason } = err else {
+            panic!("expected a denial")
+        };
+        assert!(reason.contains("harness-private"), "{reason}");
+    }
+
     #[test]
     fn closure_is_harness_disjoint_flags_unbounded_and_private() {
-        assert!(closure_is_harness_disjoint(&empty_closure()));
+        assert!(closure_is_harness_disjoint(&empty_closure(), &markers()));
         let mut private = empty_closure();
         private.fs_read = exec_scope(&["/home/u/.ssh/id_ed25519"]);
-        assert!(!closure_is_harness_disjoint(&private));
+        assert!(!closure_is_harness_disjoint(&private, &markers()));
         let mut unbounded = empty_closure();
         unbounded.exec = ResolvedScope::Unbounded;
-        assert!(!closure_is_harness_disjoint(&unbounded));
+        assert!(!closure_is_harness_disjoint(&unbounded, &markers()));
     }
 
     #[test]
@@ -712,16 +771,35 @@ mod tests {
         // A MULTI-segment marker (`.config/gh`) must match a path INSIDE it — a
         // per-segment check missed this (found by the PR-0b final adversarial pass).
         assert!(entry_reaches_harness_private(
-            "/home/u/.config/gh/hosts.yml"
+            "/home/u/.config/gh/hosts.yml",
+            &markers()
         ));
-        assert!(entry_reaches_harness_private("/home/u/.config/gh"));
+        assert!(entry_reaches_harness_private(
+            "/home/u/.config/gh",
+            &markers()
+        ));
         // Single-segment markers still match on component boundaries.
-        assert!(entry_reaches_harness_private("/home/u/.ssh/id_ed25519"));
-        assert!(entry_reaches_harness_private("/home/u/.newt/ocap"));
+        assert!(entry_reaches_harness_private(
+            "/home/u/.ssh/id_ed25519",
+            &markers()
+        ));
+        assert!(entry_reaches_harness_private(
+            "/home/u/.newt/ocap",
+            &markers()
+        ));
         // …and do NOT false-positive on a mere prefix/sibling.
-        assert!(!entry_reaches_harness_private("/opt/newt-tools/worker"));
-        assert!(!entry_reaches_harness_private("/home/u/.sshfoo/x"));
-        assert!(!entry_reaches_harness_private("/home/u/.config/ghi/x"));
+        assert!(!entry_reaches_harness_private(
+            "/opt/newt-tools/worker",
+            &markers()
+        ));
+        assert!(!entry_reaches_harness_private(
+            "/home/u/.sshfoo/x",
+            &markers()
+        ));
+        assert!(!entry_reaches_harness_private(
+            "/home/u/.config/ghi/x",
+            &markers()
+        ));
     }
 
     // ── L4 still enforced through the same admission door ────────────────────
