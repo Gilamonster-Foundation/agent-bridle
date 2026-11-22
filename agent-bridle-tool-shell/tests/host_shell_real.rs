@@ -123,11 +123,10 @@ async fn stderr_observer_and_host_envelope_apply_the_output_cap() {
     observer.wait_finished();
     let observed = observer.bytes(ShellOutputStream::Stderr);
     assert_eq!(observed.len(), OUTPUT_CAP);
-    let envelope = out["stderr"].as_str().expect("stderr string");
-    let captured = envelope
-        .strip_suffix("…[truncated]")
-        .expect("host envelope marks truncation");
+    let captured = out["stderr"].as_str().expect("stderr string");
     assert_eq!(captured.as_bytes(), observed);
+    // #491: the flag, not an in-band marker, reports the cut.
+    assert_eq!(out["stderr_truncated"], true, "{out}");
 }
 
 /// **The reality check (ADR 0019 D1/D2).** Full shell semantics run — a `$(...)`

@@ -29,9 +29,9 @@ use crate::output_observer::{drain_capped, output_session};
 /// The engine identity stamped on the disclosure (ADR 0019 D4).
 const ENGINE_NAME: &str = "sandbox-host";
 
-/// Default cap on captured output bytes (mirrors the safe-subset engine's
-/// [`LimitsPolicy`](agent_bridle_core::LimitsPolicy) default; kept local so the
-/// engine has no extra config surface for the MVP).
+/// Default cap on captured output bytes for [`HostShellTool::new`]. Smaller
+/// than the [`LimitsPolicy`](agent_bridle_core::LimitsPolicy) default (1 MiB),
+/// which [`HostShellTool::with_limits`] and `ShellEngine::build` apply.
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
 
 /// The engine's input schema, parsed once from the embedded data file. The
@@ -57,6 +57,7 @@ pub struct HostShellTool {
     shell: String,
     max_output: usize,
     timeout: std::time::Duration,
+    limits: agent_bridle_core::LimitsPolicy,
     sandbox: Arc<SandboxPolicy>,
     /// The tool's input schema — a *property* of this engine instance, not a
     /// hard-coded literal in [`Tool::schema`]. Defaults to the embedded
@@ -91,11 +92,29 @@ impl HostShellTool {
             timeout: std::time::Duration::from_secs(
                 agent_bridle_core::LimitsPolicy::default().default_timeout_secs,
             ),
+            limits: agent_bridle_core::LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             execution_lease: None,
         }
+    }
+
+    /// Apply a [`LimitsPolicy`](agent_bridle_core::LimitsPolicy): its output
+    /// cap, default timeout, timeout ceiling and env denylist.
+    #[must_use]
+    pub fn with_limits(mut self, limits: agent_bridle_core::LimitsPolicy) -> Self {
+        self.max_output = limits.max_output_bytes;
+        self.timeout = std::time::Duration::from_secs(limits.default_timeout_secs);
+        self.limits = limits;
+        self
+    }
+
+    /// Select the OS-sandbox mechanism policy for the fence.
+    #[must_use]
+    pub fn with_sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
+        self.sandbox = policy;
+        self
     }
 
     /// Bound this invocation using the shared process-group supervisor.
@@ -219,10 +238,10 @@ impl Tool for HostShellTool {
         // One request shape for every engine (#490): `env` is fenced of
         // loader/hook names (AB-004); `timeout_secs` overrides the configured
         // timeout, clamped to the limits ceiling.
-        let limits = agent_bridle_core::LimitsPolicy::default();
+        let limits = &self.limits;
         let request = crate::request::ShellRequest::parse(&args)?;
         let cmd = request.require_cmd("sandbox-host")?.to_string();
-        let timeout = request.timeout(&limits, self.timeout);
+        let timeout = request.timeout(limits, self.timeout);
 
         // ADR 0019 D2 — honesty. The engine only serves fs-restricted; a
         // restricted exec/net grant is refused (the shell forks children this
@@ -240,7 +259,7 @@ impl Tool for HostShellTool {
             ));
         }
 
-        let mut env = request.env(&limits);
+        let mut env = request.env(limits);
         // Full-access PATH seeding (Track 1a / parity). We only reach here when
         // `exec` is unrestricted (a restricted exec/net was refused above), so the
         // child is already permitted to run anything on the host. Seed a usable
@@ -343,6 +362,7 @@ impl Tool for HostShellTool {
         let envelope = ToolEnvelope::new(sandbox_kind)
             .with_disclosure(self.disclosure())
             .with_exit_code(exit_code)
+            .with_truncation(stdout_truncated, stderr_truncated && !timed_out)
             .with_stdout(stdout)
             .with_stderr(stderr)
             .with_timed_out(timed_out)
@@ -364,7 +384,9 @@ fn cap_utf8(bytes: &[u8], max: usize, truncated: bool) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…[truncated]", &s[..end])
+    // The envelope's truncation flags report the cut (#491); no in-band
+    // marker, so stdout never exceeds the cap, as in the other engines.
+    s[..end].to_owned()
 }
 
 #[cfg(test)]

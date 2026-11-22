@@ -46,7 +46,8 @@ use crate::output_observer::{drain_capped, output_session, OutputEmitter};
 
 /// The engine identity stamped on the disclosure (ADR 0005 D2 / ADR 0019 D4).
 const ENGINE_NAME: &str = "brush";
-/// Default cap on captured output bytes (mirrors the other engines' default).
+/// Default cap on captured output bytes for [`BrushShellTool::new`]; see
+/// [`BrushShellTool::with_limits`] for the 1 MiB `LimitsPolicy` default.
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
 /// Minimal, standard `PATH` used when `exec` is RESTRICTED: external commands
 /// must still *resolve* so they reach the interceptor's `before_exec` gate
@@ -94,6 +95,7 @@ pub struct BrushShellTool {
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     execution_lease: Option<crate::ExecutionLease>,
+    limits: agent_bridle_core::LimitsPolicy,
     /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
     /// and reported `timed_out:true` with exit 124.
     timeout: Duration,
@@ -122,6 +124,7 @@ impl BrushShellTool {
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             execution_lease: None,
+            limits: agent_bridle_core::LimitsPolicy::default(),
             timeout: default_timeout(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
             named_host_roots: false,
@@ -135,6 +138,16 @@ impl BrushShellTool {
         stream_limits(max_output)?;
         self.max_output = max_output;
         Ok(self)
+    }
+
+    /// Apply a [`LimitsPolicy`](agent_bridle_core::LimitsPolicy): its output
+    /// cap (validated as in [`Self::with_max_output_bytes`]), default timeout,
+    /// timeout ceiling and env denylist.
+    pub fn with_limits(self, limits: agent_bridle_core::LimitsPolicy) -> ToolResult<Self> {
+        let mut tool = self.with_max_output_bytes(limits.max_output_bytes)?;
+        tool.timeout = Duration::from_secs(limits.default_timeout_secs);
+        tool.limits = limits;
+        Ok(tool)
     }
 
     /// Retain caller-owned execution resources through worker shutdown.
@@ -229,10 +242,10 @@ impl Tool for BrushShellTool {
         // deliberate import surface (this engine runs `do_not_inherit_env`),
         // fenced of loader/hook names (AB-004); `timeout_secs` overrides the
         // configured timeout, clamped to the limits ceiling.
-        let limits = agent_bridle_core::LimitsPolicy::default();
+        let limits = &self.limits;
         let request = crate::request::ShellRequest::parse(&args)?;
         let cmd = request.require_cmd("brush")?.to_string();
-        let timeout = request.timeout(&limits, self.timeout);
+        let timeout = request.timeout(limits, self.timeout);
         let cwd = request
             .cwd
             .as_deref()
@@ -241,7 +254,7 @@ impl Tool for BrushShellTool {
             .canonicalize()
             .map_err(|error| ToolError::denied(format!("brush cwd is invalid: {error}")))?;
         cx.check_path_read(&cwd)?;
-        let env = request.env(&limits);
+        let env = request.env(limits);
 
         // PATH parity: the FULL ambient path when `exec` is unrestricted (so the
         // agent's own tools — `~/.cargo/bin`, `/opt/homebrew/bin`, … — resolve
