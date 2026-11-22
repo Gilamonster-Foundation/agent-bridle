@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use agent_bridle_core::{Gate, Scope, Tool, ToolContext, ToolResult, TrustedWorkerRequest};
+use agent_bridle_core::{Tool, ToolContext, ToolResult, TrustedWorkerRequest};
 use serde::{Deserialize, Serialize};
 
 use crate::brush_protocol::{
@@ -74,27 +74,17 @@ fn receive_request() -> Result<(WorkerPayload, ToolContext), String> {
     if !request.has_supported_version() {
         return Err("unsupported worker protocol version".to_string());
     }
-    let (nonce, caveats, strength_floor, payload) = request.into_parts();
+    let (nonce, authority, payload) = request.into_parts();
     let expected = std::env::var("AGENT_BRIDLE_WORKER_NONCE")
         .map_err(|_| "worker nonce is absent".to_string())?;
     if nonce != expected {
         return Err("worker nonce mismatch".to_string());
     }
 
-    let generation = match &caveats.valid_for_generation {
-        Scope::All => 0,
-        Scope::Only(values) => values
-            .iter()
-            .copied()
-            .next()
-            .ok_or_else(|| "worker grant has no valid generation".to_string())?,
-    };
-    let tool = WorkerTool;
-    let cx = Gate::new(generation)
-        // The delegated floor is per-axis (`EnforcementFloor`), re-applied
-        // faithfully so the worker's own confinement matches the supervisor's.
-        .with_enforcement_floor(strength_floor)
-        .authorize(&tool, &caveats)
+    // Core re-mints through `Gate::authorize`, re-applying the delegated
+    // per-axis floor and the sandbox kind of the fence this worker runs under.
+    let cx = authority
+        .authorize(&WorkerTool)
         .map_err(|error| format!("worker authorization failed: {error}"))?;
     Ok((payload, cx))
 }
