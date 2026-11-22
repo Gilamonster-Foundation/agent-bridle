@@ -40,7 +40,9 @@ use crate::{
     ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy,
     ToolContext, ToolError, ToolResult,
 };
+mod launch;
 mod worker_image;
+pub use launch::{AppliedFence, ConfinedLaunch, FencedCommand, LaunchPlan, LaunchRefusal};
 use worker_image::WorkerImage;
 
 use agent_mesh_protocol::Fingerprint;
@@ -849,7 +851,7 @@ impl ConfinedCommand {
         // (Landlock, via `apply`) and Noop. Computed here so a fail-closed wrapper
         // error aborts *before* we spawn the thread. Built from the ADMITTED
         // caveats — the same object `apply` consumes on the spawn thread.
-        let prefix = sandbox.command_prefix(&mechanism_effective)?;
+        let prefix = sandbox.command_prefix(&mechanism_effective, crate::ApplyToken::core())?;
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
         //     child inherits the OS confinement — the per-thread, fork/exec-
@@ -951,9 +953,9 @@ impl ConfinedCommand {
             // non-empty.
             if prefix.is_empty() {
                 if let Some(image) = &worker_image {
-                    sandbox.apply_with_worker(&mechanism_effective, &image.program, &image.file)?;
+                    sandbox.apply_with_worker(&mechanism_effective, &image.program, &image.file, crate::ApplyToken::core())?;
                 } else {
-                    sandbox.apply(&mechanism_effective)?;
+                    sandbox.apply(&mechanism_effective, crate::ApplyToken::core())?;
                 }
             }
 
