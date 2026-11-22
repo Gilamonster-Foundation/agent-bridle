@@ -79,7 +79,10 @@ pub async fn tools_call(registry: &Registry, grant: &Grant, params: Value) -> Va
         // `denied: true` in the envelope (the brush run "succeeded" at the
         // process level — exit 126 — but a capability was refused). Surface that
         // as an MCP tool error too, reading the structured field, NOT stderr.
-        Ok(result) if is_denied(&result) => tool_error(&denial_reason(&result)),
+        // The reason leads, but the whole envelope follows (#478): a Brush run
+        // keeps going past a refused exec, so stdout and exit code report
+        // effects that already happened.
+        Ok(result) if is_denied(&result) => tool_denied(&denial_reason(&result), &result),
         Ok(result) => tool_success(&result),
         // A leash denial on the Err path — the argv/pre-dispatch case. Surface
         // the reason in-band.
@@ -119,17 +122,32 @@ fn denial_reason(result: &Value) -> String {
     }
 }
 
-/// A successful MCP tool result: the tool's JSON value rendered as `text`
-/// content. (Structured output is preserved verbatim so a client that prefers
-/// the raw envelope can re-parse it.)
-fn tool_success(result: &Value) -> Value {
-    let text = match result {
+/// A tool's JSON value rendered as `text`. (Structured output is preserved
+/// verbatim so a client that prefers the raw envelope can re-parse it.)
+fn render(result: &Value) -> String {
+    match result {
         Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
-    };
+    }
+}
+
+/// A successful MCP tool result: the tool's JSON value as `text` content.
+fn tool_success(result: &Value) -> Value {
     serde_json::json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": [{ "type": "text", "text": render(result) }],
         "isError": false,
+    })
+}
+
+/// An in-band denial: `isError: true`, the reason as the first text block and
+/// the whole envelope (output, typed denials, disclosure) as the second.
+fn tool_denied(reason: &str, result: &Value) -> Value {
+    serde_json::json!({
+        "content": [
+            { "type": "text", "text": reason },
+            { "type": "text", "text": render(result) },
+        ],
+        "isError": true,
     })
 }
 
@@ -361,6 +379,45 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no_such_tool"));
+    }
+
+    /// #478: a denied `Ok` envelope must keep the output of commands that ran
+    /// and the typed denial, not collapse to its reason strings.
+    #[tokio::test]
+    async fn denied_envelope_keeps_output_and_typed_denials() {
+        struct Stub;
+        #[async_trait::async_trait]
+        impl agent_bridle::Tool for Stub {
+            fn name(&self) -> &str {
+                "stub"
+            }
+            fn schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn invoke(
+                &self,
+                _args: Value,
+                _cx: &agent_bridle::ToolContext,
+            ) -> agent_bridle::ToolResult<Value> {
+                Ok(serde_json::json!({
+                    "stdout": "before\n",
+                    "exit_code": 0,
+                    "denied": true,
+                    "denials": [{ "kind": "exec", "target": "rm", "reason": "rm not granted" }],
+                }))
+            }
+        }
+        let reg = Registry::builder().tool(std::sync::Arc::new(Stub)).build();
+        let grant = reg.mint_grant(Caveats::top());
+        let v = tools_call(&reg, &grant, serde_json::json!({ "name": "stub" })).await;
+        assert_eq!(v["isError"], true, "{v}");
+        assert_eq!(v["content"][0]["text"], "rm not granted");
+        let text = v["content"].to_string();
+        assert!(text.contains("before"), "stdout dropped: {text}");
+        assert!(
+            text.contains(r#"\"target\":\"rm\""#),
+            "typed denial dropped: {text}"
+        );
     }
 
     #[tokio::test]
