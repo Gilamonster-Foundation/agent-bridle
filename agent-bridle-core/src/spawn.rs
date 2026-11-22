@@ -2789,6 +2789,112 @@ mod landlock_child_tests {
         let _ = fs::remove_dir_all(&granted_read);
     }
 
+    /// The helper for the #498 proof: unshare a user and a mount namespace,
+    /// bind-mount `argv[1]` over `argv[2]`, and print `argv[2]/payload`. It
+    /// makes the two syscalls itself and writes no `uid_map`, as ADR 0011's
+    /// scenario does, so its exit code says which step was refused: 3 for
+    /// `unshare`, 4 for `mount`.
+    const BIND_MOUNT_ESCAPE: &str = r#"
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+CLONE_NEWNS, CLONE_NEWUSER, MS_BIND = 0x00020000, 0x10000000, 4096
+if libc.unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0:
+    sys.stderr.write("unshare: " + os.strerror(ctypes.get_errno()))
+    sys.exit(3)
+if libc.mount(sys.argv[1].encode(), sys.argv[2].encode(), None, MS_BIND, None) != 0:
+    sys.stderr.write("mount: " + os.strerror(ctypes.get_errno()))
+    sys.exit(4)
+sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
+"#;
+
+    /// #498: the bind-mount escape, on a real host with a positive control
+    /// (#361). ADR 0011 recorded this escape as confirmed: a confined process
+    /// unshares a user and a mount namespace, bind-mounts a payload over a
+    /// path its grant can read, and reads the payload there. The kernel's
+    /// Landlock documentation says the opposite: a thread with filesystem
+    /// rules cannot change the mount topology.
+    ///
+    /// The control runs the same helper unconfined and must read the payload.
+    /// Where it cannot (a host that restricts unprivileged user namespaces),
+    /// the host cannot show the escape and this proves nothing: the test
+    /// skips, or fails when `BRIDLE_REQUIRE_USERNS` is set.
+    #[test]
+    fn bind_mount_in_a_new_user_namespace_is_refused_under_an_fs_restricted_grant() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let python = "/usr/bin/python3";
+        if !std::path::Path::new(python).exists() {
+            eprintln!("skipping: no {python}");
+            return;
+        }
+        let readable = unique_dir("userns-readable");
+        let secret = unique_dir("userns-secret");
+        let mount_point = readable.join("mnt");
+        fs::create_dir(&mount_point).unwrap();
+        fs::write(secret.join("payload"), "escaped").unwrap();
+        let cleanup = || {
+            let _ = fs::remove_dir_all(&readable);
+            let _ = fs::remove_dir_all(&secret);
+        };
+
+        let control = std::process::Command::new(python)
+            .args(["-c", BIND_MOUNT_ESCAPE])
+            .arg(&secret)
+            .arg(&mount_point)
+            .output()
+            .expect("run the unconfined control");
+        if control.stdout != b"escaped" {
+            let why = String::from_utf8_lossy(&control.stderr).into_owned();
+            cleanup();
+            assert!(
+                std::env::var_os("BRIDLE_REQUIRE_USERNS").is_none(),
+                "BRIDLE_REQUIRE_USERNS is set, but the unconfined control could not \
+                 bind-mount in a new user namespace ({why}); this host cannot show the escape"
+            );
+            eprintln!("skipping: the unconfined control cannot bind-mount here ({why})");
+            return;
+        }
+
+        // The same helper under a grant that can read `readable` and the
+        // system trees the interpreter needs, but not `secret`.
+        let roots = [readable.to_string_lossy().into_owned()]
+            .into_iter()
+            .chain(["/usr", "/lib", "/lib64", "/etc"].map(String::from));
+        let cx = ctx(Caveats {
+            fs_read: Scope::only(roots),
+            fs_write: Scope::only([readable.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        let confined = ConfinedCommand::new(python)
+            .args(["-c", BIND_MOUNT_ESCAPE])
+            .arg(&secret)
+            .arg(&mount_point)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn(&cx)
+            .expect("an fs-restricted spawn is admitted under Landlock")
+            .child
+            .wait_with_output()
+            .unwrap();
+        cleanup();
+        let stderr = String::from_utf8_lossy(&confined.stderr);
+        eprintln!(
+            "confined helper: status {:?}, stderr {stderr:?}",
+            confined.status.code()
+        );
+        assert_ne!(
+            confined.stdout, b"escaped",
+            "the payload was read through a bind mount: the escape is real"
+        );
+        assert_eq!(
+            confined.status.code(),
+            Some(4),
+            "Landlock must refuse the mount itself (exit 4), not some earlier step: {stderr}"
+        );
+    }
+
     /// #419: replacing the admitted path must not execute the replacement.
     ///
     /// The original keeps its file name (moved to a subdirectory), and the

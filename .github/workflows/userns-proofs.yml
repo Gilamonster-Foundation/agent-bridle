@@ -1,0 +1,61 @@
+# agent-bridle — real-host proofs that need unprivileged user namespaces.
+#
+# WHY THIS EXISTS: the bind-mount escape (ADR 0011, #498) can only be shown, or
+# shown closed, on a host where an unprivileged process may create a user
+# namespace and mount inside it. Ubuntu restricts that by default, so the proof
+# skips there and proves nothing. This lane turns user namespaces on and sets
+# BRIDLE_REQUIRE_USERNS, so the positive control must mount: a run where the
+# control cannot mount fails, it does not skip.
+#
+# HOOK PARITY: intentionally NONE. `.githooks/pre-push` cannot change a sysctl,
+# and `just check` runs the same test in skip mode on a host that restricts
+# user namespaces. This lane is the proof; the hook is not.
+
+name: Userns Proofs
+
+on:
+  schedule:
+    # Mondays 08:30 UTC, beside the weekly regression sweep.
+    - cron: "30 8 * * 1"
+  workflow_dispatch: {}
+  # TEMPORARY (#498): run on this branch's pushes to get the first result
+  # before a PR exists. Removed before the PR is opened.
+  push:
+    branches: ["feat-498/**"]
+  pull_request:
+    paths:
+      - ".github/workflows/userns-proofs.yml"
+      - "agent-bridle-core/src/spawn.rs"
+      - "agent-bridle-core/src/sandbox.rs"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bind-mount-escape:
+    name: bind-mount escape (user namespaces on)
+    # A GitHub-hosted VM on purpose: the step below needs sudo to change a sysctl.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          uname -r
+          cat /sys/kernel/security/lsm
+          unshare -Urm true
+      - name: Bind-mount escape proof (the control must mount)
+        env:
+          BRIDLE_REQUIRE_LANDLOCK: "1"
+          BRIDLE_REQUIRE_USERNS: "1"
+        run: >-
+          cargo test -p agent-bridle-core --all-features --lib --
+          bind_mount_in_a_new_user_namespace --nocapture
