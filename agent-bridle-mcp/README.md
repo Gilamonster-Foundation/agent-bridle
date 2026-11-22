@@ -4,7 +4,16 @@ An MCP (Model Context Protocol) stdio server over the agent-bridle
 capability-governed tool registry. Any MCP client (e.g. `claude mcp add`, or a
 host's `mcp_servers:` config) can drive this binary over stdio and call the
 Caveats-confined Rust tools; the server speaks newline-delimited JSON-RPC 2.0
-and handles `initialize`, `tools/list`, `tools/call`, and `shutdown`/`exit`.
+and handles `initialize`, `tools/list`, `tools/call`, `ping`, and
+`shutdown`/`exit`.
+
+Each `tools/call` runs as its own task, so responses arrive in completion
+order, matched to requests by `id`. `notifications/cancelled` drops the named
+call; SIGTERM, SIGINT or `exit` drops them all. Dropping a call kills and
+reaps its worker's process group, so stopping the server leaves no worker
+running. A cancelled call is not answered and stays charged against
+`max_calls`. When stdin closes, the server answers the calls still in flight,
+then exits.
 
 The leash is real and configurable: the session's granted `Caveats` come from
 `$AGENT_BRIDLE_CAVEATS` (JSON), else `~/.agent-bridle/config.toml` `[caveats]`,
