@@ -18,10 +18,6 @@ on:
     # Mondays 08:30 UTC, beside the weekly regression sweep.
     - cron: "30 8 * * 1"
   workflow_dispatch: {}
-  # TEMPORARY (#498): run on this branch's pushes to get the first result
-  # before a PR exists. Removed before the PR is opened.
-  push:
-    branches: ["feat-498/**"]
   pull_request:
     paths:
       - ".github/workflows/userns-proofs.yml"

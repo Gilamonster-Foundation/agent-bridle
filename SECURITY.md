@@ -15,17 +15,18 @@ public issues for undisclosed vulnerabilities.
 
 On Linux, the `linux-landlock` backend kernel-confines a permitted program's
 filesystem reads/writes and denies a **direct** `execve` of an un-granted tool
-(ADR 0011). Two residual escapes are not closed by Landlock alone and have host
-mitigations an operator should apply:
+(ADR 0011). Of the two escapes once listed here, Landlock closes the first by
+itself and does not close the second:
 
-- **Bind-mount re-point** — `unshare(CLONE_NEWUSER|CLONE_NEWNS)` then
-  `mount --bind` a payload over a read-allowed path. This requires **unprivileged
-  user namespaces**; disable them on the host to close it:
-  - `sysctl -w kernel.unprivileged_userns_clone=0` (Debian/Ubuntu), and/or
-  - `sysctl -w user.max_user_namespaces=0`, and/or
-  - on Ubuntu ≥ 24.04, `sysctl -w kernel.apparmor_restrict_unprivileged_userns=1`.
-
-  Most hardened hosts already set one of these.
+- **Bind-mount re-point: refused by Landlock.** `unshare(CLONE_NEWUSER|CLONE_NEWNS)`
+  then `mount --bind` a payload over a read-allowed path. A thread under a
+  Landlock filesystem ruleset cannot `mount(2)`, in a new user namespace or not:
+  the `unshare` succeeds and the `mount` fails with `EPERM`, while the same
+  helper unconfined reads the payload. Measured by
+  `bind_mount_in_a_new_user_namespace_is_refused_under_an_fs_restricted_grant`,
+  which the weekly `Userns Proofs` lane runs on a host with user namespaces on
+  (#498). Disabling unprivileged user namespaces is ordinary host hardening, not
+  a precondition for this boundary.
 - **Loader/interpreter trampoline** — `ld.so` `mmap`-execs any *readable* ELF, and
   a granted interpreter (`sh`, `python`, …) runs arbitrary in-process code.
   Landlock has no `mmap` hook, so this is **not** kernel-closed — which is exactly
@@ -43,14 +44,6 @@ mitigations an operator should apply:
   *does*. A granted interpreter's interior is governed only by the
   `fs_read`/`fs_write`/`net` axes; keep those tight, and grant interpreters only
   deliberately (they are the highest-authority `exec` choice — ADR 0012 D8).
-
-> A future `linux-seccomp` backstop (ADR 0011 D4) could deny the mount/namespace
-> syscall family in-process as defense-in-depth for the bind-mount case. It needs
-> a hand-rolled, arch-guarded BPF filter — a single `seccompiler` `mismatch_action`
-> cannot keep the wrong-arch guard distinct from the permissive default a denylist
-> requires (the i386/x32 bypass) — so it must be authored and verified on a real
-> Landlock+seccomp host; tracked under #57/#35. The host-sysctl mitigation above
-> closes the same gap today, and a strong principal already fails closed regardless.
 
 ## Known security issues
 

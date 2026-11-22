@@ -1159,22 +1159,10 @@ impl SandboxedWorker {
         let confined = if crate::is_unbridled() {
             command.spawn_authorized(cx, Caveats::top(), SpawnAuthority::TrustedWorker)
         } else {
+            // No user-namespace precondition: a thread under a Landlock
+            // filesystem ruleset cannot `mount(2)`, in a new namespace or not
+            // (#498, `bind_mount_in_a_new_user_namespace_is_refused_...`).
             let effective = cx.caveats().clone();
-            let available = best_available_sandbox(&command.sandbox_policy).kind();
-            let reported = crate::effective_sandbox_kind(available, &effective);
-            #[cfg(not(target_os = "linux"))]
-            let _ = reported;
-            #[cfg(target_os = "linux")]
-            if reported == SandboxKind::Landlock
-                && crate::sandbox::restricts_fs(&effective)
-                && !linux_user_namespaces_hardened()
-            {
-                return Err(ToolError::denied(
-                    "refusing the Brush worker: Landlock filesystem confinement \
-                     is not a complete boundary while unprivileged user namespaces \
-                     remain available; disable them or add the namespace syscall backstop",
-                ));
-            }
             command.spawn_authorized(cx, effective, SpawnAuthority::TrustedWorker)
         }?;
         Ok(SandboxedWorkerChild {
@@ -1300,20 +1288,6 @@ fn trusted_worker_closure(
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_user_namespaces_hardened() -> bool {
-    fn sysctl_is(path: &str, expected: &str) -> bool {
-        std::fs::read_to_string(path).is_ok_and(|value| value.trim() == expected)
-    }
-
-    sysctl_is("/proc/sys/kernel/unprivileged_userns_clone", "0")
-        || sysctl_is("/proc/sys/user/max_user_namespaces", "0")
-        || sysctl_is(
-            "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
-            "1",
-        )
 }
 
 /// Spawn `program args` confined by `cx`, with the inherited stdio of the parent.
@@ -2810,9 +2784,9 @@ sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
     /// #498: the bind-mount escape, on a real host with a positive control
     /// (#361). ADR 0011 recorded this escape as confirmed: a confined process
     /// unshares a user and a mount namespace, bind-mounts a payload over a
-    /// path its grant can read, and reads the payload there. The kernel's
-    /// Landlock documentation says the opposite: a thread with filesystem
-    /// rules cannot change the mount topology.
+    /// path its grant can read, and reads the payload there. It is not: a
+    /// thread with Landlock filesystem rules cannot change the mount topology,
+    /// and the confined helper's `mount` fails with `EPERM`.
     ///
     /// The control runs the same helper unconfined and must read the payload.
     /// Where it cannot (a host that restricts unprivileged user namespaces),

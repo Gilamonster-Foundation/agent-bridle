@@ -76,7 +76,8 @@ python3 -c 'import os; os.execv("/lib64/ld-linux-x86-64.so.2",
 ```
 
 `curl` was never in `exec:Only{python3}`. **The readable set equals the runnable set.**
-Three corollaries, all empirically confirmed during the adversarial sweep, generalize it:
+Three corollaries generalize it. All three were recorded as empirically confirmed during
+the adversarial sweep; the second was not, and is corrected below:
 
 1. **`memfd`/`fexecve`/`/proc/self/fd`.** `memfd_create` + `execveat(fd,"",AT_EMPTY_PATH)`
    runs an arbitrary ELF: the memfd is an anonymous inode beneath no path rule, and
@@ -86,6 +87,15 @@ Three corollaries, all empirically confirmed during the adversarial sweep, gener
    (no `uid_map` write needed) then `mount --bind /work/payload /usr/lib/os-release` and
    read/run the payload through the read-allowed `/usr` rule. Landlock has **no `mount`
    hook** in any released ABI (V1–V6).
+
+   > **Correction (2026-11-22, #498).** This is wrong. A thread under a Landlock
+   > filesystem ruleset cannot `mount(2)`: with user namespaces on, the `unshare`
+   > succeeds and the `mount --bind` fails with `EPERM`, while the same helper
+   > unconfined reads the payload. Measured on Linux 7.0 by
+   > `bind_mount_in_a_new_user_namespace_is_refused_under_an_fs_restricted_grant`,
+   > which the weekly `Userns Proofs` lane runs. The mount/namespace deny of D4
+   > item 2 and D7 condition 4 is not needed to hold the filesystem boundary;
+   > whether it stays among the `exec → Kernel` conditions is not re-decided here.
 3. **A granted interpreter/multitool is arbitrary in-domain code by definition.**
    `python -c`, `sh -c`, `perl -e`, and `busybox <applet>` run attacker logic *in
    process* with **no further `execve`** — the `Execute` list and `check_exec` (argv0-only)
@@ -187,6 +197,7 @@ installed on the **same spawn thread, before spawn**, supplies two things Landlo
    `move_mount`, `open_tree`, `fsopen`/`fsconfig`/`fsmount`, `mount_setattr`, `pivot_root`,
    `chroot`, `setns`, and `clone`/`clone3`/`unshare` with `CLONE_NEWUSER|CLONE_NEWNS`. This
    removes the attacker's ability to re-point the read allow-list at a forbidden inode.
+   (#498: Landlock already refuses the `mount`; see the correction under corollary 2.)
 
 The seccomp filter **must default-DENY on an unexpected `seccomp_data.arch`** (validate
 `arch == ` the single native `AUDIT_ARCH_*` and `KILL_PROCESS` otherwise) and **mask
@@ -337,7 +348,7 @@ green test next to a silent run.
 | `grep -f /etc/shadow` / read-injection | **Closed** by the read allow-list (`/etc` not granted wholesale). |
 | **Loader trampoline** (`ld.so /usr/lib/<elf>`, `python -c 'execv(ld.so,…)'`) | **NOT closed** by Landlock (read-as-code, no `mmap` hook). **Honestly declared `Interceptor`** (D2/D7); strong principal **fails closed** (D8); fs boundary still holds; sound close is static-only+drop-loader (D7) or Tier-2 (D9). |
 | `memfd`/`fexecve`/`execveat`/`/proc/self/fd` | **Closed at syscall grain for `exec:none`** by the seccomp `execve`+`execveat` deny (D4, arch-guarded); for `exec:Only{set}` not reachable without exploiting the granted binary, and for a granted **interpreter** identity is gone — declared `Interceptor`. Boundary always holds. |
-| `bind-mount` / userns re-point into the read tree | **Closed** by the seccomp namespace/mount deny (D4); until that backstop is in force `exec` is **not** `Kernel` (D7). |
+| `bind-mount` / userns re-point into the read tree | **Closed by Landlock itself**: a thread under a filesystem ruleset cannot `mount(2)` (#498, measured). This row once required the D4 seccomp namespace/mount deny. |
 | `LD_PRELOAD` / `LD_LIBRARY_PATH` / `LD_AUDIT` | **Closed** by `env_clear` + the interpreter-env denylist (D5) and `read ∩ write = ∅` (D3). |
 | Path-games (basename collision in `fs_write`, writable-grant overwrite, PATH-shadow) | **Closed** by canonicalizing the exec target + `exec ∩ fs_write = ∅` + `env_clear PATH` (D5). |
 | `busybox`/`python`/`sh` multitool (no further `execve`) | **Not enforceable** — declared `exec ≡ All` for honesty (D6); strong principal fails closed. |
