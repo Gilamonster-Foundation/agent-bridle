@@ -19,15 +19,15 @@
 use std::sync::{Arc, LazyLock};
 
 use agent_bridle_core::{
-    Caveats, ConfinedCommand, Denial, DenialKind, Disclosure, Invocation, SandboxKind,
-    SandboxPolicy, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    Caveats, ConfinedCommand, Denial, DenialKind, Invocation, SandboxPolicy, Scope, Tool,
+    ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
 use crate::output_observer::{drain_capped, output_session};
 
 /// The engine identity stamped on the disclosure (ADR 0019 D4).
-const ENGINE_NAME: &str = "sandbox-host";
+const ENGINE_NAME: &str = crate::ShellEngine::Host.as_str();
 
 /// Default cap on captured output bytes for [`HostShellTool::new`]. Smaller
 /// than the [`LimitsPolicy`](agent_bridle_core::LimitsPolicy) default (1 MiB),
@@ -173,8 +173,7 @@ impl HostShellTool {
     /// `denied: true`, so a consumer can adapt (reshape, or select the
     /// safe-subset engine), never a silent fallback.
     fn engine_unavailable(&self, kind: DenialKind, axis: &str) -> serde_json::Value {
-        ToolEnvelope::new(SandboxKind::None)
-            .with_disclosure(self.disclosure())
+        ToolEnvelope::refused(ENGINE_NAME)
             .with_denials(vec![Denial {
                 kind,
                 target: format!("sandbox-host engine ({axis} restricted)"),
@@ -186,13 +185,6 @@ impl HostShellTool {
                 ),
             }])
             .into_json()
-    }
-
-    fn disclosure(&self) -> Disclosure {
-        Disclosure {
-            engine: Some(ENGINE_NAME.to_string()),
-            ..Disclosure::default()
-        }
     }
 }
 
@@ -297,7 +289,7 @@ impl Tool for HostShellTool {
         // enforces the fail-closed fs check and applies the jail on the spawn
         // thread, so the child inherits confinement.
         let confined = command.spawn(cx)?;
-        let sandbox_kind = confined.sandbox_kind;
+        let mechanism = confined.mechanism;
         let mut child = confined.child;
         let stdout_reader = child
             .stdout
@@ -359,8 +351,7 @@ impl Tool for HostShellTool {
         } else {
             cap_utf8(&stderr, max_output, stderr_truncated)
         };
-        let envelope = ToolEnvelope::new(sandbox_kind)
-            .with_disclosure(self.disclosure())
+        let envelope = ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
             .with_exit_code(exit_code)
             .with_truncation(stdout_truncated, stderr_truncated && !timed_out)
             .with_stdout(stdout)

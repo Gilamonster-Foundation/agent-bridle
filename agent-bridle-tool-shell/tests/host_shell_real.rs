@@ -178,8 +178,10 @@ async fn dynamic_construct_runs_but_out_of_scope_write_is_kernel_denied() {
         out["sandbox_kind"], "landlock",
         "engine must report real kernel enforcement: {out}"
     );
+    // #492: the host engine carries the per-axis report (ADR 0004 D1).
+    assert_eq!(out["enforcement"]["fs_write"], "kernel", "{out}");
     assert_eq!(
-        out["disclosure"]["engine"], "sandbox-host",
+        out["disclosure"]["engine"], "host",
         "engine identity must be disclosed (ADR 0019 D4): {out}"
     );
     // `denied` is omitted from JSON when false (skip_serializing_if), so it
@@ -289,7 +291,7 @@ async fn restricted_exec_is_refused_not_run() {
         "the denial must name the exec axis: {out}"
     );
     assert_eq!(
-        out["disclosure"]["engine"], "sandbox-host",
+        out["disclosure"]["engine"], "host",
         "engine identity disclosed even on refusal: {out}"
     );
     assert!(

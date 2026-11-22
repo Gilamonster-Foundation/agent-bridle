@@ -5,7 +5,7 @@
 //! recorded [`crate::SandboxKind`] travels with every result (DESIGN §6: "the
 //! Gate records `sandbox_kind` in **every** `ToolResult`").
 
-use crate::{EnforcementReport, HumanGate, SandboxKind};
+use crate::{ConfinementMechanism, EnforcementReport, HumanGate, SandboxKind, ToolContext};
 
 mod execution;
 
@@ -91,7 +91,7 @@ pub struct Disclosure {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mach_services: Option<crate::MachServiceDisclosure>,
     /// Which shell **engine** ran this operation (ADR 0019 D4 / #194) — e.g.
-    /// `"safe-subset"` or `"sandbox-host"`. Lets an embedder log which engine a
+    /// `"safe-subset"`, `"host"` or `"brush"`. Lets an embedder log which engine a
     /// dispatch used when more than one is registered. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
@@ -182,9 +182,40 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl ToolEnvelope {
-    /// An envelope stamped with the sandbox kind and nothing else set.
+    /// The envelope of a run (#492): `sandbox_kind` and the per-axis report
+    /// come from the `mechanism` the funnel admitted, measured against the
+    /// context's effective caveats; the disclosure names the `engine` and the
+    /// unbridled posture (ADR 0004 D1, ADR 0018 D5).
     #[must_use]
-    pub fn new(sandbox_kind: SandboxKind) -> Self {
+    pub fn new(engine: &str, cx: &ToolContext, mechanism: ConfinementMechanism) -> Self {
+        Self {
+            sandbox_kind: mechanism.kind(),
+            enforcement: crate::enforcement_report(cx.caveats(), mechanism),
+            ..Self::refused(engine)
+        }
+    }
+
+    /// The envelope of a refusal with no admitted mechanism: nothing ran, so
+    /// `sandbox_kind` is `none` and there is no per-axis report. The
+    /// disclosure is the same as [`Self::new`]'s.
+    #[must_use]
+    pub fn refused(engine: &str) -> Self {
+        Self {
+            disclosure: Disclosure {
+                engine: Some(engine.to_string()),
+                unbridled: crate::is_unbridled(),
+                human_gate: crate::human_gate(),
+                ..Disclosure::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// An envelope stamped with the sandbox kind and nothing else set. A
+    /// low-level form for tests and verifiers; an engine uses [`Self::new`]
+    /// or [`Self::refused`].
+    #[must_use]
+    pub fn bare(sandbox_kind: SandboxKind) -> Self {
         Self {
             sandbox_kind,
             ..Self::default()
@@ -274,7 +305,7 @@ mod tests {
 
     #[test]
     fn omits_absent_fields_keeps_sandbox_kind() {
-        let v = ToolEnvelope::new(SandboxKind::None)
+        let v = ToolEnvelope::bare(SandboxKind::None)
             .with_exit_code(0)
             .with_stdout("hi\n")
             .into_json();
@@ -289,7 +320,7 @@ mod tests {
     fn no_denials_omits_denied_and_denials() {
         // The common case: nothing was denied → neither structured field
         // appears in the JSON, so `denied` defaults to false for consumers.
-        let v = ToolEnvelope::new(SandboxKind::None)
+        let v = ToolEnvelope::bare(SandboxKind::None)
             .with_exit_code(0)
             .with_denials(Vec::new())
             .into_json();
@@ -304,7 +335,7 @@ mod tests {
             target: "rm".to_string(),
             reason: "exec of \"rm\" is not within the granted authority".to_string(),
         }];
-        let v = ToolEnvelope::new(SandboxKind::None)
+        let v = ToolEnvelope::bare(SandboxKind::None)
             .with_exit_code(126)
             .with_denials(denials)
             .into_json();
@@ -327,7 +358,7 @@ mod tests {
         };
         let report = enforcement_report(&caveats, SandboxKind::Landlock);
         assert_eq!(report.fs_write, Some(AxisEnforcement::Kernel));
-        let v = ToolEnvelope::new(SandboxKind::Landlock)
+        let v = ToolEnvelope::bare(SandboxKind::Landlock)
             .with_enforcement(report)
             .with_exit_code(0)
             .into_json();
@@ -339,7 +370,7 @@ mod tests {
 
         // An all-`All` grant produces an empty report → the field is omitted.
         let empty = enforcement_report(&Caveats::top(), SandboxKind::None);
-        let v2 = ToolEnvelope::new(SandboxKind::None)
+        let v2 = ToolEnvelope::bare(SandboxKind::None)
             .with_enforcement(empty)
             .into_json();
         assert!(
@@ -351,7 +382,7 @@ mod tests {
     #[test]
     fn disclosure_is_quiet_by_default_and_omitted() {
         // The common bridled path discloses nothing → the block is absent.
-        let v = ToolEnvelope::new(SandboxKind::Landlock)
+        let v = ToolEnvelope::bare(SandboxKind::Landlock)
             .with_exit_code(0)
             .into_json();
         assert!(
@@ -363,7 +394,7 @@ mod tests {
 
     #[test]
     fn unbridled_disclosure_always_surfaces() {
-        let v = ToolEnvelope::new(SandboxKind::None)
+        let v = ToolEnvelope::bare(SandboxKind::None)
             .with_disclosure(Disclosure {
                 unbridled: true,
                 ..Disclosure::default()
@@ -377,7 +408,7 @@ mod tests {
 
     #[test]
     fn disclosure_fields_surface_when_set() {
-        let v = ToolEnvelope::new(SandboxKind::Seatbelt)
+        let v = ToolEnvelope::bare(SandboxKind::Seatbelt)
             .with_disclosure(Disclosure {
                 normalizations_disabled: vec!["ldd_closure".to_string()],
                 net_over_delivery: true,
@@ -395,7 +426,7 @@ mod tests {
     #[test]
     fn disclosure_human_gate_distinguishes_postures() {
         // Supervised-free: unbridled but the passkey gate remains.
-        let sf = ToolEnvelope::new(SandboxKind::None)
+        let sf = ToolEnvelope::bare(SandboxKind::None)
             .with_disclosure(Disclosure {
                 unbridled: true,
                 human_gate: HumanGate::Passkey,
@@ -404,7 +435,7 @@ mod tests {
             .into_json();
         assert_eq!(sf["disclosure"]["human_gate"], "passkey");
         // Autonomous: unbridled AND no human in the loop — must be distinguishable.
-        let auto = ToolEnvelope::new(SandboxKind::None)
+        let auto = ToolEnvelope::bare(SandboxKind::None)
             .with_disclosure(Disclosure {
                 unbridled: true,
                 human_gate: HumanGate::None,
@@ -424,8 +455,8 @@ mod tests {
             ..Caveats::top()
         };
         let report = enforcement_report(&caveats, SandboxKind::Landlock);
-        let bare = ToolEnvelope::new(SandboxKind::Landlock).with_enforcement(report.clone());
-        let disclosed = ToolEnvelope::new(SandboxKind::Landlock)
+        let bare = ToolEnvelope::bare(SandboxKind::Landlock).with_enforcement(report.clone());
+        let disclosed = ToolEnvelope::bare(SandboxKind::Landlock)
             .with_enforcement(report)
             .with_disclosure(Disclosure {
                 unbridled: true,

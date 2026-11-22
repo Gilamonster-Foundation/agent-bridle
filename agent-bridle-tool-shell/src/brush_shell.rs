@@ -27,9 +27,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    default_exec_path, enforcement_report, human_gate, is_unbridled, ConfinementMechanism,
-    Disclosure, SandboxPolicy, SandboxedWorker, SandboxedWorkerChild, Scope, Tool, ToolContext,
-    ToolEnvelope, ToolError, ToolResult,
+    default_exec_path, human_gate, is_unbridled, Disclosure, SandboxPolicy, SandboxedWorker,
+    SandboxedWorkerChild, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 use brush_builtins::{default_builtins, BuiltinSet};
@@ -312,17 +311,10 @@ impl Tool for BrushShellTool {
         let confined = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))
             .spawn(cx, &nonce, &cwd)?;
-        let sandbox_kind = confined.sandbox_kind;
-        let caveats = cx.caveats().clone();
-        // The mechanism governing the worker: reported kind + the child-network
-        // policy the worker was spawned under (same `self.sandbox_policy`). Keeps
-        // the reported net witness honest (Landlock `net:none` is Kernel only under
-        // `DenyDirect`), never over-claiming from the kind alone.
-        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network)
-            .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace)
-            .with_appcontainer_mount_manager_ace(
-                self.sandbox_policy.appcontainer_mount_manager_ace,
-            );
+        // The mechanism the funnel admitted for the worker, stdio posture
+        // included (#492). Rebuilding it here would drop that posture and
+        // under-report a kernel-enforced `net: none` on macOS.
+        let mechanism = confined.mechanism;
 
         let worker_output = output.clone();
         // Dropping this async waiter flags cancellation; the blocking owner
@@ -363,9 +355,7 @@ impl Tool for BrushShellTool {
                 // already saw live. The terminal contributes status, denials,
                 // and drop accounting — never a second copy of the output that
                 // could disagree with what was displayed.
-                let envelope = ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement_report(&caveats, mechanism))
-                    .with_disclosure(self.disclosure())
+                let envelope = ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
                     .with_exit_code(response.exit_code)
                     .with_stdout(String::from_utf8_lossy(&stdout).into_owned())
                     .with_stderr(String::from_utf8_lossy(&stderr).into_owned())
@@ -381,9 +371,7 @@ impl Tool for BrushShellTool {
             }
             Supervised::TimedOut => {
                 drop(output_guard);
-                Ok(ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement_report(&caveats, mechanism))
-                    .with_disclosure(self.disclosure())
+                Ok(ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
                     .with_exit_code(124)
                     .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
                     .with_timed_out(true)
