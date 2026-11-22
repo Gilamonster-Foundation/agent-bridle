@@ -81,7 +81,7 @@ pub use provenance::{
     admit, empty_closure, relate, AdmissionDecision, AdmissionReject, ConfinedAxis,
     ResolvedAuthority, ResolvedScope, ScopeRelation,
 };
-pub use registry::{Grant, Registry, RegistryBuilder};
+pub use registry::{ChargeGuard, Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
     EnforcementFloor, EnforcementReport, EnforcementWidening, ExecBoundary, StdioPosture,
