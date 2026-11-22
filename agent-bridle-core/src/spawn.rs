@@ -3062,6 +3062,10 @@ mod landlock_child_tests {
 
     /// newt #2692 (ported with #494): composing held roots with #419's worker binding
     /// must keep both original objects after their pathnames are replaced.
+    ///
+    /// The worker is named `worker-cat` and keeps that file name when moved,
+    /// and the replacement is a script: where `cat` is a uutils multicall, it
+    /// dispatches on its own file name and refuses to run under another (#449).
     #[test]
     fn worker_image_and_held_read_root_survive_replacement_together() {
         if !landlock_is_supported() {
@@ -3069,7 +3073,7 @@ mod landlock_child_tests {
             return;
         }
         let dir = unique_dir("worker-and-held-root");
-        let worker = dir.join("worker");
+        let worker = dir.join("worker-cat");
         let read_root = dir.join("read-root");
         let moved_root = dir.join("original-root");
         fs::copy("/bin/cat", &worker).unwrap();
@@ -3098,8 +3102,12 @@ mod landlock_child_tests {
                     fs::rename(&read_root, &moved_root).unwrap();
                     fs::create_dir(&read_root).unwrap();
                     fs::write(read_root.join("value"), "replacement-root").unwrap();
-                    fs::rename(&swap_worker, swap_worker.with_extension("original")).unwrap();
-                    fs::copy("/bin/false", &swap_worker).unwrap();
+                    use std::os::unix::fs::PermissionsExt;
+                    let moved = swap_worker.parent().unwrap().join("original");
+                    fs::create_dir(&moved).unwrap();
+                    fs::rename(&swap_worker, moved.join("worker-cat")).unwrap();
+                    fs::write(&swap_worker, "#!/bin/sh\nexit 1\n").unwrap();
+                    fs::set_permissions(&swap_worker, fs::Permissions::from_mode(0o755)).unwrap();
                 },
                 || {},
             )
