@@ -9,8 +9,8 @@
 //!
 //! The leash is real and configurable: the session's granted [`Caveats`] are
 //! sourced from `$AGENT_BRIDLE_CAVEATS` (JSON), else
-//! `~/.agent-bridle/config.toml` `[caveats]`, else a loudly-warned unconfined
-//! default. Every `tools/call` is dispatched through the registry against that
+//! `~/.agent-bridle/config.toml` `[caveats]`, else deny-all (fail-closed): no
+//! grant means no authority on any axis. Every `tools/call` is dispatched through the registry against that
 //! grant, so confinement holds *through* the MCP boundary.
 //!
 //! Out of scope here (later increments, DESIGN §8): the Python sidecar / host
