@@ -77,6 +77,8 @@ mod output_observer;
 mod parse;
 #[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
 mod request;
+mod shell_engine;
+pub use shell_engine::{Cell, Check, Operation, Origin, ShellEngine, ShellOptions};
 #[cfg(feature = "shell")]
 mod shell_tool;
 #[cfg(any(feature = "shell", feature = "host-shell"))]

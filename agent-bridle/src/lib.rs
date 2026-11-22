@@ -40,6 +40,9 @@ pub use agent_bridle_core::*;
 pub use agent_bridle_tool_shell::ShellTool;
 #[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
 pub use agent_bridle_tool_shell::{ShellInvocationId, ShellOutputObserver, ShellOutputStream};
+// Engine choice as data (#491): a host selects and builds its `shell` engine.
+#[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
+pub use agent_bridle_tool_shell::{Cell, Check, Operation, Origin, ShellEngine, ShellOptions};
 // The sandboxed-host engine (ADR 0019 / #194). Anchored here so a host can
 // construct its own registry with it (`Registry::builder().tool(Arc::new(
 // HostShellTool::new()))`); it is deliberately NOT added to `registry()` — it
@@ -103,18 +106,23 @@ pub fn registry() -> Registry {
     #[allow(unused_mut)]
     let mut builder = Registry::builder();
 
-    #[cfg(feature = "carried-coreutils")]
+    // The shell is built through `ShellEngine::build` (#491). The rule stays:
+    // carried Brush where its worker transport exists, else safe-subset. A
+    // build failure is a defect, never a silent fallback to another engine.
+    #[cfg(any(feature = "shell", feature = "carried-coreutils"))]
     {
-        if brush_private_control_supported() {
-            builder = builder.tool(std::sync::Arc::new(BrushShellTool::new()));
+        #[cfg(feature = "carried-coreutils")]
+        let engine = if brush_private_control_supported() {
+            ShellEngine::Brush
         } else {
-            builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
-        }
-    }
-
-    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
-    {
-        builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
+            ShellEngine::SafeSubset
+        };
+        #[cfg(not(feature = "carried-coreutils"))]
+        let engine = ShellEngine::SafeSubset;
+        let shell = engine
+            .build(ShellOptions::default())
+            .unwrap_or_else(|error| panic!("the {engine} shell must build: {error}"));
+        builder = builder.tool(shell);
     }
 
     #[cfg(feature = "web")]

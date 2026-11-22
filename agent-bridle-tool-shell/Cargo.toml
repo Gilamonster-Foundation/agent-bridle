@@ -17,6 +17,11 @@ name = "bridle-netmon"
 required-features = ["shell"]
 
 [[test]]
+name = "engine_conformance"
+path = "tests/engine_conformance.rs"
+harness = false
+
+[[test]]
 name = "brush_real"
 path = "tests/brush_real.rs"
 harness = false
