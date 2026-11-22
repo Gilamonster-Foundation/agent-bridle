@@ -145,6 +145,14 @@ impl Gate {
         self
     }
 
+    /// Record the sandbox kind proven by a spawn's fence evidence. Crate-private:
+    /// only core's trusted-worker re-mint (#499) stamps a kind it captured.
+    #[must_use]
+    pub(crate) fn with_sandbox_kind(mut self, kind: SandboxKind) -> Self {
+        self.sandbox_kind = kind;
+        self
+    }
+
     /// Set the required fence-strength floor from a **scalar** enforcement (the
     /// historic API), bridged to the per-axis form via
     /// [`EnforcementFloor::from_scalar`]: the filesystem axes always require

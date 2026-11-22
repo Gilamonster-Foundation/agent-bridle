@@ -32,41 +32,72 @@ use crate::{
 /// `None` ⇒ unlimited; `Some(n)` ⇒ `n` calls remaining. The `Mutex` makes the
 /// check-and-decrement atomic, so concurrent dispatches on one grant cannot
 /// overspend. Its constructor is private, so a caller cannot forge a budget.
+///
+/// An **attenuated** grant ([`Grant::attenuate`], #431) has its own cell for
+/// its narrower `max_calls`, chained to the cell it was narrowed from. A
+/// charge debits the whole chain or none of it, so narrowing a grant never
+/// mints a fresh budget: the child spends its parent's calls.
 #[derive(Debug)]
 struct GrantBudget {
     remaining: Mutex<Option<u64>>,
+    /// The budget this one was attenuated from.
+    parent: Option<Arc<GrantBudget>>,
 }
 
 impl GrantBudget {
-    fn new(max_calls: CountBound) -> Self {
+    fn new(max_calls: CountBound, parent: Option<Arc<GrantBudget>>) -> Self {
         Self {
             remaining: Mutex::new(match max_calls {
                 CountBound::AtMost(n) => Some(n),
                 CountBound::Unlimited => None,
             }),
+            parent,
         }
     }
 
-    /// Charge one call. `Unlimited` never exhausts; `AtMost(0)` (or a spent
-    /// budget) is a fail-closed [`ToolError::Budget`]. Held under the lock so
-    /// concurrent charges cannot overspend.
+    /// Charge one call against this cell and every ancestor. `Unlimited` never
+    /// exhausts; `AtMost(0)` (or a spent budget) anywhere in the chain is a
+    /// fail-closed [`ToolError::Budget`] that debits nothing.
+    ///
+    /// This cell stays locked while its ancestors are charged, so the chain is
+    /// debited all-or-nothing and concurrent charges cannot overspend. Locks
+    /// are always taken descendant first, and a chain is a path in a tree, so
+    /// two charges cannot deadlock.
     fn charge(&self) -> ToolResult<()> {
         let mut remaining = self.remaining.lock().expect("grant budget mutex poisoned");
-        match &mut *remaining {
-            None => Ok(()),
-            Some(0) => Err(ToolError::Budget),
-            Some(n) => {
-                *n -= 1;
-                Ok(())
-            }
+        if matches!(*remaining, Some(0)) {
+            return Err(ToolError::Budget);
+        }
+        if let Some(parent) = &self.parent {
+            parent.charge()?;
+        }
+        if let Some(n) = remaining.as_mut() {
+            *n -= 1;
+        }
+        Ok(())
+    }
+
+    /// Return a charge that did not result in an admitted call (a pre-run
+    /// denial), to this cell and every ancestor.
+    fn refund(&self) {
+        let mut remaining = self.remaining.lock().expect("grant budget mutex poisoned");
+        if let Some(parent) = &self.parent {
+            parent.refund();
+        }
+        if let Some(n) = remaining.as_mut() {
+            *n += 1;
         }
     }
 
-    /// Return a charge that did not result in an admitted call (a pre-run denial).
-    fn refund(&self) {
-        let mut remaining = self.remaining.lock().expect("grant budget mutex poisoned");
-        if let Some(n) = remaining.as_mut() {
-            *n += 1;
+    /// The calls left: the tightest bound along the chain.
+    fn remaining(&self) -> CountBound {
+        let own = *self.remaining.lock().expect("grant budget mutex poisoned");
+        let inherited = self.parent.as_ref().map(|parent| parent.remaining());
+        match (own, inherited) {
+            (None, None | Some(CountBound::Unlimited)) => CountBound::Unlimited,
+            (None, Some(bound)) => bound,
+            (Some(n), Some(CountBound::AtMost(m))) => CountBound::AtMost(n.min(m)),
+            (Some(n), _) => CountBound::AtMost(n),
         }
     }
 }
@@ -88,6 +119,81 @@ impl Grant {
     #[must_use]
     pub fn caveats(&self) -> &Caveats {
         &self.caveats
+    }
+
+    /// The calls this grant can still make (#431): its own remaining budget,
+    /// bounded by every grant it was attenuated from. It moves with every
+    /// charge and refund, on this grant, its clones, and its attenuations.
+    #[must_use]
+    pub fn remaining(&self) -> CountBound {
+        self.budget.remaining()
+    }
+
+    /// Narrow this grant to `narrower` **within its budget** (#431).
+    ///
+    /// Minting a new grant to narrow authority starts a fresh budget, which
+    /// silently resets `max_calls`. An attenuated grant instead gets its own
+    /// cell for `narrower.max_calls`, chained to this grant's: every call on
+    /// the child also spends one of the parent's, and a refund credits both.
+    ///
+    /// # Errors
+    /// [`ToolError::Denied`] unless `narrower ⊑ self.caveats()` on every axis,
+    /// `max_calls` included. Attenuation can only narrow.
+    pub fn attenuate(&self, narrower: Caveats) -> ToolResult<Grant> {
+        if !narrower.leq(&self.caveats) {
+            return Err(ToolError::denied(
+                "attenuation must narrow: the requested caveats exceed the parent grant on an axis",
+            ));
+        }
+        let budget = Arc::new(GrantBudget::new(
+            narrower.max_calls,
+            Some(Arc::clone(&self.budget)),
+        ));
+        Ok(Grant {
+            caveats: narrower,
+            budget,
+        })
+    }
+
+    /// Charge one call against this grant, for a caller that authorizes
+    /// through a [`Gate`] directly and so never reaches
+    /// [`Registry::dispatch`]'s own charge (#431).
+    ///
+    /// The returned guard refunds the charge when dropped. Call
+    /// [`ChargeGuard::commit`] once the call has actually run, so an early
+    /// return or a refusal before the effect costs nothing.
+    ///
+    /// # Errors
+    /// [`ToolError::Budget`] when this grant, or one it was attenuated from,
+    /// is spent. Nothing is charged.
+    pub fn try_charge(&self) -> ToolResult<ChargeGuard> {
+        self.budget.charge()?;
+        Ok(ChargeGuard {
+            budget: Some(Arc::clone(&self.budget)),
+        })
+    }
+}
+
+/// One call charged against a [`Grant`] by [`Grant::try_charge`]. Dropping it
+/// refunds the charge; [`Self::commit`] keeps it.
+#[derive(Debug)]
+#[must_use = "an uncommitted charge is refunded when the guard is dropped"]
+pub struct ChargeGuard {
+    budget: Option<Arc<GrantBudget>>,
+}
+
+impl ChargeGuard {
+    /// The call ran: keep the charge.
+    pub fn commit(mut self) {
+        self.budget = None;
+    }
+}
+
+impl Drop for ChargeGuard {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.take() {
+            budget.refund();
+        }
     }
 }
 
@@ -176,7 +282,7 @@ impl Registry {
     /// grant shares that grant's budget.
     #[must_use]
     pub fn mint_grant(&self, caveats: Caveats) -> Grant {
-        let budget = Arc::new(GrantBudget::new(caveats.max_calls));
+        let budget = Arc::new(GrantBudget::new(caveats.max_calls, None));
         Grant { caveats, budget }
     }
 
@@ -1153,5 +1259,220 @@ mod tests {
         assert!(defs[0]["inputSchema"].is_object());
         assert!(r.contains("probe"));
         assert_eq!(r.tool_names(), vec!["probe"]);
+    }
+
+    // ── #431: attenuation within one grant's budget ─────────────────────────
+
+    fn call(r: &Registry, grant: &Grant) -> ToolResult<serde_json::Value> {
+        block_on(r.dispatch("probe", serde_json::json!({ "program": "echo" }), grant))
+    }
+
+    fn at_most(n: u64) -> Caveats {
+        Caveats {
+            max_calls: CountBound::AtMost(n),
+            ..Caveats::top()
+        }
+    }
+
+    /// #431: `remaining()` tracks every charge and every refund.
+    #[test]
+    fn remaining_tracks_every_charge_and_refund() {
+        let r = reg();
+        let grant = r.mint_grant(Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            ..at_most(3)
+        });
+        assert_eq!(grant.remaining(), CountBound::AtMost(3));
+        call(&r, &grant).expect("in-scope call");
+        assert_eq!(grant.remaining(), CountBound::AtMost(2));
+        // A leash denial runs nothing, so its charge is refunded.
+        let denied = block_on(r.dispatch("probe", serde_json::json!({ "program": "rm" }), &grant));
+        assert!(
+            matches!(denied, Err(ToolError::Denied { .. })),
+            "{denied:?}"
+        );
+        assert_eq!(grant.remaining(), CountBound::AtMost(2));
+        assert_eq!(
+            r.mint_grant(Caveats::top()).remaining(),
+            CountBound::Unlimited
+        );
+    }
+
+    /// #431: `attenuate` refuses a widening on any axis.
+    #[test]
+    fn attenuate_refuses_widening_on_any_axis() {
+        let r = reg();
+        let one = |name: &str| Scope::only([name.to_string()]);
+        let parent_caveats = Caveats {
+            fs_read: one("/r"),
+            fs_write: one("/w"),
+            exec: one("echo"),
+            net: one("example.test"),
+            max_calls: CountBound::AtMost(5),
+            valid_for_generation: Scope::only([0]),
+        };
+        let parent = r.mint_grant(parent_caveats.clone());
+        assert!(
+            parent.attenuate(parent_caveats.clone()).is_ok(),
+            "equal is allowed"
+        );
+        let wider = [
+            Caveats {
+                fs_read: Scope::All,
+                ..parent_caveats.clone()
+            },
+            Caveats {
+                fs_write: Scope::only(["/w".to_string(), "/x".to_string()]),
+                ..parent_caveats.clone()
+            },
+            Caveats {
+                exec: Scope::All,
+                ..parent_caveats.clone()
+            },
+            Caveats {
+                net: Scope::All,
+                ..parent_caveats.clone()
+            },
+            Caveats {
+                max_calls: CountBound::AtMost(6),
+                ..parent_caveats.clone()
+            },
+            Caveats {
+                max_calls: CountBound::Unlimited,
+                ..parent_caveats.clone()
+            },
+            Caveats {
+                valid_for_generation: Scope::All,
+                ..parent_caveats.clone()
+            },
+        ];
+        for caveats in wider {
+            let refused = parent.attenuate(caveats.clone());
+            assert!(
+                matches!(refused, Err(ToolError::Denied { .. })),
+                "a widening must be refused: {caveats:?}"
+            );
+        }
+        // Refusals cost nothing.
+        assert_eq!(parent.remaining(), CountBound::AtMost(5));
+    }
+
+    /// #431: a child's own bound holds while the parent can still spend.
+    /// Before, narrowing meant minting a new grant, which had a fresh budget.
+    #[test]
+    fn attenuated_child_is_bounded_by_its_own_max_calls() {
+        let r = reg();
+        let parent = r.mint_grant(at_most(10));
+        let child = parent.attenuate(at_most(1)).expect("attenuate");
+        call(&r, &child).expect("the child's one call");
+        assert!(matches!(call(&r, &child), Err(ToolError::Budget)));
+        assert_eq!(child.remaining(), CountBound::AtMost(0));
+        // The child's call spent one of the parent's; its refused call did not.
+        assert_eq!(parent.remaining(), CountBound::AtMost(9));
+        call(&r, &parent).expect("the parent can still spend");
+    }
+
+    /// #431: a child spends its parent's budget. One call on the parent and
+    /// one on a child exhaust a parent of two; a third on either is refused.
+    #[test]
+    fn attenuated_child_spends_the_parents_budget() {
+        let r = reg();
+        let parent = r.mint_grant(at_most(2));
+        let child = parent.attenuate(at_most(2)).expect("attenuate");
+        assert_eq!(child.remaining(), CountBound::AtMost(2));
+        call(&r, &parent).expect("parent call");
+        assert_eq!(
+            child.remaining(),
+            CountBound::AtMost(1),
+            "bounded by the parent"
+        );
+        call(&r, &child).expect("child call");
+        assert!(matches!(call(&r, &parent), Err(ToolError::Budget)));
+        assert!(matches!(call(&r, &child), Err(ToolError::Budget)));
+        // A grandchild is bounded by the whole chain, in any registry.
+        let grandchild = child.attenuate(at_most(1)).expect("attenuate");
+        assert!(matches!(call(&reg(), &grandchild), Err(ToolError::Budget)));
+        assert_eq!(grandchild.remaining(), CountBound::AtMost(0));
+    }
+
+    /// #431: a dropped, uncommitted `ChargeGuard` refunds; a committed one
+    /// does not; a spent grant yields no guard.
+    #[test]
+    fn charge_guard_refunds_unless_committed() {
+        let r = reg();
+        let parent = r.mint_grant(at_most(2));
+        let child = parent.attenuate(at_most(2)).expect("attenuate");
+
+        let guard = child.try_charge().expect("charge");
+        assert_eq!(child.remaining(), CountBound::AtMost(1));
+        assert_eq!(
+            parent.remaining(),
+            CountBound::AtMost(1),
+            "the chain is charged"
+        );
+        drop(guard);
+        assert_eq!(
+            child.remaining(),
+            CountBound::AtMost(2),
+            "dropped: refunded"
+        );
+        assert_eq!(parent.remaining(), CountBound::AtMost(2));
+
+        child.try_charge().expect("charge").commit();
+        assert_eq!(child.remaining(), CountBound::AtMost(1), "committed: kept");
+        parent.try_charge().expect("charge").commit();
+        assert!(matches!(child.try_charge(), Err(ToolError::Budget)));
+        assert!(matches!(parent.try_charge(), Err(ToolError::Budget)));
+        assert_eq!(
+            parent.remaining(),
+            CountBound::AtMost(0),
+            "a refusal charges nothing"
+        );
+    }
+
+    /// #431: the no-overspend property holds across attenuated grants. Many
+    /// threads race on separate children of one parent; exactly the parent's
+    /// budget is admitted.
+    #[test]
+    fn concurrent_dispatches_on_attenuated_grants_never_overspend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const THREADS: usize = 64;
+        const BUDGET: u64 = 20;
+        let r = reg();
+        let parent = r.mint_grant(at_most(BUDGET));
+        let children: Vec<Grant> = (0..THREADS)
+            .map(|_| parent.attenuate(at_most(BUDGET)).expect("attenuate"))
+            .collect();
+        let admitted = AtomicUsize::new(0);
+        let denied = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for child in &children {
+                s.spawn(|| match call(&r, child) {
+                    Ok(_) => {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(ToolError::Budget) => {
+                        denied.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => panic!("unexpected error under concurrency: {e:?}"),
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), BUDGET as usize);
+        assert_eq!(denied.load(Ordering::Relaxed), THREADS - BUDGET as usize);
+        assert_eq!(parent.remaining(), CountBound::AtMost(0));
+    }
+
+    /// #431: a spent grant cannot regenerate its budget by being attenuated,
+    /// in this registry or a second one.
+    #[test]
+    fn spent_grant_cannot_regenerate_budget_by_attenuation() {
+        let r = reg();
+        let parent = r.mint_grant(at_most(1));
+        call(&r, &parent).expect("the one call");
+        let child = parent.attenuate(at_most(1)).expect("attenuate");
+        assert_eq!(child.remaining(), CountBound::AtMost(0));
+        assert!(matches!(call(&r, &child), Err(ToolError::Budget)));
+        assert!(matches!(call(&reg(), &child), Err(ToolError::Budget)));
     }
 }

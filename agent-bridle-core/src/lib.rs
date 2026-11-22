@@ -81,7 +81,7 @@ pub use provenance::{
     admit, empty_closure, relate, AdmissionDecision, AdmissionReject, ConfinedAxis,
     ResolvedAuthority, ResolvedScope, ScopeRelation,
 };
-pub use registry::{Grant, Registry, RegistryBuilder};
+pub use registry::{ChargeGuard, Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
     EnforcementFloor, EnforcementReport, EnforcementWidening, ExecBoundary, StdioPosture,
@@ -106,7 +106,7 @@ pub use spawn::{
     spawn_confined_subprocess, trusted_worker_frame_digest, AppliedFence, ConfinedChild,
     ConfinedCommand, ConfinedLaunch, ConfinedStdio, FencedCommand, LaunchPlan, LaunchRefusal,
     ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind, TrustedWorkerRequest,
-    TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP, TRUSTED_WORKER_FRAME_HEADER_LEN,
+    WorkerAuthority, TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP, TRUSTED_WORKER_FRAME_HEADER_LEN,
     TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY, TRUSTED_WORKER_PROTOCOL_VERSION,
 };
 // The async-host confined spawn (tokio pipe handles). Unix-only, feature-gated,
