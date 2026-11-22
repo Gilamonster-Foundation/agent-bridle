@@ -14,7 +14,7 @@
 //! `shutdown`/`exit` lifecycle. `notifications/*` (no `id`) are accepted and
 //! acknowledged silently per JSON-RPC notification semantics.
 
-use agent_bridle::{Caveats, Grant, Registry};
+use agent_bridle::{Caveats, EnforcementFloor, Grant, Registry};
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -44,6 +44,8 @@ const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub struct McpServer {
     registry: Registry,
     grant: Grant,
+    /// The per-axis confinement floor every `tools/call` is dispatched with.
+    floor: EnforcementFloor,
 }
 
 impl McpServer {
@@ -58,7 +60,26 @@ impl McpServer {
     #[must_use]
     pub fn new(registry: Registry, granted: Caveats) -> Self {
         let grant = registry.mint_grant(granted);
-        Self { registry, grant }
+        Self {
+            registry,
+            grant,
+            floor: EnforcementFloor::DEFAULT,
+        }
+    }
+
+    /// Dispatch every `tools/call` with `floor` (`[bridle.gate]
+    /// default_strength_floor`, #495). The filesystem axes are always kernel,
+    /// so a configured floor can only raise confinement.
+    #[must_use]
+    pub fn with_enforcement_floor(mut self, floor: EnforcementFloor) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// The registry this server dispatches to.
+    #[cfg(all(test, any(feature = "shell", feature = "carried-coreutils")))]
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Run over real stdin/stdout (the production entry point).
@@ -161,7 +182,13 @@ impl McpServer {
         match method {
             "initialize" => Ok(handlers::initialize()),
             "tools/list" => Ok(handlers::tools_list(&self.registry)),
-            "tools/call" => Ok(handlers::tools_call(&self.registry, &self.grant, params).await),
+            "tools/call" => Ok(handlers::tools_call_with_floor(
+                &self.registry,
+                &self.grant,
+                self.floor,
+                params,
+            )
+            .await),
             // Lifecycle: a clean shutdown ack. `exit` is handled in the loop.
             "shutdown" => Ok(Value::Null),
             // Client notifications we accept and ignore (no `id` → no response).

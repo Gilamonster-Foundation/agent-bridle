@@ -103,34 +103,47 @@ pub use agent_bridle_tool_web::WebFetchTool;
 /// tools by enabling features (or building its own registry).
 #[must_use]
 pub fn registry() -> Registry {
-    #[allow(unused_mut)]
-    let mut builder = Registry::builder();
-
-    // The shell is built through `ShellEngine::build` (#491). The rule stays:
-    // carried Brush where its worker transport exists, else safe-subset. A
-    // build failure is a defect, never a silent fallback to another engine.
     #[cfg(any(feature = "shell", feature = "carried-coreutils"))]
     {
-        #[cfg(feature = "carried-coreutils")]
-        let engine = if brush_private_control_supported() {
-            ShellEngine::Brush
-        } else {
-            ShellEngine::SafeSubset
-        };
-        #[cfg(not(feature = "carried-coreutils"))]
-        let engine = ShellEngine::SafeSubset;
-        let shell = engine
-            .build(ShellOptions::default())
-            .unwrap_or_else(|error| panic!("the {engine} shell must build: {error}"));
-        builder = builder.tool(shell);
+        let engine = default_shell_engine();
+        registry_with_shell(engine, ShellOptions::default())
+            .unwrap_or_else(|error| panic!("the {engine} shell must build: {error}"))
     }
+    #[cfg(not(any(feature = "shell", feature = "carried-coreutils")))]
+    {
+        other_tools(Registry::builder()).build()
+    }
+}
 
+/// The engine [`registry`] serves when the host does not choose one: carried
+/// Brush where its worker transport exists, else safe-subset. This is the
+/// facade's rule, not `ShellEngine::default()`.
+#[cfg(any(feature = "shell", feature = "carried-coreutils"))]
+#[must_use]
+pub fn default_shell_engine() -> ShellEngine {
+    #[cfg(feature = "carried-coreutils")]
+    if brush_private_control_supported() {
+        return ShellEngine::Brush;
+    }
+    ShellEngine::SafeSubset
+}
+
+/// [`registry`] with a chosen shell engine and options (#495): how a host
+/// builds its `shell` tool from configuration. The shell is built through
+/// `ShellEngine::build` (#491), so an engine this build or platform cannot run
+/// is an error, never a silent fallback to another engine.
+#[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
+pub fn registry_with_shell(engine: ShellEngine, options: ShellOptions) -> ToolResult<Registry> {
+    Ok(other_tools(Registry::builder().tool(engine.build(options)?)).build())
+}
+
+/// Every non-shell tool the compiled features add.
+fn other_tools(#[allow(unused_mut)] mut builder: RegistryBuilder) -> RegistryBuilder {
     #[cfg(feature = "web")]
     {
         builder = builder.tool(std::sync::Arc::new(WebFetchTool::new()));
     }
-
-    builder.build()
+    builder
 }
 
 #[cfg(test)]

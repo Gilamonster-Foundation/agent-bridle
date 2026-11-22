@@ -7,7 +7,7 @@
 //! result, NOT a JSON-RPC transport error. The MCP boundary must carry the
 //! denial reason back to the model so the leash is observable end-to-end.
 
-use agent_bridle::{Grant, Registry, ToolError};
+use agent_bridle::{EnforcementFloor, Grant, Registry, ToolError};
 use serde_json::Value;
 
 use crate::server::PROTOCOL_VERSION;
@@ -64,7 +64,16 @@ pub fn tools_list(registry: &Registry) -> Value {
 /// `tools/call` always yields a `result`. Genuinely malformed params (e.g. a
 /// missing/non-string `name`) also come back as an `isError` content result,
 /// because they are a tool-level mistake, not a protocol fault.
-pub async fn tools_call(registry: &Registry, grant: &Grant, params: Value) -> Value {
+///
+/// `floor` is the per-axis confinement floor (#495): it is stamped into the
+/// tool's context at the gate, and a spawn refuses when a restricted axis
+/// would fall below it.
+pub async fn tools_call_with_floor(
+    registry: &Registry,
+    grant: &Grant,
+    floor: EnforcementFloor,
+    params: Value,
+) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return tool_error("missing or non-string `name` in tools/call params");
     };
@@ -73,7 +82,10 @@ pub async fn tools_call(registry: &Registry, grant: &Grant, params: Value) -> Va
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-    match registry.dispatch(name, arguments, grant).await {
+    match registry
+        .dispatch_with_enforcement_floor(name, arguments, grant, floor)
+        .await
+    {
         // An Ok result can still carry a STRUCTURED in-band denial: a free-form
         // shell `cmd` that the interceptor refused returns `Ok` with
         // `denied: true` in the envelope (the brush run "succeeded" at the
@@ -89,6 +101,12 @@ pub async fn tools_call(registry: &Registry, grant: &Grant, params: Value) -> Va
         // tool, or an error from inside a tool that passed the leash.
         Err(e) => tool_error(&e.to_string()),
     }
+}
+
+/// [`tools_call_with_floor`] at the default floor.
+#[cfg(test)]
+pub async fn tools_call(registry: &Registry, grant: &Grant, params: Value) -> Value {
+    tools_call_with_floor(registry, grant, EnforcementFloor::DEFAULT, params).await
 }
 
 /// Whether a tool result carries the structured `denied: true` flag.

@@ -7,8 +7,8 @@ without replacing unrelated settings.
 
 Configuration data types remain in `agent-bridle-core`; this internal crate
 owns file, environment, and TOML loading so those dependencies do not enter
-the lean enforcement core. It is not a separately supported crates.io
-surface.
+the lean enforcement core. It is published because `agent-bridle-mcp` depends
+on it; it is not a separately supported crates.io surface.
 
 Part of [Agent Bridle](https://github.com/Gilamonster-Foundation/agent-bridle).
 

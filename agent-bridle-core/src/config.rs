@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::report::AxisEnforcement;
 use crate::HumanGate;
 
@@ -94,8 +95,13 @@ pub enum BridleMode {
 /// ADR 0018 mode lattice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatePolicy {
-    /// The fence-strength floor stamped when none is set (`DEFAULT_STRENGTH_FLOOR`).
-    pub default_strength_floor: AxisEnforcement,
+    /// The per-axis fence-strength floor a host dispatches with (#495): a
+    /// `{ exec, net }` table. The filesystem axes always require the kernel and
+    /// are not configurable, so the floor can only raise confinement. A scalar
+    /// value (the form this field had while nothing read it) is refused at
+    /// load, never widened or guessed at. Defaults to
+    /// [`EnforcementFloor::DEFAULT`], the historic `DEFAULT_STRENGTH_FLOOR`.
+    pub default_strength_floor: crate::EnforcementFloor,
     /// Cap on the discharge freshness-window scan (`MAX_FRESHNESS_WINDOW`).
     pub max_freshness_window: u64,
     /// The **step-up floor** — the human-gate posture the host enforces for a
@@ -115,7 +121,9 @@ pub struct GatePolicy {
 impl Default for GatePolicy {
     fn default() -> Self {
         Self {
-            default_strength_floor: crate::gate::DEFAULT_STRENGTH_FLOOR,
+            default_strength_floor: crate::EnforcementFloor::from_scalar(
+                crate::gate::DEFAULT_STRENGTH_FLOOR,
+            ),
             max_freshness_window: 4096,
             step_up: HumanGate::Passkey,
         }
@@ -683,6 +691,20 @@ impl Default for VmPolicy {
     }
 }
 
+/// Which shell engine a host builds for its `shell` tool (`[bridle.shell]`,
+/// #495). Mechanism, not authority: every engine runs under the same grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellPolicy {
+    /// The engine token: `safe-subset`, `host`, `brush`, or one of their
+    /// aliases. Unset keeps the host's own default rule. Core does not
+    /// interpret it; the shell crate's `ShellEngine` parses it, and a host
+    /// refuses to start on a token it does not know or an engine it was not
+    /// built with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+}
+
 /// The complete, layered bridle configuration (mechanism). Every field defaults to
 /// today's behavior; see the module docs for the authority-vs-mechanism split.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -702,6 +724,8 @@ pub struct BridleConfig {
     pub net: NetPolicy,
     /// Shell + proxy limits.
     pub limits: LimitsPolicy,
+    /// Shell engine selection.
+    pub shell: ShellPolicy,
     /// Web-fetch limits.
     pub web: WebPolicy,
     /// Micro-VM / jail parameters.
@@ -761,7 +785,9 @@ mod tests {
     #[test]
     fn gate_policy_defaults_match_constants() {
         let g = GatePolicy::default();
-        assert_eq!(g.default_strength_floor, AxisEnforcement::Advisory);
+        assert_eq!(g.default_strength_floor, crate::EnforcementFloor::DEFAULT);
+        assert_eq!(g.default_strength_floor.exec(), AxisEnforcement::Advisory);
+        assert_eq!(g.default_strength_floor.net(), AxisEnforcement::Advisory);
         assert_eq!(g.max_freshness_window, 4096);
         // The human-gesture axis floor (ADR 0018 R6) defaults ON: the human leash
         // is Passkey unless deliberately lowered — Autonomous is never by omission.
@@ -877,6 +903,48 @@ mod tests {
         assert!(n.rules.is_empty(), "empty rules ⇒ pure exact-host behavior");
     }
 
+    /// #495: the gate floor is a per-axis `{exec, net}` table. A scalar (the
+    /// form the field had while nothing read it) and a smuggled filesystem
+    /// axis are both hard errors, never a silent default.
+    #[test]
+    fn gate_floor_is_per_axis_and_a_scalar_is_refused() {
+        let floor = |value: serde_json::Value| {
+            let mut json = serde_json::to_value(GatePolicy::default()).unwrap();
+            json["default_strength_floor"] = value;
+            serde_json::from_value::<GatePolicy>(json)
+        };
+        let raised = floor(serde_json::json!({"exec": "interceptor", "net": "kernel"})).unwrap();
+        assert_eq!(
+            raised.default_strength_floor.exec(),
+            AxisEnforcement::Interceptor
+        );
+        assert_eq!(raised.default_strength_floor.net(), AxisEnforcement::Kernel);
+        assert_eq!(
+            raised.default_strength_floor.fs_write(),
+            AxisEnforcement::Kernel,
+            "the filesystem floor is pinned, not configured"
+        );
+        assert!(
+            floor(serde_json::json!("kernel")).is_err(),
+            "a scalar is refused"
+        );
+        assert!(
+            floor(serde_json::json!({"exec": "kernel", "net": "kernel", "fs_write": "advisory"}))
+                .is_err(),
+            "a filesystem axis is not configurable"
+        );
+    }
+
+    /// #495: `[bridle.shell] engine` is carried as a token and defaults to unset.
+    #[test]
+    fn shell_engine_token_defaults_to_unset_and_round_trips() {
+        assert_eq!(BridleConfig::default().shell.engine, None);
+        let mut json = serde_json::to_value(BridleConfig::default()).unwrap();
+        json["shell"] = serde_json::json!({"engine": "safe-subset"});
+        let cfg: BridleConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.shell.engine.as_deref(), Some("safe-subset"));
+    }
+
     // ── Anti-drift: defaults must equal the source constants byte-for-byte, so
     //    this inert config can never silently diverge from today's behavior. ──
 
@@ -885,7 +953,7 @@ mod tests {
         let g = GatePolicy::default();
         assert_eq!(
             g.default_strength_floor,
-            crate::gate::DEFAULT_STRENGTH_FLOOR
+            crate::EnforcementFloor::from_scalar(crate::gate::DEFAULT_STRENGTH_FLOOR)
         );
         assert_eq!(g.max_freshness_window, crate::gate::MAX_FRESHNESS_WINDOW);
     }
