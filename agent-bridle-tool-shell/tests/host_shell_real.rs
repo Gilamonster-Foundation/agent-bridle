@@ -426,3 +426,42 @@ async fn issue_2732_host_shell_zero_budget_returns_timeout() {
     assert!(out["stderr"].as_str().unwrap().contains("0s"));
     assert!(out["stdout"].as_str().unwrap().len() <= OUTPUT_CAP);
 }
+
+/// #490: Host fences loader/hook names out of the caller `env`, like safe-subset.
+#[tokio::test]
+async fn host_loader_hook_env_vars_are_fenced_out() {
+    let out = HostShellTool::new()
+        .invoke(
+            serde_json::json!({
+                "cmd": "env",
+                "env": {"LD_PRELOAD": "/evil.so", "BASH_ENV": "/evil", "SAFE_VAR": "keep"},
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+    let stdout = out["stdout"].as_str().unwrap_or_default();
+    assert!(!stdout.contains("LD_PRELOAD"), "{stdout}");
+    assert!(!stdout.contains("BASH_ENV"), "{stdout}");
+    assert!(stdout.contains("SAFE_VAR=keep"), "{stdout}");
+}
+
+/// #490: Host honors a per-call `timeout_secs`.
+#[tokio::test]
+async fn host_honors_timeout_secs() {
+    // The engine is configured for 3s; the call asks for 1s.
+    let out = HostShellTool::new()
+        .with_timeout(std::time::Duration::from_secs(3))
+        .invoke(
+            serde_json::json!({"cmd": "while :; do :; done", "timeout_secs": 1}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("timeout envelope");
+    assert_eq!(out["timed_out"], true, "{out}");
+    assert_eq!(out["exit_code"], 124, "{out}");
+    assert!(
+        out["stderr"].as_str().unwrap().contains("after 1s"),
+        "{out}"
+    );
+}

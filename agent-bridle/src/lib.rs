@@ -21,7 +21,7 @@
 //!     ..Caveats::top()
 //! });
 //! let out = reg
-//!     .dispatch("shell", serde_json::json!({ "program": "echo", "args": ["hi"] }), &grant)
+//!     .dispatch("shell", serde_json::json!({ "cmd": "echo hi" }), &grant)
 //!     .await?;
 //! assert_eq!(out["exit_code"], 0);
 //! # Ok(())

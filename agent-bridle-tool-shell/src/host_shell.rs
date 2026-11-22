@@ -16,7 +16,6 @@
 //! `/bin/sh` says nothing about what it runs), so claiming to confine them would
 //! be a lie (I9). Restricted-exec/net requests belong on the safe-subset engine.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use agent_bridle_core::{
@@ -217,11 +216,13 @@ impl Tool for HostShellTool {
         args: serde_json::Value,
         cx: &ToolContext,
     ) -> ToolResult<Invocation> {
-        let cmd = args
-            .get("cmd")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::denied("sandbox-host: missing required `cmd` string"))?
-            .to_string();
+        // One request shape for every engine (#490): `env` is fenced of
+        // loader/hook names (AB-004); `timeout_secs` overrides the configured
+        // timeout, clamped to the limits ceiling.
+        let limits = agent_bridle_core::LimitsPolicy::default();
+        let request = crate::request::ShellRequest::parse(&args)?;
+        let cmd = request.require_cmd("sandbox-host")?.to_string();
+        let timeout = request.timeout(&limits, self.timeout);
 
         // ADR 0019 D2 — honesty. The engine only serves fs-restricted; a
         // restricted exec/net grant is refused (the shell forks children this
@@ -239,15 +240,7 @@ impl Tool for HostShellTool {
             ));
         }
 
-        let mut env: BTreeMap<String, String> = args
-            .get("env")
-            .and_then(serde_json::Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut env = request.env(&limits);
         // Full-access PATH seeding (Track 1a / parity). We only reach here when
         // `exec` is unrestricted (a restricted exec/net was refused above), so the
         // child is already permitted to run anything on the host. Seed a usable
@@ -259,7 +252,7 @@ impl Tool for HostShellTool {
         // caller-provided `PATH` wins.
         env.entry("PATH".to_string())
             .or_insert_with(agent_bridle_core::default_exec_path);
-        let cwd = args.get("cwd").and_then(serde_json::Value::as_str);
+        let cwd = request.cwd.as_deref();
         let max_output = self.max_output;
 
         // Build the confined spawn: `/bin/sh -c <cmd>`, empty env + granted vars,
@@ -297,7 +290,6 @@ impl Tool for HostShellTool {
             .ok_or_else(|| ToolError::Exec(std::io::Error::other("stderr pipe missing")))?;
         let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
 
-        let timeout = self.timeout;
         let execution_lease = self.execution_lease.clone();
         let captured = tokio::task::spawn_blocking(move || {
             let _execution_lease = execution_lease;

@@ -7,13 +7,22 @@
     },
     "env": {
       "type": "object",
-      "additionalProperties": { "type": "string" },
-      "description": "Environment for the child (no ambient inheritance)."
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Environment for the child (no ambient inheritance). Loader and hook variables on the env denylist (LD_PRELOAD, PYTHONPATH, BASH_ENV, GIT_SSH_COMMAND, ...) are dropped."
     },
     "cwd": {
       "type": "string",
       "description": "Working directory (within fs_read)."
+    },
+    "timeout_secs": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Per-call timeout in seconds, clamped to the configured ceiling. Omitted: the engine's configured timeout. On expiry the process group is terminated and the result reports timed_out."
     }
   },
-  "required": ["cmd"]
+  "required": [
+    "cmd"
+  ]
 }

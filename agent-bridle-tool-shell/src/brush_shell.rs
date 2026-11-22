@@ -225,35 +225,23 @@ impl Tool for BrushShellTool {
         args: serde_json::Value,
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
-        let cmd = args
-            .get("cmd")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::denied("brush: missing required `cmd` string"))?
-            .to_string();
-        let cwd = args
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
+        // One request shape for every engine (#490): `env` is the schema's
+        // deliberate import surface (this engine runs `do_not_inherit_env`),
+        // fenced of loader/hook names (AB-004); `timeout_secs` overrides the
+        // configured timeout, clamped to the limits ceiling.
+        let limits = agent_bridle_core::LimitsPolicy::default();
+        let request = crate::request::ShellRequest::parse(&args)?;
+        let cmd = request.require_cmd("brush")?.to_string();
+        let timeout = request.timeout(&limits, self.timeout);
+        let cwd = request
+            .cwd
+            .as_deref()
             .map(PathBuf::from)
             .unwrap_or(std::env::current_dir().map_err(ToolError::from)?)
             .canonicalize()
             .map_err(|error| ToolError::denied(format!("brush cwd is invalid: {error}")))?;
         cx.check_path_read(&cwd)?;
-
-        // The schema's `env` seam: the DELIBERATE import surface across the
-        // confinement boundary (this engine runs `do_not_inherit_env(true)`, so
-        // nothing ambient leaks in). String values only, mirroring the host and
-        // safe-subset engines. Before this, brush silently DROPPED `env` even
-        // though the schema advertised it — losing HOME/USER/VIRTUAL_ENV and
-        // re-opening the #783-class `~`-expansion bug under this engine.
-        let env: BTreeMap<String, String> = args
-            .get("env")
-            .and_then(serde_json::Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let env = request.env(&limits);
 
         // PATH parity: the FULL ambient path when `exec` is unrestricted (so the
         // agent's own tools — `~/.cargo/bin`, `/opt/homebrew/bin`, … — resolve
@@ -283,7 +271,7 @@ impl Tool for BrushShellTool {
                 cx,
                 request,
                 Arc::clone(&self.sandbox_policy),
-                self.timeout,
+                timeout,
                 self.max_output,
                 self.output_observer.clone(),
                 self.disclosure(),
@@ -322,7 +310,7 @@ impl Tool for BrushShellTool {
             .with_appcontainer_mount_manager_ace(
                 self.sandbox_policy.appcontainer_mount_manager_ace,
             );
-        let timeout = self.timeout;
+
         let worker_output = output.clone();
         // Dropping this async waiter flags cancellation; the blocking owner
         // then kills and reaps the worker before it releases the lease.
