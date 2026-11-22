@@ -462,6 +462,36 @@ fn emitter_output_round_trips_through_the_reader_with_exact_drop_evidence() {
     assert_eq!(outcome.response.dropped.stderr_bytes, 0);
 }
 
+/// A bounded pipe capture must not hide omissions from the worker protocol.
+#[test]
+fn capped_pipe_drain_preserves_worker_drop_accounting() {
+    use crate::output_observer::{drain_capped, OutputEmitter};
+
+    let sink = SharedSink::default();
+    let emitter = WorkerEmitter::new(sink.clone(), stream_limits(8).expect("limits"));
+    emitter.started().expect("started");
+    let worker = emitter.clone();
+    let output = OutputEmitter::to_worker_channel(std::sync::Arc::new(move |stream, chunk| {
+        worker.output(stream, chunk);
+    }));
+    let (captured, truncated) = drain_capped(
+        std::io::Cursor::new(b"abcdefghij"),
+        8,
+        &output,
+        crate::ShellOutputStream::Stdout,
+    )
+    .expect("drain");
+    emitter.terminal(ok_response()).expect("terminal");
+
+    assert_eq!(captured, b"abcdefgh");
+    assert!(truncated);
+    let bytes = sink.bytes();
+    let outcome = read_stream(bytes.as_slice(), limits(), |_, _| {}).expect("bounded result");
+    assert_eq!(outcome.stdout, captured);
+    assert_eq!(outcome.response.dropped.stdout_bytes, 2);
+    assert_eq!(outcome.response.dropped.stderr_bytes, 0);
+}
+
 /// A `Vec<u8>` sink the test can read back after the emitter has written to it.
 #[derive(Clone, Default)]
 struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

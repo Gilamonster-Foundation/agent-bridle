@@ -72,8 +72,8 @@ pub(crate) struct Captured {
     /// to the result envelope by the caller. Empty on the common path.
     pub net_denials: Vec<Denial>,
     /// AB-006 (#269): the run exceeded its timeout and its process group was
-    /// killed + reaped, so nothing outlives the deadline. `true` is a *confirmed*
-    /// termination — not merely "we stopped waiting."
+    /// killed + reaped. Descendants that escape the owned process group are
+    /// outside this guarantee (agent-bridle#420).
     pub timed_out: bool,
 }
 
@@ -106,10 +106,9 @@ pub(crate) struct SpawnCfg {
     pub unbridled: bool,
     /// Bounded presentation observer for this invocation (authority-neutral).
     pub output: OutputEmitter,
-    /// Wall-clock ceiling for the run. `run_pipeline` enforces it directly —
-    /// killing + reaping the stage process groups on the deadline (AB-006) —
-    /// so a timed-out child never outlives the call.
-    pub timeout: Duration,
+    /// One deadline for the invocation, shared through every script/pipeline
+    /// stage. Expiry kills/reaps owned groups before the worker returns.
+    pub deadline: crate::supervisor::Deadline,
 }
 
 pub(crate) trait Spawner: Send + Sync {
@@ -170,7 +169,7 @@ impl Spawner for OsSpawner {
                 env,
                 cfg.max_output,
                 cfg.output.clone(),
-                cfg.timeout,
+                &cfg.deadline,
                 // Unbridled: dropping the mechanism is what the operator
                 // acknowledged — redirect opens stay unbounded (#351).
                 &Scope::All,
@@ -195,7 +194,7 @@ impl Spawner for OsSpawner {
                 env,
                 cfg.max_output,
                 cfg.output.clone(),
-                cfg.timeout,
+                &cfg.deadline,
                 &caveats.fs_read,
                 &caveats.fs_write,
             )
@@ -262,7 +261,7 @@ fn run_with_egress_proxy(
     let max_output = cfg.max_output;
     let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
-    let timeout = cfg.timeout;
+    let deadline = cfg.deadline.clone();
     let captured = std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
@@ -274,7 +273,7 @@ fn run_with_egress_proxy(
                 &env,
                 max_output,
                 output,
-                timeout,
+                &deadline,
                 &fenced.fs_read,
                 &fenced.fs_write,
             )
@@ -389,7 +388,7 @@ fn run_confined(
     let max_output = cfg.max_output;
     let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
-    let timeout = cfg.timeout;
+    let deadline = cfg.deadline.clone();
     std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
@@ -401,7 +400,7 @@ fn run_confined(
                 &env,
                 max_output,
                 output,
-                timeout,
+                &deadline,
                 &caveats.fs_read,
                 &caveats.fs_write,
             )
@@ -439,6 +438,7 @@ pub struct ShellTool {
     sandbox: Arc<SandboxPolicy>,
     private_hosts: HashSet<String>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
+    execution_lease: Option<crate::ExecutionLease>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -467,6 +467,7 @@ impl ShellTool {
             sandbox: Arc::new(SandboxPolicy::default()),
             private_hosts: HashSet::new(),
             output_observer: None,
+            execution_lease: None,
         }
     }
 
@@ -479,6 +480,15 @@ impl ShellTool {
     #[must_use]
     pub fn with_output_observer(mut self, observer: Arc<dyn crate::ShellOutputObserver>) -> Self {
         self.output_observer = Some(observer);
+        self
+    }
+
+    /// Retain resources until the blocking execution owner finishes. Dropping
+    /// the async waiter does not release the lease early; the safe-subset
+    /// engine's existing execution deadline still governs worker shutdown.
+    #[must_use]
+    pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
+        self.execution_lease = Some(lease);
         self
     }
 
@@ -517,6 +527,7 @@ impl ShellTool {
             sandbox: Arc::new(SandboxPolicy::default()),
             private_hosts: HashSet::new(),
             output_observer: None,
+            execution_lease: None,
         }
     }
 
@@ -533,6 +544,7 @@ impl ShellTool {
             sandbox: Arc::new(SandboxPolicy::default()),
             private_hosts: HashSet::new(),
             output_observer: None,
+            execution_lease: None,
         }
     }
 
@@ -553,6 +565,7 @@ impl ShellTool {
             sandbox: Arc::new(SandboxPolicy::default()),
             private_hosts: HashSet::new(),
             output_observer: None,
+            execution_lease: None,
         }
     }
 }
@@ -967,11 +980,12 @@ impl Tool for ShellTool {
             }
         }
 
-        // Run on a blocking thread, bounded by the timeout. On timeout the
-        // blocking task is detached and a timeout envelope is returned.
+        // All pipelines share one clock, including time queued before the
+        // blocking owner starts. Timeout cancels and joins that owner.
         let spawner = Arc::clone(&self.spawner);
         let cwd = parsed.cwd.clone();
         let timeout = parsed.timeout;
+        let deadline = crate::supervisor::Deadline::new(timeout);
         let (output_guard, output) =
             output_session(self.output_observer.clone(), self.limits.max_output_bytes);
         let cfg = SpawnCfg {
@@ -981,7 +995,7 @@ impl Tool for ShellTool {
             private_hosts: self.private_hosts.clone(),
             unbridled,
             output,
-            timeout,
+            deadline: deadline.clone(),
         };
         // Disclosed on every envelope this run returns (ADR 0018 D5/D11 / I11).
         // `mach_services` (agent-bridle#405): the zero-floor posture of a
@@ -1007,54 +1021,52 @@ impl Tool for ShellTool {
         let (env, _dropped_env) =
             agent_bridle_core::fence_env(&parsed.env, &self.limits.env_denylist);
         let caveats = cx.caveats().clone();
-        let run = tokio::task::spawn_blocking(move || {
+        let execution_lease = self.execution_lease.clone();
+        let mut run = tokio::task::spawn_blocking(move || {
+            let _execution_lease = execution_lease;
             run_script(&*spawner, &script, cwd.as_deref(), &caveats, &env, &cfg)
         });
-        // This outer timeout bounds when `invoke` RETURNS. The kill+reap of a
-        // timed-out child is done by `run_pipeline` itself, which enforces the
-        // same deadline internally (AB-006, #269): even if this timeout fires and
-        // detaches the blocking worker, that worker keeps running `run_pipeline`,
-        // which reaches its own deadline and SIGKILLs + reaps the stage process
-        // groups — so nothing runs to completion past the deadline. (Before the
-        // fix `run_pipeline` blocked in `wait()` and the detached child ran on.)
-        match tokio::time::timeout(timeout, run).await {
-            Ok(joined) => {
-                let captured = joined
-                    .map_err(|e| ToolError::Other(anyhow::anyhow!("shell task panicked: {e}")))??;
-                // #196: a run that reached an out-of-allow-list host was refused
-                // by the egress proxy — surface those as structured `net` denials
-                // (sets `denied: true`; empty is a no-op on the common path).
-                // This is a `Ran` outcome even when `net_denials` set `denied:
-                // true`: the child DID spawn, so the call is charged — the typed
-                // outcome is what keeps that distinct from a pre-run refusal.
-                let envelope = ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement)
-                    .with_disclosure(disclosure)
-                    .with_exit_code(captured.exit_code)
-                    .with_truncation(captured.stdout_truncated, captured.stderr_truncated)
-                    .with_stdout(captured.stdout)
-                    .with_stderr(captured.stderr)
-                    .with_denials(captured.net_denials)
-                    .with_timed_out(captured.timed_out)
-                    .into_json();
-                output_guard.finish();
-                Ok(Invocation::Ran(envelope))
+        let mut output_guard = Some(output_guard);
+        let (joined, outer_timeout) = match tokio::time::timeout(timeout, &mut run).await {
+            Ok(joined) => (joined, false),
+            Err(_) => {
+                deadline.cancel();
+                drop(output_guard.take());
+                // Do not report termination while the blocking script can still
+                // spawn. Its shared deadline kills/reaps active groups first.
+                (run.await, true)
             }
-            Err(_elapsed) => {
-                // Stop accepting presentation events at the timeout boundary;
-                // the detached blocking worker may still be unwinding. A timeout
-                // is a `Ran` outcome — the child launched — so it is charged.
-                drop(output_guard);
-                Ok(Invocation::Ran(
-                    ToolEnvelope::new(sandbox_kind)
-                        .with_enforcement(enforcement)
-                        .with_disclosure(disclosure)
-                        .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
-                        .with_timed_out(true)
-                        .into_json(),
-                ))
+        };
+        let mut captured =
+            joined.map_err(|e| ToolError::Other(anyhow::anyhow!("shell task panicked: {e}")))??;
+        captured.timed_out |= outer_timeout;
+        if captured.timed_out {
+            captured.exit_code = 124;
+            captured.stderr = cap_string(
+                format!(
+                    "command timed out after {}s\n{}",
+                    timeout.as_secs(),
+                    captured.stderr
+                ),
+                self.limits.max_output_bytes,
+            );
+        }
+        let envelope = ToolEnvelope::new(sandbox_kind)
+            .with_enforcement(enforcement)
+            .with_disclosure(disclosure)
+            .with_exit_code(captured.exit_code)
+            .with_truncation(captured.stdout_truncated, captured.stderr_truncated)
+            .with_stdout(captured.stdout)
+            .with_stderr(captured.stderr)
+            .with_denials(captured.net_denials)
+            .with_timed_out(captured.timed_out)
+            .into_json();
+        if !captured.timed_out {
+            if let Some(guard) = output_guard {
+                guard.finish();
             }
         }
+        Ok(Invocation::Ran(envelope))
     }
 }
 
@@ -1079,6 +1091,11 @@ fn run_script(
     let mut timed_out = false;
 
     for item in script {
+        if cfg.deadline.remaining().is_zero() {
+            timed_out = true;
+            status = 124;
+            break;
+        }
         let run_it = match item.sep {
             Sep::Seq => true,
             Sep::And => status == 0,
@@ -1094,7 +1111,8 @@ fn run_script(
             status = captured.exit_code;
             // A pipeline that hit its deadline was killed + reaped; stop the
             // script there rather than starting further work past the deadline.
-            if captured.timed_out {
+            if captured.timed_out || cfg.deadline.remaining().is_zero() {
+                status = 124;
                 timed_out = true;
                 break;
             }
@@ -1634,7 +1652,7 @@ fn match_class(p: &[char], c: char) -> Option<(bool, &[char])> {
 /// orphan processes.
 fn kill_all(children: &mut [Child]) {
     for child in children.iter_mut() {
-        let _ = child.kill();
+        crate::kill_child_tree(child);
         let _ = child.wait();
     }
 }
@@ -1690,7 +1708,7 @@ fn run_pipeline(
     env: &BTreeMap<String, String>,
     max_output: usize,
     output: OutputEmitter,
-    timeout: Duration,
+    deadline: &crate::supervisor::Deadline,
     // #351: the effective fs axes bound the PARENT-side redirect opens below —
     // `open_scoped_*` resolves-and-opens beneath the granted roots in one
     // kernel-checked step, so a component swapped for a symlink after the leash
@@ -1712,6 +1730,9 @@ fn run_pipeline(
     let mut stderr_threads: Vec<std::thread::JoinHandle<(Vec<u8>, bool)>> = Vec::new();
 
     for (i, stage) in stages.iter().enumerate() {
+        if deadline.remaining().is_zero() {
+            break;
+        }
         let is_last = i == last;
         let stage_argv = expand_stage_argv(stage, cwd);
         // Prepend the sandbox wrapper (Seatbelt) so the program is spawned
@@ -1860,6 +1881,9 @@ fn run_pipeline(
         #[cfg(unix)]
         agent_bridle_fdguard::deny_inherited_fds(&mut cmd);
 
+        if deadline.remaining().is_zero() {
+            break;
+        }
         let mut child = ok_or_kill(cmd.spawn(), &mut children)?;
 
         if matches!(stage.stderr_disposition(), StderrTo::Capture) {
@@ -1891,41 +1915,12 @@ fn run_pipeline(
     // buffer); on the deadline, SIGKILL each stage's process group and reap, so
     // nothing — child or descendant — outlives the timeout. The pipeline's exit
     // code is the last stage's.
-    let deadline = std::time::Instant::now() + timeout;
-    let mut exit_code = -1;
-    let mut timed_out = false;
-    let mut done = vec![false; children.len()];
-    loop {
-        let mut all_done = true;
-        for (i, child) in children.iter_mut().enumerate() {
-            if done[i] {
-                continue;
-            }
-            match child.try_wait().map_err(ToolError::Exec)? {
-                Some(status) => {
-                    done[i] = true;
-                    if i == last {
-                        exit_code = status.code().unwrap_or(-1);
-                    }
-                }
-                None => all_done = false,
-            }
-        }
-        if all_done {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            timed_out = true;
-            for child in children.iter_mut() {
-                crate::kill_child_tree(child);
-            }
-            // Reap every stage so no zombie/child survives the call.
-            for child in children.iter_mut() {
-                let _ = child.wait();
-            }
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(15));
+    let (exit_code, timed_out) = crate::supervisor::supervise_until(&mut children, deadline)?;
+    // A completed stage can leave descendants holding its output pipes.
+    // End owned groups before reader joins, as in the host engine. Escaped
+    // pipe holders remain outside this mechanism (agent-bridle#420).
+    for child in &mut children {
+        crate::kill_child_tree(child);
     }
 
     let (stdout, stdout_truncated) =
@@ -2305,6 +2300,64 @@ mod tests {
         }
     }
 
+    /// #2732 round 2: short pipelines share one invocation deadline. A later
+    /// side-effect sentinel must never start after the cumulative budget expires.
+    #[test]
+    fn round2_successive_stages_share_one_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct ClockSpawner {
+            ticks: Arc<AtomicU64>,
+            calls: Mutex<Vec<String>>,
+        }
+        impl Spawner for ClockSpawner {
+            fn requires_backend_admission(&self) -> bool {
+                false
+            }
+            fn run(
+                &self,
+                stages: &[Command],
+                _: Option<&str>,
+                _: &Caveats,
+                _: &BTreeMap<String, String>,
+                _: &SpawnCfg,
+            ) -> ToolResult<Captured> {
+                self.calls.lock().unwrap().push(prog(&stages[0]).to_owned());
+                self.ticks.fetch_add(30, Ordering::SeqCst);
+                Ok(Captured::default())
+            }
+        }
+        let ticks = Arc::new(AtomicU64::new(0));
+        let clock = ticks.clone();
+        let spawner = ClockSpawner {
+            ticks,
+            calls: Mutex::new(Vec::new()),
+        };
+        let cfg = SpawnCfg {
+            max_output: 100,
+            audit_sink: None,
+            sandbox: Arc::new(SandboxPolicy::default()),
+            private_hosts: HashSet::new(),
+            unbridled: false,
+            output: OutputEmitter::default(),
+            deadline: crate::supervisor::Deadline::with_clock(Duration::from_secs(60), move || {
+                Duration::from_secs(clock.load(Ordering::SeqCst))
+            }),
+        };
+        let script = classify("first; second; sentinel").unwrap();
+        let captured = run_script(
+            &spawner,
+            &script,
+            None,
+            &Caveats::top(),
+            &BTreeMap::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(*spawner.calls.lock().unwrap(), ["first", "second"]);
+        assert!(captured.timed_out);
+        assert_eq!(captured.exit_code, 124);
+    }
+
     struct CoordinatedSpawner {
         proceed: Mutex<mpsc::Receiver<()>>,
         finished: mpsc::Sender<()>,
@@ -2324,11 +2377,11 @@ mod tests {
             cfg: &SpawnCfg,
         ) -> ToolResult<Captured> {
             cfg.output.emit(crate::ShellOutputStream::Stdout, b"first");
-            self.proceed
+            let _ = self
+                .proceed
                 .lock()
                 .expect("proceed lock")
-                .recv()
-                .expect("test releases spawner");
+                .recv_timeout(cfg.deadline.remaining());
             cfg.output.emit(crate::ShellOutputStream::Stdout, b"second");
             self.finished.send(()).expect("test observes completion");
             Ok(Captured {
@@ -2541,6 +2594,48 @@ mod tests {
         );
     }
 
+    /// #489: dropping the async waiter must not free the caller's execution
+    /// lease while the blocking owner (here a blocked mock spawner) still runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_call_keeps_its_lease_until_the_spawner_returns() {
+        let (spawner, proceed, finished) = coordinated_spawner();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let entered_tx = Mutex::new(entered_tx);
+        let observer = Arc::new(move |_, _, _: &[u8]| {
+            let _ = entered_tx.lock().expect("entered lock").send(());
+        });
+        let lease: crate::ExecutionLease = Arc::new(());
+        let held = Arc::downgrade(&lease);
+        let tool = ShellTool::with_spawner(spawner)
+            .with_output_observer(observer)
+            .with_execution_lease(lease);
+        let context = ctx(exec_only(&["anything"]));
+        let invoke = tokio::spawn(async move {
+            tool.invoke(serde_json::json!({"program": "anything"}), &context)
+                .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("spawner is running");
+        invoke.abort();
+        assert!(invoke.await.expect_err("aborted").is_cancelled());
+        assert!(
+            held.upgrade().is_some(),
+            "the lease must outlive the dropped waiter while the spawner runs"
+        );
+        proceed.send(()).expect("release spawner");
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("spawner returned");
+        for _ in 0..200 {
+            if held.upgrade().is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the lease must be released once the blocking owner finishes");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_does_not_wait_for_a_blocked_observer_or_deliver_late_output() {
         let (spawner, proceed, finished) = coordinated_spawner();
@@ -2577,7 +2672,7 @@ mod tests {
 
         invoke.abort();
         let cancelled = tokio::time::timeout(Duration::from_millis(500), &mut invoke).await;
-        proceed.send(()).expect("release detached worker");
+        let _ = proceed.send(());
         release_observer_tx
             .send(())
             .expect("release presentation callback");
@@ -2624,7 +2719,7 @@ mod tests {
         if result.is_err() {
             invoke.abort();
         }
-        proceed.send(()).expect("release detached worker");
+        let _ = proceed.send(());
         release_tx.send(()).expect("release presentation callback");
         worker_finished
             .recv_timeout(Duration::from_secs(2))

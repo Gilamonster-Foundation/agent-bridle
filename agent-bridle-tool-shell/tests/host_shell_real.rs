@@ -408,3 +408,21 @@ async fn bare_name_resolves_when_path_includes_its_dir() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #489 (newt #2732): the host engine honors its timeout. An injected zero
+/// budget terminates a non-finishing shell without sleeping to a deadline.
+#[tokio::test]
+async fn issue_2732_host_shell_zero_budget_returns_timeout() {
+    let tool = HostShellTool::new().with_timeout(Duration::ZERO);
+    let out = tool
+        .invoke(
+            serde_json::json!({"cmd": "while :; do :; done"}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("timeout envelope");
+    assert_eq!(out["timed_out"], true);
+    assert_eq!(out["exit_code"], 124);
+    assert!(out["stderr"].as_str().unwrap().contains("0s"));
+    assert!(out["stdout"].as_str().unwrap().len() <= OUTPUT_CAP);
+}
