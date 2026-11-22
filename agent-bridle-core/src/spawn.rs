@@ -2839,6 +2839,42 @@ sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
             let _ = fs::remove_dir_all(&secret);
         };
 
+        // The grant can read `readable` but not `secret`. The interpreter's
+        // own files come from the sandbox policy's base read paths, as for any
+        // confined program; naming `/lib` here would be refused, because it is
+        // a symlink on a merged-`/usr` host and admission cannot decide a
+        // symlinked grant root.
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([readable.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([readable.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+
+        // First control, on every Landlock host: under this grant the
+        // interpreter starts, and the fence hides the payload at its real
+        // path. Without it, a helper that died for an unrelated reason could
+        // pass for a refused mount.
+        let direct = ConfinedCommand::new(python)
+            .args([
+                "-c",
+                "import sys\ntry:\n    open(sys.argv[1]).read()\nexcept PermissionError:\n    sys.exit(7)",
+            ])
+            .arg(secret.join("payload"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn(&cx)
+            .expect("an fs-restricted spawn is admitted under Landlock")
+            .child
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(
+            direct.status.code(),
+            Some(7),
+            "the confined interpreter must start and be denied the payload's real path: {}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+
+        // Second control: unconfined, the escape works on this host.
         let control = std::process::Command::new(python)
             .args(["-c", BIND_MOUNT_ESCAPE])
             .arg(&secret)
@@ -2857,16 +2893,7 @@ sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
             return;
         }
 
-        // The same helper under a grant that can read `readable` and the
-        // system trees the interpreter needs, but not `secret`.
-        let roots = [readable.to_string_lossy().into_owned()]
-            .into_iter()
-            .chain(["/usr", "/lib", "/lib64", "/etc"].map(String::from));
-        let cx = ctx(Caveats {
-            fs_read: Scope::only(roots),
-            fs_write: Scope::only([readable.to_string_lossy().into_owned()]),
-            ..Caveats::top()
-        });
+        // The same helper, under the grant that already hid the payload.
         let confined = ConfinedCommand::new(python)
             .args(["-c", BIND_MOUNT_ESCAPE])
             .arg(&secret)
