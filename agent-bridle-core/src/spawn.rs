@@ -40,7 +40,9 @@ use crate::{
     ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy,
     ToolContext, ToolError, ToolResult,
 };
+mod worker_authority;
 mod worker_image;
+pub use worker_authority::WorkerAuthority;
 use worker_image::WorkerImage;
 
 use agent_mesh_protocol::Fingerprint;
@@ -148,6 +150,7 @@ struct TrustedWorkerControl {
     nonce: String,
     caveats: Caveats,
     strength_floor: EnforcementFloor,
+    fence: crate::FenceEvidence,
 }
 
 impl TrustedWorkerControl {
@@ -189,6 +192,7 @@ impl TrustedWorkerControl {
             nonce: self.nonce.clone(),
             caveats: self.caveats.clone(),
             strength_floor: self.strength_floor,
+            fence: self.fence.clone(),
             payload,
         };
         let body = serde_json::to_vec(&request)
@@ -233,6 +237,7 @@ impl TrustedWorkerControl {
             &self.nonce,
             &self.caveats,
             self.strength_floor,
+            &self.fence,
             payload,
             child_pid,
             timeout,
@@ -244,7 +249,7 @@ impl TrustedWorkerControl {
 }
 
 /// Version of the private trusted-worker authority envelope.
-pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 2;
+pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 3;
 /// Maximum serialized trusted-worker request body.
 pub const TRUSTED_WORKER_MAX_BODY: usize = 1024 * 1024;
 /// Fixed, non-authority prelude used to establish kernel peer metadata.
@@ -270,14 +275,22 @@ pub struct TrustedWorkerRequest<P> {
     nonce: String,
     caveats: Caveats,
     strength_floor: EnforcementFloor,
+    /// v3 (#499): the fence evidence of the spawn, copied from [`ConfinedChild`].
+    fence: crate::FenceEvidence,
     payload: P,
 }
 
 impl<P> TrustedWorkerRequest<P> {
-    /// Consume the envelope into its core-authenticated authority and payload.
+    /// Consume the envelope into its nonce, core-authenticated authority, and
+    /// payload.
     #[must_use]
-    pub fn into_parts(self) -> (String, Caveats, EnforcementFloor, P) {
-        (self.nonce, self.caveats, self.strength_floor, self.payload)
+    pub fn into_parts(self) -> (String, WorkerAuthority, P) {
+        let authority = WorkerAuthority {
+            caveats: self.caveats,
+            strength_floor: self.strength_floor,
+            fence: self.fence,
+        };
+        (self.nonce, authority, self.payload)
     }
 
     /// Whether the envelope uses the protocol version understood by this core.
@@ -1185,6 +1198,13 @@ impl SandboxedWorker {
                 nonce: nonce.to_string(),
                 caveats: request_caveats,
                 strength_floor: request_strength_floor,
+                fence: crate::FenceEvidence {
+                    fence_id: confined.fence_id,
+                    sandbox_kind: confined.sandbox_kind,
+                    // `spawn_authorized` engages no egress proxy.
+                    egress_proxied: false,
+                    admitted: confined.admitted.map(Box::new),
+                },
             }),
         })
     }
@@ -1830,25 +1850,26 @@ mod tests {
     use crate::enforcement_report;
     use crate::{Gate, Tool};
 
+    struct AnyTool;
+    #[async_trait::async_trait]
+    impl Tool for AnyTool {
+        fn name(&self) -> &str {
+            "any"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _cx: &ToolContext,
+        ) -> ToolResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
     /// Mint a `ToolContext` the only legitimate way — through the gate.
     fn ctx(granted: Caveats) -> ToolContext {
-        struct AnyTool;
-        #[async_trait::async_trait]
-        impl Tool for AnyTool {
-            fn name(&self) -> &str {
-                "any"
-            }
-            fn schema(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-            async fn invoke(
-                &self,
-                _args: serde_json::Value,
-                _cx: &ToolContext,
-            ) -> ToolResult<serde_json::Value> {
-                Ok(serde_json::Value::Null)
-            }
-        }
         Gate::new(0)
             .authorize(&AnyTool, &granted)
             .expect("authorize")
@@ -1972,11 +1993,13 @@ mod tests {
             exec: Scope::only(["echo".to_string()]),
             ..Caveats::top()
         };
+        let captured = test_fence(SandboxKind::Landlock);
         let control = TrustedWorkerControl {
             stream: client,
             nonce: "core-owned-nonce".to_string(),
             caveats: frozen.clone(),
             strength_floor: EnforcementFloor::DEFAULT,
+            fence: captured.clone(),
         };
         let mut worker = SandboxedWorkerChild {
             child: process,
@@ -1987,15 +2010,25 @@ mod tests {
             "cmd": "echo ok",
             "caveats": Caveats::top(),
             "strength_floor": AxisEnforcement::Kernel,
+            "fence": test_fence(SandboxKind::None),
         });
         worker
             .send_payload(&forged_payload, Duration::from_secs(5))
             .expect("first payload");
 
-        let (nonce, authority, floor, payload) = seen_rx.recv().expect("receive decoded request");
+        let (nonce, authority, payload) = seen_rx.recv().expect("receive decoded request");
         assert_eq!(nonce, "core-owned-nonce");
-        assert_eq!(authority, frozen, "payload must not replace frozen caveats");
-        assert_eq!(floor, EnforcementFloor::DEFAULT);
+        assert_eq!(
+            authority.caveats(),
+            &frozen,
+            "payload must not replace frozen caveats"
+        );
+        assert_eq!(authority.strength_floor(), EnforcementFloor::DEFAULT);
+        assert_eq!(
+            authority.fence(),
+            &captured,
+            "payload must not replace the core-captured fence (#499)"
+        );
         assert_eq!(payload, forged_payload);
         assert!(
             matches!(
@@ -2021,6 +2054,7 @@ mod tests {
             nonce: "n".to_string(),
             caveats: Caveats::top(),
             strength_floor: EnforcementFloor::CONFINED,
+            fence: test_fence(SandboxKind::None),
             payload: serde_json::json!({"cmd": "echo ok"}),
         };
         let body = serde_json::to_vec(&request).expect("encode");
@@ -2035,9 +2069,10 @@ mod tests {
             "the encoded floor must omit the filesystem axes: {floor_obj}",
         );
         // A valid body round-trips and reconstructs the pinned Kernel fs floor.
-        let (_, _, floor, _) = decode_trusted_worker_request::<serde_json::Value>(&body)
+        let (_, authority, _) = decode_trusted_worker_request::<serde_json::Value>(&body)
             .expect("decode valid")
             .into_parts();
+        let floor = authority.strength_floor();
         assert_eq!(floor.fs_read(), AxisEnforcement::Kernel);
         assert_eq!(floor.fs_write(), AxisEnforcement::Kernel);
         assert_eq!(floor, EnforcementFloor::CONFINED);
@@ -2053,6 +2088,74 @@ mod tests {
             decode_trusted_worker_request::<serde_json::Value>(forged.as_bytes()).is_err(),
             "a trusted-worker floor carrying a filesystem field must be rejected",
         );
+    }
+
+    fn test_fence(sandbox_kind: SandboxKind) -> crate::FenceEvidence {
+        let admitted = AdmittedFence::admit(
+            &Caveats::top(),
+            RuntimeClosure::empty(),
+            ConfinementMechanism::new(SandboxKind::None, crate::ChildNetworkPolicy::LandlockOnly),
+            EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+            |caveats| BackendProjection {
+                resolved: crate::ResolvedAuthority::from_delegated(caveats),
+                runtime_closure: crate::empty_closure(),
+            },
+        )
+        .expect("admit test fence");
+        crate::FenceEvidence {
+            fence_id: admitted.fence_id().clone(),
+            sandbox_kind,
+            egress_proxied: false,
+            admitted: None,
+        }
+    }
+
+    /// #499: the worker re-mints from a v3 request whose fence says Landlock.
+    /// The minted context must report Landlock (it reported `None` when the
+    /// worker re-minted via a bare `Gate::new`), and the fence must be exactly
+    /// the one carried in the envelope.
+    #[test]
+    fn worker_authority_reports_the_fence_sandbox_kind() {
+        let fence = test_fence(SandboxKind::Landlock);
+        let request = TrustedWorkerRequest {
+            version: TRUSTED_WORKER_PROTOCOL_VERSION,
+            nonce: "n".to_string(),
+            caveats: Caveats::top(),
+            strength_floor: EnforcementFloor::CONFINED,
+            fence: fence.clone(),
+            payload: serde_json::json!({}),
+        };
+        let body = serde_json::to_vec(&request).expect("encode");
+        let decoded = decode_trusted_worker_request::<serde_json::Value>(&body).expect("decode");
+        assert!(decoded.has_supported_version());
+        let (_, authority, _) = decoded.into_parts();
+        let cx = authority
+            .authorize(&AnyTool)
+            .expect("authorize worker context");
+        assert_eq!(cx.sandbox_kind(), SandboxKind::Landlock);
+        assert_eq!(cx.strength_floor(), EnforcementFloor::CONFINED);
+        assert_eq!(authority.fence(), &fence);
+    }
+
+    /// #499: a v2 body (no fence evidence) is refused, never defaulted to an
+    /// unconfined fence.
+    #[test]
+    fn v2_worker_request_is_refused() {
+        let v2 = serde_json::json!({
+            "version": 2,
+            "nonce": "n",
+            "caveats": Caveats::top(),
+            "strength_floor": EnforcementFloor::DEFAULT,
+            "payload": {},
+        });
+        let body = serde_json::to_vec(&v2).expect("encode");
+        assert!(decode_trusted_worker_request::<serde_json::Value>(&body).is_err());
+
+        let mut with_fence = v2;
+        with_fence["fence"] = serde_json::to_value(test_fence(SandboxKind::None)).unwrap();
+        let body = serde_json::to_vec(&with_fence).expect("encode");
+        let decoded = decode_trusted_worker_request::<serde_json::Value>(&body).expect("decode");
+        assert!(!decoded.has_supported_version());
     }
 
     #[test]

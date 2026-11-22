@@ -104,7 +104,7 @@ pub use spawn::{
     decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,
     spawn_confined_subprocess, trusted_worker_frame_digest, ConfinedChild, ConfinedCommand,
     ConfinedStdio, ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind,
-    TrustedWorkerRequest, TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP,
+    TrustedWorkerRequest, WorkerAuthority, TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP,
     TRUSTED_WORKER_FRAME_HEADER_LEN, TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY,
     TRUSTED_WORKER_PROTOCOL_VERSION,
 };
