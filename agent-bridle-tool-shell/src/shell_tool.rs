@@ -1014,12 +1014,11 @@ impl Tool for ShellTool {
         };
         // Host/operator-supplied environment (the env seam, newt #783): carried
         // through to the child processes. Empty when the dispatch omits `env`.
-        // AB-004: strip loader/interpreter/hook vars (LD_PRELOAD, PYTHONPATH,
-        // GIT_SSH_COMMAND, BASH_ENV, …) before they reach ANY engine — they
-        // hijack what an allowed program actually executes, regardless of the
-        // exec leash. Fenced once here so all three engines get a clean env.
-        let (env, _dropped_env) =
-            agent_bridle_core::fence_env(&parsed.env, &self.limits.env_denylist);
+        // AB-004: loader/interpreter/hook vars (LD_PRELOAD, PYTHONPATH,
+        // GIT_SSH_COMMAND, BASH_ENV, …) were already dropped by
+        // `ShellRequest::env`, which every engine reads (#490). An `export` or
+        // `VAR=value` prefix inside `cmd` is not fenced here (#476).
+        let env = parsed.env.clone();
         let caveats = cx.caveats().clone();
         let execution_lease = self.execution_lease.clone();
         let mut run = tokio::task::spawn_blocking(move || {
@@ -1230,42 +1229,18 @@ struct ShellArgs {
 
 impl ShellArgs {
     fn parse(v: &serde_json::Value, limits: &LimitsPolicy) -> ToolResult<Self> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| ToolError::denied("shell args must be a JSON object"))?;
-
-        let program = obj
-            .get("program")
-            .and_then(|x| x.as_str())
-            .map(String::from);
-        let cmd = obj.get("cmd").and_then(|x| x.as_str()).map(String::from);
-        let args = obj
-            .get("args")
-            .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let cwd = obj.get("cwd").and_then(|x| x.as_str()).map(String::from);
-        // The env seam (newt #783): a `"env": { "KEY": "VALUE", … }` object whose
-        // string values are set on the spawned child(ren). Absent → empty map
-        // (back-compat). Non-string values are dropped (the schema is string-only).
-        let env = obj
-            .get("env")
-            .and_then(|x| x.as_object())
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect::<BTreeMap<String, String>>()
-            })
-            .unwrap_or_default();
-        let timeout_secs = obj
-            .get("timeout_secs")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(limits.default_timeout_secs)
-            .clamp(1, limits.max_timeout_secs);
+        // One request shape for every engine (#490): `env` comes back fenced
+        // (AB-004) and `timeout_secs` clamped to the configured ceiling.
+        let req = crate::request::ShellRequest::parse(v)?;
+        let env = req.env(limits);
+        let timeout = req.timeout(limits, Duration::from_secs(limits.default_timeout_secs));
+        let crate::request::ShellRequest {
+            program,
+            args,
+            cmd,
+            cwd,
+            ..
+        } = req;
 
         match (&program, &cmd) {
             (Some(_), Some(_)) => {
@@ -1288,7 +1263,7 @@ impl ShellArgs {
             cmd,
             cwd,
             env,
-            timeout: Duration::from_secs(timeout_secs),
+            timeout,
         })
     }
 

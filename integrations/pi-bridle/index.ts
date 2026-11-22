@@ -128,7 +128,7 @@ class BridleMcp {
 	/** Dispatch a free-form shell command through the leashed `shell` tool. */
 	async shell(cmd: string, cwd: string, timeoutSecs?: number): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 		const args: Record<string, unknown> = { cmd, cwd };
-		if (timeoutSecs && timeoutSecs > 0) args.timeout = timeoutSecs;
+		if (timeoutSecs && timeoutSecs > 0) args.timeout_secs = timeoutSecs;
 		const result = (await this.request("tools/call", { name: "shell", arguments: args })) as ToolCallResult;
 		const text = result.content?.map((c) => c.text ?? "").join("") ?? "";
 

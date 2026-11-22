@@ -75,6 +75,8 @@ pub(crate) use agent_bridle_core::net_proxy;
 mod output_observer;
 #[cfg(feature = "shell")]
 mod parse;
+#[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
+mod request;
 #[cfg(feature = "shell")]
 mod shell_tool;
 #[cfg(any(feature = "shell", feature = "host-shell"))]
