@@ -166,6 +166,7 @@ impl McpServer {
 
             let response = match outcome {
                 Ok(result) => success_response(id, result),
+                Err(e) if e.is::<MethodNotFound>() => error_response(id, -32601, &e.to_string()),
                 Err(e) => error_response(id, -32603, &e.to_string()),
             };
             write_response(&mut writer, &response).await?;
@@ -175,7 +176,8 @@ impl McpServer {
     }
 
     /// Route one method to its handler, producing a JSON-RPC `result` value (or
-    /// an error to surface as `-32603`). MCP *tool* errors (e.g. a denied
+    /// an error: [`MethodNotFound`] surfaces as `-32601`, anything else as
+    /// `-32603`). MCP *tool* errors (e.g. a denied
     /// dispatch) are NOT transport errors: they come back inside an `Ok`
     /// `result` with `isError: true` (see [`handlers::tools_call`]).
     async fn dispatch(&self, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -191,12 +193,26 @@ impl McpServer {
             .await),
             // Lifecycle: a clean shutdown ack. `exit` is handled in the loop.
             "shutdown" => Ok(Value::Null),
+            // Liveness: MCP requires a prompt empty result.
+            "ping" => Ok(serde_json::json!({})),
             // Client notifications we accept and ignore (no `id` → no response).
             "notifications/initialized" | "initialized" => Ok(Value::Null),
-            other => anyhow::bail!("Method not found: {other}"),
+            other => Err(MethodNotFound(other.to_owned()).into()),
         }
     }
 }
+
+/// A method the server does not implement: JSON-RPC `-32601`.
+#[derive(Debug)]
+struct MethodNotFound(String);
+
+impl std::fmt::Display for MethodNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Method not found: {}", self.0)
+    }
+}
+
+impl std::error::Error for MethodNotFound {}
 
 /// A successful JSON-RPC 2.0 response.
 fn success_response(id: Value, result: Value) -> Value {
@@ -349,13 +365,26 @@ mod tests {
         }
     }
 
+    /// #479: `ping` must get an empty result, not an error, or a host that
+    /// pings for liveness reads the server as failed.
+    #[tokio::test]
+    async fn ping_returns_empty_result() {
+        let resp = roundtrip(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "ping"
+        }))
+        .await;
+        assert_eq!(resp["result"], serde_json::json!({}));
+        assert!(resp.get("error").is_none(), "ping errored: {resp}");
+    }
+
+    /// AB-021 (#261): an unknown method is `-32601`, not `-32603`.
     #[tokio::test]
     async fn unknown_method_is_method_not_found() {
         let resp = roundtrip(&serde_json::json!({
             "jsonrpc": "2.0", "id": 9, "method": "bogus/method"
         }))
         .await;
-        assert_eq!(resp["error"]["code"], -32603);
+        assert_eq!(resp["error"]["code"], -32601);
         assert!(resp["error"]["message"]
             .as_str()
             .unwrap()
