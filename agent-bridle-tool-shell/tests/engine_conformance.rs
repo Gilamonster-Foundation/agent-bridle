@@ -120,7 +120,11 @@ async fn refuses_out_of_scope(
                 exec: Scope::only(["echo".to_string()]),
                 ..Caveats::top()
             },
-            serde_json::json!({"cmd": format!("touch {}", marker.display())}),
+            // The path form goes straight to each engine's exec check. A bare
+            // name is looked up on PATH first, and under Seatbelt that lookup
+            // fails before Brush's filter sees it: the command still never
+            // runs, but it reports "command not found", not a denial.
+            serde_json::json!({"cmd": format!("/bin/touch {}", marker.display())}),
         ),
         (Operation::Open, Origin::Shell) => (
             Caveats {
@@ -150,11 +154,15 @@ async fn refuses_out_of_scope(
         ),
         other => panic!("{engine} rates {other:?} Checked but this lane has no sampler for it"),
     };
-    let refused = match tool.invoke(args, &ctx(tool, &granted)).await {
+    let outcome = tool.invoke(args, &ctx(tool, &granted)).await;
+    let refused = match &outcome {
         Err(error) => matches!(error, agent_bridle_core::ToolError::Denied { .. }),
         Ok(out) => out["denied"] == true,
     };
-    assert!(refused, "{engine} {operation:?}/{origin:?}: not refused");
+    assert!(
+        refused,
+        "{engine} {operation:?}/{origin:?}: not refused: {outcome:?}"
+    );
     assert!(
         !marker.exists(),
         "{engine} {operation:?}/{origin:?}: the refused command ran"
