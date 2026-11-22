@@ -738,7 +738,8 @@ impl ConfinedCommand {
         let closure_program = worker_image
             .as_ref()
             .map_or(self.program.as_str(), |image| image.program.as_str());
-        let closure = trusted_worker_closure(kind, authority, closure_program)?;
+        let closure =
+            trusted_worker_closure(kind, authority, closure_program, &self.sandbox_policy)?;
 
         // (3) THE admission (L2+L3+L4, one object). `AdmittedFence::admit`
         // derives the mechanism caveats (delegated ∪ declared closure) exactly
@@ -1280,25 +1281,27 @@ fn trusted_worker_closure(
     kind: SandboxKind,
     authority: SpawnAuthority,
     program: &str,
+    policy: &SandboxPolicy,
 ) -> ToolResult<RuntimeClosure> {
     if authority != SpawnAuthority::TrustedWorker {
-        return Ok(RuntimeClosure::empty());
+        return Ok(RuntimeClosure::for_policy(policy));
     }
     match kind {
         SandboxKind::Landlock => {
             // WorkerImage already bound and validated this label. Landlock
             // replaces it with rules on the held file and executes that object.
             // Never re-resolve the name after binding.
-            RuntimeClosure::empty()
+            RuntimeClosure::for_policy(policy)
                 .with_exec(program.to_owned())?
                 .with_fs_read(program.to_owned())
         }
         SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
             // Preserve the pre-#419 exec-only wrapper/domain declaration.
             // The additional worker read authority belongs only to Landlock.
-            RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
+            RuntimeClosure::for_policy(policy)
+                .with_exec(crate::admitted::canonical_closure_program(program)?)
         }
-        SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
+        SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::for_policy(policy)),
     }
 }
 
@@ -2205,6 +2208,7 @@ mod tests {
             SandboxKind::AppContainer,
             SpawnAuthority::TrustedWorker,
             "this-path-is-not-used-by-appcontainer",
+            &SandboxPolicy::default(),
         )
         .expect("AppContainer trusted-worker closure");
         assert!(
@@ -2362,8 +2366,13 @@ mod tests {
             SandboxKind::MinimalRootfs,
             SandboxKind::MicroVm,
         ] {
-            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
-                .expect("non-Landlock worker closure");
+            let closure = trusted_worker_closure(
+                kind,
+                SpawnAuthority::TrustedWorker,
+                &current,
+                &SandboxPolicy::default(),
+            )
+            .expect("non-Landlock worker closure");
             assert_eq!(
                 closure,
                 RuntimeClosure::empty().with_exec(current.clone()).unwrap(),
@@ -2401,8 +2410,13 @@ mod tests {
             .into_owned();
 
         for kind in [SandboxKind::Landlock, SandboxKind::Seatbelt] {
-            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
-                .expect("allowlist trusted-worker closure");
+            let closure = trusted_worker_closure(
+                kind,
+                SpawnAuthority::TrustedWorker,
+                &current,
+                &SandboxPolicy::default(),
+            )
+            .expect("allowlist trusted-worker closure");
             let mechanism = AdmittedFence::admit(
                 &exec_denied,
                 closure,
