@@ -53,7 +53,11 @@ pub(super) fn probe() -> i32 {
             std::fs::write("late-marker", b"survived").unwrap();
         }
         Some("hold-pipe") => {
-            std::thread::sleep(Duration::from_secs(3));
+            // Publish the pid so a test can poll this writer's liveness. It
+            // outlives any bounded cleanup, so surviving shows as a live pid
+            // and never depends on how late the cleanup started (#529).
+            std::fs::write("hold-pipe-pid", std::process::id().to_string()).unwrap();
+            std::thread::sleep(Duration::from_secs(60));
             std::fs::write("late-marker", b"survived").unwrap();
         }
         Some("orphan-pipe") => {
