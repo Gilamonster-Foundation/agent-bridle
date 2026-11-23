@@ -219,16 +219,6 @@ async fn held_read_root_follows_the_object(engine: ShellEngine) {
         })
         .expect("build with a held root");
     let held_read = cat(with_held.clone(), aside.join("held.txt")).await;
-    // Brush refuses an fs-restricted grant on a host that leaves unprivileged
-    // user namespaces available (#498); there is nothing to prove there.
-    if let Err(error) = &held_read {
-        if engine == ShellEngine::Brush && error.to_string().contains("user namespaces") {
-            eprintln!("skip held-root proof for {engine}: {error}");
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&aside);
-            return;
-        }
-    }
     let held_read = held_read.unwrap_or_else(|error| panic!("{engine} held read: {error}"));
     assert_eq!(held_read["stdout"], "held", "{engine}: {held_read}");
     let swapped_read = cat(with_held, root.join("swapped.txt"))
