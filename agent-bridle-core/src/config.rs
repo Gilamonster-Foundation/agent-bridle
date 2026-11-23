@@ -139,7 +139,8 @@ pub struct BackendToggles {
     /// Require Seatbelt (fail closed if unavailable).
     #[serde(default)]
     pub require_seatbelt: bool,
-    /// Backends to force off by name (e.g. `["seatbelt"]`).
+    /// Backends to force off by name (e.g. `["seatbelt"]`). Not read yet: a
+    /// downgrade-only override is #149.
     #[serde(default)]
     pub disable: Vec<String>,
 }
