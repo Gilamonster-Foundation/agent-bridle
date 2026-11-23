@@ -7,6 +7,13 @@
 //! running. A `Checked` cell with no sampler fails the lane, so the table
 //! cannot claim a check this lane never exercised.
 //!
+//! #523: the lane runs once per runtime row (ADR 0029 D2). The rows come from
+//! the ADR's own table, read at compile time, and are compared with the rows
+//! this host can run: every engine built in, under the fence the host
+//! applies. A row the table lists for this OS that the lane does not run, or a
+//! row the lane runs that the table omits, fails the lane. The lane prints one
+//! line per row it ran and one per row it skipped, with the reason.
+//!
 //! Single-threaded on purpose (`harness = false`, one current-thread runtime):
 //! the Brush engine re-executes this binary as its worker.
 
@@ -15,7 +22,10 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_bridle_core::{Caveats, Gate, LimitsPolicy, Scope, Tool, ToolContext};
+use agent_bridle_core::{
+    best_available_sandbox, Caveats, Gate, LimitsPolicy, SandboxKind, SandboxPolicy, Scope, Tool,
+    ToolContext,
+};
 use agent_bridle_tool_shell::{Check, Operation, Origin, ShellEngine, ShellOptions};
 
 fn main() {
@@ -34,12 +44,34 @@ fn run() {
         .enable_all()
         .build()
         .expect("test runtime");
-    let mut ran = 0;
-    for engine in ShellEngine::ALL {
-        if engine.validate_available().is_err() {
-            eprintln!("skip {engine}: not available in this build");
-            continue;
+    let (host_fence, runnable) = runnable_rows();
+    let table: Vec<Row> = adr_rows(host_fence)
+        .into_iter()
+        .filter(|row| row.fence == host_fence)
+        .collect();
+    for row in &table {
+        if !runnable.contains(row) {
+            eprintln!(
+                "skip row {} / {:?}: engine not available in this build",
+                row.engine, row.fence
+            );
         }
+    }
+    let expected: Vec<Row> = table
+        .into_iter()
+        .filter(|row| row.engine.validate_available().is_ok())
+        .collect();
+    let same = runnable.len() == expected.len()
+        && runnable.iter().all(|row| expected.contains(row))
+        && expected.iter().all(|row| runnable.contains(row));
+    assert!(
+        same,
+        "the rows this host runs {runnable:?} differ from ADR 0029 D2's rows for {} {expected:?}",
+        os_name()
+    );
+    let mut ran = 0;
+    for row in runnable {
+        let engine = row.engine;
         let tool = engine
             .build(ShellOptions {
                 limits: LimitsPolicy {
@@ -49,6 +81,8 @@ fn run() {
                 ..ShellOptions::default()
             })
             .unwrap_or_else(|error| panic!("{engine} must build: {error}"));
+        println!("row: {} / {} / {:?}", os_name(), engine, row.fence);
+        runtime.block_on(reports_the_rows_fence(row, &*tool));
         runtime.block_on(overflow_sets_truncation(engine, &*tool));
         for cell in engine.coverage() {
             if cell.check == Check::Checked {
@@ -66,6 +100,103 @@ fn run() {
     }
     assert!(ran > 0, "no engine was compiled into this lane");
     println!("engine_conformance: {ran} engine(s) ok");
+}
+
+/// One runtime row: an engine under the fence the host applies (ADR 0029 D2).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Row {
+    engine: ShellEngine,
+    fence: SandboxKind,
+}
+
+#[cfg(unix)]
+fn os_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    }
+}
+
+#[cfg(unix)]
+fn fence_from_adr(name: &str) -> Option<SandboxKind> {
+    match name {
+        "Landlock" => Some(SandboxKind::Landlock),
+        "Seatbelt" => Some(SandboxKind::Seatbelt),
+        "AppContainer" => Some(SandboxKind::AppContainer),
+        "none" => Some(SandboxKind::None),
+        _ => None,
+    }
+}
+
+/// The rows ADR 0029 D2 lists for this OS, one per engine and fence. A cell
+/// that says `any` expands to every engine, or to the fence the host applies.
+#[cfg(unix)]
+fn adr_rows(host_fence: SandboxKind) -> Vec<Row> {
+    let adr = include_str!("../../docs/adr/0029-runtime-engine-fence-tool-source.md");
+    let mut rows = Vec::new();
+    for line in adr
+        .lines()
+        .filter(|l| l.starts_with(&format!("| {} |", os_name())))
+    {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // ["", os, engine, fence, tool source, admitted by, tested by, ""]
+        let engines: Vec<ShellEngine> = if cells[2] == "any" {
+            ShellEngine::ALL.to_vec()
+        } else {
+            ShellEngine::ALL
+                .into_iter()
+                .filter(|e| cells[2].contains(&format!("`{e}`")))
+                .collect()
+        };
+        let fence = if cells[3] == "any" {
+            Some(host_fence)
+        } else {
+            fence_from_adr(cells[3])
+        };
+        let fence = fence.unwrap_or_else(|| panic!("ADR 0029 row has an unknown fence: {line}"));
+        rows.extend(engines.into_iter().map(|engine| Row { engine, fence }));
+    }
+    assert!(!rows.is_empty(), "ADR 0029 lists no row for {}", os_name());
+    rows
+}
+
+/// The rows this host can run: each engine built in and available, under the
+/// fence the host applies.
+#[cfg(unix)]
+fn runnable_rows() -> (SandboxKind, Vec<Row>) {
+    let fence = best_available_sandbox(&std::sync::Arc::new(SandboxPolicy::default())).kind();
+    let rows = ShellEngine::ALL
+        .into_iter()
+        .filter(|e| e.validate_available().is_ok())
+        .map(|engine| Row { engine, fence })
+        .collect();
+    (fence, rows)
+}
+
+/// The result of a restricted run names the fence the row claims.
+#[cfg(unix)]
+async fn reports_the_rows_fence(row: Row, tool: &dyn Tool) {
+    let dir = temp_dir(&format!("{}-fence", row.engine));
+    let granted = Caveats {
+        fs_write: only(&dir),
+        ..Caveats::top()
+    };
+    let out = tool
+        .invoke(
+            serde_json::json!({"cmd": "echo hi", "cwd": dir}),
+            &ctx(tool, &granted),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{} fence run: {error}", row.engine));
+    assert_eq!(
+        out["sandbox_kind"],
+        serde_json::to_value(row.fence).unwrap(),
+        "{}: the result names a different fence than the row: {out}",
+        row.engine
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 const CAP: usize = 4096;
