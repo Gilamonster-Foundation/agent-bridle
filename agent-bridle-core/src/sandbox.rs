@@ -407,6 +407,20 @@ mod resolved_authority_foundation_tests {
     }
 }
 
+/// Copy an executable a test is about to run. A child `cp` does the copy:
+/// `fs::copy` holds a write descriptor in this process, a test on another
+/// thread can fork while it is open, and until that child execs, running the
+/// copy fails with `ETXTBSY` ("Text file busy").
+#[cfg(all(target_os = "linux", feature = "linux-landlock", test))]
+pub(crate) fn copy_executable(source: &str, dest: &std::path::Path) {
+    let status = std::process::Command::new("cp")
+        .arg(source)
+        .arg(dest)
+        .status()
+        .expect("run cp(1)");
+    assert!(status.success(), "cp {source} {}", dest.display());
+}
+
 /// `true` if either filesystem axis is actually restricted (`Only(_)`) — the
 /// condition under which the fs-confining backends (Landlock, Seatbelt) have
 /// something to enforce. When **no** fs axis is restricted, an fs-only backend
@@ -5970,9 +5984,11 @@ mod landlock_kernel_tests {
     fn private_cat(dir: &std::path::Path) -> String {
         fs::create_dir_all(dir.join("bin")).unwrap();
         let cat = dir.join("bin/cat");
-        fs::copy("/usr/bin/cat", &cat)
-            .or_else(|_| fs::copy("/bin/cat", &cat))
-            .expect("copy cat(1)");
+        let source = ["/usr/bin/cat", "/bin/cat"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("cat(1) must exist for this test");
+        crate::sandbox::copy_executable(source, &cat);
         cat.to_string_lossy().into_owned()
     }
 
