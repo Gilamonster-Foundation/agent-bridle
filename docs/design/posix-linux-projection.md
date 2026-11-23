@@ -59,10 +59,11 @@ No single mechanism enforces everything. The projection is a *composition*.
 - **net Kernel floor requires `DenyDirect`** (Landlock TCP-deny *and* the seccomp
   socket/io_uring leg). Default `LandlockOnly` is honestly `Advisory` for
   `net:none`.
-- **Landlock filesystem confinement is not a complete boundary while unprivileged
-  user namespaces remain available** — the repo already refuses the trusted
-  worker in that case (`spawn.rs:806`, sysctl probe `spawn.rs:873`). The POSIX
-  projection inherits this precondition.
+- **Landlock filesystem confinement holds with unprivileged user namespaces
+  available.** A thread under a filesystem ruleset cannot `mount(2)`, so the
+  bind-mount re-point fails (#498, measured weekly by the `Userns Proofs` lane).
+  The trusted-worker refusal this document once cited is removed; the POSIX
+  projection inherits no user-namespace precondition.
 - **The first slice (#319)** needs only kernel primitives already present on a
   Linux 6.8 kernel (Landlock ABI v4): `close_range(2)` and `openat2(2)` with
   `RESOLVE_BENEATH` / `RESOLVE_NO_SYMLINKS`. No new daemon, no broker —

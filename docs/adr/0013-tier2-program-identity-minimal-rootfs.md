@@ -22,7 +22,9 @@
   last be reported `kernel`, ADR 0011 D7). Governed by ADR 0002 (the meet lattice;
   this only *removes* reachable code, never widens authority) and ADR 0004 (axis
   honesty). Interacts with **SECURITY.md / #101** (the disable-unprivileged-userns
-  hardening — see D4, a real tension this ADR resolves).
+  hardening — see D4, a real tension this ADR resolves; *corrected 2026-11-23, #498: the
+  bind-mount escape that hardening was recommended for does not exist under a Landlock fs
+  ruleset, and SECURITY.md no longer recommends it for that reason*).
 - Related issues: **#57** (the exec frontier — un-held for the boundary in #99;
   this is the identity close), #35 (Linux netns/`net` axis — the network half of
   the same jail), #50/#51 (the macOS/Windows tiers — D7), DESIGN §6.
@@ -101,7 +103,7 @@ Both are selected behind the existing `best_available_sandbox()` seam (a new
 
 Building a mount namespace + `pivot_root` unprivileged needs a **user namespace**
 (`CLONE_NEWUSER`) — which **directly conflicts with SECURITY.md / #101**, where we
-recommend *disabling* unprivileged user namespaces to close the bind-mount escape.
+recommend *disabling* unprivileged user namespaces to close the bind-mount escape. (*Corrected 2026-11-23, #498: that escape is not real under Landlock, and SECURITY.md no longer says so.*)
 This ADR resolves the tension explicitly:
 
 - **Do not depend on unprivileged userns.** The Tier-1.5 rootfs is constructed by
