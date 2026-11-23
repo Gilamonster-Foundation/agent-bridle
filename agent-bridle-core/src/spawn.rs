@@ -3076,7 +3076,7 @@ mod landlock_child_tests {
         let worker = dir.join("worker-cat");
         let read_root = dir.join("read-root");
         let moved_root = dir.join("original-root");
-        fs::copy("/bin/cat", &worker).unwrap();
+        crate::sandbox::copy_executable("/bin/cat", &worker);
         fs::create_dir(&read_root).unwrap();
         fs::write(read_root.join("value"), "original-root").unwrap();
         let held = crate::HeldReadRoot::bind(
