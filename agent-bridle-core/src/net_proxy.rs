@@ -2961,7 +2961,10 @@ mod tests {
             ..Caveats::top()
         };
         let prefix = best_available_sandbox(&Arc::new(SandboxPolicy::default()))
-            .command_prefix(&loopback_fenced_caveats(&granted))
+            .command_prefix(
+                &loopback_fenced_caveats(&granted),
+                crate::ApplyToken::core(),
+            )
             .expect("seatbelt wrapper");
 
         // Run `curl` wrapped by the fence, with the given env. `-v` surfaces the

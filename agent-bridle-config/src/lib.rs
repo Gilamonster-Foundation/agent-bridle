@@ -91,6 +91,7 @@ const AREAS: &[&str] = &[
     "rootfs",
     "net",
     "limits",
+    "shell",
     "web",
     "vm",
 ];
@@ -232,12 +233,28 @@ pub fn resolve(
 
 /// Load the process configuration: `~/.agent-bridle/config.toml` (if present) +
 /// the process environment, no API overlay. Missing file ⇒ defaults + env only.
+///
+/// Only a file that does not exist counts as absent (AB-010). One that exists
+/// but cannot be read is an error: falling back to the defaults there would
+/// silently drop the operator's mechanism settings.
 pub fn load() -> Result<(BridleConfig, ConfigProvenance)> {
-    let file_text = home_config_path().and_then(|p| std::fs::read_to_string(p).ok());
+    let file_text = match home_config_path() {
+        Some(path) => read_config_file(&path)?,
+        None => None,
+    };
     let env: BTreeMap<String, String> = std::env::vars()
         .filter(|(k, _)| k.starts_with("BRIDLE_") || k == "AGENT_BRIDLE_CONFIG")
         .collect();
     resolve(file_text.as_deref(), &env, None)
+}
+
+/// Read a config file. `Ok(None)` only when it does not exist.
+fn read_config_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// `~/.agent-bridle/config.toml` (the same file the caveats grant reads).
@@ -420,5 +437,56 @@ mod tests {
             resolved.contains(&base_entry.to_string()),
             "base preserved (extend)"
         );
+    }
+
+    /// AB-010 (#495): a missing config file is absent; one that exists but
+    /// cannot be read is an error, never a silent fall back to the defaults.
+    #[test]
+    fn only_a_missing_file_counts_as_absent() {
+        let dir = std::env::temp_dir().join(format!("ab-config-495-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_config_file(&dir.join("absent.toml")).unwrap(), None);
+        let present = dir.join("config.toml");
+        std::fs::write(&present, "[bridle.shell]\nengine = \"host\"\n").unwrap();
+        assert!(read_config_file(&present).unwrap().is_some());
+        // A directory exists but is not readable as a file.
+        let error = read_config_file(&dir).expect_err("an unreadable config must not be ignored");
+        assert!(error.to_string().contains("reading"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #495: `[bridle.shell] engine` resolves from the file and from the
+    /// `BRIDLE_SHELL_ENGINE` env override, env winning.
+    #[test]
+    fn shell_engine_resolves_from_file_and_env() {
+        let file = "[bridle.shell]\nengine = \"safe-subset\"\n";
+        let (cfg, _) = resolve(Some(file), &env(&[]), None).unwrap();
+        assert_eq!(cfg.shell.engine.as_deref(), Some("safe-subset"));
+        let (cfg, _) =
+            resolve(Some(file), &env(&[("BRIDLE_SHELL_ENGINE", "brush")]), None).unwrap();
+        assert_eq!(cfg.shell.engine.as_deref(), Some("brush"));
+        let (cfg, _) = resolve(None, &env(&[]), None).unwrap();
+        assert_eq!(cfg.shell.engine, None);
+    }
+
+    /// #495: the gate floor is a per-axis table; the old scalar form is a
+    /// load error, in the file and in the env override alike.
+    #[test]
+    fn a_scalar_gate_floor_fails_to_load() {
+        let table =
+            "[bridle.gate.default_strength_floor]\nexec = \"interceptor\"\nnet = \"kernel\"\n";
+        let (cfg, _) = resolve(Some(table), &env(&[]), None).unwrap();
+        assert_eq!(
+            cfg.gate.default_strength_floor.net(),
+            agent_bridle_core::AxisEnforcement::Kernel
+        );
+        let scalar = "[bridle.gate]\ndefault_strength_floor = \"kernel\"\n";
+        assert!(resolve(Some(scalar), &env(&[]), None).is_err());
+        assert!(resolve(
+            None,
+            &env(&[("BRIDLE_GATE_DEFAULT_STRENGTH_FLOOR", "kernel")]),
+            None
+        )
+        .is_err());
     }
 }

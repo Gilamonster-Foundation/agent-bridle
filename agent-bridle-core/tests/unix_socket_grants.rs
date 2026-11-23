@@ -96,10 +96,7 @@ fn unix_socket_grants_stay_advisory_on_every_backend_including_seatbelt() {
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 mod seatbelt {
     use super::*;
-    use agent_bridle_core::{
-        ConfinedCommand, ConfinedStdio, Gate, Sandbox, SeatbeltSandbox, Tool, ToolContext,
-        ToolResult,
-    };
+    use agent_bridle_core::{ConfinedCommand, ConfinedStdio, Gate, Tool, ToolContext, ToolResult};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ExitStatus};
@@ -145,54 +142,9 @@ mod seatbelt {
         }
     }
 
-    #[test]
-    fn unix_socket_profile_is_exact_outbound_only_and_validates_existing_paths() {
-        let ep = Endpoints::new();
-        let grant = ep.grant();
-        let prefix = SeatbeltSandbox::new()
-            .command_prefix(&scoped(&[&grant]))
-            .unwrap();
-        assert!(
-            !prefix.is_empty(),
-            "Unix-only authority must engage a network fence"
-        );
-        let profile = &prefix[2];
-        assert!(profile.contains("(deny network*)"));
-        assert!(profile.contains(&format!(
-            "(allow network-outbound (literal \"{}\"))",
-            ep.first.display()
-        )));
-        assert!(!profile.contains("(allow network*"));
-        assert!(!profile.contains("(allow network-inbound"));
-        assert!(
-            SeatbeltSandbox::new()
-                .command_prefix(&scoped(&[&grant, "example.test"]))
-                .is_err(),
-            "mixed remote authority requires proxy projection before direct spawn"
-        );
-        std::os::unix::fs::symlink(&ep.first, ep.dir.join("alias.sock")).unwrap();
-        std::fs::write(ep.dir.join("ordinary-file"), b"not a socket").unwrap();
-        for value in [
-            "unix:relative.sock".to_owned(),
-            "unix:".to_owned(),
-            format!("unix:{}/*", ep.dir.display()),
-            format!("unix:{}/alias.sock", ep.dir.display()),
-            format!("unix:{}/ordinary-file", ep.dir.display()),
-            format!("unix:{}/missing.sock", ep.dir.display()),
-            format!(
-                "unix:{}/../{}/first.sock",
-                ep.dir.display(),
-                ep.dir.file_name().unwrap().to_str().unwrap()
-            ),
-        ] {
-            assert!(
-                SeatbeltSandbox::new()
-                    .command_prefix(&scoped(&[&value]))
-                    .is_err(),
-                "must reject {value:?}"
-            );
-        }
-    }
+    // `unix_socket_profile_is_exact_outbound_only_and_validates_existing_paths`
+    // lives in core's own Seatbelt unit tests since #493: it calls
+    // `Sandbox::command_prefix`, which only core's funnel may call.
 
     struct Fixture;
     #[async_trait::async_trait]

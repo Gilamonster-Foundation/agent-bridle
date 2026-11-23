@@ -34,8 +34,77 @@
 //! [`Sandbox::command_prefix`] (Seatbelt/AppContainer); a spawn site honors both,
 //! so the mechanism is uniform at the call site.
 
-use crate::{Caveats, SandboxPolicy, ToolResult};
+use crate::{Caveats, SandboxPolicy, ToolError, ToolResult};
 use std::sync::Arc;
+
+/// A read root the caller already HOLDS as a directory descriptor, for a
+/// backend that can anchor its rule on the descriptor itself (Linux Landlock:
+/// `PathBeneath` takes any `AsFd`). The fence then covers the object the
+/// caller verified — not whatever `provenance` names by the time the rule is
+/// added — so a swap at the pathname between the caller's check and the
+/// ruleset cannot re-point it. `provenance` is how the grant spells the same
+/// root: it is matched to drop that root's path-opened rule, never opened.
+/// Reads are ambient under `fs_read: All`, so held roots add nothing there.
+#[derive(Debug, Clone)]
+pub struct HeldReadRoot {
+    provenance: String,
+    #[cfg(unix)]
+    fd: Arc<std::os::fd::OwnedFd>,
+}
+
+impl HeldReadRoot {
+    /// Bind `fd` — a file or directory descriptor the caller keeps, or a dup of one
+    /// (same object) — to `provenance`, the root the grant spells it as. This
+    /// is the ONLY constructor: fields are private and there is no public
+    /// struct literal, and this one REFUSES unless `fd`'s `(dev, ino)` equals
+    /// what `provenance` names right now (`fstat(fd)` vs `stat(path)` — the
+    /// path is never reopened to do this). A caller cannot install a
+    /// (label, descriptor) pair admission never saw as matching: neither an
+    /// honestly-paired but un-admitted root (the spawn funnel refuses that
+    /// one — newt #2674 P1) nor a falsely labelled one (a mismatched pair is
+    /// refused right here, before any `HeldReadRoot` for it can exist).
+    ///
+    /// # Errors
+    /// [`ToolError::Denied`] when `fd` and `provenance` do not name the same
+    /// object, or either cannot be inspected.
+    #[cfg(unix)]
+    pub fn bind(
+        provenance: impl Into<String>,
+        fd: std::os::fd::OwnedFd,
+    ) -> crate::ToolResult<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let provenance = provenance.into();
+        // `File::from`/`OwnedFd::from` are plain ownership retyping (no
+        // syscall) — `file` is the SAME object `fd` was, just typed so
+        // `.metadata()` can `fstat` it.
+        let file = std::fs::File::from(fd);
+        let held = file.metadata().map_err(crate::ToolError::from)?;
+        let named = std::fs::metadata(&provenance).map_err(crate::ToolError::from)?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(crate::ToolError::denied(format!(
+                "held descriptor does not name '{provenance}'"
+            )));
+        }
+        Ok(Self {
+            provenance,
+            fd: Arc::new(std::os::fd::OwnedFd::from(file)),
+        })
+    }
+
+    /// The pathname the grant spells this root as (provenance only).
+    #[must_use]
+    pub fn provenance(&self) -> &str {
+        &self.provenance
+    }
+
+    /// The held file or directory descriptor the rule anchors on.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.fd.as_fd()
+    }
+}
 
 /// Which OS-level sandbox actually backs an authorization.
 ///
@@ -77,6 +146,25 @@ pub enum SandboxKind {
     None,
 }
 
+/// Proof that a [`Sandbox`] confinement method is being called by core's spawn
+/// funnel (#493).
+///
+/// [`Sandbox::apply`], [`Sandbox::apply_with_worker`] and
+/// [`Sandbox::command_prefix`] take one, and only core can construct it. An
+/// engine therefore cannot apply a sandbox, or build its wrapper prefix,
+/// outside the funnel that admits the fence and verifies what it applies
+/// (`ConfinedCommand`, `ConfinedLaunch`). A backend outside core can still
+/// implement the trait: it receives the token, it never makes one.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyToken(());
+
+impl ApplyToken {
+    /// The funnel's token. Crate-private by design: see the type docs.
+    pub(crate) const fn core() -> Self {
+        Self(())
+    }
+}
+
 /// An OS-level confinement that can be applied from a set of [`Caveats`].
 ///
 /// Implementations translate the lattice's `fs_read`/`fs_write`/`exec`/`net`
@@ -97,15 +185,41 @@ pub trait Sandbox: Send + Sync {
     /// This is the confinement mechanism for *thread-confining* backends
     /// (Landlock's `restrict_self`). *Wrapper-based* backends (macOS Seatbelt)
     /// confine via [`Sandbox::command_prefix`] instead and make this a no-op.
-    fn apply(&self, effective: &Caveats) -> ToolResult<()>;
+    fn apply(&self, effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()>;
+
+    /// [`Sandbox::apply`] with read roots the caller holds as descriptors
+    /// ([`HeldReadRoot`], #494). A backend that can anchor a rule on a
+    /// descriptor (Landlock) adds `PathBeneath` on each one and never re-opens
+    /// that root by path. Every other backend REFUSES a non-empty `held`
+    /// rather than fall back to the pathname (fail-closed); with none held
+    /// this is [`Sandbox::apply`]. Sealed by the [`ApplyToken`] like `apply`:
+    /// held roots reach a backend only through the spawn funnel, which first
+    /// checks each one against the admitted `fs_read` scope.
+    fn apply_with_held_roots(
+        &self,
+        effective: &Caveats,
+        held: &[HeldReadRoot],
+        token: crate::ApplyToken,
+    ) -> ToolResult<()> {
+        if held.is_empty() {
+            return self.apply(effective, token);
+        }
+        Err(ToolError::denied(format!(
+            "the {:?} sandbox cannot anchor a read root on a held descriptor",
+            self.kind()
+        )))
+    }
 
     /// Apply with a held regular worker image replacing its read/exec pathname
-    /// entries. Backends that cannot bind both rules to that object refuse.
+    /// entries, together with any held read roots. Both bindings are installed
+    /// in one ruleset; backends that cannot bind them to those objects refuse.
     fn apply_with_worker(
         &self,
         _effective: &Caveats,
         _program: &str,
         _image: &std::fs::File,
+        _held: &[HeldReadRoot],
+        _token: crate::ApplyToken,
     ) -> ToolResult<()> {
         Err(crate::ToolError::denied(
             "sandbox cannot bind worker rules to a held image",
@@ -124,7 +238,11 @@ pub trait Sandbox: Send + Sync {
     /// **Fail-closed:** a backend that is selected but cannot build its wrapper
     /// (e.g. the wrapper binary is missing) returns `Err` — never an empty
     /// (silently unconfined) prefix. The default is the empty prefix.
-    fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+    fn command_prefix(
+        &self,
+        effective: &Caveats,
+        _token: crate::ApplyToken,
+    ) -> ToolResult<Vec<String>> {
         let _ = effective;
         Ok(Vec::new())
     }
@@ -200,7 +318,7 @@ impl Sandbox for NoopSandbox {
         SandboxKind::None
     }
 
-    fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+    fn apply(&self, _effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
         // Intentionally a no-op: the advisory default. Real kernel enforcement
         // lives in `LandlockSandbox` (Linux + `linux-landlock`).
         Ok(())
@@ -251,7 +369,7 @@ mod resolved_authority_foundation_tests {
             fn kind(&self) -> SandboxKind {
                 SandboxKind::None
             }
-            fn apply(&self, _e: &Caveats) -> ToolResult<()> {
+            fn apply(&self, _e: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
                 Ok(())
             }
         }
@@ -1218,7 +1336,7 @@ pub(crate) mod appcontainer_impl {
         /// `command_prefix` launcher wrapper (`agent-bridle-aclaunch`), not via
         /// this thread. `apply` is reached only when `command_prefix` returned an
         /// empty prefix (nothing to confine), so a no-op is correct here.
-        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+        fn apply(&self, _effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
             Ok(())
         }
 
@@ -1229,7 +1347,11 @@ pub(crate) mod appcontainer_impl {
         /// (so the spawn runs unwrapped — the backend engages only when it
         /// actually confines something). Fails closed if the launcher binary is
         /// not found.
-        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+        fn command_prefix(
+            &self,
+            effective: &Caveats,
+            _token: crate::ApplyToken,
+        ) -> ToolResult<Vec<String>> {
             if super::has_unix_socket_grants(effective) {
                 return Err(ToolError::denied(
                     "windows-appcontainer: exact Unix endpoint grants require Seatbelt",
@@ -1350,7 +1472,7 @@ pub(crate) mod appcontainer_impl {
                 true,
                 false,
             )
-            .command_prefix(&caveats)
+            .command_prefix(&caveats, crate::ApplyToken::core())
             .expect("opted-in prefix");
             assert!(
                 opted_in.iter().any(|arg| arg == "--nul-device-ace"),
@@ -1362,7 +1484,7 @@ pub(crate) mod appcontainer_impl {
                 false,
                 false,
             )
-            .command_prefix(&caveats)
+            .command_prefix(&caveats, crate::ApplyToken::core())
             .expect("default-off prefix");
             assert!(
                 !default_off.iter().any(|arg| arg == "--nul-device-ace"),
@@ -1374,7 +1496,7 @@ pub(crate) mod appcontainer_impl {
                 true,
                 false,
             )
-            .command_prefix(&Caveats::top())
+            .command_prefix(&Caveats::top(), crate::ApplyToken::core())
             .expect("ambient opted-in prefix");
             assert!(
                 ambient_opted_in.iter().any(|arg| arg == "--nul-device-ace"),
@@ -1386,7 +1508,7 @@ pub(crate) mod appcontainer_impl {
                 false,
                 false,
             )
-            .command_prefix(&Caveats::top())
+            .command_prefix(&Caveats::top(), crate::ApplyToken::core())
             .expect("ambient default-off prefix");
             assert!(
                 ambient_default_off.is_empty(),
@@ -1403,7 +1525,7 @@ pub(crate) mod appcontainer_impl {
                 false,
                 true,
             )
-            .command_prefix(&Caveats::top())
+            .command_prefix(&Caveats::top(), crate::ApplyToken::core())
             .expect("ambient mount-manager prefix");
             assert!(
                 mount_manager_only
@@ -1443,7 +1565,8 @@ pub(crate) mod appcontainer_impl {
                 net: Scope::only(names.iter().map(|name| (*name).to_owned())),
                 ..Caveats::top()
             };
-            let result = AppContainerSandbox::new(None, false, false).command_prefix(&caveats);
+            let result = AppContainerSandbox::new(None, false, false)
+                .command_prefix(&caveats, crate::ApplyToken::core());
             assert!(
                 matches!(&result, Err(ToolError::Denied { reason }) if reason.contains("Unix")),
                 "unsupported Unix authority must refuse before launcher lookup: {result:?}"
@@ -1695,8 +1818,8 @@ pub(crate) mod landlock_impl {
     use super::{Sandbox, SandboxKind};
     use crate::{Caveats, ChildNetworkPolicy, SandboxPolicy, Scope, ToolError, ToolResult};
     use landlock::{
-        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
-        RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath,
+        Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
     };
     use std::sync::Arc;
 
@@ -1929,6 +2052,7 @@ pub(crate) mod landlock_impl {
             &self,
             effective: &Caveats,
             worker: Option<(&str, &std::fs::File)>,
+            held: &[super::HeldReadRoot],
         ) -> ToolResult<()> {
             let write = AccessFs::from_write(fs_abi_floor(&self.policy));
             // Pure read rights — `from_read` also bundles `Execute`, which we
@@ -2008,10 +2132,28 @@ pub(crate) mod landlock_impl {
                 // routine so the resolved-authority projection anchors on the
                 // identical set (ADR 0011 D3: confined-exec keeps bin dirs OUT of
                 // the trampoline corpus).
-                let read_roots = self.read_roots(&path_caveats, confine_exec);
-                ruleset
+                let mut read_roots = self.read_roots(&path_caveats, confine_exec);
+                // A held root is anchored on its descriptor below; its path
+                // form is dropped so nothing re-opens that root by name after
+                // the caller's check. (The resolved-authority projection still
+                // lists the path: it is the same object's provenance.)
+                read_roots.retain(|p| !held.iter().any(|h| p.as_str() == h.provenance()));
+                let ruleset = ruleset
                     .add_rules(path_beneath_rules(&read_roots, read))
-                    .map_err(landlock_denied)?
+                    .map_err(landlock_denied)?;
+                held.iter().try_fold(ruleset, |rs, h| {
+                    // Landlock rejects ReadDir on a regular file. Determine
+                    // type from the held object, never reopen its pathname.
+                    let file =
+                        std::fs::File::from(h.fd().try_clone_to_owned().map_err(landlock_denied)?);
+                    let access = if file.metadata().map_err(landlock_denied)?.is_dir() {
+                        read
+                    } else {
+                        AccessFs::ReadFile.into()
+                    };
+                    rs.add_rule(PathBeneath::new(h.fd(), access))
+                        .map_err(landlock_denied)
+                })?
             } else {
                 ruleset
             };
@@ -2074,8 +2216,17 @@ pub(crate) mod landlock_impl {
             self.exec_boundary
         }
 
-        fn apply(&self, effective: &Caveats) -> ToolResult<()> {
-            self.apply_rules(effective, None)
+        fn apply(&self, effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
+            self.apply_rules(effective, None, &[])
+        }
+
+        fn apply_with_held_roots(
+            &self,
+            effective: &Caveats,
+            held: &[super::HeldReadRoot],
+            _token: crate::ApplyToken,
+        ) -> ToolResult<()> {
+            self.apply_rules(effective, None, held)
         }
 
         fn apply_with_worker(
@@ -2083,8 +2234,10 @@ pub(crate) mod landlock_impl {
             effective: &Caveats,
             program: &str,
             image: &std::fs::File,
+            held: &[super::HeldReadRoot],
+            _token: crate::ApplyToken,
         ) -> ToolResult<()> {
-            self.apply_rules(effective, Some((program, image)))
+            self.apply_rules(effective, Some((program, image)), held)
         }
 
         fn resolved_authority(
@@ -3494,14 +3647,18 @@ mod seatbelt_impl {
             closure
         }
 
-        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+        fn apply(&self, _effective: &Caveats, _token: crate::ApplyToken) -> ToolResult<()> {
             // Deliberate no-op: Seatbelt confines via the `sandbox-exec` wrapper
             // (see `command_prefix`), not by restricting the calling thread. The
             // boundary is the wrapped spawn.
             Ok(())
         }
 
-        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+        fn command_prefix(
+            &self,
+            effective: &Caveats,
+            _token: crate::ApplyToken,
+        ) -> ToolResult<Vec<String>> {
             let unix_sockets = unix_socket_paths(effective)?;
             let mach_grants = super::mach_service_grants(effective)?;
             if !unix_sockets.is_empty()
@@ -4176,6 +4333,104 @@ mod seatbelt_impl {
         use super::*;
         use crate::{ResolvedScope, Scope};
 
+        /// Two live Unix listeners in a private temp dir (moved here with the
+        /// test below from `tests/unix_socket_grants.rs`, #493).
+        struct Endpoints {
+            dir: std::path::PathBuf,
+            first: std::path::PathBuf,
+            _listeners: [std::os::unix::net::UnixListener; 2],
+        }
+        impl Endpoints {
+            fn new() -> Self {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "bridle-unix-unit-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir(&dir).unwrap();
+                let dir = dir.canonicalize().unwrap();
+                let first = dir.join("first.sock");
+                let listeners = [
+                    std::os::unix::net::UnixListener::bind(&first).unwrap(),
+                    std::os::unix::net::UnixListener::bind(dir.join("second.sock")).unwrap(),
+                ];
+                Self {
+                    dir,
+                    first,
+                    _listeners: listeners,
+                }
+            }
+            fn grant(&self) -> String {
+                format!("unix:{}", self.first.display())
+            }
+        }
+        impl Drop for Endpoints {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn scoped(names: &[&str]) -> Caveats {
+            Caveats {
+                net: Scope::only(names.iter().map(|s| (*s).to_owned())),
+                ..Caveats::top()
+            }
+        }
+
+        #[test]
+        fn unix_socket_profile_is_exact_outbound_only_and_validates_existing_paths() {
+            let ep = Endpoints::new();
+            let grant = ep.grant();
+            let prefix = SeatbeltSandbox::new()
+                .command_prefix(&scoped(&[&grant]), crate::ApplyToken::core())
+                .unwrap();
+            assert!(
+                !prefix.is_empty(),
+                "Unix-only authority must engage a network fence"
+            );
+            let profile = &prefix[2];
+            assert!(profile.contains("(deny network*)"));
+            assert!(profile.contains(&format!(
+                "(allow network-outbound (literal \"{}\"))",
+                ep.first.display()
+            )));
+            assert!(!profile.contains("(allow network*"));
+            assert!(!profile.contains("(allow network-inbound"));
+            assert!(
+                SeatbeltSandbox::new()
+                    .command_prefix(
+                        &scoped(&[&grant, "example.test"]),
+                        crate::ApplyToken::core()
+                    )
+                    .is_err(),
+                "mixed remote authority requires proxy projection before direct spawn"
+            );
+            std::os::unix::fs::symlink(&ep.first, ep.dir.join("alias.sock")).unwrap();
+            std::fs::write(ep.dir.join("ordinary-file"), b"not a socket").unwrap();
+            for value in [
+                "unix:relative.sock".to_owned(),
+                "unix:".to_owned(),
+                format!("unix:{}/*", ep.dir.display()),
+                format!("unix:{}/alias.sock", ep.dir.display()),
+                format!("unix:{}/ordinary-file", ep.dir.display()),
+                format!("unix:{}/missing.sock", ep.dir.display()),
+                format!(
+                    "unix:{}/../{}/first.sock",
+                    ep.dir.display(),
+                    ep.dir.file_name().unwrap().to_str().unwrap()
+                ),
+            ] {
+                assert!(
+                    SeatbeltSandbox::new()
+                        .command_prefix(&scoped(&[&value]), crate::ApplyToken::core())
+                        .is_err(),
+                    "must reject {value:?}"
+                );
+            }
+        }
+
         /// The production `net:none` profile installs the ZERO Mach-lookup floor
         /// (agent-bridle#405): default-deny named lookup and re-allow NOTHING —
         /// no candidate, no former compatibility service, no `nsurlsessiond`.
@@ -4268,13 +4523,15 @@ mod seatbelt_impl {
                 net: Scope::only(["mach:com.apple.*".to_string()]),
                 ..Caveats::top()
             };
-            assert!(SeatbeltSandbox::new().command_prefix(&bad).is_err());
+            assert!(SeatbeltSandbox::new()
+                .command_prefix(&bad, crate::ApplyToken::core())
+                .is_err());
             let floorless = Caveats {
                 net: Scope::only(["localhost".to_string(), "mach:com.apple.logd".to_string()]),
                 ..Caveats::top()
             };
             let err = SeatbeltSandbox::new()
-                .command_prefix(&floorless)
+                .command_prefix(&floorless, crate::ApplyToken::core())
                 .expect_err("loopback leaves Mach ambient; a grant there is refused");
             assert!(err.to_string().contains("network-denied"), "{err}");
         }
@@ -4464,7 +4721,7 @@ mod seatbelt_impl {
         #[test]
         fn unrestricted_caveats_make_no_wrapper() {
             assert!(SeatbeltSandbox::new()
-                .command_prefix(&Caveats::top())
+                .command_prefix(&Caveats::top(), crate::ApplyToken::core())
                 .unwrap()
                 .is_empty());
         }
@@ -4495,7 +4752,9 @@ mod seatbelt_impl {
             };
 
             // Control: the default read base does NOT admit the extra dir.
-            let default_prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            let default_prefix = SeatbeltSandbox::new()
+                .command_prefix(&cav, crate::ApplyToken::core())
+                .unwrap();
             assert!(
                 !default_prefix.iter().any(|a| a.contains(&want)),
                 "default read base must not include the extra dir: {default_prefix:?}"
@@ -4509,7 +4768,7 @@ mod seatbelt_impl {
                 ..SandboxPolicy::default()
             });
             let widened_prefix = SeatbeltSandbox::with_policy(policy)
-                .command_prefix(&cav)
+                .command_prefix(&cav, crate::ApplyToken::core())
                 .unwrap();
             assert!(
                 widened_prefix.iter().any(|a| a.contains(&want)),
@@ -4531,7 +4790,7 @@ mod seatbelt_impl {
             assert!(prof.contains("(deny network*)"), "{prof}");
             assert!(
                 !SeatbeltSandbox::new()
-                    .command_prefix(&cav)
+                    .command_prefix(&cav, crate::ApplyToken::core())
                     .unwrap()
                     .is_empty(),
                 "net:none must engage the sandbox-exec wrapper"
@@ -4582,7 +4841,7 @@ mod seatbelt_impl {
                 );
                 assert!(
                     !SeatbeltSandbox::new()
-                        .command_prefix(&cav)
+                        .command_prefix(&cav, crate::ApplyToken::core())
                         .unwrap()
                         .is_empty(),
                     "{host}: a loopback-only net grant must engage the wrapper"
@@ -4637,7 +4896,9 @@ mod seatbelt_impl {
                 fs_write: Scope::only(["/tmp".to_string()]),
                 ..Caveats::top()
             };
-            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            let prefix = SeatbeltSandbox::new()
+                .command_prefix(&cav, crate::ApplyToken::core())
+                .unwrap();
             assert_eq!(prefix[0], SANDBOX_EXEC);
             assert_eq!(prefix[1], "-p");
             assert!(prefix[2].contains("(deny file-write*)"));
@@ -4802,7 +5063,9 @@ mod seatbelt_impl {
                 exec: Scope::only(["/bin/echo".to_string()]),
                 ..Caveats::top()
             };
-            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            let prefix = SeatbeltSandbox::new()
+                .command_prefix(&cav, crate::ApplyToken::core())
+                .unwrap();
             assert_eq!(prefix.first().map(String::as_str), Some(SANDBOX_EXEC));
         }
 
@@ -5166,7 +5429,7 @@ mod tests {
     fn noop_reports_none_and_never_fails() {
         let s = NoopSandbox;
         assert_eq!(s.kind(), SandboxKind::None);
-        assert!(s.apply(&Caveats::top()).is_ok());
+        assert!(s.apply(&Caveats::top(), crate::ApplyToken::core()).is_ok());
     }
 
     // ── agent-bridle#405: `mach:` service grants are structural net tokens ──
@@ -5646,7 +5909,7 @@ mod tests {
         // AppContainer's `apply` is a deliberate no-op (confinement is applied at
         // process creation via `command_prefix`, not to the current thread).
         let sb = best_available_sandbox(&Arc::new(SandboxPolicy::default()));
-        assert!(sb.apply(&Caveats::top()).is_ok());
+        assert!(sb.apply(&Caveats::top(), crate::ApplyToken::core()).is_ok());
     }
 
     #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
@@ -5656,6 +5919,35 @@ mod tests {
             best_available_sandbox(&Arc::new(SandboxPolicy::default())).kind(),
             SandboxKind::AppContainer
         );
+    }
+    /// A descriptor that does not name the label it is bound to — the fd is
+    /// open on object B while the caller claims it is root A — is refused by
+    /// the validated constructor itself: `HeldReadRoot::bind` never returns an
+    /// object for a (label, descriptor) pair that disagree about which object
+    /// they name. No sandbox backend is involved; this is pure `fstat`/`stat`.
+    ///
+    /// Regression for newt #2674 P1 (ported with #494): previously `HeldReadRoot::new` took any
+    /// `(String, OwnedFd)` pair with no check at all, so a falsely labelled
+    /// `HeldReadRoot(A, fd(B))` was fully constructible.
+    #[cfg(unix)]
+    #[test]
+    fn falsely_labelled_held_root_is_refused_at_construction() {
+        let pid = std::process::id();
+        let a = std::env::temp_dir().join(format!("agent-bridle-bind-a-{pid}"));
+        let b = std::env::temp_dir().join(format!("agent-bridle-bind-b-{pid}"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let fd_b = std::os::fd::OwnedFd::from(std::fs::File::open(&b).unwrap());
+
+        let err = crate::HeldReadRoot::bind(a.to_string_lossy().into_owned(), fd_b)
+            .expect_err("a's label over b's descriptor must not bind");
+        assert!(
+            err.to_string().contains("does not name"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 }
 
@@ -5862,7 +6154,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::only([allowed_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
 
             let inside = fs::write(allowed_t.join("ok.txt"), b"hi");
             let outside = fs::write(forbidden_t.join("escape.txt"), b"nope");
@@ -5881,6 +6175,126 @@ mod landlock_kernel_tests {
 
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    /// File grants need ReadFile, not ReadDir, and must not admit siblings
+    /// or a replacement inode at the original pathname.
+    #[test]
+    fn held_regular_file_root_stays_object_bound_and_does_not_grant_parent() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let root = unique_dir("held-file-root");
+        let path = root.join("gitconfig");
+        let aside = root.join("original");
+        let sibling = root.join("private");
+        fs::write(&path, b"held").unwrap();
+        fs::write(&sibling, b"private").unwrap();
+        let held = crate::HeldReadRoot::bind(
+            path.to_string_lossy().into_owned(),
+            fs::File::open(&path).unwrap().into(),
+        )
+        .unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::only([path.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        fs::rename(&path, &aside).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        std::thread::spawn(move || {
+            LandlockSandbox::new()
+                .apply_with_held_roots(&caveats, &[held], crate::ApplyToken::core())
+                .unwrap();
+            assert_eq!(fs::read(&aside).unwrap(), b"held");
+            for denied in [&path, &sibling] {
+                assert_eq!(
+                    fs::read(denied).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+        })
+        .join()
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A read root bound to a HELD descriptor anchors on the object, not the
+    /// pathname: after the held directory is renamed aside and a different
+    /// directory takes its path, the confined thread still reads the held
+    /// object at its new name and is denied at the old path. Control: the same
+    /// grant with no held root follows the pathname — the swapped-in directory
+    /// is readable and the held object is not.
+    #[test]
+    fn held_read_root_anchors_on_the_object_not_the_path() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let root = unique_dir("held-root");
+        let aside = std::path::PathBuf::from(format!("{}.aside", root.display()));
+        fs::write(root.join("held.txt"), b"held").unwrap();
+        let fd = std::os::fd::OwnedFd::from(fs::File::open(&root).unwrap());
+        let cav = Caveats {
+            fs_read: Scope::only([root.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        // Bind while `root` still names the held object — the validated
+        // constructor checks `(dev, ino)` NOW, before the swap below.
+        let held = crate::HeldReadRoot::bind(root.to_string_lossy().into_owned(), fd)
+            .expect("bind before the swap");
+
+        // The swap: the held directory goes aside; a different directory takes
+        // its pathname.
+        fs::rename(&root, &aside).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("swapped.txt"), b"swapped").unwrap();
+
+        let (root_t, aside_t, cav_t) = (root.clone(), aside.clone(), cav.clone());
+        let (held_read, swapped_read) = std::thread::spawn(move || {
+            LandlockSandbox::new()
+                .apply_with_held_roots(&cav_t, &[held], crate::ApplyToken::core())
+                .expect("apply landlock");
+            (
+                fs::read(aside_t.join("held.txt")),
+                fs::read(root_t.join("swapped.txt")),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            held_read.expect("the held object stays readable at its new name"),
+            b"held"
+        );
+        assert_eq!(
+            swapped_read
+                .expect_err("the swapped-in directory is outside the held fence")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        // Control: the path-opened rule follows the pathname.
+        let (root_c, aside_c) = (root.clone(), aside.clone());
+        let (held_read, swapped_read) = std::thread::spawn(move || {
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
+            (
+                fs::read(aside_c.join("held.txt")),
+                fs::read(root_c.join("swapped.txt")),
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(
+            held_read.is_err(),
+            "control: the renamed-aside object is ungranted"
+        );
+        assert_eq!(
+            swapped_read.expect("control: the path rule admits the swapped-in directory"),
+            b"swapped"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&aside);
     }
 
     /// #144 (I5-B): the Landlock read base is config-driven. Widening
@@ -5904,7 +6318,9 @@ mod landlock_kernel_tests {
         // Control: with the DEFAULT policy the out-of-scope `extra` dir is denied.
         let (extra_c, cav_c) = (extra.clone(), cav.clone());
         let denied = std::thread::spawn(move || {
-            LandlockSandbox::new().apply(&cav_c).expect("apply");
+            LandlockSandbox::new()
+                .apply(&cav_c, crate::ApplyToken::core())
+                .expect("apply");
             fs::read(extra_c.join("data.txt"))
         })
         .join()
@@ -5924,7 +6340,7 @@ mod landlock_kernel_tests {
         let extra_w = extra.clone();
         let allowed_read = std::thread::spawn(move || {
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply");
             fs::read(extra_w.join("data.txt"))
         })
@@ -5951,7 +6367,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::none(),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             fs::write(dir_t.join("x.txt"), b"nope")
         })
         .join()
@@ -5984,7 +6402,9 @@ mod landlock_kernel_tests {
                 fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             let inside = fs::read(allowed_t.join("ok.txt"));
             let outside = fs::read(forbidden_t.join("secret.txt"));
             (inside, outside)
@@ -6025,7 +6445,9 @@ mod landlock_kernel_tests {
                 fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             let inside = std::process::Command::new("cat")
                 .arg(allowed_t.join("ok.txt"))
                 .output();
@@ -6072,7 +6494,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::only([write_t.to_string_lossy().into_owned()]),
                 ..Caveats::top() // fs_read stays All
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             fs::read(outside_t.join("readable.txt"))
         })
         .join()
@@ -6106,7 +6530,9 @@ mod landlock_kernel_tests {
                 exec: Scope::only([cat.clone()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             let granted = std::process::Command::new(&cat)
                 .arg(dir_t.join("data.txt"))
                 .output();
@@ -6191,7 +6617,9 @@ mod landlock_kernel_tests {
                 fs_write: Scope::only([scratch_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
 
             let mut attempts = vec![
                 (
@@ -6282,7 +6710,9 @@ mod landlock_kernel_tests {
                 fs_read: Scope::only([dir_t.to_string_lossy().into_owned()]),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             // Granted `cat` loads (its binary + libs are read-allowed) and reads
             // the in-scope file.
             let granted = std::process::Command::new(&cat)
@@ -6337,7 +6767,7 @@ mod landlock_kernel_tests {
                 ..Caveats::top()
             };
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply landlock + seccomp");
             let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").is_err();
             let udp6 = std::net::UdpSocket::bind("[::1]:0").is_err();
@@ -6373,7 +6803,7 @@ mod landlock_kernel_tests {
                 ..Caveats::top()
             };
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply landlock");
             std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
         })
@@ -6401,7 +6831,7 @@ mod landlock_kernel_tests {
             // net = All (ambient) → a granted net scope; DenyDirect must NOT fire.
             let cav = Caveats::top();
             LandlockSandbox::with_policy(policy)
-                .apply(&cav)
+                .apply(&cav, crate::ApplyToken::core())
                 .expect("apply landlock");
             std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
         })
@@ -6472,7 +6902,9 @@ mod landlock_kernel_tests {
                 net: Scope::none(),
                 ..Caveats::top()
             };
-            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            LandlockSandbox::new()
+                .apply(&cav, crate::ApplyToken::core())
+                .expect("apply landlock");
             hermetic_git_command(git, &main_t, &home_t)
                 .arg("worktree")
                 .arg("add")
@@ -6554,7 +6986,9 @@ mod landlock_kernel_tests {
                     net: Scope::none(),
                     ..Caveats::top()
                 };
-                LandlockSandbox::new().apply(&cav).expect("apply landlock");
+                LandlockSandbox::new()
+                    .apply(&cav, crate::ApplyToken::core())
+                    .expect("apply landlock");
                 hermetic_git_command(&git, &main, &home)
                     .arg("worktree")
                     .arg("add")
@@ -6752,7 +7186,7 @@ mod seatbelt_kernel_tests {
     /// status. This exercises the *production* profile path end to end.
     fn run_wrapped(cav: &Caveats, program: &str, args: &[&str]) -> std::process::ExitStatus {
         let prefix = SeatbeltSandbox::new()
-            .command_prefix(cav)
+            .command_prefix(cav, crate::ApplyToken::core())
             .expect("a restricted axis must yield a wrapper prefix");
         assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
         std::process::Command::new(&prefix[0])
@@ -6826,7 +7260,9 @@ mod seatbelt_kernel_tests {
             ..Caveats::top()
         };
         let target = dir.join("x.txt");
-        let prefix = SeatbeltSandbox::new().command_prefix(&cav).expect("prefix");
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(&cav, crate::ApplyToken::core())
+            .expect("prefix");
         let out = std::process::Command::new(&prefix[0])
             .args(&prefix[1..])
             .arg("/usr/bin/touch")
@@ -7167,7 +7603,7 @@ print(d.value())
             .net_none_ambient_mach_prefix(&cav)
             .expect("typed ambient-Mach characterization prefix");
         let production = sandbox
-            .command_prefix(&cav)
+            .command_prefix(&cav, crate::ApplyToken::core())
             .expect("production net:none prefix");
 
         let before = match run_deputy(&ambient, &probe.binary, &unique_probe_url("before")) {
@@ -7546,7 +7982,7 @@ print(d.value())
     /// kernel produced — the L3-grain the `exec` axis claims.
     fn run_wrapped_output(cav: &Caveats, program: &str, args: &[&str]) -> std::process::Output {
         let prefix = SeatbeltSandbox::new()
-            .command_prefix(cav)
+            .command_prefix(cav, crate::ApplyToken::core())
             .expect("a restricted axis must yield a wrapper prefix");
         assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
         std::process::Command::new(&prefix[0])
@@ -7829,7 +8265,7 @@ print(d.value())
             ..SandboxPolicy::default()
         };
         let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
-            .command_prefix(&cav)
+            .command_prefix(&cav, crate::ApplyToken::core())
             .expect("a restricted exec axis must yield a wrapper prefix");
         let status = hermetic_git_command(&prefix, git, &main, &home, &[])
             .args([
@@ -7950,7 +8386,7 @@ print(d.value())
             ..SandboxPolicy::default()
         };
         let prefix = SeatbeltSandbox::with_policy(std::sync::Arc::new(policy))
-            .command_prefix(&cav)
+            .command_prefix(&cav, crate::ApplyToken::core())
             .expect("a restricted exec axis must yield a wrapper prefix");
         let fake_exec_path = fake_dev.join("usr/libexec/git-core");
         let status = hermetic_git_command(
