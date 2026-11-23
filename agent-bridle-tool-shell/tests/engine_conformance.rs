@@ -98,7 +98,12 @@ fn run() {
         runtime.block_on(held_read_root_follows_the_object(engine));
         ran += 1;
     }
-    assert!(ran > 0, "no engine was compiled into this lane");
+    // The weekly power-set sweep builds this target with no engine feature on.
+    // There is then no row to run, and the lane has nothing to prove.
+    if ran == 0 {
+        println!("engine_conformance: no engine is compiled into this build; nothing to run");
+        return;
+    }
     println!("engine_conformance: {ran} engine(s) ok");
 }
 
@@ -183,13 +188,22 @@ async fn reports_the_rows_fence(row: Row, tool: &dyn Tool) {
         fs_write: only(&dir),
         ..Caveats::top()
     };
-    let out = tool
+    let out = match tool
         .invoke(
             serde_json::json!({"cmd": "echo hi", "cwd": dir}),
             &ctx(tool, &granted),
         )
         .await
-        .unwrap_or_else(|error| panic!("{} fence run: {error}", row.engine));
+    {
+        Ok(out) => out,
+        // With no fence in effect the Host engine refuses a restricted grant
+        // rather than run it unconfined; that refusal is the honest report.
+        Err(agent_bridle_core::ToolError::Denied { .. }) if row.fence == SandboxKind::None => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        Err(error) => panic!("{} fence run: {error}", row.engine),
+    };
     assert_eq!(
         out["sandbox_kind"],
         serde_json::to_value(row.fence).unwrap(),
