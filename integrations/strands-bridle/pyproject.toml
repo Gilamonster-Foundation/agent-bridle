@@ -1,0 +1,20 @@
+# Integration draft, kept OUT of the agent-bridle workspace like pi-bridle. It
+# is not published and not CI-wired; run its tests by hand (see README.md).
+[project]
+name = "strands-bridle"
+version = "0.0.0"
+description = "A Strands sandbox that runs shell, file tools and code under one agent-bridle grant."
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["strands-agents>=1.61"]
+classifiers = ["Private :: Do Not Upload"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+py-modules = ["strands_bridle"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
