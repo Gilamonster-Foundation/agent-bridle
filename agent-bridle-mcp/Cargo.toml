@@ -46,8 +46,8 @@ serde_json = { workspace = true }
 toml = "0.8"
 # Async stdio + the JSON-RPC read/dispatch/write loop. The MCP frontend is a
 # leaf, so tokio lives here (not in core).
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "time"] }

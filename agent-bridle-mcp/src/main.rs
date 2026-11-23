@@ -24,6 +24,7 @@ mod caveats_source;
 mod config;
 mod handlers;
 mod server;
+mod stdin;
 
 use caveats_source::GrantedCaveats;
 

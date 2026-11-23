@@ -60,6 +60,8 @@ impl McpChild {
             command.env("HOME", home);
         }
         let mut child = command
+            // A failing test must not leave the server running.
+            .kill_on_drop(true)
             .env("AGENT_BRIDLE_CAVEATS", grant)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -76,6 +78,12 @@ impl McpChild {
     }
 
     async fn call(&mut self, request: Value) -> Value {
+        self.send(request).await;
+        self.recv().await
+    }
+
+    /// Send one request or notification without waiting for a response.
+    async fn send(&mut self, request: Value) {
         let mut line = serde_json::to_string(&request).expect("serialize request");
         line.push('\n');
         self.stdin
@@ -83,7 +91,9 @@ impl McpChild {
             .await
             .expect("write MCP request");
         self.stdin.flush().await.expect("flush MCP request");
+    }
 
+    async fn recv(&mut self) -> Value {
         let line = tokio::time::timeout(Duration::from_secs(20), self.stdout.next_line())
             .await
             .expect("timed out waiting for MCP response")
@@ -287,4 +297,193 @@ async fn fs_restricted_grant_runs_carried_ls_with_default_features() {
     mcp.shutdown().await;
     std::fs::remove_dir_all(dir).expect("remove fixture dir");
     std::fs::remove_dir_all(home).expect("remove home");
+}
+
+/// A grant that leaves every axis unrestricted, so the worker runs `sleep` and
+/// `touch` natively.
+fn unrestricted_grant_json() -> String {
+    serde_json::json!({
+        "fs_read": "all",
+        "fs_write": "all",
+        "exec": "all",
+        "net": "all",
+        "max_calls": "unlimited",
+        "valid_for_generation": "all"
+    })
+    .to_string()
+}
+
+/// Whether any process is left in process group `pgid`.
+fn group_is_alive(pgid: u32) -> bool {
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        // No `--`: dash's `kill` rejects it before a negative pid.
+        .arg(format!("kill -0 -{pgid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Kills a worker's process group when the test ends, so a failing assertion
+/// cannot leave its long `sleep` running. A no-op once the group is gone.
+struct ReapGroup(u32);
+
+impl Drop for ReapGroup {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -{}", self.0))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    for _ in 0..400 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Start, as call id 1, a command that records its process group, sleeps far
+/// longer than the test runs, then would touch a marker. Returns that process
+/// group (the worker's: it leads its own, and its children stay in it) and the
+/// marker path.
+async fn start_long_call(mcp: &mut McpChild, dir: &Path) -> (ReapGroup, PathBuf) {
+    let pidfile = dir.join("worker.pid");
+    let marker = dir.join("ran-to-the-end");
+    mcp.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "shell",
+            // `ps` reports the group of the child that runs it, which is the
+            // group `sleep` will be in. Brush's own `$$` is not that group.
+            "arguments": { "cmd": format!(
+                "/bin/sh -c 'ps -o pgid= -p $$' > {}; sleep 300; touch {}",
+                shell_quote(&pidfile),
+                shell_quote(&marker)
+            ) }
+        }
+    }))
+    .await;
+    let read_pid = || {
+        std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    wait_until("the worker to record its process group", || {
+        read_pid().is_some()
+    })
+    .await;
+    let group = ReapGroup(read_pid().expect("worker process group"));
+    assert!(group_is_alive(group.0), "the worker group must be running");
+    (group, marker)
+}
+
+/// #496: cancelling a call kills and reaps its worker group, and the server
+/// keeps serving. Before, the loop did not read the cancel until the call
+/// ended, so the worker ran to the end.
+#[tokio::test]
+async fn cancelling_a_call_kills_its_worker_group() {
+    let dir = unique_temp();
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let mut mcp = McpChild::spawn_with(unrestricted_grant_json(), None);
+    let (group, marker) = start_long_call(&mut mcp, &dir).await;
+    let pgid = group.0;
+
+    mcp.send(serde_json::json!({
+        "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": { "requestId": 1, "reason": "test" }
+    }))
+    .await;
+    // The server is still serving. The next response is the ping's: the
+    // cancelled call is never answered.
+    let pong = mcp
+        .call(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+        .await;
+    assert_eq!(pong["id"], 2, "{pong}");
+
+    wait_until("the cancelled worker group to be gone", || {
+        !group_is_alive(pgid)
+    })
+    .await;
+    assert!(!marker.exists(), "the cancelled command must not finish");
+    mcp.shutdown().await;
+    std::fs::remove_dir_all(dir).expect("remove fixture dir");
+}
+
+/// #496: SIGTERM drops every call before the server exits, so stopping the
+/// server leaves no worker behind. The worker leads its own process group, so
+/// a signal sent to the server's group never reached it.
+#[tokio::test]
+async fn sigterm_kills_the_worker_group_before_the_server_exits() {
+    let dir = unique_temp();
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let mut mcp = McpChild::spawn_with(unrestricted_grant_json(), None);
+    let (group, marker) = start_long_call(&mut mcp, &dir).await;
+    let pgid = group.0;
+
+    let server = mcp.child.id().expect("server pid");
+    let sent = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -TERM {server}"))
+        .status()
+        .expect("send SIGTERM");
+    assert!(sent.success());
+    tokio::time::timeout(Duration::from_secs(20), mcp.child.wait())
+        .await
+        .expect("the server must exit on SIGTERM")
+        .expect("wait for the server");
+
+    assert!(
+        !group_is_alive(pgid),
+        "the worker group must be gone by the time the server has exited"
+    );
+    assert!(!marker.exists(), "the interrupted command must not finish");
+    std::fs::remove_dir_all(dir).expect("remove fixture dir");
+}
+
+/// #496: closing stdin does not drop a call in flight. The server answers it,
+/// then exits, as a piped batch of requests needs.
+#[tokio::test]
+async fn a_call_in_flight_when_stdin_closes_is_still_answered() {
+    let McpChild {
+        mut child,
+        mut stdin,
+        mut stdout,
+    } = McpChild::spawn_with(unrestricted_grant_json(), None);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "shell", "arguments": { "cmd": "sleep 1; echo late" } }
+    });
+    stdin
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write request");
+    drop(stdin);
+
+    let line = tokio::time::timeout(Duration::from_secs(20), stdout.next_line())
+        .await
+        .expect("the call must still be answered")
+        .expect("read response")
+        .expect("a response line");
+    let response: Value = serde_json::from_str(&line).expect("parse response");
+    assert_eq!(response["id"], 1, "{response}");
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("result text")
+            .contains("late"),
+        "{response}"
+    );
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("the server must exit after answering")
+        .expect("wait for the server");
+    assert!(status.success(), "{status:?}");
 }
