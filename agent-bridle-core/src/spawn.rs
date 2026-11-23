@@ -3028,7 +3028,7 @@ sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
     fn bind_mount_in_a_new_user_namespace_is_refused_under_an_fs_restricted_grant() {
         // The `Userns Proofs` lane sets both flags, so a runner that lost
         // Landlock or python3 fails the lane instead of passing it unproven.
-        let flag = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0");
+        let flag = |name: &str| std::env::var_os(name).is_some();
         if skip_unless(
             landlock_is_supported(),
             flag("BRIDLE_REQUIRE_LANDLOCK"),

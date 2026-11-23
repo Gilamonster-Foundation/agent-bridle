@@ -866,7 +866,7 @@ async fn fs_restricted_command_runs_under_landlock() {
         // The `Userns Proofs` lane sets the flag: a runner without Landlock
         // fails the lane instead of passing it unproven.
         assert!(
-            std::env::var("BRIDLE_REQUIRE_LANDLOCK").map_or(true, |v| v.is_empty() || v == "0"),
+            std::env::var_os("BRIDLE_REQUIRE_LANDLOCK").is_none(),
             "BRIDLE_REQUIRE_LANDLOCK is set, but this kernel lacks Landlock"
         );
         eprintln!("skipping: kernel lacks Landlock");
@@ -886,13 +886,16 @@ async fn fs_restricted_command_runs_under_landlock() {
         .await
         .expect("an fs-restricted Brush command must run");
     assert_ne!(out["denied"], true, "{out}");
+    // The worker ran under the OS fence: the result names Landlock.
+    assert_eq!(out["sandbox_kind"], "landlock", "{out}");
     assert_eq!(
         std::fs::read_to_string(dir.join("out")).expect("the command wrote its file"),
         "written\n",
         "{out}"
     );
-    // The worker is fenced: a write outside the grant must not land. A worker
-    // admitted without Landlock would pass the write above and this one.
+    // A write outside the grant must not land. Brush's own open check (L2) or
+    // the fence (L3) refuses it; the Landlock proof is the `sandbox_kind`
+    // assertion above, not this one.
     let outside = unique_temp("fs-restricted-outside");
     std::fs::create_dir_all(&outside).expect("create the directory outside the grant");
     let _ = tool()
@@ -906,7 +909,7 @@ async fn fs_restricted_command_runs_under_landlock() {
         .await;
     assert!(
         !outside.join("out").exists(),
-        "a write outside the grant must be refused by the fence"
+        "a write outside the grant must be refused"
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&outside);
