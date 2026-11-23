@@ -62,7 +62,7 @@ pub use admitted::{
 pub use config::{
     default_env_denylist, default_exec_path, fence_env, BackendToggles, BridleConfig, BridleMode,
     ChildNetworkPolicy, GatePolicy, HostMatch, LimitsPolicy, NetDefault, NetPolicy, NetRule,
-    NormalizationPolicy, PathList, RootfsPolicy, SandboxPolicy, VmPolicy, WebPolicy,
+    NormalizationPolicy, PathList, RootfsPolicy, SandboxPolicy, ShellPolicy, VmPolicy, WebPolicy,
 };
 pub use context::{open_scoped_read, open_scoped_write, ToolContext};
 pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};

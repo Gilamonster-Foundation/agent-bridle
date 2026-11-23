@@ -208,8 +208,8 @@ jobs:
   # guarantee matrix execution order, even when max-parallel is one.
   #
   # Internal-only workspace packages (`publish = false`) are deliberately
-  # absent: aclaunch ships inside the Windows binary archive; config and jaild
-  # are host/deployment internals; ceremony and gateway are non-public work.
+  # absent: aclaunch ships inside the Windows binary archive; jaild is a
+  # host/deployment internal; ceremony and gateway are non-public work.
   # agent-bridle-py is also excluded: PyO3 arm64 linker issues on the GitHub
   # Actions macOS runner make it unpublishable here. Publish its wheel manually
   # or via a maturin job if/when needed.
@@ -225,6 +225,7 @@ jobs:
       PUBLISH_CRATES: >-
         agent-bridle-fdguard
         agent-bridle-core
+        agent-bridle-config
         agent-bridle-tool-shell
         agent-bridle-tool-web
         agent-bridle

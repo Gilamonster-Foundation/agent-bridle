@@ -14,7 +14,10 @@ path = "src/main.rs"
 [features]
 # Serve the carried Brush shell + bundled coreutils by default. `shell` remains
 # an explicit lean-build alternative selecting the argv + safe-subset engine.
-default = ["carried-coreutils"]
+# `os-sandbox` is on by default (#495): without a compiled L3 backend the
+# no-op sandbox cannot meet the kernel filesystem floor, so admission refuses
+# every fs-restricted grant. Each backend is inert off its target OS.
+default = ["carried-coreutils", "os-sandbox"]
 shell = ["agent-bridle/shell"]
 carried-coreutils = ["agent-bridle/carried-coreutils"]
 # Expose the confined `web_fetch` tool (the `net` enforcer) through the server.
@@ -32,6 +35,9 @@ os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
 # workspace entry pins `default-features = false`, so this crate's own `shell`
 # feature (default-on) is what enables the facade's shell tool.
 agent-bridle = { workspace = true }
+# The layered mechanism config (`[bridle]` + `BRIDLE_*` env): which shell
+# engine to build, its limits and sandbox policy, and the gate floor (#495).
+agent-bridle-config = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
