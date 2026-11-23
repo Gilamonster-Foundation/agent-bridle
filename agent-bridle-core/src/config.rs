@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::report::AxisEnforcement;
 use crate::HumanGate;
 
@@ -94,8 +95,13 @@ pub enum BridleMode {
 /// ADR 0018 mode lattice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatePolicy {
-    /// The fence-strength floor stamped when none is set (`DEFAULT_STRENGTH_FLOOR`).
-    pub default_strength_floor: AxisEnforcement,
+    /// The per-axis fence-strength floor a host dispatches with (#495): a
+    /// `{ exec, net }` table. The filesystem axes always require the kernel and
+    /// are not configurable, so the floor can only raise confinement. A scalar
+    /// value (the form this field had while nothing read it) is refused at
+    /// load, never widened or guessed at. Defaults to
+    /// [`EnforcementFloor::DEFAULT`], the historic `DEFAULT_STRENGTH_FLOOR`.
+    pub default_strength_floor: crate::EnforcementFloor,
     /// Cap on the discharge freshness-window scan (`MAX_FRESHNESS_WINDOW`).
     pub max_freshness_window: u64,
     /// The **step-up floor** — the human-gate posture the host enforces for a
@@ -115,7 +121,9 @@ pub struct GatePolicy {
 impl Default for GatePolicy {
     fn default() -> Self {
         Self {
-            default_strength_floor: crate::gate::DEFAULT_STRENGTH_FLOOR,
+            default_strength_floor: crate::EnforcementFloor::from_scalar(
+                crate::gate::DEFAULT_STRENGTH_FLOOR,
+            ),
             max_freshness_window: 4096,
             step_up: HumanGate::Passkey,
         }
@@ -222,6 +230,13 @@ pub struct SandboxPolicy {
     /// before this field existed keep parsing (they get the defaults).
     #[serde(default = "default_device_sink_paths")]
     pub device_sink_paths: PathList,
+    /// Path markers naming harness-private stores (#500): a runtime closure
+    /// entry containing one as a component sequence is refused at declaration,
+    /// at admission, and by the backend's canonical-identity check. An embedder
+    /// adds its own; dropping a default needs `replace = true`.
+    /// `#[serde(default)]` so configs written before this field keep parsing.
+    #[serde(default = "default_harness_private_markers")]
+    pub harness_private_markers: PathList,
     /// Execute allow-list: the dynamic loader files only (`LOADER_PATHS`).
     pub loader_paths: PathList,
     /// Loopback identifiers for the net axis (`LOOPBACK_HOSTS`).
@@ -260,6 +275,12 @@ impl SandboxPolicy {
 /// resolve to arbitrary files and would widen the grant).
 fn default_device_sink_paths() -> PathList {
     PathList::from_defaults(&["/dev/null", "/dev/zero", "/dev/full"])
+}
+
+/// The `harness_private_markers` default: the harness's OCAP store, key
+/// material, and credential stores.
+pub(crate) fn default_harness_private_markers() -> PathList {
+    PathList::from_defaults(&[".newt", ".ssh", ".gnupg", ".aws", ".config/gh"])
 }
 
 impl Default for SandboxPolicy {
@@ -319,6 +340,7 @@ impl Default for SandboxPolicy {
             named_root_protected_roots: None,
             base_read_paths: PathList::from_defaults(base_read),
             device_sink_paths: default_device_sink_paths(),
+            harness_private_markers: default_harness_private_markers(),
             bin_read_paths: PathList::from_defaults(&[
                 "/usr/bin",
                 "/bin",
@@ -683,6 +705,20 @@ impl Default for VmPolicy {
     }
 }
 
+/// Which shell engine a host builds for its `shell` tool (`[bridle.shell]`,
+/// #495). Mechanism, not authority: every engine runs under the same grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellPolicy {
+    /// The engine token: `safe-subset`, `host`, `brush`, or one of their
+    /// aliases. Unset keeps the host's own default rule. Core does not
+    /// interpret it; the shell crate's `ShellEngine` parses it, and a host
+    /// refuses to start on a token it does not know or an engine it was not
+    /// built with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+}
+
 /// The complete, layered bridle configuration (mechanism). Every field defaults to
 /// today's behavior; see the module docs for the authority-vs-mechanism split.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -702,6 +738,8 @@ pub struct BridleConfig {
     pub net: NetPolicy,
     /// Shell + proxy limits.
     pub limits: LimitsPolicy,
+    /// Shell engine selection.
+    pub shell: ShellPolicy,
     /// Web-fetch limits.
     pub web: WebPolicy,
     /// Micro-VM / jail parameters.
@@ -761,7 +799,9 @@ mod tests {
     #[test]
     fn gate_policy_defaults_match_constants() {
         let g = GatePolicy::default();
-        assert_eq!(g.default_strength_floor, AxisEnforcement::Advisory);
+        assert_eq!(g.default_strength_floor, crate::EnforcementFloor::DEFAULT);
+        assert_eq!(g.default_strength_floor.exec(), AxisEnforcement::Advisory);
+        assert_eq!(g.default_strength_floor.net(), AxisEnforcement::Advisory);
         assert_eq!(g.max_freshness_window, 4096);
         // The human-gesture axis floor (ADR 0018 R6) defaults ON: the human leash
         // is Passkey unless deliberately lowered — Autonomous is never by omission.
@@ -877,6 +917,48 @@ mod tests {
         assert!(n.rules.is_empty(), "empty rules ⇒ pure exact-host behavior");
     }
 
+    /// #495: the gate floor is a per-axis `{exec, net}` table. A scalar (the
+    /// form the field had while nothing read it) and a smuggled filesystem
+    /// axis are both hard errors, never a silent default.
+    #[test]
+    fn gate_floor_is_per_axis_and_a_scalar_is_refused() {
+        let floor = |value: serde_json::Value| {
+            let mut json = serde_json::to_value(GatePolicy::default()).unwrap();
+            json["default_strength_floor"] = value;
+            serde_json::from_value::<GatePolicy>(json)
+        };
+        let raised = floor(serde_json::json!({"exec": "interceptor", "net": "kernel"})).unwrap();
+        assert_eq!(
+            raised.default_strength_floor.exec(),
+            AxisEnforcement::Interceptor
+        );
+        assert_eq!(raised.default_strength_floor.net(), AxisEnforcement::Kernel);
+        assert_eq!(
+            raised.default_strength_floor.fs_write(),
+            AxisEnforcement::Kernel,
+            "the filesystem floor is pinned, not configured"
+        );
+        assert!(
+            floor(serde_json::json!("kernel")).is_err(),
+            "a scalar is refused"
+        );
+        assert!(
+            floor(serde_json::json!({"exec": "kernel", "net": "kernel", "fs_write": "advisory"}))
+                .is_err(),
+            "a filesystem axis is not configurable"
+        );
+    }
+
+    /// #495: `[bridle.shell] engine` is carried as a token and defaults to unset.
+    #[test]
+    fn shell_engine_token_defaults_to_unset_and_round_trips() {
+        assert_eq!(BridleConfig::default().shell.engine, None);
+        let mut json = serde_json::to_value(BridleConfig::default()).unwrap();
+        json["shell"] = serde_json::json!({"engine": "safe-subset"});
+        let cfg: BridleConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.shell.engine.as_deref(), Some("safe-subset"));
+    }
+
     // ── Anti-drift: defaults must equal the source constants byte-for-byte, so
     //    this inert config can never silently diverge from today's behavior. ──
 
@@ -885,7 +967,7 @@ mod tests {
         let g = GatePolicy::default();
         assert_eq!(
             g.default_strength_floor,
-            crate::gate::DEFAULT_STRENGTH_FLOOR
+            crate::EnforcementFloor::from_scalar(crate::gate::DEFAULT_STRENGTH_FLOOR)
         );
         assert_eq!(g.max_freshness_window, crate::gate::MAX_FRESHNESS_WINDOW);
     }
@@ -896,6 +978,24 @@ mod tests {
             SandboxPolicy::default().loopback_hosts,
             to_vec(crate::sandbox::LOOPBACK_HOSTS)
         );
+    }
+
+    /// #500: the harness-private marker default pins today's five markers, and
+    /// a config written before the field existed still parses to it.
+    #[test]
+    fn harness_private_markers_default_is_todays_five_and_old_configs_parse() {
+        let d = SandboxPolicy::default();
+        assert_eq!(
+            d.harness_private_markers.resolve(),
+            to_vec(&[".newt", ".ssh", ".gnupg", ".aws", ".config/gh"]),
+            "harness-private marker drift"
+        );
+        let mut old = serde_json::to_value(&d).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("harness_private_markers");
+        let parsed: SandboxPolicy = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.harness_private_markers, d.harness_private_markers);
     }
 
     #[test]

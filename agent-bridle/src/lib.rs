@@ -21,7 +21,7 @@
 //!     ..Caveats::top()
 //! });
 //! let out = reg
-//!     .dispatch("shell", serde_json::json!({ "program": "echo", "args": ["hi"] }), &grant)
+//!     .dispatch("shell", serde_json::json!({ "cmd": "echo hi" }), &grant)
 //!     .await?;
 //! assert_eq!(out["exit_code"], 0);
 //! # Ok(())
@@ -40,6 +40,9 @@ pub use agent_bridle_core::*;
 pub use agent_bridle_tool_shell::ShellTool;
 #[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
 pub use agent_bridle_tool_shell::{ShellInvocationId, ShellOutputObserver, ShellOutputStream};
+// Engine choice as data (#491): a host selects and builds its `shell` engine.
+#[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
+pub use agent_bridle_tool_shell::{Cell, Check, Operation, Origin, ShellEngine, ShellOptions};
 // The sandboxed-host engine (ADR 0019 / #194). Anchored here so a host can
 // construct its own registry with it (`Registry::builder().tool(Arc::new(
 // HostShellTool::new()))`); it is deliberately NOT added to `registry()` — it
@@ -100,29 +103,47 @@ pub use agent_bridle_tool_web::WebFetchTool;
 /// tools by enabling features (or building its own registry).
 #[must_use]
 pub fn registry() -> Registry {
-    #[allow(unused_mut)]
-    let mut builder = Registry::builder();
+    #[cfg(any(feature = "shell", feature = "carried-coreutils"))]
+    {
+        let engine = default_shell_engine();
+        registry_with_shell(engine, ShellOptions::default())
+            .unwrap_or_else(|error| panic!("the {engine} shell must build: {error}"))
+    }
+    #[cfg(not(any(feature = "shell", feature = "carried-coreutils")))]
+    {
+        other_tools(Registry::builder()).build()
+    }
+}
 
+/// The engine [`registry`] serves when the host does not choose one: carried
+/// Brush where its worker transport exists, else safe-subset. This is the
+/// facade's rule, not `ShellEngine::default()`.
+#[cfg(any(feature = "shell", feature = "carried-coreutils"))]
+#[must_use]
+pub fn default_shell_engine() -> ShellEngine {
     #[cfg(feature = "carried-coreutils")]
-    {
-        if brush_private_control_supported() {
-            builder = builder.tool(std::sync::Arc::new(BrushShellTool::new()));
-        } else {
-            builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
-        }
+    if brush_private_control_supported() {
+        return ShellEngine::Brush;
     }
+    ShellEngine::SafeSubset
+}
 
-    #[cfg(all(feature = "shell", not(feature = "carried-coreutils")))]
-    {
-        builder = builder.tool(std::sync::Arc::new(ShellTool::new()));
-    }
+/// [`registry`] with a chosen shell engine and options (#495): how a host
+/// builds its `shell` tool from configuration. The shell is built through
+/// `ShellEngine::build` (#491), so an engine this build or platform cannot run
+/// is an error, never a silent fallback to another engine.
+#[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
+pub fn registry_with_shell(engine: ShellEngine, options: ShellOptions) -> ToolResult<Registry> {
+    Ok(other_tools(Registry::builder().tool(engine.build(options)?)).build())
+}
 
+/// Every non-shell tool the compiled features add.
+fn other_tools(#[allow(unused_mut)] mut builder: RegistryBuilder) -> RegistryBuilder {
     #[cfg(feature = "web")]
     {
         builder = builder.tool(std::sync::Arc::new(WebFetchTool::new()));
     }
-
-    builder.build()
+    builder
 }
 
 #[cfg(test)]

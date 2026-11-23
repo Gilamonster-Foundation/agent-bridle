@@ -14,6 +14,7 @@ use agent_bridle_core::{
 use crate::output_observer::{output_session, OutputEmitter};
 use crate::{ShellOutputObserver, ShellOutputStream};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn invoke_named_host_root(
     cx: &ToolContext,
     request: ExecutionRequest,
@@ -22,6 +23,7 @@ pub(crate) async fn invoke_named_host_root(
     max_output: usize,
     observer: Option<Arc<dyn ShellOutputObserver>>,
     disclosure: Disclosure,
+    execution_lease: Option<crate::ExecutionLease>,
 ) -> ToolResult<serde_json::Value> {
     let (guard, output) = output_session(observer, max_output);
     let cancellation = CancelOnDrop(Arc::new(AtomicBool::new(false)));
@@ -41,6 +43,7 @@ pub(crate) async fn invoke_named_host_root(
     // core Drop joins cleanup here. Abort acknowledgement does not mean that
     // cleanup has finished; normal completion awaits the quiescent terminal.
     let envelope = tokio::task::spawn_blocking(move || {
+        let _execution_lease = execution_lease;
         check_cancelled(&cancelled)?;
         let handle = LocalExecutionBackend::with_sandbox_policy(policy)
             .start_named_root(&collector.cx, request)?;
@@ -64,7 +67,7 @@ pub(crate) async fn invoke_named_host_root(
 }
 
 /// The async waiter's drop never joins the process supervisor.
-struct CancelOnDrop(Arc<AtomicBool>);
+pub(crate) struct CancelOnDrop(pub(crate) Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -163,7 +166,7 @@ impl NamedRootCollector {
             },
             None => SandboxKind::None,
         };
-        let mut envelope = ToolEnvelope::new(sandbox_kind)
+        let mut envelope = ToolEnvelope::bare(sandbox_kind)
             .with_disclosure(disclosure)
             .with_timed_out(timed_out);
         match &terminal.kind {

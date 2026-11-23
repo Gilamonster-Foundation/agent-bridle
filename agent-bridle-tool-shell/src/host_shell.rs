@@ -16,23 +16,22 @@
 //! `/bin/sh` says nothing about what it runs), so claiming to confine them would
 //! be a lie (I9). Restricted-exec/net requests belong on the safe-subset engine.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use agent_bridle_core::{
-    Caveats, ConfinedCommand, Denial, DenialKind, Disclosure, Invocation, SandboxKind,
-    SandboxPolicy, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    Caveats, ConfinedCommand, Denial, DenialKind, Invocation, SandboxPolicy, Scope, Tool,
+    ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
 use crate::output_observer::{drain_capped, output_session};
 
 /// The engine identity stamped on the disclosure (ADR 0019 D4).
-const ENGINE_NAME: &str = "sandbox-host";
+const ENGINE_NAME: &str = crate::ShellEngine::Host.as_str();
 
-/// Default cap on captured output bytes (mirrors the safe-subset engine's
-/// [`LimitsPolicy`](agent_bridle_core::LimitsPolicy) default; kept local so the
-/// engine has no extra config surface for the MVP).
+/// Default cap on captured output bytes for [`HostShellTool::new`]. Smaller
+/// than the [`LimitsPolicy`](agent_bridle_core::LimitsPolicy) default (1 MiB),
+/// which [`HostShellTool::with_limits`] and `ShellEngine::build` apply.
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
 
 /// The engine's input schema, parsed once from the embedded data file. The
@@ -57,6 +56,8 @@ static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
 pub struct HostShellTool {
     shell: String,
     max_output: usize,
+    timeout: std::time::Duration,
+    limits: agent_bridle_core::LimitsPolicy,
     sandbox: Arc<SandboxPolicy>,
     /// The tool's input schema — a *property* of this engine instance, not a
     /// hard-coded literal in [`Tool::schema`]. Defaults to the embedded
@@ -64,6 +65,8 @@ pub struct HostShellTool {
     /// [`HostShellTool::with_schema`] (three-Cs: Configuration).
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
+    execution_lease: Option<crate::ExecutionLease>,
+    held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
 }
 
 impl std::fmt::Debug for HostShellTool {
@@ -87,10 +90,59 @@ impl HostShellTool {
         Self {
             shell: "/bin/sh".to_string(),
             max_output: DEFAULT_MAX_OUTPUT,
+            timeout: std::time::Duration::from_secs(
+                agent_bridle_core::LimitsPolicy::default().default_timeout_secs,
+            ),
+            limits: agent_bridle_core::LimitsPolicy::default(),
             sandbox: Arc::new(SandboxPolicy::default()),
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
+            execution_lease: None,
+            held_read_roots: Vec::new(),
         }
+    }
+
+    /// Apply a [`LimitsPolicy`](agent_bridle_core::LimitsPolicy): its output
+    /// cap, default timeout, timeout ceiling and env denylist.
+    #[must_use]
+    pub fn with_limits(mut self, limits: agent_bridle_core::LimitsPolicy) -> Self {
+        self.max_output = limits.max_output_bytes;
+        self.timeout = std::time::Duration::from_secs(limits.default_timeout_secs);
+        self.limits = limits;
+        self
+    }
+
+    /// Select the OS-sandbox mechanism policy for the fence.
+    #[must_use]
+    pub fn with_sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
+        self.sandbox = policy;
+        self
+    }
+
+    /// Carry already admitted read roots to the kernel fence by descriptor
+    /// (#494). This changes the mechanism, never the tool's filesystem
+    /// authority: core refuses a root that is not in the admitted `fs_read`
+    /// scope, and a backend that cannot anchor on a descriptor.
+    #[must_use]
+    pub fn with_held_read_roots(mut self, roots: Vec<agent_bridle_core::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
+        self
+    }
+
+    /// Bound this invocation using the shared process-group supervisor.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Retain resources until the blocking process owner finishes, including
+    /// when its async waiter is dropped. This does not add host-shell
+    /// cancellation support; the configured timeout still governs shutdown.
+    #[must_use]
+    pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
+        self.execution_lease = Some(lease);
+        self
     }
 
     /// Attach a presentation-only observer for bounded stdout/stderr chunks.
@@ -133,8 +185,7 @@ impl HostShellTool {
     /// `denied: true`, so a consumer can adapt (reshape, or select the
     /// safe-subset engine), never a silent fallback.
     fn engine_unavailable(&self, kind: DenialKind, axis: &str) -> serde_json::Value {
-        ToolEnvelope::new(SandboxKind::None)
-            .with_disclosure(self.disclosure())
+        ToolEnvelope::refused(ENGINE_NAME)
             .with_denials(vec![Denial {
                 kind,
                 target: format!("sandbox-host engine ({axis} restricted)"),
@@ -146,13 +197,6 @@ impl HostShellTool {
                 ),
             }])
             .into_json()
-    }
-
-    fn disclosure(&self) -> Disclosure {
-        Disclosure {
-            engine: Some(ENGINE_NAME.to_string()),
-            ..Disclosure::default()
-        }
     }
 }
 
@@ -195,11 +239,13 @@ impl Tool for HostShellTool {
         args: serde_json::Value,
         cx: &ToolContext,
     ) -> ToolResult<Invocation> {
-        let cmd = args
-            .get("cmd")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::denied("sandbox-host: missing required `cmd` string"))?
-            .to_string();
+        // One request shape for every engine (#490): `env` is fenced of
+        // loader/hook names (AB-004); `timeout_secs` overrides the configured
+        // timeout, clamped to the limits ceiling.
+        let limits = &self.limits;
+        let request = crate::request::ShellRequest::parse(&args)?;
+        let cmd = request.require_cmd("sandbox-host")?.to_string();
+        let timeout = request.timeout(limits, self.timeout);
 
         // ADR 0019 D2 — honesty. The engine only serves fs-restricted; a
         // restricted exec/net grant is refused (the shell forks children this
@@ -217,15 +263,7 @@ impl Tool for HostShellTool {
             ));
         }
 
-        let mut env: BTreeMap<String, String> = args
-            .get("env")
-            .and_then(serde_json::Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut env = request.env(limits);
         // Full-access PATH seeding (Track 1a / parity). We only reach here when
         // `exec` is unrestricted (a restricted exec/net was refused above), so the
         // child is already permitted to run anything on the host. Seed a usable
@@ -237,7 +275,7 @@ impl Tool for HostShellTool {
         // caller-provided `PATH` wins.
         env.entry("PATH".to_string())
             .or_insert_with(agent_bridle_core::default_exec_path);
-        let cwd = args.get("cwd").and_then(serde_json::Value::as_str);
+        let cwd = request.cwd.as_deref();
         let max_output = self.max_output;
 
         // Build the confined spawn: `/bin/sh -c <cmd>`, empty env + granted vars,
@@ -245,6 +283,8 @@ impl Tool for HostShellTool {
         // permitted under exec=All), fail-closes on unenforceable fs, applies the
         // OS jail, and reports the honest kind.
         let mut command = ConfinedCommand::new(&self.shell)
+            .held_read_roots(self.held_read_roots.iter().cloned())
+            .new_process_group()
             .arg("-c")
             .arg(&cmd)
             .sandbox_policy(Arc::clone(&self.sandbox))
@@ -262,7 +302,7 @@ impl Tool for HostShellTool {
         // enforces the fail-closed fs check and applies the jail on the spawn
         // thread, so the child inherits confinement.
         let confined = command.spawn(cx)?;
-        let sandbox_kind = confined.sandbox_kind;
+        let mechanism = confined.mechanism;
         let mut child = confined.child;
         let stdout_reader = child
             .stdout
@@ -274,7 +314,9 @@ impl Tool for HostShellTool {
             .ok_or_else(|| ToolError::Exec(std::io::Error::other("stderr pipe missing")))?;
         let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
 
+        let execution_lease = self.execution_lease.clone();
         let captured = tokio::task::spawn_blocking(move || {
+            let _execution_lease = execution_lease;
             let stdout_output = output.clone();
             let stdout = std::thread::spawn(move || {
                 drain_capped(
@@ -293,7 +335,10 @@ impl Tool for HostShellTool {
                 )
             });
 
-            let status = child.wait().map_err(ToolError::Exec);
+            let status = crate::supervisor::supervise(std::slice::from_mut(&mut child), timeout);
+            // A shell can exit with background descendants still holding pipes.
+            // Terminate its group before joining the bounded output readers.
+            crate::kill_child_tree(&mut child);
             let stdout = stdout.join().map_err(|_| {
                 ToolError::Exec(std::io::Error::other("stdout reader thread panicked"))
             });
@@ -309,17 +354,26 @@ impl Tool for HostShellTool {
         .await
         .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
 
-        let (status, stdout, stdout_truncated, stderr, stderr_truncated) = captured;
+        let ((exit_code, timed_out), stdout, stdout_truncated, stderr, stderr_truncated) = captured;
         let stdout = cap_utf8(&stdout, max_output, stdout_truncated);
-        let stderr = cap_utf8(&stderr, max_output, stderr_truncated);
-        let envelope = ToolEnvelope::new(sandbox_kind)
-            .with_disclosure(self.disclosure())
-            .with_exit_code(status.code().unwrap_or(-1))
+        let stderr = if timed_out {
+            format!(
+                "command timed out after {}s; process group terminated",
+                timeout.as_secs()
+            )
+        } else {
+            cap_utf8(&stderr, max_output, stderr_truncated)
+        };
+        let envelope = ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
+            .with_exit_code(exit_code)
+            .with_truncation(stdout_truncated, stderr_truncated && !timed_out)
             .with_stdout(stdout)
             .with_stderr(stderr)
-            .with_timed_out(false)
+            .with_timed_out(timed_out)
             .into_json();
-        output_guard.finish();
+        if !timed_out {
+            output_guard.finish();
+        }
         Ok(Invocation::Ran(envelope))
     }
 }
@@ -334,7 +388,9 @@ fn cap_utf8(bytes: &[u8], max: usize, truncated: bool) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…[truncated]", &s[..end])
+    // The envelope's truncation flags report the cut (#491); no in-band
+    // marker, so stdout never exceeds the cap, as in the other engines.
+    s[..end].to_owned()
 }
 
 #[cfg(test)]

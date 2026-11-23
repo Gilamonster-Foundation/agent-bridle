@@ -21,12 +21,12 @@
 #![warn(missing_docs)]
 
 mod caveats_source;
+mod config;
 mod handlers;
 mod server;
+mod stdin;
 
-use agent_bridle::registry;
 use caveats_source::GrantedCaveats;
-use server::McpServer;
 
 fn main() -> anyhow::Result<()> {
     // Carried coreutils re-exec this binary as
@@ -62,8 +62,12 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
-    // Build the registry for this binary's compiled feature set (carried Brush
-    // shell + coreutils by default) and serve it over stdio.
-    let server = McpServer::new(registry(), granted.caveats);
+    // Mechanism config (#495): `[bridle]` in the same config file plus the
+    // `BRIDLE_*` environment choose the shell engine, its limits and sandbox
+    // policy, and the gate floor. Unset, this is the registry for the binary's
+    // compiled feature set (carried Brush shell + coreutils by default). A
+    // setting this build cannot honor fails startup here.
+    let (mechanism, _provenance) = agent_bridle_config::load()?;
+    let server = config::server(&mechanism, granted.caveats)?;
     server.run_stdio().await
 }

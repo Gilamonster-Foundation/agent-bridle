@@ -122,6 +122,18 @@ fn run_platform() {
         "stderr_observer_and_brush_envelope_apply_the_output_cap",
         stderr_observer_and_brush_envelope_apply_the_output_cap,
     );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "brush_loader_hook_env_vars_are_fenced_out",
+        brush_loader_hook_env_vars_are_fenced_out,
+    );
+    #[cfg(unix)]
+    run_async_case(
+        &runtime,
+        "brush_honors_timeout_secs",
+        brush_honors_timeout_secs,
+    );
     run_async_case(
         &runtime,
         "full_access_runs_dynamic_construct_and_captures",
@@ -593,6 +605,8 @@ async fn stderr_observer_and_brush_envelope_apply_the_output_cap() {
         out["stderr"].as_str().expect("stderr string").as_bytes(),
         observed
     );
+    // #489: the dropped bytes must surface as a truncation flag.
+    assert_eq!(out["stderr_truncated"], true, "{out}");
 }
 
 /// Full-access: a `$(...)` command substitution — refused by the safe-subset
@@ -786,6 +800,9 @@ async fn trusted_worker_net_none_runs_after_worker_control_audit() {
         "two",
         "the piped command must have actually executed, not merely been admitted: {out}"
     );
+    // #492: the envelope reports the mechanism the funnel admitted, audited
+    // stdio included, so `net: none` is kernel-enforced, not advisory.
+    assert_eq!(out["enforcement"]["net"], "kernel", "{out}");
 
     let _ = std::fs::remove_file(&file);
 }
@@ -1160,5 +1177,44 @@ async fn a_child_gets_the_seeded_path_and_the_seam_but_no_ambient_variable() {
     assert!(
         !stdout.contains("ambient-secret") && !has(AMBIENT),
         "an ambient variable that was not passed must NOT reach the child: {out}"
+    );
+}
+
+/// #490: Brush fences loader/hook names out of the caller `env`, like safe-subset.
+#[cfg(unix)]
+async fn brush_loader_hook_env_vars_are_fenced_out() {
+    let out = tool()
+        .invoke(
+            serde_json::json!({
+                "cmd": "env",
+                "env": {"LD_PRELOAD": "/evil.so", "BASH_ENV": "/evil", "SAFE_VAR": "keep"},
+            }),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("invoke");
+    let stdout = out["stdout"].as_str().unwrap_or_default();
+    assert!(!stdout.contains("LD_PRELOAD"), "{stdout}");
+    assert!(!stdout.contains("BASH_ENV"), "{stdout}");
+    assert!(stdout.contains("SAFE_VAR=keep"), "{stdout}");
+}
+
+/// #490: Brush honors a per-call `timeout_secs`.
+#[cfg(unix)]
+async fn brush_honors_timeout_secs() {
+    // The engine is configured for 3s; the call asks for 1s.
+    let out = tool()
+        .with_timeout(std::time::Duration::from_secs(3))
+        .invoke(
+            serde_json::json!({"cmd": "while :; do :; done", "timeout_secs": 1}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("timeout envelope");
+    assert_eq!(out["timed_out"], true, "{out}");
+    assert_eq!(out["exit_code"], 124, "{out}");
+    assert!(
+        out["stderr"].as_str().unwrap().contains("after 1s"),
+        "{out}"
     );
 }

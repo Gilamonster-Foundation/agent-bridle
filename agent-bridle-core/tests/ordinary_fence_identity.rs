@@ -35,7 +35,7 @@ fn ordinary_fence_body_and_cid_keep_the_existing_encoding() {
 
 #[test]
 fn ordinary_serialized_envelope_round_trips_with_omitted_false_flags() {
-    let envelope = agent_bridle_core::ToolEnvelope::new(SandboxKind::None)
+    let envelope = agent_bridle_core::ToolEnvelope::bare(SandboxKind::None)
         .with_exit_code(0)
         .with_stdout("actual ordinary result")
         .with_disclosure(agent_bridle_core::Disclosure {
@@ -57,7 +57,7 @@ fn ordinary_serialized_envelope_round_trips_with_omitted_false_flags() {
 #[test]
 fn omitted_flag_defaults_do_not_coerce_malformed_or_true_values() {
     use agent_bridle_core::{Disclosure, ToolEnvelope};
-    let mut envelope = ToolEnvelope::new(SandboxKind::None).with_disclosure(Disclosure {
+    let mut envelope = ToolEnvelope::bare(SandboxKind::None).with_disclosure(Disclosure {
         unbridled: true,
         net_over_delivery: true,
         ..Default::default()

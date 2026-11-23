@@ -75,14 +75,20 @@ pub(crate) use agent_bridle_core::net_proxy;
 mod output_observer;
 #[cfg(feature = "shell")]
 mod parse;
+#[cfg(any(feature = "shell", feature = "host-shell", feature = "brush"))]
+mod request;
+mod shell_engine;
+pub use shell_engine::{Cell, Check, Operation, Origin, ShellEngine, ShellOptions};
 #[cfg(feature = "shell")]
 mod shell_tool;
+#[cfg(any(feature = "shell", feature = "host-shell"))]
+mod supervisor;
 
 /// Stop the existing stage/worker process group before terminating its members.
 /// Killing a waited-on child first can wake a shell long enough to run its next
 /// command before the group's kill reaches it. Callers retain their wait/reap
 /// handling; this does not reach descendants that leave the process group.
-#[cfg(any(feature = "shell", feature = "brush"))]
+#[cfg(any(feature = "shell", feature = "brush", feature = "host-shell"))]
 fn kill_child_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
@@ -94,6 +100,13 @@ fn kill_child_tree(child: &mut std::process::Child) {
 }
 
 pub use output_observer::{ShellInvocationId, ShellOutputObserver, ShellOutputStream};
+
+/// Caller-owned resources retained by a shell's blocking execution owner.
+///
+/// A lease protects resource lifetime when the async waiter is dropped. It
+/// conveys no authority and does not itself add cancellation support to an
+/// engine; that engine's existing shutdown/timeout policy still applies.
+pub type ExecutionLease = std::sync::Arc<dyn Send + Sync>;
 #[cfg(feature = "shell")]
 pub use shell_tool::ShellTool;
 

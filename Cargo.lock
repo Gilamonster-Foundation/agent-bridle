@@ -102,6 +102,7 @@ name = "agent-bridle-mcp"
 version = "0.8.0-rc.7"
 dependencies = [
  "agent-bridle",
+ "agent-bridle-config",
  "anyhow",
  "async-trait",
  "serde",

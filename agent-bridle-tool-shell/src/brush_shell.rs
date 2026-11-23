@@ -22,13 +22,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_bridle_core::{
-    default_exec_path, enforcement_report, human_gate, is_unbridled, ConfinementMechanism,
-    Disclosure, SandboxPolicy, SandboxedWorker, SandboxedWorkerChild, Scope, Tool, ToolContext,
-    ToolEnvelope, ToolError, ToolResult,
+    default_exec_path, human_gate, is_unbridled, Disclosure, SandboxPolicy, SandboxedWorker,
+    SandboxedWorkerChild, Scope, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 use brush_builtins::{default_builtins, BuiltinSet};
@@ -45,7 +45,8 @@ use crate::output_observer::{drain_capped, output_session, OutputEmitter};
 
 /// The engine identity stamped on the disclosure (ADR 0005 D2 / ADR 0019 D4).
 const ENGINE_NAME: &str = "brush";
-/// Default cap on captured output bytes (mirrors the other engines' default).
+/// Default cap on captured output bytes for [`BrushShellTool::new`]; see
+/// [`BrushShellTool::with_limits`] for the 1 MiB `LimitsPolicy` default.
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
 /// Minimal, standard `PATH` used when `exec` is RESTRICTED: external commands
 /// must still *resolve* so they reach the interceptor's `before_exec` gate
@@ -92,6 +93,9 @@ pub struct BrushShellTool {
     max_output: usize,
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
+    execution_lease: Option<crate::ExecutionLease>,
+    held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
+    limits: agent_bridle_core::LimitsPolicy,
     /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
     /// and reported `timed_out:true` with exit 124.
     timeout: Duration,
@@ -119,10 +123,54 @@ impl BrushShellTool {
             max_output: DEFAULT_MAX_OUTPUT,
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
+            execution_lease: None,
+            held_read_roots: Vec::new(),
+            limits: agent_bridle_core::LimitsPolicy::default(),
             timeout: default_timeout(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
             named_host_roots: false,
         }
+    }
+
+    /// Set the maximum captured bytes per output stream. The shared worker
+    /// protocol rejects zero and values beyond its finite capture ceiling.
+    /// Output beyond this limit is reported by the envelope's truncation flags.
+    pub fn with_max_output_bytes(mut self, max_output: usize) -> ToolResult<Self> {
+        stream_limits(max_output)?;
+        self.max_output = max_output;
+        Ok(self)
+    }
+
+    /// Apply a [`LimitsPolicy`](agent_bridle_core::LimitsPolicy): its output
+    /// cap (validated as in [`Self::with_max_output_bytes`]), default timeout,
+    /// timeout ceiling and env denylist.
+    pub fn with_limits(self, limits: agent_bridle_core::LimitsPolicy) -> ToolResult<Self> {
+        let mut tool = self.with_max_output_bytes(limits.max_output_bytes)?;
+        tool.timeout = Duration::from_secs(limits.default_timeout_secs);
+        tool.limits = limits;
+        Ok(tool)
+    }
+
+    /// Carry already admitted read roots to the kernel fence by descriptor
+    /// (#494). This changes the mechanism, never the tool's filesystem
+    /// authority: core refuses a root that is not in the admitted `fs_read`
+    /// scope, and a backend that cannot anchor on a descriptor.
+    #[must_use]
+    pub fn with_held_read_roots(mut self, roots: Vec<agent_bridle_core::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
+        self
+    }
+
+    /// Retain caller-owned execution resources through worker shutdown.
+    ///
+    /// Dropping an invocation signals cancellation, but process termination
+    /// and reaping happen in its blocking supervisor. A clone of this lease
+    /// stays with that owner until cleanup finishes, including on cancellation
+    /// and errors. The lease conveys no filesystem or execution authority.
+    #[must_use]
+    pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
+        self.execution_lease = Some(lease);
+        self
     }
 
     /// Override the wall-clock ceiling (three-Cs: Configuration). A run that
@@ -201,35 +249,23 @@ impl Tool for BrushShellTool {
         args: serde_json::Value,
         cx: &ToolContext,
     ) -> ToolResult<serde_json::Value> {
-        let cmd = args
-            .get("cmd")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::denied("brush: missing required `cmd` string"))?
-            .to_string();
-        let cwd = args
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
+        // One request shape for every engine (#490): `env` is the schema's
+        // deliberate import surface (this engine runs `do_not_inherit_env`),
+        // fenced of loader/hook names (AB-004); `timeout_secs` overrides the
+        // configured timeout, clamped to the limits ceiling.
+        let limits = &self.limits;
+        let request = crate::request::ShellRequest::parse(&args)?;
+        let cmd = request.require_cmd("brush")?.to_string();
+        let timeout = request.timeout(limits, self.timeout);
+        let cwd = request
+            .cwd
+            .as_deref()
             .map(PathBuf::from)
             .unwrap_or(std::env::current_dir().map_err(ToolError::from)?)
             .canonicalize()
             .map_err(|error| ToolError::denied(format!("brush cwd is invalid: {error}")))?;
         cx.check_path_read(&cwd)?;
-
-        // The schema's `env` seam: the DELIBERATE import surface across the
-        // confinement boundary (this engine runs `do_not_inherit_env(true)`, so
-        // nothing ambient leaks in). String values only, mirroring the host and
-        // safe-subset engines. Before this, brush silently DROPPED `env` even
-        // though the schema advertised it — losing HOME/USER/VIRTUAL_ENV and
-        // re-opening the #783-class `~`-expansion bug under this engine.
-        let env: BTreeMap<String, String> = args
-            .get("env")
-            .and_then(serde_json::Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let env = request.env(limits);
 
         // PATH parity: the FULL ambient path when `exec` is unrestricted (so the
         // agent's own tools — `~/.cargo/bin`, `/opt/homebrew/bin`, … — resolve
@@ -259,10 +295,11 @@ impl Tool for BrushShellTool {
                 cx,
                 request,
                 Arc::clone(&self.sandbox_policy),
-                self.timeout,
+                timeout,
                 self.max_output,
                 self.output_observer.clone(),
                 self.disclosure(),
+                self.execution_lease.clone(),
             )
             .await;
         }
@@ -285,22 +322,32 @@ impl Tool for BrushShellTool {
         );
         let confined = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))
+            .held_read_roots(self.held_read_roots.clone())
             .spawn(cx, &nonce, &cwd)?;
-        let sandbox_kind = confined.sandbox_kind;
-        let caveats = cx.caveats().clone();
-        // The mechanism governing the worker: reported kind + the child-network
-        // policy the worker was spawned under (same `self.sandbox_policy`). Keeps
-        // the reported net witness honest (Landlock `net:none` is Kernel only under
-        // `DenyDirect`), never over-claiming from the kind alone.
-        let mechanism = ConfinementMechanism::new(sandbox_kind, self.sandbox_policy.child_network)
-            .with_appcontainer_nul_device_ace(self.sandbox_policy.appcontainer_nul_device_ace)
-            .with_appcontainer_mount_manager_ace(
-                self.sandbox_policy.appcontainer_mount_manager_ace,
-            );
-        let timeout = self.timeout;
+        // The mechanism the funnel admitted for the worker, stdio posture
+        // included (#492). Rebuilding it here would drop that posture and
+        // under-report a kernel-enforced `net: none` on macOS.
+        let mechanism = confined.mechanism;
+
         let worker_output = output.clone();
+        // Dropping this async waiter flags cancellation; the blocking owner
+        // then kills and reaps the worker before it releases the lease.
+        let cancellation =
+            crate::named_host_root_execution::CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        let cancelled = Arc::clone(&cancellation.0);
+        let execution_lease = self.execution_lease.clone();
         let supervised = tokio::task::spawn_blocking(move || {
-            supervise_worker(confined, &payload, timeout, max_output, worker_output)
+            // Keep resources in the process owner's lifetime, not just the
+            // cancellable async waiter's stack.
+            let _execution_lease = execution_lease;
+            supervise_worker(
+                confined,
+                &payload,
+                timeout,
+                max_output,
+                worker_output,
+                &cancelled,
+            )
         })
         .await
         .map_err(|error| ToolError::Exec(std::io::Error::other(format!("join: {error}"))))??;
@@ -310,7 +357,7 @@ impl Tool for BrushShellTool {
                     response,
                     stdout,
                     stderr,
-                    dropped: _,
+                    dropped,
                 } = outcome;
                 if let Some(error) = response.error {
                     return Err(ToolError::denied(format!(
@@ -321,12 +368,14 @@ impl Tool for BrushShellTool {
                 // already saw live. The terminal contributes status, denials,
                 // and drop accounting — never a second copy of the output that
                 // could disagree with what was displayed.
-                let envelope = ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement_report(&caveats, mechanism))
-                    .with_disclosure(self.disclosure())
+                let envelope = ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
                     .with_exit_code(response.exit_code)
                     .with_stdout(String::from_utf8_lossy(&stdout).into_owned())
                     .with_stderr(String::from_utf8_lossy(&stderr).into_owned())
+                    .with_truncation(
+                        response.dropped.stdout_bytes > 0 || dropped.stdout_bytes > 0,
+                        response.dropped.stderr_bytes > 0 || dropped.stderr_bytes > 0,
+                    )
                     .with_timed_out(false)
                     .with_denials(response.denials)
                     .into_json();
@@ -335,9 +384,7 @@ impl Tool for BrushShellTool {
             }
             Supervised::TimedOut => {
                 drop(output_guard);
-                Ok(ToolEnvelope::new(sandbox_kind)
-                    .with_enforcement(enforcement_report(&caveats, mechanism))
-                    .with_disclosure(self.disclosure())
+                Ok(ToolEnvelope::new(ENGINE_NAME, cx, mechanism)
                     .with_exit_code(124)
                     .with_stderr(format!("command timed out after {}s", timeout.as_secs()))
                     .with_timed_out(true)
@@ -353,20 +400,32 @@ enum Supervised {
 }
 
 fn supervise_worker(
-    mut confined: SandboxedWorkerChild,
+    confined: SandboxedWorkerChild,
     payload: &WorkerPayload,
     timeout: Duration,
     max_output: usize,
     output: OutputEmitter,
+    cancelled: &AtomicBool,
 ) -> ToolResult<Supervised> {
+    let mut worker = OwnedWorker {
+        confined,
+        reaped: false,
+    };
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ToolError::denied("brush invocation cancelled"));
+    }
     let auth_started = std::time::Instant::now();
-    if let Err(error) = confined.send_payload(payload, timeout) {
-        let mut child = confined.child;
-        let stdout = child
+    if let Err(error) = authenticate_worker(&mut worker.confined, payload, timeout, cancelled) {
+        worker.terminate()?;
+        let stdout = worker
+            .confined
+            .child
             .stdout
             .take()
             .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
-        let stderr = child
+        let stderr = worker
+            .confined
+            .child
             .stderr
             .take()
             .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
@@ -375,8 +434,6 @@ fn supervise_worker(
         let stderr_reader =
             std::thread::spawn(move || read_capped(stderr, max_output.saturating_add(4096)));
 
-        crate::kill_child_tree(&mut child);
-        let _ = child.wait();
         let stdout = stdout_reader
             .join()
             .map_err(|_| ToolError::denied("brush worker stdout reader panicked"))??;
@@ -389,12 +446,15 @@ fn supervise_worker(
         )));
     }
 
-    let mut child = confined.child;
-    let stdout = child
+    let stdout = worker
+        .confined
+        .child
         .stdout
         .take()
         .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
-    let stderr = child
+    let stderr = worker
+        .confined
+        .child
         .stderr
         .take()
         .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
@@ -410,7 +470,10 @@ fn supervise_worker(
 
     let deadline = auth_started + timeout;
     let status = loop {
-        if let Some(status) = reap_worker_tree_if_exited(&mut child)? {
+        if cancelled.load(Ordering::Acquire) {
+            break None;
+        }
+        if let Some(status) = worker.try_reap()? {
             break Some(status);
         }
         let now = std::time::Instant::now();
@@ -424,10 +487,12 @@ fn supervise_worker(
         );
     };
     if status.is_none() {
-        crate::kill_child_tree(&mut child);
-        let _ = child.wait();
+        worker.terminate()?;
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ToolError::denied("brush invocation cancelled"));
+        }
         return Ok(Supervised::TimedOut);
     }
     let outcome = stdout_reader
@@ -446,6 +511,97 @@ fn supervise_worker(
         );
     }
     Ok(Supervised::Complete(outcome))
+}
+
+/// Every exit path owns cleanup. In particular, a protocol/reader error must
+/// not drop an unreaped child while the invocation's resource lease is freed.
+struct OwnedWorker {
+    confined: SandboxedWorkerChild,
+    reaped: bool,
+}
+
+impl OwnedWorker {
+    fn terminate(&mut self) -> ToolResult<()> {
+        crate::kill_child_tree(&mut self.confined.child);
+        self.confined.child.wait().map_err(ToolError::from)?;
+        self.reaped = true;
+        Ok(())
+    }
+
+    fn try_reap(&mut self) -> ToolResult<Option<std::process::ExitStatus>> {
+        let status = reap_worker_tree_if_exited(&mut self.confined.child)?;
+        self.reaped = status.is_some();
+        Ok(status)
+    }
+}
+
+impl Drop for OwnedWorker {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.terminate();
+        }
+    }
+}
+
+fn authenticate_worker(
+    confined: &mut SandboxedWorkerChild,
+    payload: &WorkerPayload,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> ToolResult<()> {
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(confined.child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| ToolError::denied("invalid brush worker PID"))?;
+        watch_worker_authentication(pid, cancelled, || confined.send_payload(payload, timeout))
+    }
+    // Private worker authentication is currently supported only on macOS and
+    // Linux. Preserve the existing refusal on other platforms.
+    #[cfg(not(unix))]
+    {
+        let _ = cancelled;
+        confined.send_payload(payload, timeout)
+    }
+}
+
+#[cfg(unix)]
+fn watch_worker_authentication<T>(
+    pid: rustix::process::Pid,
+    cancelled: &AtomicBool,
+    authenticate: impl FnOnce() -> ToolResult<T>,
+) -> ToolResult<T> {
+    // The caller owns an UNREAPED child throughout this scope. The watcher is
+    // disarmed and joined before any wait/reap, so it can never signal a reused
+    // PID. Killing the worker closes its private control endpoint and unblocks
+    // authentication without shortening the configured startup timeout.
+    std::thread::scope(|scope| {
+        let (finished, completion) = std::sync::mpsc::channel::<()>();
+        let watcher = std::thread::Builder::new()
+            .name("brush-auth-cancellation".into())
+            .spawn_scoped(scope, move || loop {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::STOP);
+                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    break;
+                }
+                match completion.recv_timeout(Duration::from_millis(10)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            })
+            .map_err(ToolError::from)?;
+        let result = authenticate();
+        // Disconnect also happens during unwinding, so the scoped watcher
+        // cannot strand its parent if authentication panics.
+        drop(finished);
+        watcher
+            .join()
+            .map_err(|_| ToolError::denied("brush authentication watcher panicked"))?;
+        result
+    })
 }
 
 fn brush_worker_handshake_error_message(
@@ -817,6 +973,18 @@ fn brush_io(ctx: &str, e: &impl std::fmt::Display) -> std::io::Error {
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+    /// #489: the output cap is configurable, finite and validated.
+    #[test]
+    fn output_capture_limit_is_finite_and_validated() {
+        assert!(BrushShellTool::new().with_max_output_bytes(0).is_err());
+        assert!(BrushShellTool::new()
+            .with_max_output_bytes(crate::brush_protocol::MAX_CONFIGURED_OUTPUT + 1)
+            .is_err());
+        let limit = agent_bridle_core::LimitsPolicy::default().max_output_bytes;
+        let tool = BrushShellTool::new().with_max_output_bytes(limit).unwrap();
+        assert_eq!(tool.max_output, limit);
+    }
+
     #[test]
     fn default_schema_describes_brush_without_host_shell_overclaims() {
         let schema = BrushShellTool::new().schema();
@@ -854,6 +1022,44 @@ mod cancel_tests {
     use agent_bridle_core::{Caveats, Denial, DenialKind, Gate, Scope, Tool, ToolResult};
 
     use crate::caveat_interceptor::DenialSink;
+
+    /// #489: cancelling a call while the worker authenticates kills it at once,
+    /// not at the startup deadline.
+    #[test]
+    fn authentication_cancellation_unblocks_before_the_startup_deadline() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sleep")
+            .arg("5")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start bounded authentication stand-in");
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        let mut channel = child.stdout.take().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let started = Instant::now();
+        let result = std::thread::scope(|scope| {
+            let (auth_started, ready) = std::sync::mpsc::channel();
+            let cancellation = &cancelled;
+            scope.spawn(move || {
+                ready.recv().unwrap();
+                cancellation.store(true, Ordering::Release);
+            });
+            watch_worker_authentication(pid, &cancelled, || {
+                auth_started.send(()).unwrap();
+                channel
+                    .read_to_end(&mut Vec::new())
+                    .map_err(ToolError::from)
+            })
+        });
+        // The identity remains owned and unreaped until the watcher has joined.
+        let status = child.wait().expect("reap authentication stand-in");
+        assert!(result.is_ok());
+        assert!(!status.success(), "cancellation must terminate the child");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     /// Mint a `ToolContext` the only legitimate way — through the gate.
     fn ctx(granted: Caveats) -> agent_bridle_core::ToolContext {

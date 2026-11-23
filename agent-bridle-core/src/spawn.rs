@@ -40,7 +40,11 @@ use crate::{
     ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy,
     ToolContext, ToolError, ToolResult,
 };
+mod launch;
+mod worker_authority;
 mod worker_image;
+pub use launch::{AppliedFence, ConfinedLaunch, FencedCommand, LaunchPlan, LaunchRefusal};
+pub use worker_authority::WorkerAuthority;
 use worker_image::WorkerImage;
 
 use agent_mesh_protocol::Fingerprint;
@@ -75,6 +79,9 @@ pub struct ConfinedChild {
     pub fence_id: AdmittedFenceId,
     /// The inspectable body verified at the actual NamedRoot launch boundary.
     pub admitted: Option<AdmittedFenceBody>,
+    /// The mechanism the funnel admitted, stdio posture included (#492). An
+    /// engine reports this, never a mechanism it rebuilds for itself.
+    pub mechanism: ConfinementMechanism,
 }
 
 /// A confined child together with **every** fence whose lifetime brackets it.
@@ -115,6 +122,9 @@ pub struct SandboxedWorkerChild {
     pub child: Child,
     /// The OS-level sandbox actually applied to the worker.
     pub sandbox_kind: SandboxKind,
+    /// The mechanism the funnel admitted for the worker, stdio posture
+    /// included (#492).
+    pub mechanism: ConfinementMechanism,
     control: Option<TrustedWorkerControl>,
 }
 
@@ -148,6 +158,7 @@ struct TrustedWorkerControl {
     nonce: String,
     caveats: Caveats,
     strength_floor: EnforcementFloor,
+    fence: crate::FenceEvidence,
 }
 
 impl TrustedWorkerControl {
@@ -189,6 +200,7 @@ impl TrustedWorkerControl {
             nonce: self.nonce.clone(),
             caveats: self.caveats.clone(),
             strength_floor: self.strength_floor,
+            fence: self.fence.clone(),
             payload,
         };
         let body = serde_json::to_vec(&request)
@@ -233,6 +245,7 @@ impl TrustedWorkerControl {
             &self.nonce,
             &self.caveats,
             self.strength_floor,
+            &self.fence,
             payload,
             child_pid,
             timeout,
@@ -244,7 +257,7 @@ impl TrustedWorkerControl {
 }
 
 /// Version of the private trusted-worker authority envelope.
-pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 2;
+pub const TRUSTED_WORKER_PROTOCOL_VERSION: u8 = 3;
 /// Maximum serialized trusted-worker request body.
 pub const TRUSTED_WORKER_MAX_BODY: usize = 1024 * 1024;
 /// Fixed, non-authority prelude used to establish kernel peer metadata.
@@ -270,14 +283,22 @@ pub struct TrustedWorkerRequest<P> {
     nonce: String,
     caveats: Caveats,
     strength_floor: EnforcementFloor,
+    /// v3 (#499): the fence evidence of the spawn, copied from [`ConfinedChild`].
+    fence: crate::FenceEvidence,
     payload: P,
 }
 
 impl<P> TrustedWorkerRequest<P> {
-    /// Consume the envelope into its core-authenticated authority and payload.
+    /// Consume the envelope into its nonce, core-authenticated authority, and
+    /// payload.
     #[must_use]
-    pub fn into_parts(self) -> (String, Caveats, EnforcementFloor, P) {
-        (self.nonce, self.caveats, self.strength_floor, self.payload)
+    pub fn into_parts(self) -> (String, WorkerAuthority, P) {
+        let authority = WorkerAuthority {
+            caveats: self.caveats,
+            strength_floor: self.strength_floor,
+            fence: self.fence,
+        };
+        (self.nonce, authority, self.payload)
     }
 
     /// Whether the envelope uses the protocol version understood by this core.
@@ -507,6 +528,9 @@ pub struct ConfinedCommand {
     /// Put the child in a fresh process group so a supervising caller can
     /// terminate the complete descendant tree at a timeout boundary.
     new_process_group: bool,
+    /// Read roots the caller holds as descriptors; the Landlock ruleset
+    /// anchors on them instead of re-opening the root by path (#494).
+    held_read_roots: Vec<crate::HeldReadRoot>,
     /// The sandbox mechanism config (read/exec allow-lists). Rides the builder —
     /// NOT the `ToolContext`, which carries only authority (I5-B, #144, ADR 0017
     /// D2). Defaults to today's built-in allow-lists.
@@ -532,6 +556,7 @@ impl ConfinedCommand {
             stdout: None,
             stderr: None,
             new_process_group: false,
+            held_read_roots: Vec::new(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
     }
@@ -541,6 +566,19 @@ impl ConfinedCommand {
     #[must_use]
     pub fn sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
         self.sandbox_policy = policy;
+        self
+    }
+
+    /// Bind read roots the caller already holds as descriptors
+    /// ([`crate::HeldReadRoot`], #494): the Landlock ruleset anchors on each
+    /// descriptor instead of re-opening that root by path, so a swap at the
+    /// pathname after the caller's check cannot re-point the fence. The roots
+    /// must also be spelled in the context's `fs_read` grant — this changes
+    /// how the fence is BUILT, never what is admitted. A backend that cannot
+    /// anchor on a descriptor refuses the spawn.
+    #[must_use]
+    pub fn held_read_roots(mut self, roots: impl IntoIterator<Item = crate::HeldReadRoot>) -> Self {
+        self.held_read_roots.extend(roots);
         self
     }
 
@@ -738,7 +776,8 @@ impl ConfinedCommand {
         let closure_program = worker_image
             .as_ref()
             .map_or(self.program.as_str(), |image| image.program.as_str());
-        let closure = trusted_worker_closure(kind, authority, closure_program)?;
+        let closure =
+            trusted_worker_closure(kind, authority, closure_program, &self.sandbox_policy)?;
 
         // (3) THE admission (L2+L3+L4, one object). `AdmittedFence::admit`
         // derives the mechanism caveats (delegated ∪ declared closure) exactly
@@ -830,6 +869,11 @@ impl ConfinedCommand {
         after_admission();
         let mechanism_effective = admitted.mechanism_caveats().clone();
 
+        // A held root's LABEL must be a member of the fs_read scope admission
+        // just computed (delegated ∪ declared closure), checked before the
+        // spawn thread starts.
+        require_held_roots_admitted(&self.held_read_roots, &mechanism_effective.fs_read)?;
+
         // ASM-CID / L2 at runtime: the caveats we are about to compile+apply must
         // content-address to the fence admission stamped. Same object today, so
         // this holds by construction; it is the cryptographic backstop that a
@@ -843,7 +887,13 @@ impl ConfinedCommand {
         // (Landlock, via `apply`) and Noop. Computed here so a fail-closed wrapper
         // error aborts *before* we spawn the thread. Built from the ADMITTED
         // caveats — the same object `apply` consumes on the spawn thread.
-        let prefix = sandbox.command_prefix(&mechanism_effective)?;
+        let prefix = sandbox.command_prefix(&mechanism_effective, crate::ApplyToken::core())?;
+        // A wrapper-based backend confines by profile text, which names paths:
+        // it cannot honor a descriptor-bound root, so it refuses rather than
+        // silently re-open that root by name.
+        if !prefix.is_empty() && !self.held_read_roots.is_empty() {
+            return Err(ToolError::denied(HELD_ROOTS_NEED_A_DESCRIPTOR_BACKEND));
+        }
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
         //     child inherits the OS confinement — the per-thread, fork/exec-
@@ -858,6 +908,7 @@ impl ConfinedCommand {
             stdout,
             stderr,
             new_process_group,
+            held_read_roots,
             // Already consumed above into `sandbox` via `best_available_sandbox`.
             sandbox_policy: _,
             // Consulted only on the `spawn_tokio` path, not this sync `spawn`.
@@ -942,12 +993,22 @@ impl ConfinedCommand {
             // achieved by the `command_prefix` wrapper — no per-thread state is
             // involved, and calling `apply` would be wrong (AppContainer fails
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
-            // non-empty.
+            // non-empty. The held roots stay alive here, past `restrict_self`.
             if prefix.is_empty() {
                 if let Some(image) = &worker_image {
-                    sandbox.apply_with_worker(&mechanism_effective, &image.program, &image.file)?;
+                    sandbox.apply_with_worker(
+                        &mechanism_effective,
+                        &image.program,
+                        &image.file,
+                        &held_read_roots,
+                        crate::ApplyToken::core(),
+                    )?;
                 } else {
-                    sandbox.apply(&mechanism_effective)?;
+                    sandbox.apply_with_held_roots(
+                        &mechanism_effective,
+                        &held_read_roots,
+                        crate::ApplyToken::core(),
+                    )?;
                 }
             }
 
@@ -964,6 +1025,7 @@ impl ConfinedCommand {
             // confirmed above — copied out, never recomputed downstream.
             fence_id: admitted.fence_id().clone(),
             admitted: admitted.admitted_body().cloned(),
+            mechanism: admitted.mechanism(),
         })
     }
 
@@ -1025,6 +1087,7 @@ impl ConfinedCommand {
             sandbox_kind,
             fence_id,
             admitted,
+            ..
         } = self.spawn_authorized(cx, effective, authority)?;
 
         Ok(ManagedSpawn {
@@ -1071,6 +1134,7 @@ pub struct SandboxedWorker {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     kind: TrustedWorkerKind,
     sandbox_policy: Arc<SandboxPolicy>,
+    held_read_roots: Vec<crate::HeldReadRoot>,
 }
 
 impl SandboxedWorker {
@@ -1085,6 +1149,7 @@ impl SandboxedWorker {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             kind: TrustedWorkerKind::Brush,
             sandbox_policy: Arc::new(SandboxPolicy::default()),
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -1092,6 +1157,16 @@ impl SandboxedWorker {
     #[must_use]
     pub fn sandbox_policy(mut self, policy: Arc<SandboxPolicy>) -> Self {
         self.sandbox_policy = policy;
+        self
+    }
+
+    /// Keep descriptor-bound read roots when installing the worker's fence
+    /// (#494). The worker's `ConfinedCommand` checks each root against the
+    /// admitted `fs_read` scope and refuses a backend that cannot anchor on a
+    /// descriptor; nothing about the roots enters the worker protocol.
+    #[must_use]
+    pub fn held_read_roots(mut self, roots: Vec<crate::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
         self
     }
 
@@ -1145,6 +1220,7 @@ impl SandboxedWorker {
         })?;
 
         let command = ConfinedCommand::new(executable)
+            .held_read_roots(self.held_read_roots)
             .args([flag, kind])
             .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
             .current_dir(cwd)
@@ -1168,11 +1244,19 @@ impl SandboxedWorker {
         Ok(SandboxedWorkerChild {
             child: confined.child,
             sandbox_kind: confined.sandbox_kind,
+            mechanism: confined.mechanism,
             control: Some(TrustedWorkerControl {
                 stream: control,
                 nonce: nonce.to_string(),
                 caveats: request_caveats,
                 strength_floor: request_strength_floor,
+                fence: crate::FenceEvidence {
+                    fence_id: confined.fence_id,
+                    sandbox_kind: confined.sandbox_kind,
+                    // `spawn_authorized` engages no egress proxy.
+                    egress_proxied: false,
+                    admitted: confined.admitted.map(Box::new),
+                },
             }),
         })
     }
@@ -1182,6 +1266,35 @@ impl SandboxedWorker {
 /// safe generic fallback. In particular, do not silently run an ordinary child
 /// when the Windows AppContainer wrapper is unavailable: that would discard the
 /// requested host grant while making the operator believe it was applied.
+/// The refusal a backend that cannot anchor on a descriptor gives a non-empty
+/// held-root set.
+const HELD_ROOTS_NEED_A_DESCRIPTOR_BACKEND: &str =
+    "a wrapper-based sandbox cannot anchor a read root on a held descriptor";
+
+/// A held root's label must be a member of the admitted `fs_read` scope (newt
+/// #2674 P1). Without this a caller could hand in `HeldReadRoot(B, fd(B))` for
+/// a `B` that was never admitted and the backend would anchor a read rule on
+/// it regardless: admission never saw it. `HeldReadRoot::bind`'s own identity
+/// check rules out the falsely labelled case; this rules out the unmatched one.
+fn require_held_roots_admitted(
+    held: &[crate::HeldReadRoot],
+    fs_read: &crate::Scope<String>,
+) -> ToolResult<()> {
+    for root in held {
+        let admitted = match fs_read {
+            crate::Scope::All => true,
+            crate::Scope::Only(paths) => paths.contains(root.provenance()),
+        };
+        if !admitted {
+            return Err(ToolError::denied(format!(
+                "held read root '{}' is not in the admitted fs_read scope",
+                root.provenance()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn require_appcontainer_for_device_aces(
     policy: &SandboxPolicy,
     available: SandboxKind,
@@ -1268,25 +1381,27 @@ fn trusted_worker_closure(
     kind: SandboxKind,
     authority: SpawnAuthority,
     program: &str,
+    policy: &SandboxPolicy,
 ) -> ToolResult<RuntimeClosure> {
     if authority != SpawnAuthority::TrustedWorker {
-        return Ok(RuntimeClosure::empty());
+        return Ok(RuntimeClosure::for_policy(policy));
     }
     match kind {
         SandboxKind::Landlock => {
             // WorkerImage already bound and validated this label. Landlock
             // replaces it with rules on the held file and executes that object.
             // Never re-resolve the name after binding.
-            RuntimeClosure::empty()
+            RuntimeClosure::for_policy(policy)
                 .with_exec(program.to_owned())?
                 .with_fs_read(program.to_owned())
         }
         SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
             // Preserve the pre-#419 exec-only wrapper/domain declaration.
             // The additional worker read authority belongs only to Landlock.
-            RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
+            RuntimeClosure::for_policy(policy)
+                .with_exec(crate::admitted::canonical_closure_program(program)?)
         }
-        SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
+        SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::for_policy(policy)),
     }
 }
 
@@ -1498,8 +1613,7 @@ mod tokio_spawn {
             let ConfinedChild {
                 mut child,
                 sandbox_kind,
-                fence_id: _,
-                admitted: _,
+                ..
             } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
@@ -1804,25 +1918,26 @@ mod tests {
     use crate::enforcement_report;
     use crate::{Gate, Tool};
 
+    struct AnyTool;
+    #[async_trait::async_trait]
+    impl Tool for AnyTool {
+        fn name(&self) -> &str {
+            "any"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _cx: &ToolContext,
+        ) -> ToolResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
     /// Mint a `ToolContext` the only legitimate way — through the gate.
     fn ctx(granted: Caveats) -> ToolContext {
-        struct AnyTool;
-        #[async_trait::async_trait]
-        impl Tool for AnyTool {
-            fn name(&self) -> &str {
-                "any"
-            }
-            fn schema(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-            async fn invoke(
-                &self,
-                _args: serde_json::Value,
-                _cx: &ToolContext,
-            ) -> ToolResult<serde_json::Value> {
-                Ok(serde_json::Value::Null)
-            }
-        }
         Gate::new(0)
             .authorize(&AnyTool, &granted)
             .expect("authorize")
@@ -1946,30 +2061,46 @@ mod tests {
             exec: Scope::only(["echo".to_string()]),
             ..Caveats::top()
         };
+        let captured = test_fence(SandboxKind::Landlock);
         let control = TrustedWorkerControl {
             stream: client,
             nonce: "core-owned-nonce".to_string(),
             caveats: frozen.clone(),
             strength_floor: EnforcementFloor::DEFAULT,
+            fence: captured.clone(),
         };
         let mut worker = SandboxedWorkerChild {
             child: process,
             sandbox_kind: SandboxKind::None,
+            mechanism: ConfinementMechanism::new(
+                SandboxKind::None,
+                crate::ChildNetworkPolicy::LandlockOnly,
+            ),
             control: Some(control),
         };
         let forged_payload = serde_json::json!({
             "cmd": "echo ok",
             "caveats": Caveats::top(),
             "strength_floor": AxisEnforcement::Kernel,
+            "fence": test_fence(SandboxKind::None),
         });
         worker
             .send_payload(&forged_payload, Duration::from_secs(5))
             .expect("first payload");
 
-        let (nonce, authority, floor, payload) = seen_rx.recv().expect("receive decoded request");
+        let (nonce, authority, payload) = seen_rx.recv().expect("receive decoded request");
         assert_eq!(nonce, "core-owned-nonce");
-        assert_eq!(authority, frozen, "payload must not replace frozen caveats");
-        assert_eq!(floor, EnforcementFloor::DEFAULT);
+        assert_eq!(
+            authority.caveats(),
+            &frozen,
+            "payload must not replace frozen caveats"
+        );
+        assert_eq!(authority.strength_floor(), EnforcementFloor::DEFAULT);
+        assert_eq!(
+            authority.fence(),
+            &captured,
+            "payload must not replace the core-captured fence (#499)"
+        );
         assert_eq!(payload, forged_payload);
         assert!(
             matches!(
@@ -1995,6 +2126,7 @@ mod tests {
             nonce: "n".to_string(),
             caveats: Caveats::top(),
             strength_floor: EnforcementFloor::CONFINED,
+            fence: test_fence(SandboxKind::None),
             payload: serde_json::json!({"cmd": "echo ok"}),
         };
         let body = serde_json::to_vec(&request).expect("encode");
@@ -2009,9 +2141,10 @@ mod tests {
             "the encoded floor must omit the filesystem axes: {floor_obj}",
         );
         // A valid body round-trips and reconstructs the pinned Kernel fs floor.
-        let (_, _, floor, _) = decode_trusted_worker_request::<serde_json::Value>(&body)
+        let (_, authority, _) = decode_trusted_worker_request::<serde_json::Value>(&body)
             .expect("decode valid")
             .into_parts();
+        let floor = authority.strength_floor();
         assert_eq!(floor.fs_read(), AxisEnforcement::Kernel);
         assert_eq!(floor.fs_write(), AxisEnforcement::Kernel);
         assert_eq!(floor, EnforcementFloor::CONFINED);
@@ -2027,6 +2160,74 @@ mod tests {
             decode_trusted_worker_request::<serde_json::Value>(forged.as_bytes()).is_err(),
             "a trusted-worker floor carrying a filesystem field must be rejected",
         );
+    }
+
+    fn test_fence(sandbox_kind: SandboxKind) -> crate::FenceEvidence {
+        let admitted = AdmittedFence::admit(
+            &Caveats::top(),
+            RuntimeClosure::empty(),
+            ConfinementMechanism::new(SandboxKind::None, crate::ChildNetworkPolicy::LandlockOnly),
+            EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+            |caveats| BackendProjection {
+                resolved: crate::ResolvedAuthority::from_delegated(caveats),
+                runtime_closure: crate::empty_closure(),
+            },
+        )
+        .expect("admit test fence");
+        crate::FenceEvidence {
+            fence_id: admitted.fence_id().clone(),
+            sandbox_kind,
+            egress_proxied: false,
+            admitted: None,
+        }
+    }
+
+    /// #499: the worker re-mints from a v3 request whose fence says Landlock.
+    /// The minted context must report Landlock (it reported `None` when the
+    /// worker re-minted via a bare `Gate::new`), and the fence must be exactly
+    /// the one carried in the envelope.
+    #[test]
+    fn worker_authority_reports_the_fence_sandbox_kind() {
+        let fence = test_fence(SandboxKind::Landlock);
+        let request = TrustedWorkerRequest {
+            version: TRUSTED_WORKER_PROTOCOL_VERSION,
+            nonce: "n".to_string(),
+            caveats: Caveats::top(),
+            strength_floor: EnforcementFloor::CONFINED,
+            fence: fence.clone(),
+            payload: serde_json::json!({}),
+        };
+        let body = serde_json::to_vec(&request).expect("encode");
+        let decoded = decode_trusted_worker_request::<serde_json::Value>(&body).expect("decode");
+        assert!(decoded.has_supported_version());
+        let (_, authority, _) = decoded.into_parts();
+        let cx = authority
+            .authorize(&AnyTool)
+            .expect("authorize worker context");
+        assert_eq!(cx.sandbox_kind(), SandboxKind::Landlock);
+        assert_eq!(cx.strength_floor(), EnforcementFloor::CONFINED);
+        assert_eq!(authority.fence(), &fence);
+    }
+
+    /// #499: a v2 body (no fence evidence) is refused, never defaulted to an
+    /// unconfined fence.
+    #[test]
+    fn v2_worker_request_is_refused() {
+        let v2 = serde_json::json!({
+            "version": 2,
+            "nonce": "n",
+            "caveats": Caveats::top(),
+            "strength_floor": EnforcementFloor::DEFAULT,
+            "payload": {},
+        });
+        let body = serde_json::to_vec(&v2).expect("encode");
+        assert!(decode_trusted_worker_request::<serde_json::Value>(&body).is_err());
+
+        let mut with_fence = v2;
+        with_fence["fence"] = serde_json::to_value(test_fence(SandboxKind::None)).unwrap();
+        let body = serde_json::to_vec(&with_fence).expect("encode");
+        let decoded = decode_trusted_worker_request::<serde_json::Value>(&body).expect("decode");
+        assert!(!decoded.has_supported_version());
     }
 
     #[test]
@@ -2179,6 +2380,7 @@ mod tests {
             SandboxKind::AppContainer,
             SpawnAuthority::TrustedWorker,
             "this-path-is-not-used-by-appcontainer",
+            &SandboxPolicy::default(),
         )
         .expect("AppContainer trusted-worker closure");
         assert!(
@@ -2336,8 +2538,13 @@ mod tests {
             SandboxKind::MinimalRootfs,
             SandboxKind::MicroVm,
         ] {
-            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
-                .expect("non-Landlock worker closure");
+            let closure = trusted_worker_closure(
+                kind,
+                SpawnAuthority::TrustedWorker,
+                &current,
+                &SandboxPolicy::default(),
+            )
+            .expect("non-Landlock worker closure");
             assert_eq!(
                 closure,
                 RuntimeClosure::empty().with_exec(current.clone()).unwrap(),
@@ -2375,8 +2582,13 @@ mod tests {
             .into_owned();
 
         for kind in [SandboxKind::Landlock, SandboxKind::Seatbelt] {
-            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
-                .expect("allowlist trusted-worker closure");
+            let closure = trusted_worker_closure(
+                kind,
+                SpawnAuthority::TrustedWorker,
+                &current,
+                &SandboxPolicy::default(),
+            )
+            .expect("allowlist trusted-worker closure");
             let mechanism = AdmittedFence::admit(
                 &exec_denied,
                 closure,
@@ -2674,7 +2886,7 @@ mod landlock_child_tests {
             .find(|p| std::path::Path::new(p).exists())
             .expect("echo(1) must exist for this test");
         let worker = dir.join("worker-echo");
-        fs::copy(source, &worker).expect("copy worker binary (preserves the exec bit)");
+        crate::sandbox::copy_executable(source, &worker);
         worker
     }
 
@@ -2896,6 +3108,125 @@ sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
         );
     }
 
+    /// A held root's descriptor is genuinely paired with its label (so
+    /// `HeldReadRoot::bind` succeeds) but the label itself is NOT a member of
+    /// the context's `fs_read` grant — admission never saw it. `spawn` refuses
+    /// before the spawn thread starts; the child never runs.
+    ///
+    /// Regression for newt #2674 P1 (ported with #494): previously the backend added a
+    /// `PathBeneath` rule for EVERY held root unconditionally, regardless of
+    /// whether its label was ever admitted (an `HeldReadRoot(B, fd(B))` for a
+    /// `B` outside `fs_read` gained read access admission never saw).
+    #[test]
+    fn held_root_not_in_admitted_fs_read_is_refused_before_spawn() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let touch = ["/usr/bin/touch", "/bin/touch"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        let Some(touch) = touch else {
+            eprintln!("skipping: no touch(1) found");
+            return;
+        };
+
+        let admitted_dir = unique_dir("p1-admitted");
+        let other_dir = unique_dir("p1-other");
+        let cx = ctx(Caveats {
+            exec: Scope::only(["touch".to_string()]),
+            fs_read: Scope::only([admitted_dir.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+
+        // Genuinely bound to `other_dir` — the constructor's own identity
+        // check passes — but `other_dir` is not in `cx`'s fs_read grant.
+        let fd = std::os::fd::OwnedFd::from(fs::File::open(&other_dir).unwrap());
+        let held = crate::HeldReadRoot::bind(other_dir.to_string_lossy().into_owned(), fd)
+            .expect("genuinely paired; the constructor must accept it");
+
+        let marker = admitted_dir.join("must-not-spawn");
+        match ConfinedCommand::new(touch)
+            .arg(&marker)
+            .held_read_roots([held])
+            .spawn(&cx)
+        {
+            Err(ToolError::Denied { .. }) => {}
+            Err(other) => panic!("expected a held-root admission denial, got {other}"),
+            Ok(mut spawned) => {
+                let _ = spawned.child.kill();
+                panic!("an un-admitted held root must be refused before spawn");
+            }
+        }
+        assert!(
+            !marker.exists(),
+            "the denied command must never have executed"
+        );
+
+        let _ = fs::remove_dir_all(&admitted_dir);
+        let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    /// newt #2692 (ported with #494): composing held roots with #419's worker binding
+    /// must keep both original objects after their pathnames are replaced.
+    ///
+    /// The worker is named `worker-cat` and keeps that file name when moved,
+    /// and the replacement is a script: where `cat` is a uutils multicall, it
+    /// dispatches on its own file name and refuses to run under another (#449).
+    #[test]
+    fn worker_image_and_held_read_root_survive_replacement_together() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let dir = unique_dir("worker-and-held-root");
+        let worker = dir.join("worker-cat");
+        let read_root = dir.join("read-root");
+        let moved_root = dir.join("original-root");
+        crate::sandbox::copy_executable("/bin/cat", &worker);
+        fs::create_dir(&read_root).unwrap();
+        fs::write(read_root.join("value"), "original-root").unwrap();
+        let held = crate::HeldReadRoot::bind(
+            read_root.to_string_lossy().into_owned(),
+            fs::File::open(&read_root).unwrap().into(),
+        )
+        .unwrap();
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([read_root.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        let swap_worker = worker.clone();
+        let output = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(moved_root.join("value"))
+            .held_read_roots([held])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    fs::rename(&read_root, &moved_root).unwrap();
+                    fs::create_dir(&read_root).unwrap();
+                    fs::write(read_root.join("value"), "replacement-root").unwrap();
+                    use std::os::unix::fs::PermissionsExt;
+                    let moved = swap_worker.parent().unwrap().join("original");
+                    fs::create_dir(&moved).unwrap();
+                    fs::rename(&swap_worker, moved.join("worker-cat")).unwrap();
+                    fs::write(&swap_worker, "#!/bin/sh\nexit 1\n").unwrap();
+                    fs::set_permissions(&swap_worker, fs::Permissions::from_mode(0o755)).unwrap();
+                },
+                || {},
+            )
+            .expect("bound worker and read root must compose")
+            .child
+            .wait_with_output()
+            .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"original-root");
+    }
+
     /// #419: replacing the admitted path must not execute the replacement.
     ///
     /// The original keeps its file name (moved to a subdirectory), and the
@@ -2955,7 +3286,7 @@ sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
         let dir = unique_dir("worker-substitution");
         let worker = dir.join("worker");
         let original = dir.join("original");
-        fs::copy("/bin/cat", &worker).unwrap();
+        crate::sandbox::copy_executable("/bin/cat", &worker);
         fs::hard_link(&worker, &original).unwrap();
         let secret = if symlink_to_parent {
             dir.join("sibling")
@@ -3192,6 +3523,46 @@ mod seatbelt_child_tests {
             }
         });
         addr
+    }
+
+    /// #494: a wrapper backend confines by profile text, which names paths.
+    /// It cannot anchor a read root on a descriptor, so a spawn that carries
+    /// a held root is refused before the child starts.
+    #[test]
+    fn held_read_root_is_refused_under_the_wrapper_backend() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let dir = unique_dir("held-root-wrapper");
+        let held = crate::HeldReadRoot::bind(
+            dir.to_string_lossy().into_owned(),
+            fs::File::open(&dir).unwrap().into(),
+        )
+        .expect("bind");
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([dir.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        match ConfinedCommand::new("/bin/echo")
+            .arg("ran")
+            .held_read_roots([held])
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
+            .spawn(&cx)
+        {
+            Err(error @ ToolError::Denied { .. }) => assert!(
+                error.to_string().contains("held descriptor"),
+                "the refusal must name the held root: {error}"
+            ),
+            Err(other) => panic!("expected a held-root refusal, got {other}"),
+            Ok(mut spawned) => {
+                let _ = spawned.child.kill();
+                panic!("a held root must be refused under a wrapper backend");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// agent-bridle#416 round 3 (fix-first review): a `net:none` spawn whose

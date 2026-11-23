@@ -324,7 +324,7 @@ fmt:
 #     CARGO_REGISTRY_TOKEN="$(cat /path/to/your/token)" just publish-crates
 #
 # NOT PUBLISHED: `publish = false` internal packages (aclaunch ships inside the
-# Windows binary archive; config/jaild are host/deployment internals;
+# Windows binary archive; jaild is a host/deployment internal;
 # ceremony/gateway are non-public work). agent-bridle-py's PyO3 arm64 linker
 # issues keep it out of this crates.io path; publish its wheel via maturin.
 #
@@ -340,7 +340,7 @@ publish-crates:
     set -euo pipefail
     dry=""
     [ "${DRY_RUN:-0}" != "0" ] && dry="--dry-run"
-    for crate in agent-bridle-fdguard agent-bridle-core agent-bridle-tool-shell agent-bridle-tool-web agent-bridle agent-bridle-mcp; do
+    for crate in agent-bridle-fdguard agent-bridle-core agent-bridle-config agent-bridle-tool-shell agent-bridle-tool-web agent-bridle agent-bridle-mcp; do
         echo ">>> cargo publish -p ${crate} ${dry}"
         cargo publish -p "${crate}" ${dry}
     done

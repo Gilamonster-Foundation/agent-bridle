@@ -143,15 +143,17 @@ speaks newline-delimited JSON-RPC 2.0 and handles `initialize`, `tools/list`,
 `tools/call`, and `shutdown`/`exit`.
 
 ```bash
-# Build the release-equivalent binary: carried Brush/coreutils plus the native
-# Landlock, Seatbelt, or AppContainer backend selected for the target OS.
-cargo build -p agent-bridle-mcp --release --features os-sandbox
+# Build the release binary: carried Brush/coreutils plus the native Landlock,
+# Seatbelt, or AppContainer backend selected for the target OS (the default
+# feature set).
+cargo build -p agent-bridle-mcp --release
 # Binary: target/release/agent-bridle-mcp  (reads/writes JSON-RPC on stdio)
 ```
 
-A plain default build still carries the worker-local L2 shell interceptor, but
-does not compile a native L3 backend. Use `os-sandbox` for production
-confinement, or select one of the per-OS features directly.
+The default build carries the worker-local L2 shell interceptor and compiles
+the native L3 backends (`os-sandbox`). A build without a backend refuses every
+fs-restricted grant. The shell engine and the confinement floor are set in the
+`[bridle]` table of the config file; see the `agent-bridle-mcp` README.
 
 ### Wiring it into an MCP client
 

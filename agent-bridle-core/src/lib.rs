@@ -62,7 +62,7 @@ pub use admitted::{
 pub use config::{
     default_env_denylist, default_exec_path, fence_env, BackendToggles, BridleConfig, BridleMode,
     ChildNetworkPolicy, GatePolicy, HostMatch, LimitsPolicy, NetDefault, NetPolicy, NetRule,
-    NormalizationPolicy, PathList, RootfsPolicy, SandboxPolicy, VmPolicy, WebPolicy,
+    NormalizationPolicy, PathList, RootfsPolicy, SandboxPolicy, ShellPolicy, VmPolicy, WebPolicy,
 };
 pub use context::{open_scoped_read, open_scoped_write, ToolContext};
 pub use envelope::{Denial, DenialKind, Disclosure, ToolEnvelope};
@@ -81,7 +81,7 @@ pub use provenance::{
     admit, empty_closure, relate, AdmissionDecision, AdmissionReject, ConfinedAxis,
     ResolvedAuthority, ResolvedScope, ScopeRelation,
 };
-pub use registry::{Grant, Registry, RegistryBuilder};
+pub use registry::{ChargeGuard, Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
     EnforcementFloor, EnforcementReport, EnforcementWidening, ExecBoundary, StdioPosture,
@@ -92,8 +92,9 @@ pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, 
 pub use sandbox::{
     best_available_sandbox, effective_sandbox_kind, effective_sandbox_kind_with_policy,
     egress_proxy_plan, loopback_fenced_caveats, mach_service_disclosure, mach_service_grants,
-    net_egress_proxy_hosts, seatbelt_mach_service_class, MachServiceDisclosure, NoopSandbox,
-    Sandbox, SandboxKind, MACH_GRANT_PREFIX, MACH_SERVICE_CANDIDATES,
+    net_egress_proxy_hosts, seatbelt_mach_service_class, ApplyToken, HeldReadRoot,
+    MachServiceDisclosure, NoopSandbox, Sandbox, SandboxKind, MACH_GRANT_PREFIX,
+    MACH_SERVICE_CANDIDATES,
 };
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
@@ -102,11 +103,11 @@ pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
 pub use spawn::{
     confinement_unenforceable, decode_trusted_worker_frame_header, decode_trusted_worker_hello,
     decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,
-    spawn_confined_subprocess, trusted_worker_frame_digest, ConfinedChild, ConfinedCommand,
-    ConfinedStdio, ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind,
-    TrustedWorkerRequest, TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP,
-    TRUSTED_WORKER_FRAME_HEADER_LEN, TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY,
-    TRUSTED_WORKER_PROTOCOL_VERSION,
+    spawn_confined_subprocess, trusted_worker_frame_digest, AppliedFence, ConfinedChild,
+    ConfinedCommand, ConfinedLaunch, ConfinedStdio, FencedCommand, LaunchPlan, LaunchRefusal,
+    ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind, TrustedWorkerRequest,
+    WorkerAuthority, TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP, TRUSTED_WORKER_FRAME_HEADER_LEN,
+    TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY, TRUSTED_WORKER_PROTOCOL_VERSION,
 };
 // The async-host confined spawn (tokio pipe handles). Unix-only, feature-gated,
 // so it re-exports only when built — mirroring the OS-sandbox re-exports above.

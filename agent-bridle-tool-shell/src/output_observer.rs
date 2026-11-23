@@ -313,9 +313,12 @@ pub(crate) fn drain_capped(
         if n == 0 {
             return Ok((buf, truncated));
         }
+        // The emitter applies its own finite observer/channel budget. Feed it
+        // every byte so the worker channel can count omissions beyond that
+        // budget, even after this local capture has filled.
+        output.emit(stream, &chunk[..n]);
         let retained = (max_output - buf.len()).min(n);
         if retained > 0 {
-            output.emit(stream, &chunk[..retained]);
             buf.extend_from_slice(&chunk[..retained]);
         }
         truncated |= retained < n;

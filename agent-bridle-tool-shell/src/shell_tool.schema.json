@@ -7,7 +7,9 @@
     },
     "args": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Argv form: arguments passed to `program` (argv[1..]). Taken literally — no globbing/quoting interpretation."
     },
     "cmd": {
@@ -20,8 +22,10 @@
     },
     "env": {
       "type": "object",
-      "additionalProperties": { "type": "string" },
-      "description": "Host/operator-supplied environment variables (string values) set on the spawned child process(es), additive over the inherited ambient environment. Pass real env vars here instead of prepending `export VAR=…;` statements to `cmd` — an `export` builtin is not a program and the confined engine refuses it. These values are host input, not model-authored command text, and do NOT widen the leash: the exec/fs check is on the real program, never on env."
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Host/operator-supplied environment variables (string values) set on the spawned child process(es). Loader and hook variables on the env denylist (LD_PRELOAD, PYTHONPATH, BASH_ENV, GIT_SSH_COMMAND, ...) are dropped. Pass real env vars here instead of prepending `export VAR=…;` statements to `cmd` — an `export` builtin is not a program and the confined engine refuses it. These values are host input, not model-authored command text, and do NOT widen the leash: the exec/fs check is on the real program, never on env."
     },
     "timeout_secs": {
       "type": "integer",

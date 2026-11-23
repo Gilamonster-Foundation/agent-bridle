@@ -6,7 +6,7 @@
 //! This grounds the direct-thread `apply` proofs in `agent-bridle-core`
 //! (`sandbox::landlock_kernel_tests::deny_direct_*`) against the real tool: it
 //! proves the `SandboxPolicy.child_network` field is actually threaded from
-//! `ShellTool::with_sandbox_policy` through `run_confined` → `Sandbox::apply` on
+//! `ShellTool::with_sandbox_policy` through core's `ConfinedLaunch::run` → `Sandbox::apply` on
 //! the same thread that spawns the child.
 //!
 //! Linux + `linux-landlock` + `shell` (which provides `ShellTool`), gated on
