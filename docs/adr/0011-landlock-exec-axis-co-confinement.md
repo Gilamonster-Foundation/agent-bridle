@@ -269,7 +269,9 @@ still holds. `exec` is reported **`Kernel` only when ALL of**:
 3. `fs_read` is restricted (`Only(_)`) — co-confinement engaged (ambient reads ⇒
    trampoline wide open), **and**
 4. `fs_read ∩ fs_write = ∅` for code paths and the env is scrubbed (D3/D5), **and the
-   namespace/mount seccomp deny is installed** (D4 — else bind-mount re-opens it), **and**
+   namespace/mount seccomp deny is installed** (D4 — else bind-mount re-opens it; *corrected 2026-11-23, #498: a Landlock
+   fs domain already refuses `mount(2)`, so the bind-mount needs no seccomp deny; see the correction under
+   corollary 2*), **and**
 5. **either** (a) `exec` is empty (`exec:none`) with the seccomp `execve`+`execveat` deny
    installed — the no-further-exec floor; **or** (b) the granted program set is
    statically-linked-only, contains **no** interpreter/multitool (D6), **and**

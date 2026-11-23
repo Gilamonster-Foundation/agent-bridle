@@ -863,6 +863,12 @@ async fn restricted_exec_allows_in_scope_command() {
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 async fn fs_restricted_command_runs_under_landlock() {
     if !agent_bridle_core::landlock_is_supported() {
+        // The `Userns Proofs` lane sets the flag: a runner without Landlock
+        // fails the lane instead of passing it unproven.
+        assert!(
+            std::env::var("BRIDLE_REQUIRE_LANDLOCK").map_or(true, |v| v.is_empty() || v == "0"),
+            "BRIDLE_REQUIRE_LANDLOCK is set, but this kernel lacks Landlock"
+        );
         eprintln!("skipping: kernel lacks Landlock");
         return;
     }
@@ -885,7 +891,25 @@ async fn fs_restricted_command_runs_under_landlock() {
         "written\n",
         "{out}"
     );
+    // The worker is fenced: a write outside the grant must not land. A worker
+    // admitted without Landlock would pass the write above and this one.
+    let outside = unique_temp("fs-restricted-outside");
+    std::fs::create_dir_all(&outside).expect("create the directory outside the grant");
+    let _ = tool()
+        .invoke(
+            serde_json::json!({ "cmd": format!("echo escaped > '{}/out'", outside.display()) }),
+            &ctx(Caveats {
+                fs_write: Scope::only([dir.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            }),
+        )
+        .await;
+    assert!(
+        !outside.join("out").exists(),
+        "a write outside the grant must be refused by the fence"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// A restricted filesystem grant is never silently downgraded to the L2

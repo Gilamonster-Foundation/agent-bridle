@@ -2975,6 +2975,26 @@ mod landlock_child_tests {
         let _ = fs::remove_dir_all(&granted_read);
     }
 
+    /// Whether a proof test should skip for a missing prerequisite. A required
+    /// run (the `Userns Proofs` lane) fails instead, so it cannot go green
+    /// without exercising the kernel boundary.
+    fn skip_unless(present: bool, required: bool, what: &str) -> bool {
+        if present {
+            return false;
+        }
+        assert!(!required, "a required proof cannot run: {what}");
+        eprintln!("skipping: {what}");
+        true
+    }
+
+    #[test]
+    fn a_required_proof_with_a_missing_prerequisite_fails_not_skips() {
+        assert!(!skip_unless(true, true, "present"));
+        assert!(skip_unless(false, false, "absent, not required"));
+        let refused = std::panic::catch_unwind(|| skip_unless(false, true, "absent, required"));
+        assert!(refused.is_err(), "required and absent must fail");
+    }
+
     /// The helper for the #498 proof: unshare a user and a mount namespace,
     /// bind-mount `argv[1]` over `argv[2]`, and print `argv[2]/payload`. It
     /// makes the two syscalls itself and writes no `uid_map`, as ADR 0011's
@@ -3006,13 +3026,22 @@ sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
     /// skips, or fails when `BRIDLE_REQUIRE_USERNS` is set.
     #[test]
     fn bind_mount_in_a_new_user_namespace_is_refused_under_an_fs_restricted_grant() {
-        if !landlock_is_supported() {
-            eprintln!("skipping: kernel lacks Landlock");
+        // The `Userns Proofs` lane sets both flags, so a runner that lost
+        // Landlock or python3 fails the lane instead of passing it unproven.
+        let flag = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0");
+        if skip_unless(
+            landlock_is_supported(),
+            flag("BRIDLE_REQUIRE_LANDLOCK"),
+            "kernel lacks Landlock",
+        ) {
             return;
         }
         let python = "/usr/bin/python3";
-        if !std::path::Path::new(python).exists() {
-            eprintln!("skipping: no {python}");
+        if skip_unless(
+            std::path::Path::new(python).exists(),
+            flag("BRIDLE_REQUIRE_USERNS"),
+            "no /usr/bin/python3",
+        ) {
             return;
         }
         let readable = unique_dir("userns-readable");
