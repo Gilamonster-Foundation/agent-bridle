@@ -126,6 +126,24 @@ strategy is ADR 0009.
 - Brush remains isolated behind leaf-crate features; `agent-bridle-core` stays
   free of heavy shell dependencies.
 
+## Choosing an engine
+
+`ShellEngine` names the three engines (`safe-subset`, `host`, `brush`, with
+their aliases) and `ShellEngine::build(ShellOptions)` builds one. `ShellOptions`
+carries the limits, the sandbox policy, an optional output observer, an optional
+`ExecutionLease` (caller resources held until the child is reaped) and
+`held_read_roots` (read roots the caller holds as descriptors; the fence anchors
+on them instead of re-opening each by path, and each must be in the grant's
+`fs_read` scope). `build` refuses an engine whose feature or transport is
+missing and never substitutes another. `ShellEngine::coverage` is a static
+table of what each engine checks before the fence.
+
+All three engines parse one request: the environment drops the denied loader and
+hook names, and `timeout_secs` is clamped to the limits ceiling, falling back to
+the engine's configured timeout. The Host and Brush builders have
+`with_timeout`, all three have `with_execution_lease`, and Brush adds
+`with_max_output_bytes`.
+
 ## Live output observation
 
 `ShellTool`, `HostShellTool`, and `BrushShellTool` each provide a

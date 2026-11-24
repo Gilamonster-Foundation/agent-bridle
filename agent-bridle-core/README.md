@@ -137,6 +137,41 @@ current executable, or when `SandboxPolicy::appcontainer_launcher_path` names an
 explicit absolute helper path; the AppContainer backend never searches ambient
 `PATH` for its sandbox constructor.
 
+## Grants, the confinement funnel, and result envelopes
+
+- **Attenuation.** `Grant::attenuate(narrower)` returns a child grant, refused
+  unless `narrower` is within the parent's caveats on every axis, `max_calls`
+  included. The child has its own budget cell chained to the parent's: a charge
+  debits the whole chain or none of it, and a refund credits all of it, so
+  narrowing never mints a fresh budget. `Grant::remaining()` is the tightest
+  bound along the chain. `Grant::try_charge()` charges one call for a caller that
+  authorizes through a `Gate` directly; the `ChargeGuard` it returns refunds on
+  drop unless `commit()` is called.
+- **One funnel.** `Sandbox::apply`, `Sandbox::apply_with_worker` and
+  `Sandbox::command_prefix` take an `ApplyToken` that only core can construct,
+  so an engine cannot apply a sandbox outside `ConfinedCommand` or
+  `ConfinedLaunch`. A backend outside core can still implement `Sandbox`: it
+  receives the token and never makes one.
+- **Held read roots.** `HeldReadRoot::bind` is the only constructor and refuses
+  a descriptor whose `(dev, ino)` differs from its path. The funnel anchors the
+  fence on the descriptor, refuses a root that is not in the admitted `fs_read`
+  scope, and refuses a backend that cannot anchor on a descriptor.
+- **Envelopes.** `ToolEnvelope::new(engine, &ToolContext, ConfinementMechanism)`
+  computes the sandbox kind, the per-axis report and the disclosure from what was
+  applied. `ToolEnvelope::bare(kind)` is the old bare constructor and
+  `ToolEnvelope::refused(engine)` covers a refusal that ran nothing.
+- **Trusted worker.** The trusted-worker envelope is v3 (was v2) and a v2 body
+  is refused. `TrustedWorkerRequest::into_parts` returns
+  `(String, WorkerAuthority, P)`: the worker's context is minted from the
+  authority the parent spawned it with, so `cx.sandbox_kind()` reports the live
+  fence instead of `None`.
+- **Config.** `[bridle.gate] default_strength_floor` is a per-axis
+  `{ exec, net }` table. The old scalar form is a load error, in the file and in
+  `BRIDLE_GATE_DEFAULT_STRENGTH_FLOOR`. `SandboxPolicy::harness_private_markers`
+  (default: the previous five markers) lets an embedder name its own private
+  stores, and `BridleConfig::shell` (`[bridle.shell] engine`) names the shell
+  engine a host builds; unset keeps the host's own default.
+
 ## Exact private-host approvals for async subprocesses
 
 With `spawn-tokio`, an owning harness may call
