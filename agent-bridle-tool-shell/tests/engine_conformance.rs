@@ -45,28 +45,31 @@ fn run() {
         .build()
         .expect("test runtime");
     let (host_fence, runnable) = runnable_rows();
+    // The engines this build must run come from its features, not from what
+    // the lane happened to build: a regression that makes every engine refuse
+    // to build must fail here instead of passing as an empty lane.
+    let compiled: Vec<ShellEngine> = [
+        (cfg!(feature = "shell"), ShellEngine::SafeSubset),
+        (cfg!(feature = "host-shell"), ShellEngine::Host),
+        (cfg!(feature = "brush"), ShellEngine::Brush),
+    ]
+    .into_iter()
+    .filter_map(|(on, engine)| on.then_some(engine))
+    .collect();
+    assert!(
+        runnable.len() == compiled.len() && compiled.iter().all(|e| runnable.iter().any(|r| r.engine == *e)),
+        "the engines this lane can build {runnable:?} differ from the engine features compiled in {compiled:?}"
+    );
     let table: Vec<Row> = adr_rows(host_fence)
         .into_iter()
-        .filter(|row| row.fence == host_fence)
+        .filter(|row| row.fence == host_fence && compiled.contains(&row.engine))
         .collect();
-    for row in &table {
-        if !runnable.contains(row) {
-            eprintln!(
-                "skip row {} / {:?}: engine not available in this build",
-                row.engine, row.fence
-            );
-        }
-    }
-    let expected: Vec<Row> = table
-        .into_iter()
-        .filter(|row| row.engine.validate_available().is_ok())
-        .collect();
-    let same = runnable.len() == expected.len()
-        && runnable.iter().all(|row| expected.contains(row))
-        && expected.iter().all(|row| runnable.contains(row));
+    let same = runnable.len() == table.len()
+        && runnable.iter().all(|row| table.contains(row))
+        && table.iter().all(|row| runnable.contains(row));
     assert!(
         same,
-        "the rows this host runs {runnable:?} differ from ADR 0029 D2's rows for {} {expected:?}",
+        "the rows this host runs {runnable:?} differ from ADR 0029 D2's rows for {} {table:?}",
         os_name()
     );
     let mut ran = 0;
@@ -100,7 +103,7 @@ fn run() {
     }
     // The weekly power-set sweep builds this target with no engine feature on.
     // There is then no row to run, and the lane has nothing to prove.
-    if ran == 0 {
+    if compiled.is_empty() {
         println!("engine_conformance: no engine is compiled into this build; nothing to run");
         return;
     }
@@ -188,21 +191,37 @@ async fn reports_the_rows_fence(row: Row, tool: &dyn Tool) {
         fs_write: only(&dir),
         ..Caveats::top()
     };
-    let out = match tool
+    let outcome = tool
         .invoke(
             serde_json::json!({"cmd": "echo hi", "cwd": dir}),
             &ctx(tool, &granted),
         )
-        .await
-    {
-        Ok(out) => out,
-        // With no fence in effect the Host engine refuses a restricted grant
-        // rather than run it unconfined; that refusal is the honest report.
-        Err(agent_bridle_core::ToolError::Denied { .. }) if row.fence == SandboxKind::None => {
+        .await;
+    // With no fence in effect each engine has one documented outcome for a
+    // restricted filesystem grant. safe-subset runs it under its own L2
+    // checks and reports `none`; Host is refused by core's admission bound;
+    // Brush needs a kernel fence for the axis. Any other denial is a defect.
+    let out = match (row.fence == SandboxKind::None, row.engine, outcome) {
+        (false, _, Ok(out)) | (true, ShellEngine::SafeSubset, Ok(out)) => out,
+        (true, ShellEngine::Host, Err(agent_bridle_core::ToolError::Denied { reason })) => {
+            assert!(
+                reason.contains("a WIDENING of the delegated grant"),
+                "host: {reason}"
+            );
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
-        Err(error) => panic!("{} fence run: {error}", row.engine),
+        (true, ShellEngine::Brush, Err(agent_bridle_core::ToolError::Denied { reason })) => {
+            assert!(
+                reason.contains(
+                    "requires Kernel but the governing backend delivers only Interceptor"
+                ),
+                "brush: {reason}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        (_, engine, other) => panic!("{engine} fence run, fence {:?}: {other:?}", row.fence),
     };
     assert_eq!(
         out["sandbox_kind"],

@@ -43,6 +43,7 @@ row says so.
 | Linux | any | none | as the engine | no backend compiled or kernel lacks Landlock: `sandbox_kind` is `none`, every restricted axis is advisory | `engine_conformance.rs` runs the host's default fence only |
 | macOS | `safe-subset` | Seatbelt | host `PATH` | `macos-seatbelt` feature | `seatbelt_floor_evidence.rs`, `seatbelt_net_evidence.rs` |
 | macOS | `host`, `brush` | Seatbelt | as the engine | `macos-seatbelt` feature | untested |
+| macOS | any | none | as the engine | `macos-seatbelt` feature off | `engine_conformance.rs` in the sweep's no-Seatbelt subsets |
 | Windows | `safe-subset` | AppContainer | host `PATH` | `windows-appcontainer` feature | `windows_appcontainer_contract.rs` |
 | Windows | `host` | AppContainer | host `PATH` | `windows-appcontainer` feature | untested |
 | Windows | `brush` | any | none | refused: `brush_private_control_supported()` is false off Linux and macOS | `shell_engine.rs` |
