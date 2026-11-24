@@ -712,6 +712,7 @@ impl ConfinedCommand {
         };
         let kind = sandbox.kind();
         require_appcontainer_for_device_aces(&self.sandbox_policy, kind)?;
+        require_declared_backends(&self.sandbox_policy, kind)?;
         // The kind that actually GOVERNS this spawn: the backend's kind only when
         // it will actually confine something (fs or net restricted), else `None`.
         // The fail-closed
@@ -1289,6 +1290,32 @@ fn require_held_roots_admitted(
             return Err(ToolError::denied(format!(
                 "held read root '{}' is not in the admitted fs_read scope",
                 root.provenance()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse when a backend the policy requires (`backends.require_landlock`,
+/// `backends.require_seatbelt`) is not the one in effect, rather than run under
+/// whatever fence is present (#472).
+fn require_declared_backends(policy: &SandboxPolicy, available: SandboxKind) -> ToolResult<()> {
+    for (required, backend, switch) in [
+        (
+            policy.backends.require_landlock,
+            SandboxKind::Landlock,
+            "require_landlock",
+        ),
+        (
+            policy.backends.require_seatbelt,
+            SandboxKind::Seatbelt,
+            "require_seatbelt",
+        ),
+    ] {
+        if required && available != backend {
+            return Err(ToolError::denied(format!(
+                "sandbox.backends.{switch} is set, but the fence in effect is {available:?}; \
+                 refusing rather than run under another fence"
             )));
         }
     }
@@ -1965,6 +1992,46 @@ mod tests {
             require_appcontainer_for_device_aces(&SandboxPolicy::default(), SandboxKind::None)
                 .is_ok(),
             "the default-off policy must retain the existing no-backend behavior"
+        );
+    }
+
+    /// #472: `require_landlock` and `require_seatbelt` were parsed and read by
+    /// nothing, so a host without the required backend ran under whatever fence
+    /// was present. Each must refuse unless the backend in effect is its own.
+    #[test]
+    fn required_backend_refuses_when_another_fence_is_in_effect() {
+        let landlock = SandboxPolicy {
+            backends: crate::BackendToggles {
+                require_landlock: true,
+                ..crate::BackendToggles::default()
+            },
+            ..SandboxPolicy::default()
+        };
+        assert!(require_declared_backends(&landlock, SandboxKind::Landlock).is_ok());
+        for other in [
+            SandboxKind::None,
+            SandboxKind::Seatbelt,
+            SandboxKind::AppContainer,
+        ] {
+            let error = require_declared_backends(&landlock, other)
+                .expect_err("require_landlock must refuse another fence");
+            assert!(
+                error.to_string().contains("require_landlock"),
+                "the refusal must name the switch: {error}"
+            );
+        }
+        let seatbelt = SandboxPolicy {
+            backends: crate::BackendToggles {
+                require_seatbelt: true,
+                ..crate::BackendToggles::default()
+            },
+            ..SandboxPolicy::default()
+        };
+        assert!(require_declared_backends(&seatbelt, SandboxKind::Seatbelt).is_ok());
+        assert!(require_declared_backends(&seatbelt, SandboxKind::None).is_err());
+        assert!(
+            require_declared_backends(&SandboxPolicy::default(), SandboxKind::None).is_ok(),
+            "with nothing required, no backend stays the existing behavior"
         );
     }
 
