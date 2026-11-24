@@ -251,11 +251,12 @@ async fn an_unknown_shell_engine_fails_startup() {
     std::fs::remove_dir_all(home).expect("remove home");
 }
 
-/// #495: with the default features (which now include the OS backends), an
-/// fs-restricted grant runs carried `ls`. Without a compiled backend the no-op
-/// sandbox could not meet the kernel filesystem floor and admission refused
-/// every fs-restricted grant.
-#[cfg(target_os = "macos")]
+/// #495: with the Seatbelt backend compiled in (the default features include
+/// it), an fs-restricted grant runs carried `ls`. Without a compiled backend the
+/// no-op sandbox cannot meet the kernel filesystem floor and admission refuses
+/// every fs-restricted grant, so this test needs `macos-seatbelt` and does not
+/// run in the feature subsets that leave it out.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 #[tokio::test]
 async fn fs_restricted_grant_runs_carried_ls_with_default_features() {
     let dir = unique_temp();
