@@ -160,9 +160,17 @@ explicit absolute helper path; the AppContainer backend never searches ambient
   computes the sandbox kind, the per-axis report and the disclosure from what was
   applied. `ToolEnvelope::bare(kind)` is the old bare constructor and
   `ToolEnvelope::refused(engine)` covers a refusal that ran nothing.
+- **Trusted worker.** The trusted-worker envelope is v3 (was v2) and a v2 body
+  is refused. `TrustedWorkerRequest::into_parts` returns
+  `(String, WorkerAuthority, P)`: the worker's context is minted from the
+  authority the parent spawned it with, so `cx.sandbox_kind()` reports the live
+  fence instead of `None`.
 - **Config.** `[bridle.gate] default_strength_floor` is a per-axis
   `{ exec, net }` table. The old scalar form is a load error, in the file and in
-  `BRIDLE_GATE_DEFAULT_STRENGTH_FLOOR`.
+  `BRIDLE_GATE_DEFAULT_STRENGTH_FLOOR`. `SandboxPolicy::harness_private_markers`
+  (default: the previous five markers) lets an embedder name its own private
+  stores, and `BridleConfig::shell` (`[bridle.shell] engine`) names the shell
+  engine a host builds; unset keeps the host's own default.
 
 ## Exact private-host approvals for async subprocesses
 
