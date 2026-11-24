@@ -54,6 +54,10 @@ impl McpChild {
 
     /// Spawn with an explicit grant and, optionally, a `HOME` whose
     /// `.agent-bridle/config.toml` supplies the mechanism config (#495).
+    ///
+    /// The `require_*` switches are cleared: CI exports them for the fence
+    /// tests, and #531 makes the server refuse when they are set and no fence
+    /// is built in (`--no-default-features`). These tests are not about the fence.
     fn spawn_with(grant: String, home: Option<&Path>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-bridle-mcp"));
         if let Some(home) = home {
@@ -63,6 +67,8 @@ impl McpChild {
             // A failing test must not leave the server running.
             .kill_on_drop(true)
             .env("AGENT_BRIDLE_CAVEATS", grant)
+            .env_remove("BRIDLE_REQUIRE_LANDLOCK")
+            .env_remove("BRIDLE_REQUIRE_SEATBELT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -235,6 +241,8 @@ async fn an_unknown_shell_engine_fails_startup() {
     let output = Command::new(env!("CARGO_BIN_EXE_agent-bridle-mcp"))
         .env("HOME", &home)
         .env("AGENT_BRIDLE_CAVEATS", grant_json())
+        .env_remove("BRIDLE_REQUIRE_LANDLOCK")
+        .env_remove("BRIDLE_REQUIRE_SEATBELT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
