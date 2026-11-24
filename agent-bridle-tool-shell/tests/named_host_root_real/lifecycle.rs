@@ -8,13 +8,17 @@ use agent_bridle_core::Tool;
 use super::{context, Fixture};
 
 /// A reaped or zombie process is gone: a zombie keeps its `/proc` entry until
-/// its parent reaps it, but it can no longer run.
+/// its parent reaps it, but it can no longer run. Only a missing entry means
+/// reaped; any other read error is a failure of the check, not a pass.
 fn process_is_gone(pid: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-        stat.rsplit(')')
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit(')')
             .next()
-            .is_some_and(|rest| rest.trim_start().starts_with('Z'))
-    })
+            .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => panic!("cannot read /proc/{pid}/stat: {error}"),
+    }
 }
 
 /// #2274: dropping the adapter used to join the core reaper on Tokio's sole
@@ -67,18 +71,12 @@ pub(super) fn cancellation_does_not_block_current_thread() {
                 // surviving writer must die. Poll its liveness against a
                 // deadline: a fixed sleep raced the writer's own clock and failed
                 // when load delayed the abort (#529).
-                let pid_file = fixture.workspace.join("hold-pipe-pid");
+                // The leader published the writer's pid before the test got here.
+                let writer = std::fs::read_to_string(fixture.workspace.join("hold-pipe-pid"))
+                    .expect("the writer's pid was published before the leader exited");
+                let writer = writer.trim().to_string();
+                assert!(!writer.is_empty(), "the writer published an empty pid");
                 let deadline = Instant::now() + Duration::from_secs(30);
-                let writer = loop {
-                    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                        break pid;
-                    }
-                    assert!(
-                        Instant::now() < deadline,
-                        "the writer never published its pid"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                };
                 while !process_is_gone(&writer) {
                     assert!(
                         Instant::now() < deadline,
