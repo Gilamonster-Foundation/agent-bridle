@@ -18,17 +18,21 @@ fn parse_pid(text: &str) -> Result<u32, String> {
     }
 }
 
-/// The state letter of a `/proc/<pid>/stat` read: the one character after the
-/// last `)` and a space, followed by a space. The command name can hold spaces
-/// and parentheses, so the last `)` is the delimiter. Malformed data is an
-/// error, never a state.
-fn proc_state(stat: &str) -> Result<char, String> {
-    let close = stat.rfind(')').ok_or("no closing parenthesis")?;
-    let rest = stat[close + 1..]
+/// The state letter of a `/proc/<pid>/stat` read, which must be
+/// `<pid> (<name>) <state> ...`: the expected pid, one space, an opening
+/// parenthesis, the name, the LAST `)`, one space, one state character from the
+/// documented set, then a space. The name can hold spaces and parentheses, so
+/// the last `)` closes it. Anything else is an error, never a state.
+fn proc_state(pid: u32, stat: &str) -> Result<char, String> {
+    let after_name = stat
+        .strip_prefix(&format!("{pid} ("))
+        .ok_or_else(|| format!("does not start with \"{pid} (\""))?;
+    let close = after_name.rfind(')').ok_or("no closing parenthesis")?;
+    let rest = after_name[close + 1..]
         .strip_prefix(' ')
         .ok_or("no space after the name")?;
     let mut chars = rest.chars();
-    let state = chars.next().ok_or("no state letter")?;
+    let state = chars.next().ok_or("no state character")?;
     if !"RSDZTtWXxKPI".contains(state) {
         return Err(format!("{state:?} is not a process state"));
     }
@@ -46,7 +50,8 @@ fn proc_state(stat: &str) -> Result<char, String> {
 fn process_is_gone(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => {
-            proc_state(&stat).unwrap_or_else(|why| panic!("pid {pid}: bad stat {stat:?}: {why}"))
+            proc_state(pid, &stat)
+                .unwrap_or_else(|why| panic!("pid {pid}: bad stat {stat:?}: {why}"))
                 == 'Z'
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
@@ -69,13 +74,23 @@ fn liveness_parsers_reject_malformed_input() {
         "123 (hold-pipe) Q 1",
         "123 hold-pipe Z 1",
         "123 (hold-pipe)Z 1",
+        "123 hold-pipe) Z 1 2",
+        ") Z ",
+        "456 (hold-pipe) Z 1 2",
+        "123 (hold-pipe) z 1 2",
+        "123 (hold-pipe) Z",
     ] {
-        assert!(proc_state(bad).is_err(), "{bad:?} must not yield a state");
+        assert!(
+            proc_state(123, bad).is_err(),
+            "{bad:?} must not yield a state"
+        );
     }
-    assert_eq!(proc_state("123 (hold-pipe) S 1 2"), Ok('S'));
-    assert_eq!(proc_state("123 (hold-pipe) Z 1 2"), Ok('Z'));
-    assert_eq!(proc_state("123 (a b) c) Z 1 2"), Ok('Z'));
-    assert_eq!(proc_state("123 (Z) S 1 2"), Ok('S'));
+    assert_eq!(proc_state(123, "123 (hold-pipe) S 1 2"), Ok('S'));
+    assert_eq!(proc_state(123, "123 (hold-pipe) Z 1 2"), Ok('Z'));
+    assert_eq!(proc_state(123, "123 (a b) c) Z 1 2"), Ok('Z'));
+    assert_eq!(proc_state(123, "123 (Z) S 1 2"), Ok('S'));
+    // The name holds ") Z " itself: the LAST `)` closes it, so the state is R.
+    assert_eq!(proc_state(123, "123 (a) Z b) R 1 2"), Ok('R'));
 }
 
 /// #2274: dropping the adapter used to join the core reaper on Tokio's sole

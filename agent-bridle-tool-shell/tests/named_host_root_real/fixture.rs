@@ -53,8 +53,9 @@ pub(super) fn probe() -> i32 {
             std::fs::write("late-marker", b"survived").unwrap();
         }
         Some("hold-pipe") => {
-            // Publish the pid so a test can poll this writer's liveness. It
-            // outlives any bounded cleanup, so surviving shows as a live pid
+            // Publish the pid so a test can poll this writer's liveness. The
+            // 60 s sleep is far longer than the cleanup grace and the test's
+            // 30 s deadline: surviving shows as a live pid at that deadline,
             // and never depends on how late the cleanup started (#529).
             // Written whole, then renamed, so a reader never sees it empty.
             std::fs::write("hold-pipe-pid.tmp", std::process::id().to_string()).unwrap();
