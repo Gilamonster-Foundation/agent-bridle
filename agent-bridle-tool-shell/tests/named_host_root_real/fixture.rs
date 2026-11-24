@@ -53,7 +53,14 @@ pub(super) fn probe() -> i32 {
             std::fs::write("late-marker", b"survived").unwrap();
         }
         Some("hold-pipe") => {
-            std::thread::sleep(Duration::from_secs(3));
+            // Publish the pid so a test can poll this writer's liveness. The
+            // 60 s sleep is far longer than the cleanup grace and the test's
+            // 30 s deadline: surviving shows as a live pid at that deadline,
+            // and never depends on how late the cleanup started (#529).
+            // Written whole, then renamed, so a reader never sees it empty.
+            std::fs::write("hold-pipe-pid.tmp", std::process::id().to_string()).unwrap();
+            std::fs::rename("hold-pipe-pid.tmp", "hold-pipe-pid").unwrap();
+            std::thread::sleep(Duration::from_secs(60));
             std::fs::write("late-marker", b"survived").unwrap();
         }
         Some("orphan-pipe") => {
@@ -65,6 +72,17 @@ pub(super) fn probe() -> i32 {
                 .args(["--host-root-probe", "hold-pipe"])
                 .spawn()
                 .expect("grandchild starts and holds inherited stdout");
+            // The test proceeds on `exiting-root-pid`, so the writer's pid file
+            // must exist first: cleanup could otherwise kill the writer before
+            // it publishes, and the test would wait for a file that never comes.
+            let published = std::time::Instant::now();
+            while !std::path::Path::new("hold-pipe-pid").exists() {
+                assert!(
+                    published.elapsed() < Duration::from_secs(10),
+                    "the pipe-holding writer never published its pid"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             std::fs::write("exiting-root-pid", std::process::id().to_string()).unwrap();
             // The core reaper now owns the descendant and both pipe writers.
         }
