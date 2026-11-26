@@ -26,6 +26,10 @@ use agent_bridle_tool_shell::{
     BrushShellTool, ShellInvocationId, ShellOutputObserver, ShellOutputStream,
 };
 
+#[cfg(unix)]
+#[path = "support/posix_discovery.rs"]
+mod posix_discovery;
+
 fn tool() -> BrushShellTool {
     BrushShellTool::new()
 }
@@ -91,6 +95,14 @@ fn main() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_platform() {
     let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    run_async_case(&runtime, "posix_command_discovery", || async {
+        posix_discovery::exercise(&tool()).await;
+    });
+    run_async_case(
+        &runtime,
+        "posix_discovery_does_not_authorize_execution",
+        posix_discovery_does_not_authorize_execution,
+    );
     #[cfg(not(feature = "carried-coreutils"))]
     run_async_case(
         &runtime,
@@ -1242,6 +1254,36 @@ async fn brush_honors_timeout_secs() {
     assert_eq!(out["exit_code"], 124, "{out}");
     assert!(
         out["stderr"].as_str().unwrap().contains("after 1s"),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+async fn posix_discovery_does_not_authorize_execution() {
+    let out = tool()
+        .invoke(
+            serde_json::json!({
+                "cmd": "which /bin/sh; /bin/sh -c 'printf SHOULD_NOT_RUN'",
+                "env": {"PATH": ""},
+            }),
+            &ctx(Caveats {
+                exec: Scope::none(),
+                ..Caveats::top()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out["stdout"], "/bin/sh\n",
+        "lookup must succeed before denial: {out}"
+    );
+    assert_eq!(out["denied"], true, "{out}");
+    assert!(
+        out["denials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["kind"] == "exec"),
         "{out}"
     );
 }

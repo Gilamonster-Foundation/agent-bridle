@@ -12,6 +12,15 @@ A capability-confined family of shell engines for agent-bridle:
 - `HostShellTool` (`host-shell`): full host-shell semantics when the OS sandbox
   can carry the confinement guarantee.
 
+On Unix, Brush and Host provide `which` as a shell function backed by
+`command -v`, preserving the selected shell's lookup behavior, options, and
+current PATH. For example, Brush's `command -v` does not report user functions.
+The helper takes precedence over an external `which`; user definitions of
+`which` or `command` follow ordinary shell function precedence. Lookup grants
+no execution permission. Embedders using `with_posix_command_discovery` apply
+it only at a POSIX interpreter boundary, after inspecting the original user
+source.
+
 The safe-subset engine makes agent-bridle the exec funnel: it parses the request
 itself, checks the `exec`/`fs` leash, spawns programs directly, and refuses
 dynamic constructs by design. It accepts two input shapes:

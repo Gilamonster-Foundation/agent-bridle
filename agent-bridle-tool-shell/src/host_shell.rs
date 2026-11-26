@@ -278,6 +278,9 @@ impl Tool for HostShellTool {
         let cwd = request.cwd.as_deref();
         let max_output = self.max_output;
 
+        #[cfg(unix)]
+        let cmd = crate::with_posix_command_discovery(&cmd);
+
         // Build the confined spawn: `/bin/sh -c <cmd>`, empty env + granted vars,
         // piped output. ConfinedCommand admission-checks exec (the shell binary,
         // permitted under exec=All), fail-closes on unenforceable fs, applies the

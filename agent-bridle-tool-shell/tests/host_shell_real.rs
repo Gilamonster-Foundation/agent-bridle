@@ -466,3 +466,11 @@ async fn host_honors_timeout_secs() {
         "{out}"
     );
 }
+
+#[path = "support/posix_discovery.rs"]
+mod posix_discovery;
+
+#[tokio::test]
+async fn posix_command_discovery() {
+    posix_discovery::exercise(&HostShellTool::new()).await;
+}
