@@ -98,6 +98,12 @@ cannot be projected. `find -exec` is explicitly marked as delegated because the
 external `find` process—not Brush—spawns that child. This projection is approval
 metadata, not enforcement or a complete process graph.
 
+With `brush` enabled, `literal_shell_word` resolves exactly one literal shell
+argument without treating it as an executable or reserved word. It removes
+supported quoting and escapes, accepts values such as `owner/r` and `done`,
+and rejects extra source, redirections, globbing, and runtime expansions.
+It parses without executing source and does not authorize the resulting value.
+
 The safe-subset path is the **L2 convenience** layer; the subprocess boundary is
 L3 (ADR 0005). Coverage is backend- and scope-shaped:
 
