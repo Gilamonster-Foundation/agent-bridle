@@ -26,6 +26,11 @@
 // ── The leash: canonical authority lattice (re-exported, single source) ──────
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod delegated_control;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use delegated_control::{receive_control_endpoint, send_control_endpoint};
+
 mod config;
 mod context;
 mod envelope;

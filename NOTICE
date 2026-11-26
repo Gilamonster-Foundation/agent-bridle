@@ -98,13 +98,19 @@ Sapin's archived `utf-8` crate:
 --------------------------------------------------------------------------------
 
 The authenticated private-worker transport uses `nix` for safe Unix socket
-credential and descriptor operations, and `libproc` on macOS to resolve a peer
-PID to its live executable image:
+credential and descriptor operations, `rustix` for delegated Unix endpoint
+transfer, and `libproc` on macOS to resolve a peer PID to its live executable image:
 
   nix
   Copyright (c) 2015 Carl Lerche + nix-rust Authors
   Licensed under the MIT License.
   https://github.com/nix-rust/nix
+
+  rustix
+  Copyrights in the rustix project are retained by their contributors.
+  Licensed under Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT.
+  Used under the MIT option.
+  https://github.com/bytecodealliance/rustix
 
   libproc
   Copyright (c) 2010 3scale networks S.L.
