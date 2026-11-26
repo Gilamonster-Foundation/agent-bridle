@@ -44,6 +44,17 @@ let child = cmd.spawn()?;
   the descriptor universe cannot be proven sweepable — the pre-exec hook returns
   an error, so `spawn` fails and the child never runs.
 
+## Delegated control sockets
+
+On Linux and macOS, `duplicate_control_socket(raw_fd)` duplicates an explicitly
+delegated, connected Unix stream with `FD_CLOEXEC`, preserving the caller's
+ownership of the original descriptor. It rejects standard streams, invalid
+file descriptors, non-stream sockets, disconnected sockets and non-Unix sockets.
+Validation uses the owned duplicate to avoid descriptor reuse between validation
+and ownership. The caller must authenticate the peer and protocol and establish
+the endpoint's authority; duplication does not confer authority or exempt a
+socket from the confined-spawn descriptor guard.
+
 ## Bounded opens (`GrantedRoot`, agent-bridle#351/#354)
 
 The crate also hosts the race-free bounded-open seam. Its invariant:

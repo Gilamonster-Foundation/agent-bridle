@@ -258,3 +258,117 @@ mod tests {
         );
     }
 }
+
+/// Duplicate an explicitly delegated Unix stream descriptor with close-on-exec.
+///
+/// This does not take ownership of `source`, open a path, or authenticate its
+/// peer. The caller must authenticate its protocol and scope before using it.
+/// Validation occurs on the duplicate so descriptor reuse cannot change the
+/// resource between validation and ownership. Standard streams are refused.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn duplicate_control_socket(
+    source: std::os::fd::RawFd,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if source < 3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a delegated control endpoint must not replace standard streams",
+        ));
+    }
+    // SAFETY: fcntl accepts any integer descriptor and returns either a new,
+    // exclusively owned descriptor or -1. We do not dereference caller memory
+    // or assume that source remains open across the call.
+    let duplicated = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful F_DUPFD_CLOEXEC returned this new owned descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(duplicated) };
+    let mut kind: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&kind) as libc::socklen_t;
+    // SAFETY: both pointers refer to valid writable locals of the stated sizes;
+    // owned remains live for the complete call.
+    let result = unsafe {
+        libc::getsockopt(
+            owned.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut size,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if kind != libc::SOCK_STREAM || size as usize != std::mem::size_of_val(&kind) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "delegated control endpoint is not a stream socket",
+        ));
+    }
+    let socket = std::os::unix::net::UnixStream::from(owned);
+    // std validates the socket address family and requires a connected peer.
+    socket.peer_addr()?;
+    Ok(socket)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod delegated_control_tests {
+    use super::duplicate_control_socket;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn duplicate_control_preserves_original_and_sets_cloexec() {
+        let (original, mut peer) = UnixStream::pair().unwrap();
+        let mut duplicate = duplicate_control_socket(original.as_raw_fd()).unwrap();
+        // SAFETY: duplicate remains live, F_GETFD has no pointer arguments.
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        duplicate.write_all(b"a").unwrap();
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"a");
+        drop(duplicate);
+        (&original).write_all(b"b").unwrap();
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"b");
+    }
+
+    #[test]
+    fn duplicate_control_rejects_files_and_standard_streams() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(duplicate_control_socket(file.as_raw_fd()).is_err());
+        for fd in [-1, 0, 1, 2, i32::MAX] {
+            assert!(duplicate_control_socket(fd).is_err());
+        }
+        // Validation failed after duplication; the original remains owned.
+        assert!(file.metadata().is_ok());
+    }
+
+    #[test]
+    fn duplicate_control_rejects_disconnected_and_non_unix_streams() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::net::UnixDatagram;
+
+        // SAFETY: socket has no pointer arguments and returns a new descriptor.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        // SAFETY: the successful socket call returned this owned descriptor.
+        let disconnected = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert!(duplicate_control_socket(disconnected.as_raw_fd()).is_err());
+
+        let (datagram, _peer) = UnixDatagram::pair().unwrap();
+        assert!(duplicate_control_socket(datagram.as_raw_fd()).is_err());
+        assert!(datagram.peer_addr().is_ok());
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        assert!(duplicate_control_socket(stream.as_raw_fd()).is_err());
+        assert!(stream.peer_addr().is_ok());
+    }
+}
