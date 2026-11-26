@@ -63,6 +63,8 @@ brush = [
     "dep:getrandom",
     "dep:libproc",
     "dep:nix",
+    "dep:content-addressable",
+    "dep:serde_bytes",
 ]
 # Carried coreutils (agent-bridle#20 / issue #206): the brush engine registers
 # bundled uu_* coreutils shims that re-exec `<self> --invoke-bundled <name>`, so
@@ -93,6 +95,9 @@ async-trait = { workspace = true }
 tokio = { workspace = true, optional = true }
 getrandom = { version = "0.2", optional = true }
 rustix = { version = "1", features = ["process"] }
+# Vendored broker codec foundations; excluded when Brush is not selected.
+content-addressable = { version = "0.1.2", features = ["unstable-merkle"], optional = true }
+serde_bytes = { version = "0.11", optional = true }
 
 # The `brush-ocap-*` fork on crates.io (github.com/hartsock/brush @ brush-ocap):
 # upstream brush + the CommandInterceptor hook (reubeno/brush#1184), renamed +
