@@ -461,6 +461,7 @@ fn inspect_simple_command(
     };
     if let Some((program, reason)) = resolved_program
         .as_deref()
+        .filter(|program| !is_timeout_program(program))
         .and_then(|program| unprojectable_program_reason(program).map(|reason| (program, reason)))
     {
         return Err(ShellInspectionError::new(format!(
@@ -497,6 +498,8 @@ fn inspect_simple_command(
 
     let descendant_execs = if resolved_program.as_deref().is_some_and(is_find_program) {
         inspect_find_descendants(&argv_words, containing_source, options, warnings)?
+    } else if resolved_program.as_deref().is_some_and(is_timeout_program) {
+        inspect_timeout_descendants(&argv_words, containing_source, options, warnings)?
     } else {
         Vec::new()
     };
@@ -981,6 +984,116 @@ fn is_find_program(program: &str) -> bool {
     classification_basename(program) == "find"
 }
 
+fn is_timeout_program(program: &str) -> bool {
+    classification_basename(program) == "timeout"
+}
+
+/// Project one literal timeout wrapper, retaining the original command. This
+/// is an inventory, not a promise that Brush intercepts its native children.
+fn inspect_timeout_descendants(
+    words: &[&Word],
+    source: &str,
+    options: &ParserOptions,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<DescendantExec>, ShellInspectionError> {
+    let invalid = || {
+        ShellInspectionError::new(
+        "`timeout` requires recognized literal options, a nonnegative finite duration, and a static descendant executable",
+    )
+    };
+    let literal = |index: usize| {
+        words
+            .get(index)
+            .ok_or_else(invalid)
+            .and_then(|word| static_shell_word(word, options).map_err(|_| invalid()))
+    };
+    let duration = |value: &str| {
+        let number = value.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(value);
+        number
+            .parse::<f64>()
+            .is_ok_and(|n| n.is_finite() && n >= 0.0)
+    };
+    let signal =
+        |value: &str| !value.is_empty() && value.bytes().all(|c| c.is_ascii_alphanumeric());
+    let mut index = 1;
+    loop {
+        let option = literal(index)?;
+        match option.as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "--foreground" | "--preserve-status" | "--verbose" | "-f" | "-p" | "-v" => {
+                index += 1;
+            }
+            "-s" | "--signal" | "-k" | "--kill-after" => {
+                let value = literal(index + 1)?;
+                let valid = if matches!(option.as_str(), "-s" | "--signal") {
+                    signal(&value)
+                } else {
+                    duration(&value)
+                };
+                if !valid {
+                    return Err(invalid());
+                }
+                index += 2;
+            }
+            _ if option.starts_with("--signal=") => {
+                if !signal(&option["--signal=".len()..]) {
+                    return Err(invalid());
+                }
+                index += 1;
+            }
+            _ if option.starts_with("--kill-after=") => {
+                if !duration(&option["--kill-after=".len()..]) {
+                    return Err(invalid());
+                }
+                index += 1;
+            }
+            _ if option.starts_with('-') => return Err(invalid()),
+            _ => break,
+        }
+    }
+    if !duration(&literal(index)?) {
+        return Err(invalid());
+    }
+    let child_index = index + 1;
+    let program = literal(child_index)?;
+    if program.is_empty() {
+        return Err(invalid());
+    }
+    // Do not hide a second dispatcher below the one represented here. Find's
+    // existing explicit child inventory is folded below; other wrappers fail.
+    if let Some(reason) = unprojectable_program_reason(&program) {
+        return Err(ShellInspectionError::new(format!(
+            "`timeout` descendant `{program}` cannot be projected statically: {reason}"
+        )));
+    }
+    let reason = format!(
+        "external `timeout` spawns `{program}` itself; Brush cannot independently intercept that descendant process"
+    );
+    warnings.push(reason.clone());
+    let mut children = vec![DescendantExec {
+        program: program.clone(),
+        argv: words[child_index..]
+            .iter()
+            .map(|word| word.value.clone())
+            .collect(),
+        source: source_between_words(words[0], words[words.len() - 1], source)
+            .ok_or_else(invalid)?,
+        reason,
+    }];
+    if is_find_program(&program) {
+        children.extend(inspect_find_descendants(
+            &words[child_index..],
+            source,
+            options,
+            warnings,
+        )?);
+    }
+    Ok(children)
+}
+
 fn unprojectable_program_reason(program: &str) -> Option<&'static str> {
     let basename = classification_basename(program);
 
@@ -1159,6 +1272,11 @@ fn inspect_find_descendants(
                 "`find {action}` has an empty descendant executable"
             )));
         }
+        if is_timeout_program(&program) {
+            return Err(ShellInspectionError::new(
+                "`find` delegating to `timeout` requires a nested native dispatcher projection; only a direct timeout wrapper is represented",
+            ));
+        }
         let source = source_between_words(
             argv_words[index],
             argv_words[terminator_index],
@@ -1200,6 +1318,157 @@ mod tests {
     use super::*;
 
     const COMPOUND_EXAMPLE: &str = r#"ls -1 $(find . -name "*.rs" -type f -exec wc -l {} + 2>/dev/null | sort -nr | head -10)"#;
+
+    #[test]
+    fn timeout_projects_a_literal_descendant_without_rewriting_source() {
+        for prefix in [
+            "timeout 120",
+            "'timeout' --foreground --preserve-status --verbose -s TERM -k 2s 0.5m",
+            "/usr/bin/timeout --signal=9 --kill-after=1s -- 3h",
+        ] {
+            let source = format!("printf before; {prefix} 'cargo' check --offline 2>&1 | tail -30");
+            let inspected = inspect_shell(&source).unwrap();
+            assert_eq!(inspected.source, source);
+            let wrapper = &inspected.commands[1];
+            assert_eq!(wrapper.descendant_execs.len(), 1);
+            let child = &wrapper.descendant_execs[0];
+            assert_eq!(child.program, "cargo");
+            assert_eq!(child.argv, ["'cargo'", "check", "--offline"]);
+            assert!(child.source.contains(prefix));
+            assert!(child.source.ends_with("'cargo' check --offline"));
+            assert!(child.reason.contains("cannot independently intercept"));
+        }
+    }
+
+    #[test]
+    fn timeout_keeps_unproven_dispatch_out_of_the_inventory() {
+        for source in [
+            "timeout --unknown 2 cargo check",
+            "timeout --help 2 cargo check",
+            "timeout --version 2 cargo check",
+            "timeout -s \"$SIGNAL\" 2 cargo check",
+            "timeout $SECONDS cargo check",
+            "timeout 2 \"$PROGRAM\" check",
+            "timeout 2 sh -c 'cargo check'",
+            "timeout 2 timeout 3 cargo check",
+            "timeout NaN cargo check",
+            "timeout -1 cargo check",
+            "timeout 2",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn timeout_retains_find_delegation_and_nested_argument_constructs() {
+        let source = "timeout 2 find . -exec git commit -m message \\;";
+        let inspected = inspect_shell(source).unwrap();
+        let children = &inspected.commands[0].descendant_execs;
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].program, "find");
+        assert_eq!(children[1].program, "git");
+        let inspected =
+            inspect_shell("timeout 2 cargo check --package \"$(printf package)\"").unwrap();
+        assert_eq!(inspected.constructs.len(), 1);
+        assert_eq!(inspected.commands[0].descendant_execs[0].program, "cargo");
+    }
+
+    #[test]
+    fn find_cannot_hide_an_unprojected_timeout_descendant() {
+        for source in [
+            "find . -exec timeout 2 git commit -m delegated \\;",
+            "timeout 3 find . -exec timeout 2 git commit -m delegated \\;",
+            "git commit -m direct; find . -exec timeout 2 git commit -m delegated \\;",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn timeout_option_operands_and_duration_boundaries_are_checked() {
+        for options in [
+            "-f -p -v --signal TERM --kill-after 0.25s -- 0",
+            "-s 9 -k 0.1m 1d",
+            "--signal=KILL --kill-after=2h 1e2s",
+        ] {
+            let source = format!("timeout {options} git status --short");
+            let inspected = inspect_shell(&source).unwrap();
+            assert_eq!(inspected.source, source);
+            assert_eq!(inspected.commands[0].descendant_execs[0].program, "git");
+        }
+        for tail in [
+            "-s",
+            "-k",
+            "--signal",
+            "--kill-after",
+            "--",
+            "-- 2",
+            "--signal= 2 git",
+            "-s 'TERM!' 2 git",
+            "--kill-after= 2 git",
+            "-k -1 2 git",
+            "-k NaN 2 git",
+            "-k inf 2 git",
+            "--kill-after=1e999 2 git",
+            "-k \"$SECONDS\" 2 git",
+            "-s $(printf TERM) 2 git",
+            "-sTERM 2 git",
+            "--unknown=2 2 git",
+            "inf git",
+            "1e999 git",
+            "-0.1 git",
+            "1ms git",
+            "'' git",
+            "2 ''",
+            "2 env git status",
+            "2 /usr/bin/timeout 1 git status",
+        ] {
+            assert!(inspect_shell(&format!("timeout {tail}")).is_err(), "{tail}");
+        }
+    }
+
+    #[test]
+    fn timeout_find_inventory_preserves_spelling_and_direct_command_identity() {
+        let source = r"C:/Tools/TIMEOUT.EXE 2 find . -execdir 'git' status {} +";
+        let inspected = inspect_shell(source).unwrap();
+        assert_eq!(inspected.source, source);
+        assert_eq!(inspected.commands.len(), 1);
+        let wrapper = &inspected.commands[0];
+        assert_eq!(wrapper.source, source);
+        assert_eq!(wrapper.program.as_deref(), Some("C:/Tools/TIMEOUT.EXE"));
+        assert_eq!(wrapper.descendant_execs[0].program, "find");
+        assert_eq!(wrapper.descendant_execs[1].program, "git");
+        assert_eq!(
+            wrapper.descendant_execs[1].source,
+            "-execdir 'git' status {} +"
+        );
+        for source in [
+            r"find . -ok C:/Tools/TIMEOUT.EXE 2 git status \;",
+            r"timeout 2 find . -okdir timeout 1 git status \;",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn timeout_inventory_does_not_grant_descendant_execution_authority() {
+        use agent_bridle_core::{Caveats, Gate, Scope};
+        let granted = Caveats {
+            exec: Scope::only(["timeout".to_string()]),
+            ..Caveats::top()
+        };
+        let cx = Gate::new(0)
+            .authorize(&crate::BrushShellTool::new(), &granted)
+            .unwrap();
+        let before = cx.caveats().clone();
+        let inspected = inspect_shell("timeout 2 git status").unwrap();
+        assert_eq!(inspected.commands[0].program.as_deref(), Some("timeout"));
+        assert!(cx.check_exec("timeout").is_ok());
+        assert!(cx
+            .check_exec(&inspected.commands[0].descendant_execs[0].program)
+            .is_err());
+        assert_eq!(cx.caveats(), &before);
+    }
 
     #[test]
     fn inspects_compound_substitution_pipeline_and_find_descendant() {

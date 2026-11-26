@@ -98,6 +98,13 @@ cannot be projected. `find -exec` is explicitly marked as delegated because the
 external `find` process—not Brush—spawns that child. This projection is approval
 metadata, not enforcement or a complete process graph.
 
+A direct, literal `timeout` wrapper is also projected: recognized options and a
+finite, nonnegative duration precede a statically known descendant executable.
+The original source and native timeout command are retained. `timeout find`
+includes the existing `find` descendant inventory; nested timeout wrappers and
+`find -exec timeout` are refused. Descendant records grant no execution or broker
+authority, and do not imply that Brush can intercept the native child.
+
 The safe-subset path is the **L2 convenience** layer; the subprocess boundary is
 L3 (ADR 0005). Coverage is backend- and scope-shaped:
 
