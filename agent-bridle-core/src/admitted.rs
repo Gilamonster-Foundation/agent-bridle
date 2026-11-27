@@ -56,10 +56,14 @@ pub(crate) fn entry_reaches_harness_private(entry: &str, markers: &[String]) -> 
     // Padding with separators keeps the match on component boundaries, so a
     // sibling like `/opt/newt-tools` does NOT match `.newt` and `/home/u/.sshfoo`
     // does NOT match `.ssh`.
-    let padded = format!("/{}/", entry.trim_matches('/'));
-    markers
-        .iter()
-        .any(|marker| padded.contains(&format!("/{}/", marker.trim_matches('/'))))
+    // Normalize both policy markers and entries, including mixed separators.
+    // This predicate does not replace callers' canonical-path checks.
+    let normalized = entry.replace('\\', "/");
+    let padded = format!("/{}/", normalized.trim_matches('/'));
+    markers.iter().any(|marker| {
+        let normalized = marker.replace('\\', "/");
+        padded.contains(&format!("/{}/", normalized.trim_matches('/')))
+    })
 }
 
 fn require_harness_disjoint(entry: &str, markers: &[String]) -> ToolResult<()> {
@@ -687,6 +691,62 @@ mod tests {
     }
 
     #[test]
+    fn private_store_checks_reject_windows_and_posix_default_markers() {
+        for root in [
+            "/home/user/.newt/helpers",
+            "/home/user/.ssh",
+            "/home/user/.config/gh",
+            r"C:\Users\user\.newt\helpers",
+            r"C:\Users\user\.config\gh",
+        ] {
+            assert!(
+                RuntimeClosure::empty().with_fs_read(root).is_err(),
+                "{root}"
+            );
+            assert!(RuntimeClosure::empty().with_exec(root).is_err(), "{root}");
+        }
+    }
+
+    #[test]
+    fn private_store_checks_normalize_configured_marker_separators_and_boundaries() {
+        for marker in [
+            ".example-harness/store",
+            r".example-harness\store",
+            r"\.example-harness/store\",
+        ] {
+            let mut policy = SandboxPolicy::default();
+            policy.harness_private_markers.extra.push(marker.into());
+            let closure = RuntimeClosure::for_policy(&policy);
+            for entry in [
+                "/home/u/.example-harness/store",
+                r"C:\Users\u\.example-harness\store\key",
+                r"C:\Users/u\.example-harness/store\key",
+            ] {
+                assert!(
+                    closure.clone().with_fs_read(entry).is_err(),
+                    "{marker}: {entry}"
+                );
+                assert!(
+                    closure.clone().with_exec(entry).is_err(),
+                    "{marker}: {entry}"
+                );
+                assert!(RuntimeClosure::empty().with_fs_read(entry).is_ok());
+            }
+            for entry in [
+                r"C:\Users\u\.example-harness\stores\key",
+                r"C:\Users\u\prefix.example-harness\store\key",
+                r"C:\Users\u\.config\ghi\key",
+                r"C:\Users\u\.newt-tools\worker",
+            ] {
+                assert!(
+                    closure.clone().with_fs_read(entry).is_ok(),
+                    "{marker}: {entry}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_backend_runtime_closure_reaching_a_harness_store_refuses_at_admission() {
         // The whole-closure guard: even a backend-declared closure (not the exec
         // ledger) that reaches `.newt` is refused before the scope check.
@@ -724,7 +784,7 @@ mod tests {
             .harness_private_markers
             .extra
             .push(".example-harness".into());
-        let entry = "/home/u/.example-harness/store";
+        let entry = r"C:\Users\u\.example-harness\store";
         assert!(
             RuntimeClosure::for_policy(&policy)
                 .with_exec(entry)

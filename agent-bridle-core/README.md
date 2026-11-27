@@ -169,7 +169,9 @@ explicit absolute helper path; the AppContainer backend never searches ambient
   `{ exec, net }` table. The old scalar form is a load error, in the file and in
   `BRIDLE_GATE_DEFAULT_STRENGTH_FLOOR`. `SandboxPolicy::harness_private_markers`
   (default: the previous five markers) lets an embedder name its own private
-  stores, and `BridleConfig::shell` (`[bridle.shell] engine`) names the shell
+  stores. Marker checks normalize slash and backslash separators in both paths
+  and configured markers, preserving component boundaries and canonical-path
+  checks. `BridleConfig::shell` (`[bridle.shell] engine`) names the shell
   engine a host builds; unset keeps the host's own default.
 
 ## Exact private-host approvals for async subprocesses
