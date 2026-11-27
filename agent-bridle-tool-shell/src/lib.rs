@@ -32,8 +32,11 @@
 /// Supply portable `which` without depending on an external utility. Lookup uses
 /// the selected POSIX shell's own `command -v`, including its current PATH.
 /// Apply only at a POSIX interpreter boundary, after inspecting the user command.
+/// The prelude shares the first source line, preserving line numbers. Diagnostic
+/// columns on that line include the prefix (`with_posix_command_discovery("").len()`
+/// bytes); columns on subsequent lines are unchanged.
 pub fn with_posix_command_discovery(command: &str) -> String {
-    format!("which() {{ command -v -- \"$@\"; }}\n{command}")
+    format!("which() {{ command -v -- \"$@\"; }}; {command}")
 }
 
 #[cfg(feature = "brush")]

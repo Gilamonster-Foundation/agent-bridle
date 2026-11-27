@@ -103,6 +103,18 @@ fn run_platform() {
         "posix_discovery_does_not_authorize_execution",
         posix_discovery_does_not_authorize_execution,
     );
+    run_async_case(
+        &runtime,
+        "posix_discovery_preserves_line_numbers",
+        || async {
+            posix_discovery::exercise_line_numbers(&tool()).await;
+        },
+    );
+    run_async_case(
+        &runtime,
+        "posix_discovery_preserves_error_line_numbers",
+        posix_discovery_preserves_error_line_numbers,
+    );
     #[cfg(not(feature = "carried-coreutils"))]
     run_async_case(
         &runtime,
@@ -1273,17 +1285,53 @@ async fn posix_discovery_does_not_authorize_execution() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        out["stdout"], "/bin/sh\n",
-        "lookup must succeed before denial: {out}"
+    let seatbelt = out["sandbox_kind"] == "seatbelt";
+    let lookup = if seatbelt { "" } else { "/bin/sh\n" };
+    eprintln!(
+        "posix discovery: sandbox={}; exec={}; lookup={:?}",
+        out["sandbox_kind"].as_str().unwrap(),
+        out["enforcement"]["exec"].as_str().unwrap(),
+        out["stdout"].as_str().unwrap()
     );
+    // Seatbelt can hide an ungranted executable from command -v's X_OK check.
+    assert_eq!(out["stdout"], lookup, "backend-aware lookup: {out}");
     assert_eq!(out["denied"], true, "{out}");
+    assert!(
+        !out["stdout"].as_str().unwrap().contains("SHOULD_NOT_RUN"),
+        "{out}"
+    );
+    assert_eq!(
+        out["enforcement"]["exec"],
+        if seatbelt { "kernel" } else { "interceptor" },
+        "{out}"
+    );
     assert!(
         out["denials"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|d| d["kind"] == "exec"),
+            .any(|d| d["kind"] == "exec" && d["target"] == "/bin/sh"),
         "{out}"
     );
+}
+
+#[cfg(unix)]
+async fn posix_discovery_preserves_error_line_numbers() {
+    for (command, line, column) in [
+        (
+            "echo 'unterminated",
+            1,
+            agent_bridle_tool_shell::with_posix_command_discovery("").len() + 6,
+        ),
+        ("echo ok\necho 'unterminated", 2, 6),
+    ] {
+        let out = tool()
+            .invoke(serde_json::json!({"cmd": command}), &ctx(Caveats::top()))
+            .await
+            .unwrap();
+        assert_ne!(out["exit_code"], 0, "{out}");
+        let stderr = out["stderr"].as_str().unwrap();
+        eprintln!("Brush user line {line}, diagnostic column {column}: {stderr:?}");
+        assert!(stderr.contains(&format!("at {line},{column} ")), "{out}");
+    }
 }

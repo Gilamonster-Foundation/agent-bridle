@@ -474,3 +474,30 @@ mod posix_discovery;
 async fn posix_command_discovery() {
     posix_discovery::exercise(&HostShellTool::new()).await;
 }
+
+#[tokio::test]
+async fn posix_discovery_preserves_line_numbers() {
+    posix_discovery::exercise_line_numbers(&HostShellTool::new().with_shell("/bin/bash")).await;
+}
+
+#[tokio::test]
+async fn posix_discovery_preserves_error_line_numbers() {
+    for (command, line) in [
+        ("bridle-command-that-does-not-exist", 1),
+        ("printf 'ok\\n'\nbridle-command-that-does-not-exist", 2),
+        ("echo 'unterminated", 1),
+    ] {
+        let out = HostShellTool::new()
+            .invoke(serde_json::json!({"cmd": command}), &ctx(Caveats::top()))
+            .await
+            .unwrap();
+        assert_ne!(out["exit_code"], 0, "{out}");
+        let stderr = out["stderr"].as_str().unwrap();
+        eprintln!("Host user line {line}: {stderr:?}");
+        // dash reports `/bin/sh: N:`; macOS's bash reports `line N:`.
+        assert!(
+            stderr.contains(&format!(": {line}:")) || stderr.contains(&format!("line {line}:")),
+            "{out}"
+        );
+    }
+}
