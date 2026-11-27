@@ -134,11 +134,13 @@ dependencies = [
  "brush-ocap-core",
  "brush-ocap-coreutils-builtins",
  "brush-parser",
+ "content-addressable",
  "getrandom 0.2.17",
  "libproc",
  "nix",
  "rustix",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tokio",
 ]

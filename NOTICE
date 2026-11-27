@@ -168,3 +168,9 @@ and compatible with Apache-2.0:
 This product depends on `agent-mesh-protocol` for the canonical `Caveats`
 authority lattice ("the leash"). agent-mesh-protocol is part of the Gilamonster
 agent line and is distributed under its own license.
+
+The shell's optional broker codec uses these components from the vendored
+implementation (the serde_bytes dependency is used under Apache-2.0):
+
+  content-addressable  Apache-2.0         https://github.com/hartsock/content-addressable
+  serde_bytes          MIT OR Apache-2.0 https://github.com/serde-rs/bytes
