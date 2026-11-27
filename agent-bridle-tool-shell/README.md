@@ -130,6 +130,14 @@ Static executable and literal-argument classification models Brush's runtime.
 Unquoted extended-glob patterns, later expanding brace groups, and
 array-assignment words are dynamic. Quoted or escaped parentheses remain literal.
 
+With `brush` enabled, `literal_shell_word` resolves exactly one source-bound
+literal argument under Brush's rules, without treating it as an executable or
+reserved word. It removes supported quoting and escapes and accepts values such
+as `owner/r` and `done`. Extra source, redirections, globbing (including extglob),
+brace expansion, array-assignment words and runtime expansions are refused
+conservatively. It parses without executing source and does not authorize the
+resulting value; it does not model other shells' expansion rules.
+
 The safe-subset path is the **L2 convenience** layer; the subprocess boundary is
 L3 (ADR 0005). Coverage is backend- and scope-shaped:
 
