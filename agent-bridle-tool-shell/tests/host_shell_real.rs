@@ -410,6 +410,98 @@ async fn bare_name_resolves_when_path_includes_its_dir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+fn skip_stdio_control_without_seatbelt() -> bool {
+    if agent_bridle_core::seatbelt_is_supported() {
+        return false;
+    }
+    let required = std::env::var("BRIDLE_REQUIRE_SEATBELT")
+        .is_ok_and(|value| !value.is_empty() && value != "0");
+    assert!(
+        !required,
+        "BRIDLE_REQUIRE_SEATBELT is set but /usr/bin/sandbox-exec is unavailable"
+    );
+    eprintln!("skipping stdio control: /usr/bin/sandbox-exec unavailable");
+    true
+}
+
+/// Caller-shape coverage from newt#2673/#2680 (upstream #416/#417).
+/// HostShellTool::invoke refuses restricted net before building a spawn, so
+/// exercise its /bin/sh -c + default-policy + Null/Piped/Piped builder shape
+/// directly. This complements core's generic stdio controls; the production
+/// fix is already upstream. Requires an unprivileged macOS caller.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[test]
+fn host_shell_confined_command_admits_net_none_with_named_stdio() {
+    use agent_bridle_core::{ConfinedCommand, ConfinedStdio, SandboxKind, SandboxPolicy};
+
+    if skip_stdio_control_without_seatbelt() {
+        return;
+    }
+
+    let cx = ctx(Caveats {
+        net: Scope::none(),
+        ..Caveats::top()
+    });
+
+    let child = ConfinedCommand::new("/bin/sh")
+        .arg("-c")
+        .arg("echo host-shell-ran")
+        .sandbox_policy(Arc::new(SandboxPolicy::default()))
+        .stdin(ConfinedStdio::Null)
+        .stdout(ConfinedStdio::Piped)
+        .stderr(ConfinedStdio::Piped)
+        .spawn(&cx)
+        .expect("net:none with the host-shell's own named stdio shape must be admitted");
+
+    assert_eq!(child.sandbox_kind, SandboxKind::Seatbelt);
+    let output = child.child.wait_with_output().expect("wait");
+    assert!(
+        output.status.success(),
+        "the admitted shell command must run: {output:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "host-shell-ran",
+        "the shell command must actually have executed"
+    );
+}
+
+/// The negative control for the test above: the SAME host-shell invocation
+/// shape with a raw, un-named `std::process::Stdio` — what `host_shell.rs`
+/// passed before the upstream stdio fix — refuses `net: none` admission. "A caller
+/// that wants Piped/Null credit must say so by name" (`ConfinedStdio`'s own
+/// doc comment); converting a raw `Stdio` in, even a freshly made pipe, is
+/// `ConfinedStdio::Other`.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[test]
+fn host_shell_confined_command_refuses_net_none_with_raw_other_stdio() {
+    use agent_bridle_core::{ConfinedCommand, SandboxPolicy, ToolError};
+
+    if skip_stdio_control_without_seatbelt() {
+        return;
+    }
+
+    let cx = ctx(Caveats {
+        net: Scope::none(),
+        ..Caveats::top()
+    });
+
+    let res = ConfinedCommand::new("/bin/sh")
+        .arg("-c")
+        .arg("echo host-shell-ran")
+        .sandbox_policy(Arc::new(SandboxPolicy::default()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn(&cx);
+
+    assert!(
+        matches!(res, Err(ToolError::Denied { .. })),
+        "the raw-Stdio shape must refuse net:none admission, got {res:?}"
+    );
+}
+
 /// #489 (newt #2732): the host engine honors its timeout. An injected zero
 /// budget terminates a non-finishing shell without sleeping to a deadline.
 #[tokio::test]
