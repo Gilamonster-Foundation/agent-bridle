@@ -143,25 +143,6 @@ impl SandboxedWorkerChild {
             .ok_or_else(|| ToolError::denied("trusted worker request was already sent"))?;
         control.send(payload, self.child.id(), timeout)
     }
-
-    /// Authenticate the worker and explicitly delegate one separate Unix control
-    /// endpoint during its take-once bootstrap. The receiver must request this
-    /// attachment in its authenticated tool payload and consume it before ACK.
-    /// The initial authority channel is still closed after that ACK; it is never
-    /// a broker request channel. Captured authority and fence evidence are unchanged.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub fn send_payload_with_control_channel<T: Serialize>(
-        &mut self,
-        payload: &T,
-        channel: std::os::unix::net::UnixStream,
-        timeout: Duration,
-    ) -> ToolResult<()> {
-        let mut control = self
-            .control
-            .take()
-            .ok_or_else(|| ToolError::denied("trusted worker request was already sent"))?;
-        control.send_with_channel(payload, self.child.id(), timeout, Some(&channel))
-    }
 }
 
 /// The supervisor-owned end of a trusted worker's private control channel.
@@ -187,17 +168,6 @@ impl TrustedWorkerControl {
         payload: &T,
         child_pid: u32,
         timeout: Duration,
-    ) -> ToolResult<()> {
-        self.send_with_channel(payload, child_pid, timeout, None)
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn send_with_channel<T: Serialize>(
-        &mut self,
-        payload: &T,
-        child_pid: u32,
-        timeout: Duration,
-        channel: Option<&std::os::unix::net::UnixStream>,
     ) -> ToolResult<()> {
         self.stream
             .set_read_timeout(Some(timeout))
@@ -249,9 +219,6 @@ impl TrustedWorkerControl {
         self.stream.write_all(&header).map_err(ToolError::from)?;
         self.stream.write_all(&body).map_err(ToolError::from)?;
         self.stream.flush().map_err(ToolError::from)?;
-        if let Some(channel) = channel {
-            crate::send_control_endpoint(&self.stream, channel)?;
-        }
         let mut ack = [0_u8; TRUSTED_WORKER_ACK.len()];
         self.stream.read_exact(&mut ack).map_err(ToolError::from)?;
         if ack != TRUSTED_WORKER_ACK {
@@ -322,12 +289,6 @@ pub struct TrustedWorkerRequest<P> {
 }
 
 impl<P> TrustedWorkerRequest<P> {
-    /// Borrow the authenticated tool payload without changing its authority envelope.
-    #[must_use]
-    pub fn payload(&self) -> &P {
-        &self.payload
-    }
-
     /// Consume the envelope into its nonce, core-authenticated authority, and
     /// payload.
     #[must_use]
@@ -2124,23 +2085,6 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn trusted_worker_control_freezes_authority_and_is_take_once() {
-        exercise_worker_control(false, true);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn delegated_control_arrives_before_ack_and_outlives_bootstrap() {
-        exercise_worker_control(true, true);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn failed_delegated_bootstrap_is_still_take_once() {
-        exercise_worker_control(true, false);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn exercise_worker_control(delegate: bool, valid_ack: bool) {
         let true_program = ["/usr/bin/true", "/bin/true"]
             .into_iter()
             .find(|path| Path::new(path).exists())
@@ -2152,13 +2096,6 @@ mod tests {
         let (client, mut server) =
             std::os::unix::net::UnixStream::pair().expect("private socketpair");
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
-        let (endpoint, mut endpoint_peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        endpoint_peer
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
 
         let peer = std::thread::spawn(move || {
             let mut bootstrap = [0_u8; TRUSTED_WORKER_BOOTSTRAP.len()];
@@ -2180,25 +2117,11 @@ mod tests {
             assert_eq!(digest, trusted_worker_frame_digest(&challenge, &body));
             let request: TrustedWorkerRequest<serde_json::Value> =
                 decode_trusted_worker_request(&body).expect("decode request");
-            assert!(request.has_supported_version());
-            let endpoint = if request.payload()["control"] == true {
-                Some(crate::receive_control_endpoint(&server).expect("endpoint before ACK"))
-            } else {
-                None
-            };
             seen_tx.send(request.into_parts()).expect("report request");
             server
-                .write_all(if valid_ack {
-                    &TRUSTED_WORKER_ACK
-                } else {
-                    b"bad-ACK!"
-                })
+                .write_all(&TRUSTED_WORKER_ACK)
                 .and_then(|()| server.flush())
                 .expect("write ACK");
-            assert_eq!(server.read(&mut [0]).unwrap(), 0, "bootstrap must retire");
-            if let Some(mut endpoint) = endpoint {
-                endpoint.write_all(b"private").unwrap();
-            }
         });
 
         let frozen = Caveats {
@@ -2223,27 +2146,14 @@ mod tests {
             control: Some(control),
         };
         let forged_payload = serde_json::json!({
-            "control": delegate,
             "cmd": "echo ok",
             "caveats": Caveats::top(),
             "strength_floor": AxisEnforcement::Kernel,
             "fence": test_fence(SandboxKind::None),
         });
-        let result = if delegate {
-            worker.send_payload_with_control_channel(
-                &forged_payload,
-                endpoint,
-                Duration::from_secs(5),
-            )
-        } else {
-            worker.send_payload(&forged_payload, Duration::from_secs(5))
-        };
-        assert_eq!(result.is_ok(), valid_ack, "{result:?}");
-        if delegate {
-            let mut bytes = [0; 7];
-            endpoint_peer.read_exact(&mut bytes).unwrap();
-            assert_eq!(&bytes, b"private");
-        }
+        worker
+            .send_payload(&forged_payload, Duration::from_secs(5))
+            .expect("first payload");
 
         let (nonce, authority, payload) = seen_rx.recv().expect("receive decoded request");
         assert_eq!(nonce, "core-owned-nonce");
@@ -2267,16 +2177,6 @@ mod tests {
             "the private control endpoint must be take-once"
         );
 
-        assert!(
-            worker
-                .send_payload_with_control_channel(
-                    &forged_payload,
-                    endpoint_peer,
-                    Duration::from_secs(1)
-                )
-                .is_err(),
-            "attachment sends must also be take-once"
-        );
         peer.join().expect("join fake worker");
         let _ = worker.child.wait();
     }

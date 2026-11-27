@@ -19,14 +19,13 @@ closure: no worker image read grant is added. AppContainer and Noop declare
 no worker closure. These backends retain their platform launch routes without
 Linux's descriptor-execution path or its image-binding guarantee.
 
-On Linux and macOS, `SandboxedWorkerChild::send_payload_with_control_channel`
-can transfer one separate Unix stream during the take-once bootstrap. The fixed
-worker authenticates the original channel, inspects `TrustedWorkerRequest::payload`,
-then receives the requested endpoint before ACK. The authority channel retires
-after ACK; version-3 `WorkerAuthority` and fence evidence remain unchanged.
-`send_control_endpoint` / `receive_control_endpoint` only transfer descriptors:
-they neither authenticate peers nor grant authority. Broker policy and activation
-are separate; no ordinary shell invocation receives an attachment by default.
+On Linux and macOS, the private `delegated_control` module stages bounded
+transport of exactly one connected Unix stream. It is compiled and tested but
+has no runtime caller or public export. It neither authenticates peers nor grants
+authority. The receiver owns accepted descriptors and closes rejected descriptors,
+including complete ancillary batches on macOS. Worker bootstrap is unchanged;
+attaching an endpoint is deferred until broker activation can update the stdin
+posture and ADR 0015 together.
 
 The non-bypassable invariant: a `Tool` can only act through a `ToolContext`,
 and a `ToolContext` can only be minted inside `Gate::authorize`. The tool

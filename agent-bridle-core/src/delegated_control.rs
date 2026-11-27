@@ -36,7 +36,7 @@ const RECEIVE_CONTROL_SPACE: usize = rustix::cmsg_space!(ScmRights(253), ScmCred
 ///
 /// Ownership stays with the caller; the receiver obtains a new owned reference.
 /// No filesystem path is opened and no filesystem/network grant is changed.
-pub fn send_control_endpoint(channel: &UnixStream, endpoint: &UnixStream) -> ToolResult<()> {
+pub(crate) fn send_control_endpoint(channel: &UnixStream, endpoint: &UnixStream) -> ToolResult<()> {
     let descriptors = [endpoint.as_fd()];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
@@ -66,7 +66,11 @@ pub fn send_control_endpoint(channel: &UnixStream, endpoint: &UnixStream) -> Too
 /// Only call this after authenticating the channel peer. Unknown markers,
 /// truncated control data, missing/extra descriptors, non-sockets and other
 /// socket families are rejected. Rejected descriptors are closed by ownership.
-pub fn receive_control_endpoint(channel: &UnixStream) -> ToolResult<UnixStream> {
+/// The receiver must control the channel's socket options and enable only
+/// supported ancillary types. After this marker, close the channel unread or use
+/// descriptor-aware receives with a full control buffer: plain reads on macOS
+/// can install further peer-supplied descriptors without reporting their numbers.
+pub(crate) fn receive_control_endpoint(channel: &UnixStream) -> ToolResult<UnixStream> {
     let mut marker = [0; MARKER.len()];
     let mut space = [MaybeUninit::uninit(); RECEIVE_CONTROL_SPACE];
     let mut descriptors = Vec::new();
@@ -257,6 +261,20 @@ mod tests {
             "isolated descriptor check failed: {case}\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "isolated descriptor check must run exactly one test: {case}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "isolated descriptor check must run exactly one test")]
+    fn isolation_refuses_an_unmatched_test_name() {
+        isolated("no_such_delegated_control_test", || {
+            panic!("unmatched test must not run a child check");
+        });
     }
 
     fn open_descriptors() -> std::collections::BTreeSet<std::os::fd::RawFd> {
