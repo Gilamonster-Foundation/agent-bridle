@@ -687,3 +687,30 @@ fn a_missing_confined_program_still_reports_not_found() {
         .expect_err("spawning a missing program must fail, not succeed");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
+
+/// Duplicating a delegated endpoint neither clears its source's flags nor
+/// exempts either descriptor from the ordinary confined-spawn guard.
+#[test]
+fn a_control_socket_duplicate_does_not_leak_or_exempt_ambient_fds() {
+    let _guard = fd_lock();
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let ambient = place_ambient(socket.as_raw_fd());
+    let duplicate = agent_bridle_fdguard::duplicate_control_socket(ambient).unwrap();
+    let copied = duplicate.as_raw_fd();
+    let targets = [ambient, copied];
+
+    let control = probe_child(&targets, None, false);
+    assert!(matches!(control.get(&ambient), Some(Some(_))));
+    assert_eq!(
+        control.get(&copied),
+        Some(&None),
+        "duplicate must be CLOEXEC"
+    );
+    let guarded = probe_child(&targets, None, true);
+    assert_eq!(guarded.get(&ambient), Some(&None));
+    assert_eq!(guarded.get(&copied), Some(&None));
+
+    make_inheritable(copied);
+    assert_guard_closes(copied, "control socket with CLOEXEC cleared");
+    close_fd(ambient);
+}
