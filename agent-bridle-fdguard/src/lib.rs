@@ -263,8 +263,17 @@ mod tests {
 ///
 /// This does not take ownership of `source`, open a path, or authenticate its
 /// peer. The caller must authenticate its protocol and scope before using it.
+/// The caller asserts that `source` names a descriptor delegated to it: a stale
+/// number duplicates whichever connected Unix stream holds that number when
+/// duplication occurs. The number check rejects negative descriptors and 0–2;
+/// a descriptor >= 3 that aliases a standard stream is accepted if it otherwise
+/// passes validation. This checks descriptor numbers, not stream identity.
+///
 /// Validation occurs on the duplicate so descriptor reuse cannot change the
-/// resource between validation and ownership. Standard streams are refused.
+/// resource between validation and ownership. The duplicate shares the original's
+/// open file description: shutdown, `set_nonblocking`, and socket-option changes
+/// through either descriptor affect the other. Closing the duplicate alone does
+/// not close the original descriptor.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn duplicate_control_socket(
     source: std::os::fd::RawFd,
@@ -338,12 +347,32 @@ mod delegated_control_tests {
     }
 
     #[test]
+    fn duplicate_control_shutdown_affects_original() {
+        let (mut original, mut peer) = UnixStream::pair().unwrap();
+        let duplicate = duplicate_control_socket(original.as_raw_fd()).unwrap();
+        duplicate.shutdown(std::net::Shutdown::Both).unwrap();
+
+        let error = original.write_all(b"x").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
     fn duplicate_control_rejects_files_and_standard_streams() {
         let file = std::fs::File::open("/dev/null").unwrap();
         assert!(duplicate_control_socket(file.as_raw_fd()).is_err());
-        for fd in [-1, 0, 1, 2, i32::MAX] {
-            assert!(duplicate_control_socket(fd).is_err());
+        for fd in [-1, 0, 1, 2] {
+            let error = duplicate_control_socket(fd).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "fd {fd}");
+            assert_eq!(
+                error.to_string(),
+                "a delegated control endpoint must not replace standard streams",
+                "fd {fd}"
+            );
         }
+        assert!(duplicate_control_socket(i32::MAX).is_err());
         // Validation failed after duplication; the original remains owned.
         assert!(file.metadata().is_ok());
     }
