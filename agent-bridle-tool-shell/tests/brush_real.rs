@@ -139,6 +139,16 @@ fn run_platform() {
         "full_access_runs_dynamic_construct_and_captures",
         full_access_runs_dynamic_construct_and_captures,
     );
+    run_async_case(
+        &runtime,
+        "static_words_match_real_brush_argv",
+        static_words_match_real_brush_argv,
+    );
+    run_async_case(
+        &runtime,
+        "literal_shell_words_match_real_brush_argv",
+        literal_shell_words_match_real_brush_argv,
+    );
     #[cfg(unix)]
     run_async_case(
         &runtime,
@@ -360,6 +370,94 @@ fn unique_temp(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn static_word_cases() -> [(&'static str, Option<&'static str>); 33] {
+    [
+        ("@(a|b)", None),
+        ("+(x)", None),
+        ("!(x)", None),
+        ("?(x)", None),
+        ("*(x)", None),
+        ("a@(b)", None),
+        ("!()", None),
+        ("{a}{b,c}", None),
+        ("{}{1..2}", None),
+        ("'{a}'{b,c}", None),
+        ("x{a}{,}", None),
+        ("{a}{b,c}{d}", None),
+        ("a=(b c)", None),
+        ("*", None),
+        ("x.*", None),
+        ("[", None),
+        ("{a,b}", None),
+        ("{1..2}", None),
+        ("literal", Some("literal")),
+        ("owner/r", Some("owner/r")),
+        ("done", Some("done")),
+        ("a=~/x", Some("a=~/x")),
+        ("{a}b{c}", Some("{a}b{c}")),
+        ("''", Some("")),
+        ("'two words'", Some("two words")),
+        ("'!(x)'", Some("!(x)")),
+        (r#""@(a|b)""#, Some("@(a|b)")),
+        (r"a\(b", Some("a(b")),
+        (r"@\(a\|b\)", Some("@(a|b)")),
+        ("'a=(b c)'", Some("a=(b c)")),
+        (r"a=\(b\ c\)", Some("a=(b c)")),
+        ("'*.rs'", Some("*.rs")),
+        ("résumé", Some("résumé")),
+    ]
+}
+
+/// Grounds the inspector's static-word promise in the real worker's expansion.
+/// The public find projection resolves each descendant argument through
+/// static_shell_word, so this needs no test-only classification API. The find
+/// source is inspected only; the worker runs a builtin argv-recording function.
+async fn static_words_match_real_brush_argv() {
+    use agent_bridle_tool_shell::inspect_shell;
+
+    let dir = unique_temp("static-words");
+    std::fs::create_dir(&dir).expect("create word-expansion fixture");
+    for name in ["a", "b", "x", "x.rs", "ab"] {
+        std::fs::write(dir.join(name), "").expect("write glob fixture");
+    }
+    let cases = static_word_cases();
+    let mut mismatches = Vec::new();
+    for (source, expected) in cases {
+        let claim = inspect_shell(&format!("find . -exec word-probe {source} \\;"))
+            .ok()
+            .map(|inspection| {
+                let argv = &inspection.commands[0].descendant_execs[0].argv;
+                assert_eq!(argv.len(), 2, "one source word: {source:?}");
+                argv[1].clone()
+            });
+        let cmd =
+            format!("capture_argv() {{ printf '%s\\0' \"$#\" \"$@\"; }}; capture_argv {source}");
+        let out = tool()
+            .invoke(
+                serde_json::json!({ "cmd": cmd, "cwd": dir }),
+                &ctx(Caveats::top()),
+            )
+            .await
+            .expect("invoke word-expansion worker");
+        assert_eq!(out["exit_code"], 0, "word {source:?}: {out}");
+        let mut fields = out["stdout"].as_str().unwrap().split_terminator('\0');
+        let count: usize = fields.next().unwrap().parse().expect("argument count");
+        let actual: Vec<_> = fields.collect();
+        assert_eq!(actual.len(), count, "framed argv: {source:?}");
+        let agrees = claim.as_deref().is_none_or(|literal| actual == [literal]);
+        if !agrees || claim.as_deref() != expected {
+            mismatches.push(format!("{source:?}: static={claim:?}, Brush={actual:?}"));
+        }
+    }
+    std::fs::remove_dir_all(&dir).expect("remove word-expansion fixture");
+    eprintln!(
+        "static word differential: {} cases, {} mismatches",
+        cases.len(),
+        mismatches.len()
+    );
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 /// The private worker protocol belongs to `brush`, not `carried-coreutils`.
@@ -1244,4 +1342,87 @@ async fn brush_honors_timeout_secs() {
         out["stderr"].as_str().unwrap().contains("after 1s"),
         "{out}"
     );
+}
+
+async fn literal_shell_words_match_real_brush_argv() {
+    use agent_bridle_tool_shell::literal_shell_word;
+
+    let dir = unique_temp("literal-words");
+    std::fs::create_dir(&dir).unwrap();
+    for name in ["a", "b", "x", "x.rs", "ab"] {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let cases: Vec<_> = static_word_cases()
+        .into_iter()
+        .chain([
+            ("$'x'", None),
+            (r"$'a\tb'", None),
+            (r#"$"x""#, None),
+            ("~", None),
+            ("~/x", None),
+            ("~root", None),
+            ("# comment", None),
+            ("x # comment", None),
+            (" x", None),
+            ("x ", None),
+            ("x\t", None),
+            ("x\n", None),
+            ("a b", None),
+            ("<<<x", None),
+            ("x <<<y", None),
+            ("$HOME", None),
+            ("$(printf x)", None),
+            ("x\\\ny", None),
+            ("x\\", None),
+            ("'unterminated", None),
+            ("o/r", Some("o/r")),
+            ("if", Some("if")),
+            ("sh", Some("sh")),
+            (r#""two words""#, Some("two words")),
+            (r"two\ words", Some("two words")),
+            ("'$(touch file)'", Some("$(touch file)")),
+            (r#""""#, Some("")),
+            (r"\$HOME", Some("$HOME")),
+            (r"\*.rs", Some("*.rs")),
+            (r#""*.rs""#, Some("*.rs")),
+            ("'a'\"b\"c", Some("abc")),
+            (r#""a\qb""#, Some(r"a\qb")),
+            ("'café ü'", Some("café ü")),
+        ])
+        .collect();
+    let mut mismatches = Vec::new();
+    for &(source, expected) in &cases {
+        let claim = literal_shell_word(source).ok();
+        let cmd =
+            format!("capture_argv() {{ printf '%s\\0' \"$#\" \"$@\"; }}; capture_argv {source}");
+        let out = tool()
+            .invoke(
+                serde_json::json!({"cmd": cmd, "cwd": dir, "env": {"HOME": dir}}),
+                &ctx(Caveats::top()),
+            )
+            .await
+            .unwrap();
+        let actual = if out["exit_code"] == 0 {
+            let mut fields = out["stdout"].as_str().unwrap().split_terminator('\0');
+            let count: usize = fields.next().unwrap().parse().expect("argument count");
+            let argv: Vec<_> = fields.collect();
+            assert_eq!(argv.len(), count, "framed argv for {source:?}: {out}");
+            Some(argv)
+        } else {
+            None
+        };
+        let agrees = claim
+            .as_deref()
+            .is_none_or(|literal| actual.as_deref() == Some(&[literal]));
+        if !agrees || claim.as_deref() != expected {
+            mismatches.push(format!("{source:?}: helper={claim:?}, Brush={actual:?}"));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    eprintln!(
+        "literal helper differential: {} cases, {} mismatches",
+        cases.len(),
+        mismatches.len()
+    );
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
