@@ -98,6 +98,10 @@ cannot be projected. `find -exec` is explicitly marked as delegated because the
 external `find` process—not Brush—spawns that child. This projection is approval
 metadata, not enforcement or a complete process graph.
 
+Static executable and literal-argument classification models Brush's runtime.
+Unquoted extended-glob patterns, later expanding brace groups, and
+array-assignment words are dynamic. Quoted or escaped parentheses remain literal.
+
 The safe-subset path is the **L2 convenience** layer; the subprocess boundary is
 L3 (ADR 0005). Coverage is backend- and scope-shaped:
 
