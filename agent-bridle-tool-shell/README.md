@@ -12,6 +12,12 @@ A capability-confined family of shell engines for agent-bridle:
 - `HostShellTool` (`host-shell`): full host-shell semantics when the OS sandbox
   can carry the confinement guarantee.
 
+The `brush` feature exports broker callback contracts as a foundation for later
+integration. No broker client or shell activation is available yet. The private
+codec checks canonical MerkleNode CIDs, causal response links, 32-byte challenges,
+1 MiB frames, and a 512 KiB receiver request limit. Responses retain the existing
+frame limit. Host callbacks remain responsible for policy; identity is not authority.
+
 On Unix, Brush and Host provide `which` as a shell function backed by
 `command -v`, using the selected shell's current PATH and lookup semantics.
 Lookup grants no execution permission: under a kernel exec fence such as
@@ -119,6 +125,10 @@ Known dispatch wrappers and interpreters fail closed when their runtime command
 cannot be projected. `find -exec` is explicitly marked as delegated because the
 external `find` process—not Brush—spawns that child. This projection is approval
 metadata, not enforcement or a complete process graph.
+
+Static executable and literal-argument classification models Brush's runtime.
+Unquoted extended-glob patterns, later expanding brace groups, and
+array-assignment words are dynamic. Quoted or escaped parentheses remain literal.
 
 The safe-subset path is the **L2 convenience** layer; the subprocess boundary is
 L3 (ADR 0005). Coverage is backend- and scope-shaped:

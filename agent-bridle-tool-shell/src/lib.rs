@@ -41,6 +41,23 @@ pub fn with_posix_command_discovery(command: &str) -> String {
 }
 
 #[cfg(feature = "brush")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Private codec awaits authenticated transport integration"
+    )
+)]
+mod broker_codec;
+#[cfg(feature = "brush")]
+mod command_broker;
+#[cfg(feature = "brush")]
+pub use command_broker::{
+    BrokerCommand, BrokerControl, BrokerPeer, BrokerProcess, BrokerSession, CommandBroker,
+    PreparedBrokerCommand,
+};
+
+#[cfg(feature = "brush")]
 mod brush_protocol;
 #[cfg(feature = "brush")]
 mod brush_shell;
