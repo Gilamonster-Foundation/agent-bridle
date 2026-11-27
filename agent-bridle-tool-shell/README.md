@@ -12,6 +12,12 @@ A capability-confined family of shell engines for agent-bridle:
 - `HostShellTool` (`host-shell`): full host-shell semantics when the OS sandbox
   can carry the confinement guarantee.
 
+The `brush` feature exports broker callback contracts as a foundation for later
+integration. No broker client or shell activation is available yet. The private
+codec checks canonical MerkleNode CIDs, causal response links, 32-byte challenges,
+1 MiB frames, and a 512 KiB receiver request limit. Responses retain the existing
+frame limit. Host callbacks remain responsible for policy; identity is not authority.
+
 The safe-subset engine makes agent-bridle the exec funnel: it parses the request
 itself, checks the `exec`/`fs` leash, spawns programs directly, and refuses
 dynamic constructs by design. It accepts two input shapes:

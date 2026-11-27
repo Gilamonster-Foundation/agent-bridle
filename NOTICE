@@ -98,13 +98,20 @@ Sapin's archived `utf-8` crate:
 --------------------------------------------------------------------------------
 
 The authenticated private-worker transport uses `nix` for safe Unix socket
-credential and descriptor operations, and `libproc` on macOS to resolve a peer
-PID to its live executable image:
+credential and descriptor operations and `libproc` on macOS to resolve a peer
+PID to its live executable image. The staged private Unix endpoint transport
+uses `rustix` for descriptor transfer:
 
   nix
   Copyright (c) 2015 Carl Lerche + nix-rust Authors
   Licensed under the MIT License.
   https://github.com/nix-rust/nix
+
+  rustix
+  Copyrights in the rustix project are retained by their contributors.
+  Licensed under Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT.
+  Used under the MIT option.
+  https://github.com/bytecodealliance/rustix
 
   libproc
   Copyright (c) 2010 3scale networks S.L.
@@ -168,3 +175,9 @@ and compatible with Apache-2.0:
 This product depends on `agent-mesh-protocol` for the canonical `Caveats`
 authority lattice ("the leash"). agent-mesh-protocol is part of the Gilamonster
 agent line and is distributed under its own license.
+
+The shell's optional broker codec uses these components from the vendored
+implementation (the serde_bytes dependency is used under Apache-2.0):
+
+  content-addressable  Apache-2.0         https://github.com/hartsock/content-addressable
+  serde_bytes          MIT OR Apache-2.0 https://github.com/serde-rs/bytes

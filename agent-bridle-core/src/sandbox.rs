@@ -3182,6 +3182,31 @@ pub(crate) mod landlock_impl {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        #[test]
+        fn private_store_backslash_marker_checks_the_canonical_closure_root() {
+            let dir =
+                std::env::temp_dir().join(format!("ab-private-marker-{}", std::process::id()));
+            let private = dir.join(".example-harness/store");
+            std::fs::create_dir_all(&private).unwrap();
+            let link = dir.join("innocent-substrate");
+            symlink(&private, &link).unwrap();
+            let mut policy = SandboxPolicy {
+                base_read_paths: crate::PathList::from_defaults(&[link.to_str().unwrap()]),
+                ..SandboxPolicy::default()
+            };
+            let benign = LandlockSandbox::with_policy(std::sync::Arc::new(policy.clone()))
+                .runtime_closure(&fs_read_only("/tmp"));
+            policy
+                .harness_private_markers
+                .extra
+                .push(r".example-harness\store".into());
+            let private = LandlockSandbox::with_policy(std::sync::Arc::new(policy))
+                .runtime_closure(&fs_read_only("/tmp"));
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(matches!(benign.fs_read, ResolvedScope::Bounded { .. }));
+            assert_eq!(private.fs_read, ResolvedScope::Unknown);
+        }
+
         /// E1 end-to-end: a symlinked read grant (`sub -> /`) resolves `fs_read`
         /// to `Unknown`, so mesh admission refuses — the whole-tree-read escape
         /// can never admit.

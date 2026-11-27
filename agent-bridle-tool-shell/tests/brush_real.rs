@@ -422,7 +422,41 @@ async fn static_words_match_real_brush_argv() {
     for name in ["a", "b", "x", "x.rs", "ab"] {
         std::fs::write(dir.join(name), "").expect("write glob fixture");
     }
-    let cases = static_word_cases();
+    let cases = [
+        ("@(a|b)", None),
+        ("+(x)", None),
+        ("!(x)", None),
+        ("?(x)", None),
+        ("*(x)", None),
+        ("a@(b)", None),
+        ("!()", None),
+        ("{a}{b,c}", None),
+        ("{}{1..2}", None),
+        ("'{a}'{b,c}", None),
+        ("x{a}{,}", None),
+        ("{a}{b,c}{d}", None),
+        ("a=(b c)", None),
+        ("*", None),
+        ("x.*", None),
+        ("[", None),
+        ("{a,b}", None),
+        ("{1..2}", None),
+        ("literal", Some("literal")),
+        ("owner/r", Some("owner/r")),
+        ("done", Some("done")),
+        ("a=~/x", Some("a=~/x")),
+        ("{a}b{c}", Some("{a}b{c}")),
+        ("''", Some("")),
+        ("'two words'", Some("two words")),
+        ("'!(x)'", Some("!(x)")),
+        (r#""@(a|b)""#, Some("@(a|b)")),
+        (r"a\(b", Some("a(b")),
+        (r"@\(a\|b\)", Some("@(a|b)")),
+        ("'a=(b c)'", Some("a=(b c)")),
+        (r"a=\(b\ c\)", Some("a=(b c)")),
+        ("'*.rs'", Some("*.rs")),
+        ("résumé", Some("résumé")),
+    ];
     let mut mismatches = Vec::new();
     for (source, expected) in cases {
         let claim = inspect_shell(&format!("find . -exec word-probe {source} \\;"))

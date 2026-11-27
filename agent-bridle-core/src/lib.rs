@@ -26,6 +26,18 @@
 // ── The leash: canonical authority lattice (re-exported, single source) ──────
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 
+// Keep the staged transport compiled; this expectation only suppresses dead-code
+// warnings and does not act as an activation guard.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Private endpoint transport awaits broker integration"
+    )
+)]
+mod delegated_control;
+
 mod config;
 mod context;
 mod envelope;
