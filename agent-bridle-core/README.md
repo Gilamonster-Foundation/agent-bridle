@@ -19,6 +19,14 @@ closure: no worker image read grant is added. AppContainer and Noop declare
 no worker closure. These backends retain their platform launch routes without
 Linux's descriptor-execution path or its image-binding guarantee.
 
+On Linux and macOS, the private `delegated_control` module stages bounded
+transport of exactly one connected Unix stream. It is compiled and tested but
+has no runtime caller or public export. It neither authenticates peers nor grants
+authority. The receiver owns accepted descriptors and closes rejected descriptors,
+including complete ancillary batches on macOS. Worker bootstrap is unchanged;
+attaching an endpoint is deferred until broker activation can update the stdin
+posture and ADR 0015 together.
+
 The non-bypassable invariant: a `Tool` can only act through a `ToolContext`,
 and a `ToolContext` can only be minted inside `Gate::authorize`. The tool
 receives the *meet* of granted-and-required authority — least authority by
