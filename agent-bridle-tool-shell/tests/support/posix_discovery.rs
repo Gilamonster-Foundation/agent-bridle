@@ -76,11 +76,10 @@ pub async fn exercise(tool: &dyn Tool) {
     assert_ne!(missing["exit_code"], 0, "{missing}");
 }
 
-// Host callers select bash for this check: POSIX does not require LINENO and
-// Linux's default /bin/sh (dash) leaves it unset.
-pub async fn exercise_line_numbers(tool: &dyn Tool) {
-    let cx = Gate::new(0).authorize(tool, &Caveats::top()).unwrap();
-    for (command, expected) in [
+// Brush has pinned absolute expectations; Host compares these same sources with
+// an unwrapped invocation of the selected shell instead.
+pub fn line_number_cases() -> [(&'static str, &'static str); 4] {
+    [
         ("printf '%s\\n' \"$LINENO\"", "1\n"),
         ("# leading comment\nprintf '%s\\n' \"$LINENO\"", "2\n"),
         ("\nprintf '%s\\n' \"$LINENO\"", "2\n"),
@@ -88,13 +87,5 @@ pub async fn exercise_line_numbers(tool: &dyn Tool) {
             "cat <<'EOF'\nbody\nEOF\nprintf '%s\\n' \"$LINENO\"",
             "body\n4\n",
         ),
-    ] {
-        let out = tool
-            .invoke(serde_json::json!({"cmd": command}), &cx)
-            .await
-            .unwrap();
-        assert_eq!(out["exit_code"], 0, "{command}: {out}");
-        assert_eq!(out["stdout"], expected, "{command}: {out}");
-        assert_eq!(out["stderr"], "", "{command}: {out}");
-    }
+    ]
 }

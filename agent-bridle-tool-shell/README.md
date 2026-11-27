@@ -27,8 +27,9 @@ follow ordinary shell function precedence.
 
 Embedders using `with_posix_command_discovery` apply it only at a POSIX interpreter
 boundary, after inspecting the original user source. The function definition is
-joined with `; ` on the first source line, so line numbers are preserved, including
-leading comments and here-documents. First-line diagnostic columns include the
+joined with `; ` on the first source line, adding no lines even with leading
+comments and here-documents. Each shell retains its own `$LINENO` and diagnostic
+conventions. Where first-line diagnostic columns are reported, they include the
 33-byte prelude; subtract `with_posix_command_discovery("").len()` to map them to
 user columns. Later columns are unchanged. Shell tracing and function inspection
 can expose the helper definition; it is not exported to child shells.

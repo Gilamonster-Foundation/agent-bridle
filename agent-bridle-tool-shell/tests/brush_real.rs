@@ -106,9 +106,7 @@ fn run_platform() {
     run_async_case(
         &runtime,
         "posix_discovery_preserves_line_numbers",
-        || async {
-            posix_discovery::exercise_line_numbers(&tool()).await;
-        },
+        posix_discovery_preserves_line_numbers,
     );
     run_async_case(
         &runtime,
@@ -1313,6 +1311,19 @@ async fn posix_discovery_does_not_authorize_execution() {
             .any(|d| d["kind"] == "exec" && d["target"] == "/bin/sh"),
         "{out}"
     );
+}
+
+#[cfg(unix)]
+async fn posix_discovery_preserves_line_numbers() {
+    for (command, expected) in posix_discovery::line_number_cases() {
+        let out = tool()
+            .invoke(serde_json::json!({"cmd": command}), &ctx(Caveats::top()))
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0, "{command}: {out}");
+        assert_eq!(out["stdout"], expected, "{command}: {out}");
+        assert_eq!(out["stderr"], "", "{command}: {out}");
+    }
 }
 
 #[cfg(unix)]
