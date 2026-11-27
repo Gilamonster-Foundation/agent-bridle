@@ -43,6 +43,42 @@ fn canonical_identity_and_response_link_round_trip() {
 }
 
 #[test]
+fn reply_error_and_endpoint_combinations_remain_unrestricted() {
+    let request_id = request(Vec::new()).id;
+    for error in [None, Some("x".repeat(MAX_PAYLOAD + 1))] {
+        for endpoint in [false, true] {
+            let reply = make_frame(
+                b"reply".to_vec(),
+                vec![7; 32],
+                [request_id].into(),
+                error.clone(),
+                endpoint,
+            )
+            .unwrap();
+            let bytes = wire(&reply);
+            let received = read_frame(&mut bytes.as_slice()).unwrap();
+            verify_frame(&received, &[7; 32], [request_id].into()).unwrap();
+            assert_eq!(received.node.payload().payload, b"reply");
+            assert_eq!(received.node.payload().error, error);
+            assert_eq!(received.node.payload().endpoint, endpoint);
+            assert!(read_request(&mut bytes.as_slice(), &[7; 32]).is_err());
+        }
+    }
+}
+
+#[test]
+fn unknown_version_decodes_but_verification_refuses_it() {
+    let mut frame = request(Vec::new());
+    frame.node.payload.version = 2;
+    frame.id = frame.node.id().unwrap();
+    let bytes = wire(&frame);
+    let decoded = read_frame(&mut bytes.as_slice()).unwrap();
+    assert_eq!(decoded.node.payload().version, 2);
+    assert!(verify_frame(&decoded, &[7; 32], BTreeSet::new()).is_err());
+    assert!(read_request(&mut bytes.as_slice(), &[7; 32]).is_err());
+}
+
+#[test]
 fn wrong_identity_challenge_parents_version_and_request_roles_refuse() {
     for case in 0..7 {
         let mut frame = request(b"request".to_vec());

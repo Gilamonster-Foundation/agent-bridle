@@ -1,7 +1,7 @@
 //! Host-owned command preparation and scoped helper callbacks.
 //!
 //! These contracts describe trusted host callbacks, not a host command executor.
-//! Implementations must enforce domain policy: authenticated helper messages are
+//! Implementations MUST enforce domain policy: authenticated helper messages are
 //! still untrusted input. Transport and shell activation are separate; no callback
 //! is invoked by the shell yet.
 
@@ -13,7 +13,10 @@ use std::time::Instant;
 
 use agent_bridle_core::{ToolContext, ToolError, ToolResult};
 
-/// The final native command before any host-provided preparation.
+/// Caller-filled native command data before any host-provided preparation.
+///
+/// The embedder MUST resolve the executable and absolute cwd and preserve exact
+/// argument boundaries and the explicit exported environment when constructing it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BrokerCommand {
     /// Resolved executable path; source spelling is kept separately.
@@ -24,7 +27,8 @@ pub struct BrokerCommand {
     pub argv0: OsString,
     /// Exact argument boundaries, excluding argv[0].
     pub args: Vec<OsString>,
-    /// Explicit exported environment; ambient environment is never inherited.
+    /// Explicit exported environment; the embedder MUST NOT inherit ambient
+    /// environment entries.
     pub env: Vec<(OsString, OsString)>,
     /// Final absolute working directory.
     pub cwd: PathBuf,
@@ -60,7 +64,11 @@ impl BrokerControl {
     }
 }
 
-/// Kernel-observed identity of a helper making a scoped callback.
+/// Caller-filled identity of a helper making a scoped callback.
+///
+/// The embedder MUST populate and verify these fields from kernel observations,
+/// not request-body claims, before admitting a callback. This struct performs no
+/// identity lookup or authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerPeer {
     /// Actual peer process ID, not a value asserted by the request body.
@@ -77,7 +85,10 @@ pub struct BrokerPeer {
     pub parent_birth: u64,
 }
 
-/// Kernel-observed native process identity captured at spawn registration.
+/// Caller-filled native process identity for spawn registration.
+///
+/// The embedder MUST capture and verify these fields from kernel observations
+/// before admitting helper requests; this struct performs no identity lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerProcess {
     /// Actual native child process ID.
@@ -90,16 +101,21 @@ pub struct BrokerProcess {
 
 /// Invocation-local opaque helper policy and any resources it must retain.
 ///
-/// The owner retains this object until the native worker has been stopped and
-/// reaped and all callbacks have joined. Implementations can own hook-directory
+/// The owner MUST retain this object until the native worker has been stopped
+/// and reaped and all callbacks have joined. Implementations can own hook-directory
 /// leases here. A helper's message kind or success claim is never authority:
-/// validate canonical payloads and actual repository state independently.
+/// implementations MUST validate canonical payloads and actual repository state
+/// independently.
 pub trait BrokerSession: Send + Sync {
-    /// Bind the native child's actual PID before any helper request is admitted.
-    /// An error aborts the launch owner; no helper receives a successful reply.
+    /// An implementation MUST bind the native child's actual PID before any
+    /// helper request is admitted. On error, the embedder MUST abort the launch
+    /// owner and prevent successful helper replies.
     fn on_spawn(&self, process: &BrokerProcess, control: &BrokerControl) -> ToolResult<()>;
 
-    /// Handle bounded opaque bytes from an authenticated helper.
+    /// Handle opaque helper bytes. The embedder MUST authenticate the helper and
+    /// enforce the 512 KiB request payload bound before calling this method.
+    /// Replies have only the codec's 1 MiB encoded-frame bound, not a 512 KiB
+    /// payload cap; the embedder MUST refuse replies exceeding that frame bound.
     fn request(
         &self,
         peer: &BrokerPeer,
@@ -110,20 +126,24 @@ pub trait BrokerSession: Send + Sync {
 
 /// Host preparation for a selected native command.
 ///
-/// Program, cwd, argv[0], and stdio remain unchanged. The final execution policy
-/// rechecks the resulting command and explicit descriptor delegation before
-/// spawn. The callback session is kept alive through owner cleanup.
+/// The embedder MUST preserve program, cwd, argv[0], and stdio, and recheck the
+/// resulting command and explicit descriptor delegation against the final
+/// execution policy before spawn. It MUST retain the callback session through
+/// owner cleanup. These obligations are not implemented by this data type.
 pub struct PreparedBrokerCommand {
     /// Explicit trusted image reached by a platform launcher after exec.
-    /// `None` requires the exact admitted executable image. This is host policy
-    /// data, never learned from a helper's reported path or basename.
+    /// For `None`, the embedder MUST require the exact admitted executable image.
+    /// It MUST obtain this policy from the trusted host, never from a helper's
+    /// reported path or basename.
     pub expected_process_image: Option<PathBuf>,
     /// Replacement native argument vector, or `None` to retain exact arguments.
     pub args: Option<Vec<OsString>>,
-    /// Environment updates for protected helpers; other entries are retained.
+    /// Environment updates for protected helpers; the embedder MUST retain
+    /// other entries.
     pub env: Vec<(OsString, OsString)>,
-    /// Explicit Unix descriptor number for the scoped helper endpoint (>=3).
-    /// A collision with an existing shell redirection is a refusal.
+    /// Explicit Unix descriptor number for the scoped helper endpoint.
+    /// The embedder MUST require >=3 and refuse a collision with an existing
+    /// shell redirection.
     pub target_fd: i32,
     /// Scoped host callback policy and resource lease.
     pub session: Arc<dyn BrokerSession>,
@@ -131,22 +151,24 @@ pub struct PreparedBrokerCommand {
 
 /// Host-owned optional preparation of already-resolved native commands.
 ///
-/// Returning `None` leaves normal execution unchanged. The context is the exact
-/// original invocation context; a callback cannot replace or widen it. This is
-/// not a host command-execution API.
+/// On `None`, the embedder MUST leave normal execution unchanged. It MUST supply
+/// the exact original invocation context; implementations MUST NOT replace or
+/// widen it. This is not a host command-execution API.
 pub trait CommandBroker: Send + Sync {
-    /// Read-only fixed-worker alias directories prepared before admission.
+    /// Read-only fixed-worker alias directories the embedder MUST prepare before
+    /// admission.
     ///
-    /// Only flat symlink directories targeting the fixed worker image qualify;
-    /// no additional executable authority is introduced. The fence refuses any
-    /// effective write scope that reaches these paths or
-    /// their relocation ancestors. They do not widen the invocation context.
-    /// In particular, an all-files write grant cannot protect these resources.
+    /// The embedder MUST accept only flat symlink directories targeting the fixed
+    /// worker image, without adding executable authority or widening the invocation
+    /// context. Its fence integration MUST refuse any effective write scope that
+    /// reaches these paths or their relocation ancestors; an all-files write grant
+    /// cannot protect these resources. This trait performs none of those checks.
     fn read_only_resources(&self, _context: &ToolContext) -> ToolResult<Vec<PathBuf>> {
         Ok(Vec::new())
     }
 
-    /// Prepare a command or leave it unchanged, within the supplied context.
+    /// Prepare a command or leave it unchanged. An implementation MUST stay
+    /// within the supplied context.
     fn prepare(
         &self,
         command: &BrokerCommand,

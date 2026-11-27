@@ -11,15 +11,32 @@ use std::io::{Read, Write};
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_PAYLOAD: usize = MAX_FRAME / 2;
 
+/// Version 1 has no role tag. Host-side `read_request` requires empty parents,
+/// `error: None` and `endpoint: false`. A reply links to the request CID as its
+/// only parent, checked by `verify_frame` after `read_frame`.
+///
+/// Beyond the common CID/version/challenge/parent checks, there is no reply-role
+/// validator: payload, error and endpoint combinations are unrestricted within
+/// the 1 MiB encoded-frame bound. Replies MUST only be read on the less trusted
+/// helper side; these fields do not authenticate a peer or authorize an action.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Body {
+    /// Wire schema version, included in the hashed body. Writers emit 1;
+    /// `verify_frame` and `read_request` refuse every other value without
+    /// negotiation. `read_frame` alone only decodes and does not check it.
     version: u8,
+    /// Expected 32-byte exchange challenge; the codec keeps no replay state.
     #[serde(with = "serde_bytes")]
     challenge: Vec<u8>,
+    /// Opaque request or reply bytes; only requests have a 512 KiB payload cap.
     #[serde(with = "serde_bytes")]
     payload: Vec<u8>,
+    /// Reply-only peer-supplied failure text (`None` means no reported failure).
+    /// The codec neither interprets nor logs it and adds no separate text bound.
     error: Option<String>,
+    /// Reply-only announcement that a Unix stream descriptor follows the frame
+    /// in a separate transfer; the codec neither receives nor validates it.
     endpoint: bool,
 }
 
@@ -105,6 +122,10 @@ pub(super) fn write_frame(stream: &mut impl Write, frame: &Frame) -> ToolResult<
     Ok(())
 }
 
+/// Reads bytes from any `Read`; a Unix-socket transport MUST receive every frame
+/// fragment with descriptor-aware `recvmsg`, a full-sized control buffer, and
+/// refusal of attached rights, because a plain read can install peer-supplied
+/// descriptors on platforms such as macOS.
 pub(super) fn read_frame(stream: &mut impl Read) -> ToolResult<Frame> {
     let mut length = [0; 4];
     stream
