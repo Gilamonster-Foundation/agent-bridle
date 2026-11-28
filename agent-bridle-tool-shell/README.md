@@ -108,6 +108,47 @@ Static executable and literal-argument classification models Brush's runtime.
 Unquoted extended-glob patterns, later expanding brace groups, and
 array-assignment words are dynamic. Quoted or escaped parentheses remain literal.
 
+A direct, literal `timeout` wrapper is also projected. The reference is GNU
+coreutils `timeout` 9.4, with this deliberately bounded subset of its grammar:
+
+- Before the duration: `--foreground`, `--preserve-status`, `-v`/`--verbose`;
+  `-s SIGNAL`/`--signal SIGNAL`/`--signal=SIGNAL`; and
+  `-k DURATION`/`--kill-after DURATION`/`--kill-after=DURATION`.
+  Signals must be nonempty ASCII alphanumeric tokens; platform-specific signal
+  validity is not checked.
+- Durations must parse as finite, nonnegative decimal floating-point values,
+  optionally followed by lowercase `s`, `m`, `h` or `d`. Decimal fractions,
+  signs and decimal exponents are accepted (for example `0`, `.5s`, `1.d`,
+  `+1` and `1e2s`). Zero disables the associated native timeout. Hexadecimal,
+  infinite, NaN, negative and compound durations such as `1d2h` are refused.
+- `--` ends options only before the duration, as in `timeout -- 5 git status`.
+  GNU 9.4 treats `--` after the duration as the command name, not a separator.
+  Inspection refuses every descendant program beginning with `-`, including
+  `--`, even when quoted or escaped.
+
+All wrapper options and duration forms outside this subset are refused,
+including bundled/attached short options, abbreviated long options, `--help`
+and `--version`. GNU 9.4 rejects `-f` and `-p` with exit status 125; inspection
+also refuses them. Options, duration and the descendant program must be static
+under Brush's literal-word rules. The remaining child arguments retain their
+source spelling and may still contain expansions.
+
+The original source and native timeout command are retained. `timeout find`
+includes the existing `find` descendant inventory; nested timeout wrappers and
+`find -exec timeout` are refused, including dynamically spelled programs.
+The wrapper grammar set is closed at `{find, timeout}` pending command packs
+(ADR 0010). Recognition uses the executable basename and does not authenticate
+the utility. Other implementations, including BusyBox, uutils and Windows
+`timeout.exe`, are not compatibility targets and may reject accepted forms or
+interpret them differently.
+
+Without `--foreground`, GNU `timeout` puts the wrapped command in its own
+process group; it can outlive the tool's own timeout or cancellation. Inspection
+emits that warning for non-foreground wrappers. Projecting a descendant says
+nothing about its lifetime, grants no execution or broker authority, and does
+not imply that Brush can intercept the native child. `--foreground` removes
+this particular process-group escape, not all possible descendant escapes.
+
 With `brush` enabled, `literal_shell_word` resolves exactly one source-bound
 literal argument under Brush's rules, without treating it as an executable or
 reserved word. It removes supported quoting and escapes and accepts values such
