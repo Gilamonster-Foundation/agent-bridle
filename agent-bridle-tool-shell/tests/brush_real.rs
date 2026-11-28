@@ -26,6 +26,10 @@ use agent_bridle_tool_shell::{
     BrushShellTool, ShellInvocationId, ShellOutputObserver, ShellOutputStream,
 };
 
+#[cfg(unix)]
+#[path = "support/posix_discovery.rs"]
+mod posix_discovery;
+
 fn tool() -> BrushShellTool {
     BrushShellTool::new()
 }
@@ -91,6 +95,24 @@ fn main() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_platform() {
     let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    run_async_case(&runtime, "posix_command_discovery", || async {
+        posix_discovery::exercise(&tool()).await;
+    });
+    run_async_case(
+        &runtime,
+        "posix_discovery_does_not_authorize_execution",
+        posix_discovery_does_not_authorize_execution,
+    );
+    run_async_case(
+        &runtime,
+        "posix_discovery_preserves_line_numbers",
+        posix_discovery_preserves_line_numbers,
+    );
+    run_async_case(
+        &runtime,
+        "posix_discovery_preserves_error_line_numbers",
+        posix_discovery_preserves_error_line_numbers,
+    );
     #[cfg(not(feature = "carried-coreutils"))]
     run_async_case(
         &runtime,
@@ -1376,6 +1398,85 @@ async fn brush_honors_timeout_secs() {
         out["stderr"].as_str().unwrap().contains("after 1s"),
         "{out}"
     );
+}
+
+#[cfg(unix)]
+async fn posix_discovery_does_not_authorize_execution() {
+    let out = tool()
+        .invoke(
+            serde_json::json!({
+                "cmd": "which /bin/sh; /bin/sh -c 'printf SHOULD_NOT_RUN'",
+                "env": {"PATH": ""},
+            }),
+            &ctx(Caveats {
+                exec: Scope::none(),
+                ..Caveats::top()
+            }),
+        )
+        .await
+        .unwrap();
+    let seatbelt = out["sandbox_kind"] == "seatbelt";
+    let lookup = if seatbelt { "" } else { "/bin/sh\n" };
+    eprintln!(
+        "posix discovery: sandbox={}; exec={}; lookup={:?}",
+        out["sandbox_kind"].as_str().unwrap(),
+        out["enforcement"]["exec"].as_str().unwrap(),
+        out["stdout"].as_str().unwrap()
+    );
+    // Seatbelt can hide an ungranted executable from command -v's X_OK check.
+    assert_eq!(out["stdout"], lookup, "backend-aware lookup: {out}");
+    assert_eq!(out["denied"], true, "{out}");
+    assert!(
+        !out["stdout"].as_str().unwrap().contains("SHOULD_NOT_RUN"),
+        "{out}"
+    );
+    assert_eq!(
+        out["enforcement"]["exec"],
+        if seatbelt { "kernel" } else { "interceptor" },
+        "{out}"
+    );
+    assert!(
+        out["denials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["kind"] == "exec" && d["target"] == "/bin/sh"),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+async fn posix_discovery_preserves_line_numbers() {
+    for (command, expected) in posix_discovery::line_number_cases() {
+        let out = tool()
+            .invoke(serde_json::json!({"cmd": command}), &ctx(Caveats::top()))
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0, "{command}: {out}");
+        assert_eq!(out["stdout"], expected, "{command}: {out}");
+        assert_eq!(out["stderr"], "", "{command}: {out}");
+    }
+}
+
+#[cfg(unix)]
+async fn posix_discovery_preserves_error_line_numbers() {
+    for (command, line, column) in [
+        (
+            "echo 'unterminated",
+            1,
+            agent_bridle_tool_shell::with_posix_command_discovery("").len() + 6,
+        ),
+        ("echo ok\necho 'unterminated", 2, 6),
+    ] {
+        let out = tool()
+            .invoke(serde_json::json!({"cmd": command}), &ctx(Caveats::top()))
+            .await
+            .unwrap();
+        assert_ne!(out["exit_code"], 0, "{out}");
+        let stderr = out["stderr"].as_str().unwrap();
+        eprintln!("Brush user line {line}, diagnostic column {column}: {stderr:?}");
+        assert!(stderr.contains(&format!("at {line},{column} ")), "{out}");
+    }
 }
 
 async fn literal_shell_words_match_real_brush_argv() {

@@ -18,6 +18,28 @@ codec checks canonical MerkleNode CIDs, causal response links, 32-byte challenge
 1 MiB frames, and a 512 KiB receiver request limit. Responses retain the existing
 frame limit. Host callbacks remain responsible for policy; identity is not authority.
 
+On Unix, Brush and Host provide `which` as a shell function backed by
+`command -v`, using the selected shell's current PATH and lookup semantics.
+Lookup grants no execution permission: under a kernel exec fence such as
+Seatbelt, discovery of an ungranted program may report nothing.
+
+Use one name per call. Brush and dash inspect only the first operand; external
+`which` options such as `-a` and `--version` are not supported. A missing name
+returns 1 in Brush and 127 in dash. Brush does not report user functions, while
+dash does; dash can also report an absolute path that exists but is not executable.
+Other host shells retain their own `command -v` behavior. The helper takes
+precedence over an external `which`; user definitions of `which` or `command`
+follow ordinary shell function precedence.
+
+Embedders using `with_posix_command_discovery` apply it only at a POSIX interpreter
+boundary, after inspecting the original user source. The function definition is
+joined with `; ` on the first source line, adding no lines even with leading
+comments and here-documents. Each shell retains its own `$LINENO` and diagnostic
+conventions. Where first-line diagnostic columns are reported, they include the
+33-byte prelude; subtract `with_posix_command_discovery("").len()` to map them to
+user columns. Later columns are unchanged. Shell tracing and function inspection
+can expose the helper definition; it is not exported to child shells.
+
 The safe-subset engine makes agent-bridle the exec funnel: it parses the request
 itself, checks the `exec`/`fs` leash, spawns programs directly, and refuses
 dynamic constructs by design. It accepts two input shapes:

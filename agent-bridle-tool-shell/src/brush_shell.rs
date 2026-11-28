@@ -873,6 +873,8 @@ pub(crate) fn run_in_brush(
             .set_global("PS4", ps4)
             .map_err(|e| ToolError::Exec(brush_io("pin readonly PS4", &e)))?;
 
+        #[cfg(unix)]
+        let cmd = crate::with_posix_command_discovery(&cmd);
         let result = shell.run_dash_c_command(cmd).await.map_err(|e| {
             // FIX 2: the interceptor's `before_command` answers a cancelled
             // run with a TERMINATING `CommandDenied`, which the interpreter

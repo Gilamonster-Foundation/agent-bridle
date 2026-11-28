@@ -558,3 +558,67 @@ async fn host_honors_timeout_secs() {
         "{out}"
     );
 }
+
+#[path = "support/posix_discovery.rs"]
+mod posix_discovery;
+
+#[tokio::test]
+async fn posix_command_discovery() {
+    posix_discovery::exercise(&HostShellTool::new()).await;
+}
+
+// Use identical shell, source, environment and stdio for the raw baseline and
+// the Host engine. Shell versions differ in LINENO support and error formatting.
+async fn assert_host_matches_unwrapped(shell: &str, command: &str, success: bool) {
+    let path = agent_bridle_core::default_exec_path();
+    let baseline = std::process::Command::new(shell)
+        .arg("-c")
+        .arg(command)
+        .env_clear()
+        .env("PATH", &path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(baseline.status.success(), success, "{shell}: {command}");
+    let stdout = String::from_utf8(baseline.stdout).unwrap();
+    let stderr = String::from_utf8(baseline.stderr).unwrap();
+    let out = HostShellTool::new()
+        .with_shell(shell)
+        .invoke(
+            serde_json::json!({"cmd": command, "env": {"PATH": path}}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .unwrap();
+    eprintln!("Host baseline {shell}: source={command:?}; stdout={stdout:?}; stderr={stderr:?}");
+    assert_eq!(
+        out["exit_code"],
+        baseline.status.code().unwrap(),
+        "{shell}: {command}: {out}"
+    );
+    assert_eq!(out["stdout"], stdout, "{shell}: {command}: {out}");
+    assert_eq!(out["stderr"], stderr, "{shell}: {command}: {out}");
+}
+
+#[tokio::test]
+async fn posix_discovery_preserves_line_numbers() {
+    for shell in ["/bin/sh", "/bin/bash"] {
+        for (command, _) in posix_discovery::line_number_cases() {
+            assert_host_matches_unwrapped(shell, command, true).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn posix_discovery_preserves_error_line_numbers() {
+    for shell in ["/bin/sh", "/bin/bash"] {
+        for command in [
+            "bridle-command-that-does-not-exist",
+            "printf 'ok\\n'\n:\nbridle-command-that-does-not-exist",
+            "echo 'unterminated",
+            "printf 'ok\\n'\n:\necho 'unterminated",
+        ] {
+            assert_host_matches_unwrapped(shell, command, false).await;
+        }
+    }
+}
